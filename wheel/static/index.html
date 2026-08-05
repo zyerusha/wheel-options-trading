@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Wheel Dashboard</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="top">
+        <div>
+          <h1>Options Wheel Dashboard</h1>
+          <div class="subtitle" id="subtitle">Loading…</div>
+        </div>
+        <div class="top-actions">
+          <button id="theme-toggle" title="Switch light / dark">Theme</button>
+        </div>
+      </header>
+
+      <!-- Data source: choose an export, or upload a new one. Nothing is
+           evaluated until Load is pressed. -->
+      <section class="source" aria-label="Data source">
+        <div class="field source-list">
+          <label id="dataset-label">
+            Exports to combine
+            <span class="hint-inline">tick several — overlapping trades are counted once</span>
+          </label>
+          <div class="dataset-list" id="dataset-list" role="group" aria-labelledby="dataset-label"></div>
+        </div>
+        <div class="field">
+          <label for="csv-file">Add Fidelity CSVs</label>
+          <input type="file" id="csv-file" accept=".csv,text/csv" multiple />
+        </div>
+        <div class="field">
+          <label>&nbsp;</label>
+          <button id="load-data" class="primary">Load</button>
+        </div>
+        <div class="source-status" id="source-status" role="status" aria-live="polite"></div>
+      </section>
+
+      <!-- One filter row, above everything it scopes. -->
+      <section class="filters" aria-label="Filters">
+        <div class="field">
+          <label for="preset">Date range</label>
+          <select id="preset">
+            <option value="all">All history</option>
+            <option value="10">Last 10 days</option>
+            <option value="ytd">Year to date</option>
+            <option value="1y">1 year</option>
+            <option value="3y">3 years</option>
+            <option value="5y">5 years</option>
+            <option value="custom">Custom…</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="start">From</label>
+          <input type="date" id="start" />
+        </div>
+        <div class="field">
+          <label for="end">To</label>
+          <input type="date" id="end" />
+        </div>
+        <div class="field">
+          <label id="status-label">Status</label>
+          <div class="chip-row" id="status-chips" role="group" aria-labelledby="status-label"></div>
+        </div>
+        <div class="field" style="flex: 1 1 320px">
+          <label id="ticker-label">Ticker</label>
+          <div class="chip-row" id="ticker-chips" role="group" aria-labelledby="ticker-label"></div>
+        </div>
+        <div class="field">
+          <label>&nbsp;</label>
+          <button id="reset">Reset</button>
+        </div>
+      </section>
+
+      <div id="notices"></div>
+
+      <section class="tiles" id="tiles" aria-label="Headline metrics"></section>
+
+      <div class="grid two">
+        <section class="card">
+          <header>
+            <h2>Capital deployed</h2>
+            <div class="card-actions">
+              <button class="toggle" id="capital-mode" aria-pressed="false">% of total</button>
+              <button class="toggle" data-twin="capital-table" aria-pressed="false">Table</button>
+            </div>
+          </header>
+          <p class="hint">
+            <strong>Stacked</strong> — each day's bands sit on top of each other, so the height of
+            the stack is your total committed capital (the grey line, in dollars). Put collateral is
+            strike × 100 × contracts; assigned shares carry their cost basis; a covered call adds
+            nothing, because the capital is already in the shares.
+          </p>
+          <div class="chart-scroll"><svg id="chart-capital" role="img"></svg></div>
+          <div class="legend" id="legend-capital"></div>
+          <div class="table-twin" id="capital-table" hidden></div>
+        </section>
+
+        <section class="card">
+          <header>
+            <h2>Cumulative premium &amp; realized P/L</h2>
+            <button class="toggle" data-twin="pnl-table" aria-pressed="false">Table</button>
+          </header>
+          <p class="hint">
+            Premium is credit taken in at open. Realized P/L nets buy-backs, expirations and stock
+            called away — it is what actually stuck.
+          </p>
+          <div class="chart-scroll"><svg id="chart-pnl" role="img"></svg></div>
+          <div class="legend" id="legend-pnl"></div>
+          <div class="table-twin" id="pnl-table" hidden></div>
+        </section>
+      </div>
+
+      <div class="grid two">
+        <section class="card">
+          <header>
+            <h2>Realized P/L by ticker</h2>
+            <button class="toggle" data-twin="ticker-table" aria-pressed="false">Table</button>
+          </header>
+          <p class="hint">Net of option cash and realized stock P/L. Blue is a gain, red a loss.</p>
+          <div class="chart-scroll"><svg id="chart-ticker-pl" role="img"></svg></div>
+          <div class="table-twin" id="ticker-table" hidden></div>
+        </section>
+
+        <section class="card">
+          <header>
+            <h2>Annualized return on capital</h2>
+            <button class="toggle" data-twin="roc-table" aria-pressed="false">Table</button>
+          </header>
+          <p class="hint">
+            Net P/L ÷ time-weighted average capital, scaled to a year. Tickers marked ~ include a
+            strike-based proxy for stock held before this export.
+          </p>
+          <div class="chart-scroll"><svg id="chart-roc" role="img"></svg></div>
+          <div class="table-twin" id="roc-table" hidden></div>
+        </section>
+      </div>
+
+      <section class="card" style="margin-bottom: var(--gap)">
+        <header>
+          <h2>Wheel timelines</h2>
+          <button class="toggle" data-twin="timeline-table" aria-pressed="false">Table</button>
+        </header>
+        <p class="hint">
+          One row per cycle. Each bar is an option leg — hover for the trade. ▲ marks a sell-to-open,
+          ▼ a buy-to-close, ◆ an assignment.
+        </p>
+        <div class="chart-scroll"><svg id="chart-timeline" role="img"></svg></div>
+        <div class="legend" id="legend-timeline"></div>
+        <div class="table-twin" id="timeline-table" hidden></div>
+      </section>
+
+      <section class="card">
+        <header>
+          <h2>Wheel sequences</h2>
+          <span class="hint" style="margin: 0">Click a row for legs, rolls and assignments</span>
+        </header>
+        <div style="overflow-x: auto"><table id="cycles-table"></table></div>
+      </section>
+    </div>
+
+    <div id="tooltip" role="tooltip" aria-live="polite"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>
