@@ -13,6 +13,8 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime
 from typing import Any, Sequence
 
+from wheel import benchmark as bm
+from wheel import marketdata
 from wheel.engine import Cycle, WheelEngine, build_cycles
 from wheel.metrics import (
     capital_timeline,
@@ -31,22 +33,59 @@ from wheel.parser import (
     Transaction,
     parse_exports,
 )
+from wheel.positions import discover_position_snapshots, latest_snapshot_per_account, load_snapshots
 
 EXPORT_DIRS = (".", "data")
 
 
-def looks_like_export(path: str) -> bool:
-    """Cheap header peek: does this CSV look like a broker history export?
-
-    Keeps generated output and unrelated CSVs out of discovery and out of the
-    dashboard's file picker, without paying for a full parse.
-    """
+def _find_history_header(path: str) -> str | None:
+    """The 'Run Date...' header line of a broker export, if this file has one."""
     try:
         with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
             head = handle.read(4096)
     except OSError:
+        return None
+    return next((line for line in head.splitlines() if line.lower().startswith("run date")), None)
+
+
+def _is_multi_account_header(header: str) -> bool:
+    columns = {col.strip().strip('"').lower() for col in header.split(",")}
+    return {"account", "account number"}.issubset(columns)
+
+
+def looks_like_multi_account_export(path: str) -> bool:
+    """Fidelity's combined, "Accounts_History.csv"-style download: every
+    linked account's transactions in one file, distinguished by 'Account'/
+    'Account Number' columns the single-account 'History_for_Account_*.csv'
+    export never has.
+
+    Not supported yet (see ``docs/DESIGN.md``, "Account folders"): its other
+    column names don't match this parser's expected header either (``Amount``
+    vs. ``Amount ($)``, ``Price`` vs. ``Price ($)``, etc.), so importing it as
+    an ordinary export would silently zero out every dollar amount rather
+    than fail loudly -- and even with the names fixed, there's still no
+    per-row account column plumbed through to split trades by, which would
+    merge different real accounts' cycles together. Kept out of
+    :func:`looks_like_export` (and therefore out of discovery, uploads, and
+    the dataset picker) until that's built.
+    """
+    header = _find_history_header(path)
+    return header is not None and _is_multi_account_header(header)
+
+
+def looks_like_export(path: str) -> bool:
+    """Cheap header peek: does this CSV look like a *supported* broker history export?
+
+    Keeps generated output and unrelated CSVs out of discovery and out of the
+    dashboard's file picker, without paying for a full parse. A file that
+    otherwise looks like an export but carries 'Account'/'Account Number'
+    columns is Fidelity's multi-account download, not the single-account
+    dialect this parser handles -- see :func:`looks_like_multi_account_export`.
+    """
+    header = _find_history_header(path)
+    if header is None:
         return False
-    return any(line.lower().startswith("run date") for line in head.splitlines())
+    return not _is_multi_account_header(header)
 
 
 def discover_exports(directories: Sequence[str] = EXPORT_DIRS) -> list[str]:
@@ -58,6 +97,22 @@ def discover_exports(directories: Sequence[str] = EXPORT_DIRS) -> list[str]:
         for entry in sorted(os.listdir(directory)):
             path = os.path.join(directory, entry)
             if entry.lower().endswith(".csv") and looks_like_export(path):
+                found.append(path)
+    return found
+
+
+def discover_multi_account_exports(directories: Sequence[str] = EXPORT_DIRS) -> list[str]:
+    """Every not-yet-supported multi-account export found, so callers can
+    tell the user it was seen and skipped, rather than it vanishing silently
+    the way ``discover_exports`` (correctly) leaves it out.
+    """
+    found: list[str] = []
+    for directory in directories:
+        if not os.path.isdir(directory):
+            continue
+        for entry in sorted(os.listdir(directory)):
+            path = os.path.join(directory, entry)
+            if entry.lower().endswith(".csv") and looks_like_multi_account_export(path):
                 found.append(path)
     return found
 
@@ -290,18 +345,61 @@ class Dashboard:
     nowhere at each file boundary.
     """
 
-    def __init__(self, csv_path: str | Sequence[str] | None = None):
+    def __init__(
+        self,
+        csv_path: str | Sequence[str] | None = None,
+        position_paths: str | Sequence[str] | None = None,
+        account_number: str | None = None,
+    ):
         if csv_path is None:
             csv_path = discover_exports()
         paths = [csv_path] if isinstance(csv_path, str) else list(csv_path)
-        if not paths:
-            raise ValueError("no broker export found; pass one explicitly")
+
+        if position_paths is None:
+            position_paths = discover_position_snapshots()
+        else:
+            position_paths = [position_paths] if isinstance(position_paths, str) else list(position_paths)
+
+        if not paths and not position_paths:
+            raise ValueError("no broker export or position snapshot found; pass one explicitly")
 
         self.csv_paths = paths
-        self.csv_path = paths[0]  # kept for single-file callers
-        self.transactions, self.reports, self.merge = parse_exports(paths)
-        self.report = self.reports[0]
+        self.csv_path = paths[0] if paths else None  # kept for single-file callers
+        if paths:
+            self.transactions, self.reports, self.merge = parse_exports(paths)
+            self.report = self.reports[0]
+        else:
+            # A positions-only account (no transaction history yet) is legitimate --
+            # net worth still works, wheel-cycle figures are just all zero.
+            self.transactions, self.reports, self.merge = [], [], MergeReport()
+            self.report = ParseReport()
         self.all_cycles, self.engine = build_cycles(self.transactions)
+
+        self.position_paths = position_paths
+        self.snapshots, self.position_warnings = (
+            load_snapshots(position_paths) if position_paths else ([], [])
+        )
+        if account_number and self.snapshots:
+            # A single Positions export can list more than one real account
+            # (e.g. a Fidelity "all accounts" download) even though this
+            # Dashboard is scoped to one account -- see wheel.accounts, both
+            # for a folder whose account is named in data/accounts.json and
+            # for an auto-discovered, positions-only account that has no
+            # folder at all. Once the caller has told us which account this
+            # is, any other account's rows found in the same file(s) must
+            # never be blended in or silently shown in its place.
+            other_numbers = sorted(
+                {snapshot.account_number for snapshot in self.snapshots if snapshot.account_number != account_number}
+            )
+            self.snapshots = [s for s in self.snapshots if s.account_number == account_number]
+            if other_numbers:
+                self.position_warnings = self.position_warnings + [
+                    "ignored Positions rows for account(s) "
+                    + ", ".join(other_numbers)
+                    + f" -- this dashboard is scoped to account {account_number}"
+                ]
+        self._net_worth = self._build_net_worth()
+        self._benchmark = self._build_benchmark()
 
     # ---- metadata ----
 
@@ -327,6 +425,180 @@ class Dashboard:
                 if transaction.action in TRADE_ACTIONS and transaction.underlying
             }
         )
+
+    # ---- net worth & benchmark ----
+    #
+    # Both are computed once in __init__, independent of Filters -- a position
+    # snapshot is a fact about a moment in time, not a slice of the transaction
+    # window, so it is copied verbatim into every build() result regardless of
+    # the ticker/date/status filters in play.
+
+    def _build_net_worth(self) -> dict[str, Any]:
+        if not self.snapshots:
+            return {
+                "available": False,
+                "warnings": list(self.position_warnings)
+                + ["no Portfolio Positions snapshot found for this account"],
+                "snapshot_files": [],
+            }
+
+        latest_by_account = latest_snapshot_per_account(self.snapshots)
+        warnings = list(self.position_warnings)
+        if len(latest_by_account) > 1:
+            warnings.append(
+                "multiple account numbers found in one dataset ("
+                + ", ".join(sorted(latest_by_account))
+                + "); showing the most recently seen -- put each account in its own "
+                "folder under data/ to keep them separate"
+            )
+        latest = max(latest_by_account.values(), key=lambda snapshot: snapshot.as_of)
+        as_of_day = latest.as_of.date()
+
+        wheel_tickers = {cycle.underlying for cycle in self.all_cycles}
+        capital_series = (
+            portfolio_capital_series(self.all_cycles, as_of_day) if self.all_cycles else []
+        )
+        wheel_capital_deployed = capital_series[-1].total if capital_series else 0.0
+        if capital_series and capital_series[-1].day < as_of_day:
+            warnings.append(
+                "wheel capital deployed is carried forward from the last transaction "
+                f"activity on {capital_series[-1].day}, prior to the snapshot date {as_of_day}"
+            )
+
+        account_history = sorted(
+            (s for s in self.snapshots if s.account_number == latest.account_number),
+            key=lambda snapshot: snapshot.as_of,
+        )
+
+        return {
+            "available": True,
+            "warnings": warnings,
+            "snapshot_files": [
+                {"name": s.source, "as_of": s.as_of.isoformat(), "as_of_source": s.as_of_source}
+                for s in self.snapshots
+            ],
+            "account_number": latest.account_number,
+            "account_name": latest.account_name,
+            "as_of": latest.as_of.isoformat(),
+            "total_value": _money(latest.total_value),
+            "cash_total": _money(latest.cash_total),
+            "equity_value": _money(latest.equity_value),
+            "option_value": _money(latest.option_value),
+            "cost_basis_known_total": _money(latest.cost_basis_known_total),
+            "cost_basis_unknown_rows": latest.cost_basis_unknown_rows,
+            "wheel_capital_deployed": _money(wheel_capital_deployed),
+            "positions": [
+                {
+                    "symbol": row.symbol,
+                    "description": row.description,
+                    "kind": row.kind,
+                    "quantity": row.quantity,
+                    "current_value": _money(row.current_value),
+                    "cost_basis_total": _money(row.cost_basis_total),
+                    "account_type": row.account_type,
+                    "in_wheel_history": bool(row.underlying) and row.underlying in wheel_tickers,
+                }
+                for row in latest.rows
+            ],
+            "timeline": [
+                {
+                    "as_of": snapshot.as_of.date().isoformat(),
+                    "total_value": _money(snapshot.total_value),
+                    "cash_total": _money(snapshot.cash_total),
+                }
+                for snapshot in account_history
+            ],
+        }
+
+    def _build_benchmark(self) -> dict[str, Any]:
+        if not self.snapshots:
+            return {
+                "available": False,
+                "warnings": ["no Portfolio Positions snapshot found for this account"],
+            }
+
+        latest_by_account = latest_snapshot_per_account(self.snapshots)
+        primary_account = max(latest_by_account.values(), key=lambda snapshot: snapshot.as_of).account_number
+        account_snapshots = sorted(
+            (s for s in self.snapshots if s.account_number == primary_account),
+            key=lambda snapshot: snapshot.as_of,
+        )
+
+        if len(account_snapshots) < 2:
+            return {
+                "available": False,
+                "warnings": [
+                    "at least two Portfolio Positions snapshots, taken on different "
+                    "dates, are needed to compute a return -- only one is available so far"
+                ],
+            }
+
+        events, warnings = bm.external_cashflows(self.transactions)
+        first_snapshot = account_snapshots[0]
+        as_of = account_snapshots[-1].as_of.date()
+
+        # The tracked transaction history rarely reaches back to when the account
+        # was first funded, so the account's value at the earliest available
+        # snapshot stands in for an opening investment made on that date. Without
+        # it, XIRR would see only cash moved after that point and ignore whatever
+        # balance was already in place -- understating invested capital, or with
+        # no external transfers on record at all, making the return uncomputable.
+        opening_day = first_snapshot.as_of.date()
+        opening_event = bm.CashFlowEvent(
+            date=opening_day,
+            amount=first_snapshot.total_value,
+            label="Opening balance (first available snapshot)",
+            source=first_snapshot.source,
+            kind="OPENING_BALANCE",
+        )
+        all_events = [opening_event] + [event for event in events if event.date > opening_day]
+
+        price_points, market_warnings = marketdata.get_price_series()
+        warnings.extend(market_warnings)
+
+        def price_lookup(day: date):
+            return marketdata.price_on_or_before(price_points, day)
+
+        valuation_dates = [snapshot.as_of.date() for snapshot in account_snapshots]
+        benchmark_values = bm.simulate_benchmark_series(all_events, valuation_dates, price_lookup)
+
+        actual_terminal_value = account_snapshots[-1].total_value
+        benchmark_terminal_value = benchmark_values.get(as_of)
+
+        result = bm.compare_to_benchmark(all_events, actual_terminal_value, benchmark_terminal_value, as_of)
+
+        return {
+            "available": True,
+            "warnings": warnings,
+            "as_of": as_of.isoformat(),
+            "cash_flow_events": [
+                {
+                    "date": event.date.isoformat(),
+                    "amount": _money(event.amount),
+                    "label": event.label,
+                    "kind": event.kind,
+                }
+                for event in all_events
+            ],
+            "actual": {
+                "terminal_value": _money(result.actual_terminal_value),
+                "xirr_pct": _money(result.actual_xirr_pct),
+            },
+            "benchmark": {
+                "name": "SPY",
+                "terminal_value": _money(result.benchmark_terminal_value),
+                "xirr_pct": _money(result.benchmark_xirr_pct),
+            },
+            "value_added": _money(result.value_added),
+            "series": [
+                {
+                    "as_of": snapshot.as_of.date().isoformat(),
+                    "actual_value": _money(snapshot.total_value),
+                    "benchmark_value": _money(benchmark_values.get(snapshot.as_of.date())),
+                }
+                for snapshot in account_snapshots
+            ],
+        }
 
     # ---- query ----
 
@@ -428,4 +700,6 @@ class Dashboard:
             "reconciliation": _reconciliation(
                 transactions, built_cycles, self.reports, engine.unmatched_cash
             ),
+            "net_worth": self._net_worth,
+            "benchmark": self._benchmark,
         }

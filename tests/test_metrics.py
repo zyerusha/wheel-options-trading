@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import itertools
 import os
+import string
 import sys
 import unittest
 from datetime import date
@@ -10,7 +12,7 @@ from datetime import date
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.test_engine import tx  # noqa: E402
-from wheel.engine import build_cycles  # noqa: E402
+from wheel.engine import COVERED_CALL, CSP, LONG_PUT, build_cycles  # noqa: E402
 from wheel.metrics import (  # noqa: E402
     _time_weighted_average,
     capital_timeline,
@@ -20,7 +22,7 @@ from wheel.metrics import (  # noqa: E402
     realized_pl_series,
     ticker_summary,
 )
-from wheel.parser import ASSIGNED, BTC, EXPIRED, STO  # noqa: E402
+from wheel.parser import ASSIGNED, BTC, BTO, EXPIRED, STC, STO  # noqa: E402
 
 
 class TestCapitalTimeline(unittest.TestCase):
@@ -180,10 +182,8 @@ class TestReturnMath(unittest.TestCase):
         self.assertAlmostEqual(metrics.peak_collateral, 15000.0)
         # ROI = 334.33 / 15000
         self.assertAlmostEqual(metrics.roi_pct, 2.2289, places=3)
-        # Annualized = ROI x 365/7
-        self.assertAlmostEqual(metrics.annualized_roc_pct, 2.2289 * 365 / 7, places=2)
-        # No stock in this cycle, so the premium-only variant matches the full-wheel one.
-        self.assertAlmostEqual(metrics.annualized_roc_premium_pct, metrics.annualized_roc_pct, places=6)
+        # Wheel ROC, annualized = ROI x 365/7 (no stock in this cycle, so option P/L == net P/L)
+        self.assertAlmostEqual(metrics.annualized_wheel_roc_pct, 2.2289 * 365 / 7, places=2)
 
     def test_average_capital_ignores_idle_days(self):
         """A cycle sitting flat between legs must not dilute its denominator."""
@@ -210,8 +210,10 @@ class TestReturnMath(unittest.TestCase):
         self.assertAlmostEqual(metrics.peak_collateral, 40000.0)
         self.assertLess(metrics.initial_collateral, metrics.avg_collateral)
         self.assertLess(metrics.avg_collateral, metrics.peak_collateral)
-        self.assertGreater(metrics.roi_pct, metrics.roi_on_avg_pct)
-        self.assertGreater(metrics.roi_on_avg_pct, metrics.roi_on_peak_pct)
+        # No stock in this cycle, so option P/L == net P/L and the wheel variant
+        # orders identically to the net-based ones.
+        self.assertGreater(metrics.roi_pct, metrics.roi_on_avg_wheel_pct)
+        self.assertGreater(metrics.roi_on_avg_wheel_pct, metrics.roi_on_peak_pct)
 
     def test_stock_pl_from_assignment_reaches_net(self):
         cycles, _ = build_cycles(
@@ -227,8 +229,12 @@ class TestReturnMath(unittest.TestCase):
         self.assertAlmostEqual(metrics.stock_realized_pl, 500.0, places=2)
         self.assertAlmostEqual(metrics.net_realized_pl, 1098.66, places=2)
         self.assertEqual(metrics.assignments, 2)
-        # Stock P/L moves the full-wheel ROC above the premium-only ROC.
-        self.assertGreater(metrics.annualized_roc_pct, metrics.annualized_roc_premium_pct)
+        # The Wheel ROC numerator is option P/L only -- the $500 stock gain from
+        # the assignment/call-away round trip must not leak into it.
+        expected_wheel_roc = (
+            100.0 * metrics.option_realized_pl / metrics.avg_collateral * (365.0 / metrics.days_active)
+        )
+        self.assertAlmostEqual(metrics.annualized_wheel_roc_pct, expected_wheel_roc, places=6)
 
     def test_unknown_basis_shares_are_excluded_and_counted(self):
         cycles, _ = build_cycles(
@@ -290,15 +296,25 @@ class TestPortfolioRollup(unittest.TestCase):
 
     def test_annualized_uses_portfolio_capital_not_averaged_percentages(self):
         result = portfolio_metrics(self.cycles, self.through)
-        expected = 100.0 * result.net_realized_pl / result.avg_capital * (365.0 / result.days_span)
-        self.assertAlmostEqual(result.annualized_roc_pct, expected, places=6)
-        # No stock in this fixture, so the premium-only figure equals the full-wheel one.
-        self.assertAlmostEqual(result.annualized_roc_premium_pct, result.annualized_roc_pct, places=6)
+        expected = 100.0 * result.option_realized_pl / result.avg_capital * (365.0 / result.days_span)
+        self.assertAlmostEqual(result.annualized_wheel_roc_pct, expected, places=6)
 
     def test_ticker_summary_is_ranked_by_net_pl(self):
         rows = ticker_summary(self.cycles, self.through)
         self.assertEqual([row["underlying"] for row in rows], ["MU", "QQQ"])
         self.assertGreater(rows[0]["net_realized_pl"], rows[1]["net_realized_pl"])
+
+    def test_ticker_summary_days_span_reproduces_the_annualized_figure(self):
+        """`days_span` is exposed so a caller (the dashboard's tooltip, in
+        particular) can rebuild ``annualized_wheel_roc_pct`` from
+        ``roi_on_avg_wheel_pct`` without guessing the annualizing factor.
+        """
+        rows = ticker_summary(self.cycles, self.through)
+        for row in rows:
+            self.assertIsNotNone(row["days_span"])
+            self.assertGreaterEqual(row["days_span"], 1)
+            expected = row["roi_on_avg_wheel_pct"] * (365.0 / row["days_span"])
+            self.assertAlmostEqual(row["annualized_wheel_roc_pct"], expected, places=6)
 
     def test_cumulative_series_ends_at_the_portfolio_total(self):
         result = portfolio_metrics(self.cycles, self.through)
@@ -311,7 +327,7 @@ class TestPortfolioRollup(unittest.TestCase):
     def test_empty_input_is_safe(self):
         result = portfolio_metrics([], date(2025, 9, 26))
         self.assertEqual(result.cycles, 0)
-        self.assertIsNone(result.annualized_roc_pct)
+        self.assertIsNone(result.annualized_wheel_roc_pct)
         self.assertIsNone(result.win_rate_pct)
 
 
@@ -420,7 +436,605 @@ class TestCapitalWindowContinuity(unittest.TestCase):
         self.assertEqual(mu["net_realized_pl"], 0.0)
         self.assertEqual(mu["cycles"], 0)
         self.assertGreater(mu["avg_capital"], 0.0)
-        self.assertIsNotNone(mu["annualized_roc_pct"])
+        self.assertIsNotNone(mu["annualized_wheel_roc_pct"])
+
+
+class TestWheelROC(unittest.TestCase):
+    """The Wheel ROC is an option-income metric: option P/L over time-weighted
+    average capital, annualized. It must never be moved by stock P/L, realized
+    or otherwise -- this codebase has no notion of unrealized/mark-to-market
+    stock P/L at all (metrics.py only ever sums *realized* disposals), so
+    "stock falls/rises while assigned" is exercised here as a realized gain or
+    loss on the eventual disposal, which is the only form stock P/L takes here.
+    """
+
+    def test_csp_only(self):
+        """$10,000 collateral, $300 CSP premium, 30 days -> ROC = 36.5%."""
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250131P100", -1, 3.00, 300.0, row_id=1),
+                tx("2025-01-31", EXPIRED, "-XYZ250131P100", 1, None, 0.0, row_id=2, as_of="2025-01-31"),
+            ]
+        )
+        metrics = cycle_metrics(cycles[0], date(2025, 1, 31))
+        self.assertEqual(metrics.days_active, 30)
+        self.assertAlmostEqual(metrics.avg_collateral, 10000.0)
+        self.assertAlmostEqual(metrics.option_realized_pl, 300.0, places=2)
+        self.assertAlmostEqual(metrics.annualized_wheel_roc_pct, 36.5, places=1)
+
+    def test_csp_plus_covered_call_accrues_both_premiums_on_flat_capital(self):
+        """30d CSP ($300) -> assignment -> 60d covered call ($300), $10,000 the
+        whole way through. Wheel ROC = (300 + 300) / 10,000 * 365 / 90, with no
+        stock price movement anywhere in this fixture.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250131P100", -1, 3.00, 300.0, row_id=1),
+                tx("2025-01-31", ASSIGNED, "-XYZ250131P100", 1, None, 0.0, row_id=2, as_of="2025-01-31"),
+                tx("2025-01-31", STO, "-XYZ250401C110", -1, 3.00, 300.0, row_id=3),
+                tx("2025-04-01", EXPIRED, "-XYZ250401C110", 1, None, 0.0, row_id=4, as_of="2025-04-01"),
+            ]
+        )
+        through = date(2025, 4, 1)
+        metrics = cycle_metrics(cycles[0], through)
+        self.assertEqual(metrics.days_active, 90)
+        self.assertAlmostEqual(metrics.avg_collateral, 10000.0)
+        self.assertAlmostEqual(metrics.option_realized_pl, 600.0, places=2)
+        self.assertAlmostEqual(metrics.stock_realized_pl, 0.0)  # shares never sold
+        expected = 100.0 * 600.0 / 10000.0 * (365.0 / 90.0)
+        self.assertAlmostEqual(metrics.annualized_wheel_roc_pct, expected, places=6)
+
+    def _assigned_and_called_away(self, put_strike: float, call_strike: float):
+        """One MU cycle: CSP assigned at ``put_strike``, then called away at
+        ``call_strike`` -- the sign and size of the resulting stock P/L is
+        controlled entirely by the strike spread.
+        """
+        return build_cycles(
+            [
+                tx("2025-11-17", STO, f"-MU251121P{put_strike:g}", -1, 4.00, 399.33, row_id=1),
+                tx(
+                    "2025-11-21",
+                    ASSIGNED,
+                    f"-MU251121P{put_strike:g}",
+                    1,
+                    None,
+                    0.0,
+                    row_id=2,
+                    as_of="2025-11-20",
+                ),
+                tx("2025-11-24", STO, f"-MU251128C{call_strike:g}", -1, 2.00, 199.33, row_id=3),
+                tx(
+                    "2025-12-01",
+                    ASSIGNED,
+                    f"-MU251128C{call_strike:g}",
+                    1,
+                    None,
+                    0.0,
+                    row_id=4,
+                    as_of="2025-11-28",
+                ),
+            ]
+        )
+
+    def test_assigned_stock_that_falls_does_not_touch_the_wheel_roc_numerator(self):
+        """Called away below cost basis -- a realized stock loss -- must not
+        make the Wheel ROC numerator anything but the $598.66 of option premium.
+        """
+        cycles, _ = self._assigned_and_called_away(put_strike=230, call_strike=225)
+        metrics = cycle_metrics(cycles[0], date(2025, 11, 28))
+        self.assertAlmostEqual(metrics.option_realized_pl, 598.66, places=2)
+        self.assertLess(metrics.stock_realized_pl, 0.0)  # sold below cost basis
+        expected = (
+            100.0 * metrics.option_realized_pl / metrics.avg_collateral * (365.0 / metrics.days_active)
+        )
+        self.assertAlmostEqual(metrics.annualized_wheel_roc_pct, expected, places=6)
+
+    def test_assigned_stock_that_rises_does_not_touch_the_wheel_roc_numerator(self):
+        """Called away above cost basis -- a realized stock gain -- must not
+        inflate the Wheel ROC numerator beyond the $598.66 of option premium.
+        """
+        cycles, _ = self._assigned_and_called_away(put_strike=230, call_strike=235)
+        metrics = cycle_metrics(cycles[0], date(2025, 11, 28))
+        self.assertAlmostEqual(metrics.option_realized_pl, 598.66, places=2)
+        self.assertGreater(metrics.stock_realized_pl, 0.0)  # sold above cost basis
+        expected = (
+            100.0 * metrics.option_realized_pl / metrics.avg_collateral * (365.0 / metrics.days_active)
+        )
+        self.assertAlmostEqual(metrics.annualized_wheel_roc_pct, expected, places=6)
+
+    def test_csp_plus_cc_plus_stock_loss_keeps_option_pl_separate_from_net(self):
+        """CSP +$300ish, CC +$400ish, a $2,000+ realized stock loss on top: the
+        wheel's option P/L must be the (positive) sum of the two premiums, never
+        net_realized_pl, which the stock loss drags negative.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-06-02", STO, "-XYZ250704P200", -1, 3.00, 300.0, row_id=1),
+                tx("2025-07-04", ASSIGNED, "-XYZ250704P200", 1, None, 0.0, row_id=2, as_of="2025-07-04"),
+                # Strike is $20 below the $200 cost basis, so the eventual
+                # call-away realizes a $2,000 stock loss.
+                tx("2025-07-07", STO, "-XYZ250815C180", -1, 4.00, 400.0, row_id=3),
+                tx("2025-08-15", ASSIGNED, "-XYZ250815C180", 1, None, 0.0, row_id=4, as_of="2025-08-15"),
+            ]
+        )
+        metrics = cycle_metrics(cycles[0], date(2025, 8, 15))
+        self.assertAlmostEqual(metrics.option_realized_pl, 700.0, places=2)
+        self.assertLess(metrics.net_realized_pl, 0.0)
+        self.assertLess(metrics.net_realized_pl, metrics.option_realized_pl)
+        self.assertGreater(metrics.annualized_wheel_roc_pct, 0.0)
+
+    def test_multiple_wheel_cycles_accumulate_option_pl_and_capital_independently(self):
+        """Two separate tickers, each a full CSP -> assignment -> covered-call
+        -> called-away cycle with opposite-signed stock P/L, roll up so the
+        portfolio's option P/L is the plain sum of both cycles' option P/L and
+        the capital timeline is the sum of both, independent of what the stock
+        did in either.
+        """
+        loss_cycles, _ = self._assigned_and_called_away(put_strike=230, call_strike=225)
+        gain_transactions = [
+            tx("2025-11-17", STO, "-QQQ251121P230", -1, 4.00, 399.33, row_id=101),
+            tx("2025-11-21", ASSIGNED, "-QQQ251121P230", 1, None, 0.0, row_id=102, as_of="2025-11-20"),
+            tx("2025-11-24", STO, "-QQQ251128C240", -1, 2.00, 199.33, row_id=103),
+            tx("2025-12-01", ASSIGNED, "-QQQ251128C240", 1, None, 0.0, row_id=104, as_of="2025-11-28"),
+        ]
+        gain_cycles, _ = build_cycles(gain_transactions)
+
+        through = date(2025, 11, 28)
+        cycles = [loss_cycles[0], gain_cycles[0]]
+        result = portfolio_metrics(cycles, through)
+
+        per_cycle_option_pl = sum(cycle_metrics(c, through).option_realized_pl for c in cycles)
+        self.assertAlmostEqual(result.option_realized_pl, per_cycle_option_pl, places=2)
+        # The two stock legs move opposite directions; net_realized_pl reflects
+        # that offset while option_realized_pl -- and the ROC built on it -- does not.
+        self.assertNotAlmostEqual(result.net_realized_pl, result.option_realized_pl, places=2)
+        expected_roc = (
+            100.0 * result.option_realized_pl / result.avg_capital * (365.0 / result.days_span)
+        )
+        self.assertAlmostEqual(result.annualized_wheel_roc_pct, expected_roc, places=6)
+
+    def test_covered_call_on_assigned_shares_adds_no_capital_to_the_metric(self):
+        """The metrics-level denominator, not just the raw capital timeline,
+        must hold at the $10,000 stock basis once a covered call is sold
+        against already-tracked shares -- see also
+        TestCapitalTimeline.test_covered_call_does_not_double_count_capital.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-11-17", STO, "-MU251121P230", -1, 4.00, 399.33, row_id=1),
+                tx("2025-11-21", ASSIGNED, "-MU251121P230", 1, None, 0.0, row_id=2, as_of="2025-11-20"),
+                tx("2025-11-24", STO, "-MU251128C235", -1, 2.00, 199.33, row_id=3),
+            ]
+        )
+        metrics = cycle_metrics(cycles[0], date(2025, 11, 25))
+        self.assertAlmostEqual(metrics.avg_collateral, 23000.0, places=2)
+        self.assertAlmostEqual(metrics.current_collateral, 23000.0, places=2)
+
+
+def _synthetic_tickers(n: int) -> list[str]:
+    """Pure-letter tickers (AAA, AAB, ...), so the OCC-symbol regex never
+    confuses a ticker digit for part of the expiry date.
+    """
+    combos = itertools.product(string.ascii_uppercase, repeat=3)
+    return ["".join(letters) for letters in itertools.islice(combos, n)]
+
+
+def _build_legs(n_win: int = 0, n_loss: int = 0, n_open: int = 0, n_breakeven: int = 0):
+    """One single-leg cycle per synthetic ticker, classified by construction:
+
+    * win       -- sold for a credit, expires worthless (fully realized, positive)
+    * loss      -- sold for a credit, bought back for more than that credit
+    * breakeven -- sold for a credit, bought back for exactly that credit
+    * open      -- sold for a credit, never closed
+
+    Each ticker is independent, so none of these can merge into the same cycle.
+    """
+    tickers = iter(_synthetic_tickers(n_win + n_loss + n_open + n_breakeven))
+    txs = []
+    row_id = itertools.count(1)
+
+    for _ in range(n_win):
+        t = next(tickers)
+        txs.append(tx("2025-01-01", STO, f"-{t}250131P100", -1, 2.00, 200.0, row_id=next(row_id)))
+        txs.append(
+            tx("2025-01-31", EXPIRED, f"-{t}250131P100", 1, None, 0.0, row_id=next(row_id), as_of="2025-01-31")
+        )
+    for _ in range(n_loss):
+        t = next(tickers)
+        txs.append(tx("2025-01-01", STO, f"-{t}250131P100", -1, 2.00, 100.0, row_id=next(row_id)))
+        txs.append(tx("2025-01-15", BTC, f"-{t}250131P100", 1, 3.00, -300.0, row_id=next(row_id)))
+    for _ in range(n_breakeven):
+        t = next(tickers)
+        txs.append(tx("2025-01-01", STO, f"-{t}250131P100", -1, 1.50, 150.0, row_id=next(row_id)))
+        txs.append(tx("2025-01-15", BTC, f"-{t}250131P100", 1, 1.50, -150.0, row_id=next(row_id)))
+    for _ in range(n_open):
+        t = next(tickers)
+        txs.append(tx("2025-01-01", STO, f"-{t}250131P100", -1, 2.00, 200.0, row_id=next(row_id)))
+
+    cycles, _ = build_cycles(txs)
+    return cycles
+
+
+class TestWinRate(unittest.TestCase):
+    """Win rate is a secondary, diagnostic figure -- frequency of profitable
+    closed legs -- never the primary Wheel performance number (annualized
+    Wheel ROC). It excludes open legs and exact break-evens from its
+    denominator entirely, rather than counting either as a loss.
+    """
+
+    def _win_rate(self, **counts):
+        cycles = _build_legs(**counts)
+        return portfolio_metrics(cycles, date(2025, 1, 31))
+
+    def test_winners_losers_and_open_legs(self):
+        """109 winners, 21 losers, 7 open -- the worked example from the spec."""
+        result = self._win_rate(n_win=109, n_loss=21, n_open=7)
+        self.assertEqual(result.total_legs, 137)
+        self.assertEqual(result.wins, 109)
+        self.assertEqual(result.losses, 21)
+        self.assertEqual(result.wins + result.losses, 130)  # classified, not 137
+        self.assertAlmostEqual(result.win_rate_pct, 100.0 * 109 / 130, places=6)
+        self.assertAlmostEqual(result.win_rate_pct, 83.8461538, places=5)
+
+    def test_all_winners_is_100_percent(self):
+        result = self._win_rate(n_win=10, n_open=2)
+        self.assertEqual(result.total_legs, 12)
+        self.assertAlmostEqual(result.win_rate_pct, 100.0)
+
+    def test_all_losers_is_0_percent_not_none(self):
+        result = self._win_rate(n_loss=10, n_open=2)
+        self.assertEqual(result.total_legs, 12)
+        # 0% (a real, decided result) must be distinguishable from "no data".
+        self.assertIsNotNone(result.win_rate_pct)
+        self.assertAlmostEqual(result.win_rate_pct, 0.0)
+
+    def test_open_legs_only_is_none_not_zero(self):
+        """No closed legs at all -- N/A, not 0%, since 0% implies losses existed."""
+        result = self._win_rate(n_open=10)
+        self.assertEqual(result.total_legs, 10)
+        self.assertEqual(result.wins, 0)
+        self.assertEqual(result.losses, 0)
+        self.assertIsNone(result.win_rate_pct)
+
+    def test_breakeven_legs_excluded_from_denominator(self):
+        """10 winners, 10 losers, 5 exact break-evens -> 50%, not 10/25 = 40%."""
+        result = self._win_rate(n_win=10, n_loss=10, n_breakeven=5)
+        self.assertEqual(result.total_legs, 25)
+        self.assertEqual(result.wins, 10)
+        self.assertEqual(result.losses, 10)
+        self.assertAlmostEqual(result.win_rate_pct, 50.0)
+
+    def test_only_breakeven_legs_is_none(self):
+        result = self._win_rate(n_breakeven=6)
+        self.assertEqual(result.total_legs, 6)
+        self.assertIsNone(result.win_rate_pct)
+
+    def test_open_leg_excluded_from_rate_but_counted_in_total(self):
+        """An unresolved leg (here: still open, the only "can't classify P/L"
+        state this data model produces) must not read as a loss: one win and
+        one open leg is still a 100% win rate over a total of two legs.
+        """
+        result = self._win_rate(n_win=1, n_open=1)
+        self.assertEqual(result.total_legs, 2)
+        self.assertEqual(result.wins, 1)
+        self.assertEqual(result.losses, 0)
+        self.assertAlmostEqual(result.win_rate_pct, 100.0)
+
+    def test_csp_and_covered_call_legs_share_one_win_rate(self):
+        """A short put and a short call -- CSP and covered-call strategies --
+        both feed the same overall wins/losses tally; the model does not (and
+        per spec should not) split them into separate win rates.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-AAA250131P100", -1, 2.00, 200.0, row_id=1),
+                tx("2025-01-31", EXPIRED, "-AAA250131P100", 1, None, 0.0, row_id=2, as_of="2025-01-31"),
+                tx("2025-01-01", STO, "-BBB250131C100", -1, 2.00, 100.0, row_id=3),
+                tx("2025-01-15", BTC, "-BBB250131C100", 1, 3.00, -300.0, row_id=4),
+            ]
+        )
+        strategies = {leg.strategy for cycle in cycles for leg in cycle.legs}
+        self.assertEqual(strategies, {CSP, COVERED_CALL})
+
+        result = portfolio_metrics(cycles, date(2025, 1, 31))
+        self.assertEqual(result.wins, 1)
+        self.assertEqual(result.losses, 1)
+        self.assertAlmostEqual(result.win_rate_pct, 50.0)
+
+
+class TestHedgePL(unittest.TestCase):
+    """Protective puts and credit-spread hedges are ordinary option legs to the
+    engine -- LONG_PUT/LONG_CALL for the long side, CSP/COVERED_CALL for a
+    spread's short side -- and were already summed into ``option_realized_pl``
+    by the unfiltered ``sum(leg.realized_pl for leg in cycle.legs)``. These
+    tests lock that in explicitly and exercise the new ``wheel_core_realized_pl``
+    / ``hedge_realized_pl`` breakdown (CSP+covered-call vs. everything else).
+    """
+
+    def test_protective_put_sold_at_a_loss(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", BTO, "-XYZ250201P100", 1, 10.00, -1000.0, row_id=1),
+                tx("2025-01-10", STC, "-XYZ250201P100", -1, 7.00, 700.0, row_id=2),
+            ]
+        )
+        metrics = cycle_metrics(cycles[0], date(2025, 1, 10))
+        self.assertEqual(cycles[0].legs[0].strategy, LONG_PUT)
+        self.assertAlmostEqual(metrics.hedge_realized_pl, -300.0, places=2)
+        self.assertAlmostEqual(metrics.wheel_core_realized_pl, 0.0)
+        self.assertAlmostEqual(metrics.option_realized_pl, -300.0, places=2)
+
+    def test_protective_put_sold_for_a_partial_recovery(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", BTO, "-XYZ250201P100", 1, 10.00, -1000.0, row_id=1),
+                tx("2025-01-10", STC, "-XYZ250201P100", -1, 4.00, 400.0, row_id=2),
+            ]
+        )
+        metrics = cycle_metrics(cycles[0], date(2025, 1, 10))
+        self.assertAlmostEqual(metrics.hedge_realized_pl, -600.0, places=2)
+        self.assertAlmostEqual(metrics.option_realized_pl, -600.0, places=2)
+
+    def test_protective_put_sold_at_a_profit(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", BTO, "-XYZ250201P100", 1, 5.00, -500.0, row_id=1),
+                tx("2025-01-10", STC, "-XYZ250201P100", -1, 9.00, 900.0, row_id=2),
+            ]
+        )
+        metrics = cycle_metrics(cycles[0], date(2025, 1, 10))
+        self.assertAlmostEqual(metrics.hedge_realized_pl, 400.0, places=2)
+        self.assertAlmostEqual(metrics.option_realized_pl, 400.0, places=2)
+
+    def test_protective_put_expires_worthless(self):
+        """The realized loss is the full premium paid -- never $0 and never
+        left dangling as an unrealized number once the leg is actually closed.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", BTO, "-XYZ250201P100", 1, 10.00, -1000.0, row_id=1),
+                tx("2025-02-01", EXPIRED, "-XYZ250201P100", 1, None, 0.0, row_id=2, as_of="2025-02-01"),
+            ]
+        )
+        metrics = cycle_metrics(cycles[0], date(2025, 2, 1))
+        self.assertAlmostEqual(metrics.hedge_realized_pl, -1000.0, places=2)
+        self.assertAlmostEqual(metrics.option_realized_pl, -1000.0, places=2)
+
+    def test_credit_spread_closes_for_a_profit(self):
+        """Short leg (CSP) sold for $300, long leg (LONG_PUT) bought for $100,
+        both expire worthless -- net spread P/L +$200, split $300 wheel-core /
+        -$100 hedge, but summed the same either way.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250201P100", -1, 3.00, 300.0, row_id=1),
+                tx("2025-01-01", BTO, "-XYZ250201P95", 1, 1.00, -100.0, row_id=2),
+                tx("2025-02-01", EXPIRED, "-XYZ250201P100", 1, None, 0.0, row_id=3, as_of="2025-02-01"),
+                tx("2025-02-01", EXPIRED, "-XYZ250201P95", 1, None, 0.0, row_id=4, as_of="2025-02-01"),
+            ]
+        )
+        metrics = cycle_metrics(cycles[0], date(2025, 2, 1))
+        self.assertAlmostEqual(metrics.wheel_core_realized_pl, 300.0, places=2)
+        self.assertAlmostEqual(metrics.hedge_realized_pl, -100.0, places=2)
+        self.assertAlmostEqual(metrics.option_realized_pl, 200.0, places=2)
+
+    def test_credit_spread_closes_for_a_loss(self):
+        """Short leg costs more to close than it collected; long leg recovers
+        only part of its cost -- net spread P/L -$400.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250201P100", -1, 5.00, 500.0, row_id=1),
+                tx("2025-01-01", BTO, "-XYZ250201P95", 1, 3.00, -300.0, row_id=2),
+                tx("2025-01-20", BTC, "-XYZ250201P100", 1, 7.00, -700.0, row_id=3),
+                tx("2025-01-20", STC, "-XYZ250201P95", -1, 1.00, 100.0, row_id=4),
+            ]
+        )
+        metrics = cycle_metrics(cycles[0], date(2025, 1, 20))
+        self.assertAlmostEqual(metrics.wheel_core_realized_pl, -200.0, places=2)  # 500 - 700
+        self.assertAlmostEqual(metrics.hedge_realized_pl, -200.0, places=2)  # 100 - 300
+        self.assertAlmostEqual(metrics.option_realized_pl, -400.0, places=2)
+
+    def test_multiple_protective_puts_accumulate(self):
+        """Two separate hedges over the life of one wheel: -$400 then -$300,
+        for a combined -$700 -- not the cost of either one alone.
+
+        An anchor leg that never closes keeps both hedges in the same cycle
+        (a cycle closes once it goes flat -- see wheel/engine.py); its own
+        contribution to every realized-P/L figure here is exactly $0.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250601P80", -1, 0.50, 50.0, row_id=0),
+                tx("2025-01-01", BTO, "-XYZ250201P100", 1, 10.00, -1000.0, row_id=1),
+                tx("2025-01-10", STC, "-XYZ250201P100", -1, 6.00, 600.0, row_id=2),
+                tx("2025-01-15", BTO, "-XYZ250301P100", 1, 8.00, -800.0, row_id=3),
+                tx("2025-01-25", STC, "-XYZ250301P100", -1, 5.00, 500.0, row_id=4),
+            ]
+        )
+        metrics = cycle_metrics(cycles[0], date(2025, 1, 25))
+        self.assertAlmostEqual(metrics.hedge_realized_pl, -700.0, places=2)
+        self.assertAlmostEqual(metrics.option_realized_pl, -700.0, places=2)
+
+    def test_multiple_credit_spreads_accumulate(self):
+        """Two independent spreads: the first nets +$150, the second -$50 --
+        combined option P/L is their sum, correctly split across the four legs.
+        Anchored open so both spreads land in the same cycle (see above).
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250601P80", -1, 0.50, 50.0, row_id=0),
+                # Spread 1: short +250, long -100 -> net +150.
+                tx("2025-01-01", STO, "-XYZ250201P100", -1, 2.50, 250.0, row_id=1),
+                tx("2025-01-01", BTO, "-XYZ250201P95", 1, 1.00, -100.0, row_id=2),
+                tx("2025-02-01", EXPIRED, "-XYZ250201P100", 1, None, 0.0, row_id=3, as_of="2025-02-01"),
+                tx("2025-02-01", EXPIRED, "-XYZ250201P95", 1, None, 0.0, row_id=4, as_of="2025-02-01"),
+                # Spread 2: short +200, long -250 -> net -50.
+                tx("2025-02-05", STO, "-XYZ250301P100", -1, 2.00, 200.0, row_id=5),
+                tx("2025-02-05", BTO, "-XYZ250301P95", 1, 2.50, -250.0, row_id=6),
+                tx("2025-03-01", EXPIRED, "-XYZ250301P100", 1, None, 0.0, row_id=7, as_of="2025-03-01"),
+                tx("2025-03-01", EXPIRED, "-XYZ250301P95", 1, None, 0.0, row_id=8, as_of="2025-03-01"),
+            ]
+        )
+        metrics = cycle_metrics(cycles[0], date(2025, 3, 1))
+        # The anchor leg never closes, so it contributes $0 to realized P/L --
+        # only capital and leg counts, not this sum.
+        self.assertAlmostEqual(metrics.wheel_core_realized_pl, 450.0, places=2)  # 250 + 200
+        self.assertAlmostEqual(metrics.hedge_realized_pl, -350.0, places=2)  # -100 + -250
+        self.assertAlmostEqual(metrics.option_realized_pl, 100.0, places=2)  # 150 + -50
+
+    def test_open_protective_put_excluded_from_realized_roc(self):
+        """An open hedge contributes nothing to realized P/L -- its cost only
+        counts once the position actually closes -- but it does show up as
+        committed capital while open (the *actual* debit paid, not notional).
+        """
+        cycles, _ = build_cycles(
+            [tx("2025-01-01", BTO, "-XYZ250601P100", 1, 10.00, -1000.0, row_id=1)]
+        )
+        through = date(2025, 1, 31)
+        metrics = cycle_metrics(cycles[0], through)
+        self.assertAlmostEqual(metrics.hedge_realized_pl, 0.0)
+        self.assertAlmostEqual(metrics.option_realized_pl, 0.0)
+        # Capital is committed (the debit paid), so this is a real, decided 0%
+        # -- not None, which is reserved for "no capital committed at all".
+        self.assertAlmostEqual(metrics.annualized_wheel_roc_pct, 0.0)
+
+        points = capital_timeline(cycles[0], through)
+        self.assertAlmostEqual(points[0].long_premium, 1000.0)
+        self.assertAlmostEqual(points[0].total, 1000.0)
+
+    def test_csp_plus_protective_put_plus_covered_call(self):
+        """+$400 CSP, -$300 hedge, +$500 covered call -> $600 total, $900 of
+        it wheel-core and -$300 of it hedge.
+
+        An anchor leg that never closes keeps all three in one cycle (see
+        ``test_multiple_protective_puts_accumulate``) -- it contributes $0 to
+        every realized figure below.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250601P80", -1, 0.50, 50.0, row_id=0),
+                tx("2025-01-01", STO, "-XYZ250201P100", -1, 4.00, 400.0, row_id=1),
+                tx("2025-02-01", EXPIRED, "-XYZ250201P100", 1, None, 0.0, row_id=2, as_of="2025-02-01"),
+                tx("2025-01-01", BTO, "-XYZ250201P90", 1, 10.00, -1000.0, row_id=3),
+                tx("2025-01-20", STC, "-XYZ250201P90", -1, 7.00, 700.0, row_id=4),
+                tx("2025-02-05", STO, "-XYZ250305C110", -1, 5.00, 500.0, row_id=5),
+                tx("2025-03-05", EXPIRED, "-XYZ250305C110", 1, None, 0.0, row_id=6, as_of="2025-03-05"),
+            ]
+        )
+        metrics = cycle_metrics(cycles[0], date(2025, 3, 5))
+        self.assertAlmostEqual(metrics.wheel_core_realized_pl, 900.0, places=2)
+        self.assertAlmostEqual(metrics.hedge_realized_pl, -300.0, places=2)
+        self.assertAlmostEqual(metrics.option_realized_pl, 600.0, places=2)
+
+    def test_end_to_end_csp_put_spread_and_cc_matches_worked_example(self):
+        """The full scenario from the design doc: CSP +$400, protective put
+        net -$300, covered call +$500, credit spread net +$200 -> $800 total.
+        Annualized Wheel ROC is then whatever the formula gives on this
+        cycle's own capital/duration -- checked against the same formula the
+        implementation uses, not a hand-picked capital figure. An anchor leg
+        again keeps all four instruments in one cycle.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250601P80", -1, 0.50, 50.0, row_id=0),
+                tx("2025-01-01", STO, "-XYZ250201P100", -1, 4.00, 400.0, row_id=1),
+                tx("2025-02-01", EXPIRED, "-XYZ250201P100", 1, None, 0.0, row_id=2, as_of="2025-02-01"),
+                tx("2025-01-01", BTO, "-XYZ250201P90", 1, 10.00, -1000.0, row_id=3),
+                tx("2025-01-20", STC, "-XYZ250201P90", -1, 7.00, 700.0, row_id=4),
+                tx("2025-02-05", STO, "-XYZ250305C110", -1, 5.00, 500.0, row_id=5),
+                tx("2025-03-05", EXPIRED, "-XYZ250305C110", 1, None, 0.0, row_id=6, as_of="2025-03-05"),
+                tx("2025-03-06", STO, "-XYZ250401P100", -1, 3.00, 300.0, row_id=7),
+                tx("2025-03-06", BTO, "-XYZ250401P95", 1, 1.00, -100.0, row_id=8),
+                tx("2025-04-01", EXPIRED, "-XYZ250401P100", 1, None, 0.0, row_id=9, as_of="2025-04-01"),
+                tx("2025-04-01", EXPIRED, "-XYZ250401P95", 1, None, 0.0, row_id=10, as_of="2025-04-01"),
+            ]
+        )
+        through = date(2025, 4, 1)
+        metrics = cycle_metrics(cycles[0], through)
+        self.assertAlmostEqual(metrics.option_realized_pl, 800.0, places=2)
+
+        expected_roc = (
+            100.0 * metrics.option_realized_pl / metrics.avg_collateral * (365.0 / metrics.days_active)
+        )
+        self.assertAlmostEqual(metrics.annualized_wheel_roc_pct, expected_roc, places=6)
+
+        # The formula itself, on the design doc's own $10,000 / 90-day figures,
+        # independent of whatever capital this particular fixture produces.
+        self.assertAlmostEqual(100.0 * 800.0 / 10000.0 * (365.0 / 90.0), 32.44, places=2)
+
+    def test_multi_leg_spread_does_not_double_count(self):
+        """Two legs, two cash flows each -- exactly four realized numbers sum
+        to the net spread P/L; nothing is counted an extra time.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250201P100", -1, 3.00, 300.0, row_id=1),
+                tx("2025-01-01", BTO, "-XYZ250201P95", 1, 1.00, -100.0, row_id=2),
+                tx("2025-01-15", BTC, "-XYZ250201P100", 1, 1.00, -100.0, row_id=3),
+                tx("2025-01-15", STC, "-XYZ250201P95", -1, 0.20, 20.0, row_id=4),
+            ]
+        )
+        metrics = cycle_metrics(cycles[0], date(2025, 1, 15))
+        short_leg_pl = 300.0 - 100.0  # 200
+        long_leg_pl = -100.0 + 20.0  # -80
+        self.assertAlmostEqual(metrics.wheel_core_realized_pl, short_leg_pl, places=2)
+        self.assertAlmostEqual(metrics.hedge_realized_pl, long_leg_pl, places=2)
+        self.assertAlmostEqual(metrics.option_realized_pl, short_leg_pl + long_leg_pl, places=2)
+        # Not the sum of the raw cash flows counted independently (300 - 100 -
+        # 100 + 20 double-counted some other way, or the opening/closing legs
+        # mistaken for four unrelated trades): exactly leg_1 + leg_2.
+        self.assertNotAlmostEqual(metrics.option_realized_pl, 300.0 - 100.0 + 100.0 - 20.0, places=2)
+
+    def test_hedge_pl_moves_roc_but_stock_pl_does_not(self):
+        """A hedge loss on top of an assignment that later profits on the
+        stock: the Wheel ROC numerator must move with the hedge, not the
+        stock gain -- mirroring TestWheelROC's assigned-stock tests, but with
+        a hedge leg layered on.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-11-17", STO, "-MU251121P230", -1, 4.00, 399.33, row_id=1),
+                tx("2025-11-21", ASSIGNED, "-MU251121P230", 1, None, 0.0, row_id=2, as_of="2025-11-20"),
+                tx("2025-11-17", BTO, "-MU251205P210", 1, 3.00, -300.0, row_id=3),
+                tx("2025-11-24", STC, "-MU251205P210", -1, 1.00, 100.0, row_id=4),
+                tx("2025-11-24", STO, "-MU251128C235", -1, 2.00, 199.33, row_id=5),
+                tx("2025-12-01", ASSIGNED, "-MU251128C235", 1, None, 0.0, row_id=6, as_of="2025-11-28"),
+            ]
+        )
+        metrics = cycle_metrics(cycles[0], date(2025, 11, 28))
+        self.assertAlmostEqual(metrics.hedge_realized_pl, -200.0, places=2)  # -300 + 100
+        self.assertAlmostEqual(metrics.wheel_core_realized_pl, 598.66, places=2)  # 399.33 + 199.33
+        self.assertAlmostEqual(metrics.option_realized_pl, 398.66, places=2)
+        self.assertGreater(metrics.stock_realized_pl, 0.0)  # the assignment/call-away round trip gained
+        # ROC reflects the hedge loss and the option gains, never the stock gain.
+        expected_roc = (
+            100.0 * metrics.option_realized_pl / metrics.avg_collateral * (365.0 / metrics.days_active)
+        )
+        self.assertAlmostEqual(metrics.annualized_wheel_roc_pct, expected_roc, places=6)
+        self.assertNotAlmostEqual(
+            metrics.annualized_wheel_roc_pct,
+            100.0 * metrics.net_realized_pl / metrics.avg_collateral * (365.0 / metrics.days_active),
+            places=2,
+        )
+
+    def test_hedge_premium_is_not_notional_and_clears_on_close(self):
+        """Capital for a $50-strike protective put (notional $5,000) is the
+        $320 actually paid for it, not $5,000 -- and it drops to $0 the day
+        the leg closes, because by then its cost lives in realized P/L instead.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", BTO, "-XYZ250201P50", 1, 3.20, -320.0, row_id=1),
+                tx("2025-01-15", STC, "-XYZ250201P50", -1, 1.00, 100.0, row_id=2),
+            ]
+        )
+        points = {point.day: point for point in capital_timeline(cycles[0], date(2025, 1, 20))}
+        self.assertAlmostEqual(points[date(2025, 1, 2)].long_premium, 320.0, places=2)
+        self.assertLess(points[date(2025, 1, 2)].long_premium, 50 * 100)  # nowhere near notional
+        self.assertAlmostEqual(points[date(2025, 1, 15)].long_premium, 0.0, places=2)  # closed
+        metrics = cycle_metrics(cycles[0], date(2025, 1, 20))
+        self.assertAlmostEqual(metrics.hedge_realized_pl, -220.0, places=2)  # -320 + 100
 
 
 if __name__ == "__main__":

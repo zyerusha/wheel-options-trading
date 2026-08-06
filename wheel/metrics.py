@@ -14,15 +14,49 @@ to a different strike or shares are assigned.  Cash-secured puts commit
 call commits nothing extra, since the shares already carry the capital -- unless
 those shares pre-date the export, when the strike stands in for them.
 
-**Return** -- ROI is quoted three ways because a single denominator is
-misleading for a rolled position: against the collateral committed on day one,
-against the peak, and against the time-weighted average.  Annualized return on
-capital always uses the time-weighted average, which is the only denominator that
-correctly credits a position for freeing capital early.  Every ROI and annualized
-ROC figure is also quoted twice: once against ``net_realized_pl`` (premium plus
-stock P/L -- the full wheel result) and once against ``option_realized_pl`` alone
-(premium only, credits minus debits, excluding whatever the underlying's price
-did). The ``_premium`` suffix marks the premium-only variant throughout.
+**Return** -- ``roi_pct`` and ``roi_on_peak_pct`` are quoted against the
+collateral committed on day one and against the peak, respectively, using
+``net_realized_pl`` (premium plus realized stock P/L), since they exist to show
+how sensitive ROI is to denominator choice on a resized position, not to gauge
+the wheel's own option income.
+
+The headline **Wheel ROC** (``roi_on_avg_wheel_pct`` and its annualized form,
+``annualized_wheel_roc_pct``) is a different, narrower question: how much did
+the wheel's *option activity* return on the capital it tied up, over time.  Its
+numerator is ``option_realized_pl`` only -- premium credits minus debits paid to
+close -- and never includes stock P/L, whether realized or not, gained or lost.
+A put assigned at $100 that later trades at $80 does not make the wheel's ROC
+negative; the stock is capital the wheel has tied up, not a loss the wheel's
+option leg took. The brokerage export already carries the stock's own P/L
+(``stock_realized_pl``, and ``net_realized_pl`` for the sum) for anyone who wants
+the full investment picture; this tracker's ROC number stays scoped to what the
+option strategy itself produced.
+
+``option_realized_pl`` sums every leg in the cycle regardless of strategy --
+it always has, because nothing here ever filtered by :data:`WHEEL_STRATEGIES`.
+That includes protective puts and the long legs of credit-spread hedges
+(``LONG_PUT`` / ``LONG_CALL``), whose own ``realized_pl`` already nets the
+purchase against whatever it was later sold, exercised or expired for -- a put
+bought for $1,000 and sold for $700 contributes -$300, never -$1,000 or +$700
+separately.  ``wheel_core_realized_pl`` (CSP + covered-call legs) and
+``hedge_realized_pl`` (everything else -- the model has no notion of "this
+long put hedges that short put", so every non-core leg is a hedge) are exposed
+as the two addends of ``option_realized_pl`` purely so a caller -- the
+dashboard's calculation tooltip, in particular -- can show hedge cost/recovery
+as its own line rather than asserting a number with no visible components.
+
+Capital for a long leg (``long_premium``) is the actual debit paid, decaying to
+$0 the day it closes -- never the option's notional -- so a protective put's
+cost lives in the P/L numerator, not as inflated capital in the denominator.
+A short leg that happens to be one side of a defined-risk spread still gets
+full cash-secured-put/covered-call collateral, because nothing here pairs
+legs into spreads; a real broker's reduced spread margin is not something this
+data model can see. That is a known, deliberate limitation, not a bug -- see
+:func:`capital_timeline`.
+
+Both variants use the time-weighted average collateral as their denominator,
+which is the only one that correctly credits a position for freeing capital
+early, and both annualize by scaling to ``DAYS_PER_YEAR / days_active``.
 """
 
 from __future__ import annotations
@@ -65,7 +99,23 @@ class CapitalPoint:
 
 
 def capital_timeline(cycle: Cycle, through: date) -> list[CapitalPoint]:
-    """Daily committed capital for a cycle, from its start through ``through``."""
+    """Daily committed capital for a cycle, from its start through ``through``.
+
+    ``long_premium`` (a protective put, or the long leg of a credit-spread
+    hedge) is the actual debit paid per contract while the leg is open, never
+    the option's notional -- it drops to $0 the day it closes, at which point
+    its cost is already accounted for in ``option_realized_pl`` instead.
+
+    A short leg gets full cash-secured-put or covered-call collateral even
+    when it is economically one side of a defined-risk spread: this model has
+    no concept of two legs being paired into one spread, so it cannot net a
+    spread down to its true (smaller) margin requirement. That overstates
+    capital -- and understates Wheel ROC -- for a hedged position relative to
+    what a broker would actually require. Deliberate, not a bug: getting this
+    right needs matching legs by underlying/right/expiry/side/timing, which is
+    ambiguous enough (multiple concurrent spreads, rolls, partial fills) that
+    a wrong pairing would be worse than a conservative overstatement.
+    """
     end = cycle.end_date or through
     if end < cycle.start_date:
         end = cycle.start_date
@@ -116,7 +166,9 @@ class CycleMetrics:
 
     premium_received: float = 0.0  # credits taken in on short opens
     premium_paid: float = 0.0  # debits paid to close shorts (negative)
-    option_realized_pl: float = 0.0
+    option_realized_pl: float = 0.0  # = wheel_core_realized_pl + hedge_realized_pl
+    wheel_core_realized_pl: float = 0.0  # CSP + covered-call legs only
+    hedge_realized_pl: float = 0.0  # protective puts + credit-spread legs (LONG_PUT/LONG_CALL)
     option_open_premium: float = 0.0  # credit held on still-open legs
     stock_realized_pl: float = 0.0
     stock_basis_unknown_shares: float = 0.0
@@ -132,12 +184,10 @@ class CycleMetrics:
     call_collateral_now: float = 0.0
     capital_estimated: bool = False
 
-    roi_pct: float | None = None  # vs initial collateral
-    roi_on_peak_pct: float | None = None
-    roi_on_avg_pct: float | None = None
-    annualized_roc_pct: float | None = None  # full wheel: premium + stock P/L
-    roi_on_avg_premium_pct: float | None = None  # premium only, excludes stock P/L
-    annualized_roc_premium_pct: float | None = None
+    roi_pct: float | None = None  # net P/L (incl. stock) vs initial collateral
+    roi_on_peak_pct: float | None = None  # net P/L (incl. stock) vs peak collateral
+    roi_on_avg_wheel_pct: float | None = None  # option P/L only, vs time-weighted avg collateral
+    annualized_wheel_roc_pct: float | None = None  # the headline Wheel ROC: option P/L only
 
     legs_total: int = 0
     legs_open: int = 0
@@ -151,6 +201,15 @@ class CycleMetrics:
 
     @property
     def win_rate_pct(self) -> float | None:
+        """Winning legs over winning-plus-losing legs -- a secondary, diagnostic
+        figure, never the primary performance number (that's the annualized
+        Wheel ROC). ``wins`` and ``losses`` already come only from *closed*
+        legs (open legs are excluded), and a leg with ``realized_pl == 0``
+        counts toward neither, so it drops out of this ratio's denominator
+        entirely rather than counting against it. ``None`` -- not ``0.0`` --
+        when nothing has been decided yet, since 0% would misreport "no data"
+        as "all losses".
+        """
         decided = self.wins + self.losses
         return 100.0 * self.wins / decided if decided else None
 
@@ -172,7 +231,12 @@ def cycle_metrics(cycle: Cycle, through: date) -> CycleMetrics:
     premium_paid = sum(
         close.cash for leg in short_legs for close in leg.closes if close.cash < 0
     )
-    option_realized = sum(leg.realized_pl for leg in cycle.legs)
+    # Hedges (protective puts, credit-spread legs) are whatever isn't a plain
+    # CSP or covered call -- see the module docstring. Summing the two halves
+    # must equal summing every leg directly; nothing here filters legs out.
+    wheel_core_realized = sum(leg.realized_pl for leg in cycle.legs if leg.strategy in WHEEL_STRATEGIES)
+    hedge_realized = sum(leg.realized_pl for leg in cycle.legs if leg.strategy not in WHEEL_STRATEGIES)
+    option_realized = wheel_core_realized + hedge_realized
     option_open_premium = sum(leg.open_premium for leg in cycle.legs if leg.is_open)
 
     stock_realized = 0.0
@@ -195,11 +259,9 @@ def cycle_metrics(cycle: Cycle, through: date) -> CycleMetrics:
     losses = sum(1 for leg in closed_legs if leg.realized_pl < 0)
     held = [leg.days_held for leg in closed_legs if leg.days_held is not None]
 
-    annualized = None
-    annualized_premium = None
+    annualized_wheel_roc = None
     if average > 1e-9:
-        annualized = 100.0 * (net_realized / average) * (DAYS_PER_YEAR / days_active)
-        annualized_premium = 100.0 * (option_realized / average) * (DAYS_PER_YEAR / days_active)
+        annualized_wheel_roc = 100.0 * (option_realized / average) * (DAYS_PER_YEAR / days_active)
 
     return CycleMetrics(
         cycle_id=cycle.cycle_id,
@@ -211,6 +273,8 @@ def cycle_metrics(cycle: Cycle, through: date) -> CycleMetrics:
         premium_received=premium_received,
         premium_paid=premium_paid,
         option_realized_pl=option_realized,
+        wheel_core_realized_pl=wheel_core_realized,
+        hedge_realized_pl=hedge_realized,
         option_open_premium=option_open_premium,
         stock_realized_pl=stock_realized,
         stock_basis_unknown_shares=unknown_shares,
@@ -226,10 +290,8 @@ def cycle_metrics(cycle: Cycle, through: date) -> CycleMetrics:
         capital_estimated=cycle.capital_estimated,
         roi_pct=_safe_pct(net_realized, initial),
         roi_on_peak_pct=_safe_pct(net_realized, peak),
-        roi_on_avg_pct=_safe_pct(net_realized, average),
-        annualized_roc_pct=annualized,
-        roi_on_avg_premium_pct=_safe_pct(option_realized, average),
-        annualized_roc_premium_pct=annualized_premium,
+        roi_on_avg_wheel_pct=_safe_pct(option_realized, average),
+        annualized_wheel_roc_pct=annualized_wheel_roc,
         legs_total=len(cycle.legs),
         legs_open=sum(1 for leg in cycle.legs if leg.is_open),
         rolls=len(cycle.rolls),
@@ -258,7 +320,9 @@ class PortfolioMetrics:
 
     premium_received: float = 0.0
     premium_paid: float = 0.0
-    option_realized_pl: float = 0.0
+    option_realized_pl: float = 0.0  # = wheel_core_realized_pl + hedge_realized_pl
+    wheel_core_realized_pl: float = 0.0  # CSP + covered-call legs only
+    hedge_realized_pl: float = 0.0  # protective puts + credit-spread legs (LONG_PUT/LONG_CALL)
     stock_realized_pl: float = 0.0
     net_realized_pl: float = 0.0
     open_premium: float = 0.0
@@ -267,10 +331,8 @@ class PortfolioMetrics:
     capital_deployed_now: float = 0.0
     peak_capital: float = 0.0
     avg_capital: float = 0.0
-    annualized_roc_pct: float | None = None  # full wheel: premium + stock P/L
-    roi_on_avg_pct: float | None = None
-    annualized_roc_premium_pct: float | None = None  # premium only, excludes stock P/L
-    roi_on_avg_premium_pct: float | None = None
+    annualized_wheel_roc_pct: float | None = None  # the headline Wheel ROC: option P/L only
+    roi_on_avg_wheel_pct: float | None = None
 
     total_legs: int = 0
     open_legs: int = 0
@@ -282,6 +344,15 @@ class PortfolioMetrics:
 
     @property
     def win_rate_pct(self) -> float | None:
+        """Winning legs over winning-plus-losing legs -- a secondary, diagnostic
+        figure, never the primary performance number (that's the annualized
+        Wheel ROC). ``wins`` and ``losses`` already come only from *closed*
+        legs (open legs are excluded), and a leg with ``realized_pl == 0``
+        counts toward neither, so it drops out of this ratio's denominator
+        entirely rather than counting against it. ``None`` -- not ``0.0`` --
+        when nothing has been decided yet, since 0% would misreport "no data"
+        as "all losses".
+        """
         decided = self.wins + self.losses
         return 100.0 * self.wins / decided if decided else None
 
@@ -384,6 +455,8 @@ def portfolio_metrics(
         result.premium_received += metric.premium_received
         result.premium_paid += metric.premium_paid
         result.option_realized_pl += metric.option_realized_pl
+        result.wheel_core_realized_pl += metric.wheel_core_realized_pl
+        result.hedge_realized_pl += metric.hedge_realized_pl
         result.stock_realized_pl += metric.stock_realized_pl
         result.net_realized_pl += metric.net_realized_pl
         result.open_premium += metric.option_open_premium
@@ -400,10 +473,8 @@ def portfolio_metrics(
     result.avg_capital = _time_weighted_average(series)
 
     if result.avg_capital > 1e-9:
-        result.roi_on_avg_pct = 100.0 * result.net_realized_pl / result.avg_capital
-        result.annualized_roc_pct = result.roi_on_avg_pct * (DAYS_PER_YEAR / result.days_span)
-        result.roi_on_avg_premium_pct = 100.0 * result.option_realized_pl / result.avg_capital
-        result.annualized_roc_premium_pct = result.roi_on_avg_premium_pct * (
+        result.roi_on_avg_wheel_pct = 100.0 * result.option_realized_pl / result.avg_capital
+        result.annualized_wheel_roc_pct = result.roi_on_avg_wheel_pct * (
             DAYS_PER_YEAR / result.days_span
         )
 
@@ -475,7 +546,9 @@ def ticker_summary(
                 "capital_estimated": any(cycle.capital_estimated for cycle in cap_group),
                 "premium_received": sum(metric.premium_received for metric in metrics),
                 "premium_paid": sum(metric.premium_paid for metric in metrics),
-                "option_realized_pl": sum(metric.option_realized_pl for metric in metrics),
+                "option_realized_pl": option_net,
+                "wheel_core_realized_pl": sum(metric.wheel_core_realized_pl for metric in metrics),
+                "hedge_realized_pl": sum(metric.hedge_realized_pl for metric in metrics),
                 "stock_realized_pl": sum(metric.stock_realized_pl for metric in metrics),
                 "net_realized_pl": net,
                 "open_premium": sum(metric.option_open_premium for metric in metrics),
@@ -489,12 +562,9 @@ def ticker_summary(
                 "avg_capital": average,
                 "peak_capital": max((point.total for point in series), default=0.0),
                 "capital_now": series[-1].total if series else 0.0,
-                "roi_on_avg_pct": _safe_pct(net, average),
-                "annualized_roc_pct": (
-                    _safe_pct(net, average) * (DAYS_PER_YEAR / span) if average > 1e-9 else None
-                ),
-                "roi_on_avg_premium_pct": _safe_pct(option_net, average),
-                "annualized_roc_premium_pct": (
+                "days_span": span,  # denominator of the 365/span annualizing factor below
+                "roi_on_avg_wheel_pct": _safe_pct(option_net, average),
+                "annualized_wheel_roc_pct": (
                     _safe_pct(option_net, average) * (DAYS_PER_YEAR / span)
                     if average > 1e-9
                     else None

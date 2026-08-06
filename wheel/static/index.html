@@ -18,6 +18,13 @@
         </div>
       </header>
 
+      <!-- Account switcher: which data/<account>/ folder to view. "Combined"
+           aggregates every discovered account without merging their cycles. -->
+      <section class="accounts" id="accounts-bar" aria-label="Account" hidden>
+        <label id="account-label">Account</label>
+        <div class="chip-row" id="account-chips" role="group" aria-labelledby="account-label"></div>
+      </section>
+
       <!-- Data source: choose an export, or upload a new one. Nothing is
            evaluated until Load is pressed. -->
       <section class="source" aria-label="Data source">
@@ -46,6 +53,9 @@
           <select id="preset">
             <option value="all">All history</option>
             <option value="10">Last 10 days</option>
+            <option value="30">Last 30 days</option>
+            <option value="60">Last 60 days</option>
+            <option value="90">Last 90 days</option>
             <option value="ytd">Year to date</option>
             <option value="1y">1 year</option>
             <option value="3y">3 years</option>
@@ -78,6 +88,24 @@
       <div id="notices"></div>
 
       <section class="tiles" id="tiles" aria-label="Headline metrics"></section>
+
+      <section class="card" id="net-worth-card" style="margin-bottom: var(--gap)" hidden>
+        <header>
+          <h2>Net worth &amp; benchmark</h2>
+          <button class="toggle" data-twin="networth-table" aria-pressed="false">Table</button>
+        </header>
+        <p class="hint">
+          From Fidelity Portfolio Positions snapshots — independent of the filters below. Money-weighted
+          (XIRR) return replays your own contribution/withdrawal timing into SPY, so the comparison
+          isolates whether the wheel beat a buy-and-hold benchmark from when you happened to add or
+          remove money. Add more snapshots over time for a smoother trend.
+        </p>
+        <div id="net-worth-empty" class="notice" hidden></div>
+        <div class="tiles" id="networth-tiles"></div>
+        <div class="chart-scroll"><svg id="chart-networth" role="img"></svg></div>
+        <div class="legend" id="legend-networth"></div>
+        <div class="table-twin" id="networth-table" hidden></div>
+      </section>
 
       <div class="grid two">
         <section class="card">
@@ -127,12 +155,13 @@
 
         <section class="card">
           <header>
-            <h2>Annualized return on capital</h2>
+            <h2>Annualized Wheel ROC</h2>
             <button class="toggle" data-twin="roc-table" aria-pressed="false">Table</button>
           </header>
           <p class="hint">
-            Net P/L ÷ time-weighted average capital, scaled to a year. Tickers marked ~ include a
-            strike-based proxy for stock held before this export.
+            Option P/L only (never stock P/L) ÷ time-weighted average capital, scaled to a year.
+            Assigned shares count as capital by their cost basis, not by their price move. Tickers
+            marked ~ include a strike-based proxy for stock held before this export.
           </p>
           <div class="chart-scroll"><svg id="chart-roc" role="img"></svg></div>
           <div class="table-twin" id="roc-table" hidden></div>
