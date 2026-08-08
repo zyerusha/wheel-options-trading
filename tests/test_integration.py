@@ -341,7 +341,9 @@ class TestCapitalPayload(unittest.TestCase):
             for point in series:
                 self.assertEqual(
                     point["total"],
-                    round(point["put"] + point["stock"] + point["call"] + point["long"], 2),
+                    round(
+                        point["put"] + point["stock"] + point["call"] + point["long"] + point["spread"], 2
+                    ),
                     point["date"],
                 )
                 checked += 1
@@ -378,7 +380,7 @@ class TestCapitalPayload(unittest.TestCase):
 
     def test_capital_is_never_negative(self):
         for point in self.payload["capital_series"]:
-            for key in ("put", "stock", "call", "long", "total"):
+            for key in ("put", "stock", "call", "long", "spread", "total"):
                 self.assertGreaterEqual(point[key], 0.0, f"{point['date']} {key}")
 
 

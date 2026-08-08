@@ -142,6 +142,23 @@
         </section>
       </div>
 
+      <section class="card" style="margin-bottom: var(--gap)">
+        <header>
+          <h2>Monthly cash flow</h2>
+          <button class="toggle" data-twin="cashflow-table" aria-pressed="false">Table</button>
+        </header>
+        <p class="hint">
+          Realized credits (premium sold, dividends) minus realized debits (premium paid to close a
+          short or open a hedge) minus fees, booked to the day cash actually settled — independent of
+          expiration date or whether the position is still open. Share assignment costs and call-away
+          proceeds are capital shifts, not income, and are excluded; see Capital deployed above for those.
+        </p>
+        <div class="tiles" id="cashflow-tiles"></div>
+        <div class="chart-scroll"><svg id="chart-cashflow" role="img"></svg></div>
+        <div class="legend" id="legend-cashflow"></div>
+        <div class="table-twin" id="cashflow-table" hidden></div>
+      </section>
+
       <div class="grid two">
         <section class="card">
           <header>

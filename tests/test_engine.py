@@ -39,6 +39,7 @@ def tx(
     commission: float = 0.0,
     fees: float = 0.0,
     as_of: str | None = None,
+    action_raw: str | None = None,
 ) -> Transaction:
     """Build a Transaction the way the parser would, with minimal ceremony."""
     from wheel.parser import parse_occ_symbol
@@ -50,7 +51,7 @@ def tx(
         run_date=date.fromisoformat(day),
         settlement_date=None,
         action=action,
-        action_raw=action,
+        action_raw=action_raw if action_raw is not None else action,
         description="",
         underlying=underlying,
         occ_symbol=symbol.lstrip("-").upper() if parsed else None,
@@ -276,6 +277,97 @@ class TestRolls(unittest.TestCase):
             ]
         )
         self.assertEqual(cycles[0].rolls, [])
+
+
+class TestSpreadDetection(unittest.TestCase):
+    def test_same_day_short_and_long_pair_into_a_spread(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250201P100", -1, 3.00, 300.0, row_id=1),
+                tx("2025-01-01", BTO, "-XYZ250201P95", 1, 1.00, -100.0, row_id=2),
+            ]
+        )
+        cycle = cycles[0]
+        self.assertEqual(len(cycle.spreads), 1)
+        spread = cycle.spreads[0]
+        self.assertEqual(spread.right, "P")
+        self.assertEqual(spread.short_strike, 100.0)
+        self.assertEqual(spread.long_strike, 95.0)
+        self.assertEqual(spread.paired_contracts, 1)
+        self.assertAlmostEqual(spread.collateral_per_contract, 500.0)  # (100-95)*100
+        self.assertAlmostEqual(spread.net_credit, 200.0)  # 300 - 100
+        short_leg = next(leg for leg in cycle.legs if leg.strike == 100.0)
+        long_leg = next(leg for leg in cycle.legs if leg.strike == 95.0)
+        self.assertEqual(short_leg.paired_contracts, {spread.spread_id: 1})
+        self.assertEqual(long_leg.paired_contracts, {spread.spread_id: 1})
+
+    def test_different_expiry_does_not_pair(self):
+        """A calendar spread -- same strike/right, different expiry -- is not
+        paired: the rule is same-day AND same expiry.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250201P100", -1, 3.00, 300.0, row_id=1),
+                tx("2025-01-01", BTO, "-XYZ250301P100", 1, 2.00, -200.0, row_id=2),
+            ]
+        )
+        self.assertEqual(cycles[0].spreads, [])
+
+    def test_lone_long_creates_no_spread(self):
+        """An ordinary protective put with no same-day short stays unpaired."""
+        cycles, _ = build_cycles(
+            [tx("2025-01-01", BTO, "-XYZ250201P100", 1, 10.00, -1000.0, row_id=1)]
+        )
+        self.assertEqual(cycles[0].spreads, [])
+
+    def test_lone_short_creates_no_spread(self):
+        cycles, _ = build_cycles(
+            [tx("2025-01-01", STO, "-XYZ250201P100", -1, 3.00, 300.0, row_id=1)]
+        )
+        self.assertEqual(cycles[0].spreads, [])
+
+    def test_quantity_mismatch_pairs_the_smaller_side_and_leaves_the_rest_naked(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250201P100", -2, 6.00, 600.0, row_id=1),
+                tx("2025-01-01", BTO, "-XYZ250201P95", 1, 1.00, -100.0, row_id=2),
+            ]
+        )
+        cycle = cycles[0]
+        self.assertEqual(len(cycle.spreads), 1)
+        self.assertEqual(cycle.spreads[0].paired_contracts, 1)
+        short_leg = next(leg for leg in cycle.legs if leg.strike == 100.0)
+        self.assertEqual(short_leg.contracts, 2)
+        self.assertEqual(sum(short_leg.paired_contracts.values()), 1)  # 1 of 2 paired, 1 naked
+
+    def test_ambiguous_multi_candidate_group_stays_naked_with_a_warning(self):
+        """One short, two same-day longs at different strikes -- which pairs
+        with which is not decidable, so none of them pair (mirrors the real
+        MU 2025-11-17 data this rule was designed against).
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250201P230", -1, 4.00, 400.0, row_id=1),
+                tx("2025-01-01", BTO, "-XYZ250201P245", 1, 1.00, -100.0, row_id=2),
+                tx("2025-01-01", BTO, "-XYZ250201P240", 1, 1.00, -100.0, row_id=3),
+            ]
+        )
+        cycle = cycles[0]
+        self.assertEqual(cycle.spreads, [])
+        self.assertTrue(any("ambiguous" in warning.lower() or "same day" in warning.lower() for warning in cycle.warnings))
+
+    def test_puts_and_calls_opened_same_day_pair_independently(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250201P100", -1, 3.00, 300.0, row_id=1),
+                tx("2025-01-01", BTO, "-XYZ250201P95", 1, 1.00, -100.0, row_id=2),
+                tx("2025-01-01", STO, "-XYZ250201C120", -1, 2.50, 250.0, row_id=3),
+                tx("2025-01-01", BTO, "-XYZ250201C130", 1, 0.80, -80.0, row_id=4),
+            ]
+        )
+        cycle = cycles[0]
+        self.assertEqual(len(cycle.spreads), 2)
+        self.assertEqual({spread.right for spread in cycle.spreads}, {"P", "C"})
 
 
 class TestAssignment(unittest.TestCase):

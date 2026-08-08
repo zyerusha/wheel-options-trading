@@ -12,17 +12,20 @@ from datetime import date
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.test_engine import tx  # noqa: E402
+from wheel.cashflow import dividend_transactions  # noqa: E402
 from wheel.engine import COVERED_CALL, CSP, LONG_PUT, build_cycles  # noqa: E402
 from wheel.metrics import (  # noqa: E402
     _time_weighted_average,
     capital_timeline,
     cycle_metrics,
+    dividends_by_cycle,
+    net_adjusted_cost_basis,
     portfolio_capital_series,
     portfolio_metrics,
     realized_pl_series,
     ticker_summary,
 )
-from wheel.parser import ASSIGNED, BTC, BTO, EXPIRED, STC, STO  # noqa: E402
+from wheel.parser import ASSIGNED, BTC, BTO, EXPIRED, OTHER, STC, STO  # noqa: E402
 
 
 class TestCapitalTimeline(unittest.TestCase):
@@ -78,6 +81,350 @@ class TestCapitalTimeline(unittest.TestCase):
         points = capital_timeline(cycles[0], date(2025, 9, 16))
         self.assertAlmostEqual(points[0].call_collateral, 58800.0)
         self.assertTrue(cycles[0].capital_estimated)
+
+
+class TestSpreadCollateral(unittest.TestCase):
+    def test_paired_leg_reports_netted_collateral_not_full_csp(self):
+        """Short $100 put + long $95 put, both open the same day: collateral
+        is the $500 strike distance, not the $10,000 full CSP collateral --
+        and none of it leaks into put_collateral or long_premium.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250201P100", -1, 3.00, 300.0, row_id=1),
+                tx("2025-01-01", BTO, "-XYZ250201P95", 1, 1.00, -100.0, row_id=2),
+            ]
+        )
+        points = capital_timeline(cycles[0], date(2025, 1, 2))
+        point = points[0]
+        self.assertAlmostEqual(point.spread_collateral, 500.0)  # (100-95)*100
+        self.assertAlmostEqual(point.put_collateral, 0.0)
+        self.assertAlmostEqual(point.long_premium, 0.0)
+        self.assertAlmostEqual(point.total, 500.0)
+        self.assertLess(point.total, 100 * 100)  # far less than the unpaired CSP collateral
+
+    def test_unpaired_short_still_gets_full_collateral(self):
+        """A short put with no same-day long partner is completely unaffected
+        by spreads existing elsewhere in the codebase.
+        """
+        cycles, _ = build_cycles([tx("2025-01-01", STO, "-XYZ250201P100", -1, 3.00, 300.0, row_id=1)])
+        points = capital_timeline(cycles[0], date(2025, 1, 2))
+        self.assertAlmostEqual(points[0].put_collateral, 10000.0)
+        self.assertAlmostEqual(points[0].spread_collateral, 0.0)
+        self.assertAlmostEqual(points[0].total, 10000.0)
+
+    def test_partial_pairing_splits_naked_and_spread_collateral(self):
+        """2 short contracts, 1 long: 1 contract nets to spread collateral,
+        1 stays a naked CSP -- the two must sum to less than the old
+        (pre-spread) full 2-contract CSP collateral.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250201P100", -2, 6.00, 600.0, row_id=1),
+                tx("2025-01-01", BTO, "-XYZ250201P95", 1, 1.00, -100.0, row_id=2),
+            ]
+        )
+        points = capital_timeline(cycles[0], date(2025, 1, 2))
+        point = points[0]
+        self.assertAlmostEqual(point.spread_collateral, 500.0)  # 1 contract paired
+        self.assertAlmostEqual(point.put_collateral, 10000.0)  # 1 contract naked
+        self.assertAlmostEqual(point.total, 10500.0)
+        self.assertLess(point.total, 100 * 100 * 2)  # less than full 2-contract CSP collateral
+
+    def test_spread_collateral_lapses_once_the_long_leg_closes_early(self):
+        """The netting only holds while both legs are open -- once the long
+        side closes, the short reverts to full naked collateral for whatever
+        it has left.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250301P100", -1, 3.00, 300.0, row_id=1),
+                tx("2025-01-01", BTO, "-XYZ250301P95", 1, 1.00, -100.0, row_id=2),
+                tx("2025-01-10", STC, "-XYZ250301P95", -1, 0.20, 20.0, row_id=3),
+            ]
+        )
+        points = {point.day: point for point in capital_timeline(cycles[0], date(2025, 1, 15))}
+        before = points[date(2025, 1, 5)]
+        self.assertAlmostEqual(before.spread_collateral, 500.0)
+        self.assertAlmostEqual(before.put_collateral, 0.0)
+
+        after = points[date(2025, 1, 10)]
+        self.assertAlmostEqual(after.spread_collateral, 0.0)
+        self.assertAlmostEqual(after.put_collateral, 10000.0)  # reverted to full naked CSP
+
+    def test_ambiguous_group_never_nets_and_stays_full_collateral(self):
+        """One short, two same-day longs: no spread forms (see
+        TestSpreadDetection), so collateral is completely unaffected --
+        confirms the capital-timeline side of the conservative-when-ambiguous
+        rule, not just the engine's own bookkeeping.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250201P230", -1, 4.00, 400.0, row_id=1),
+                tx("2025-01-01", BTO, "-XYZ250201P245", 1, 1.00, -100.0, row_id=2),
+                tx("2025-01-01", BTO, "-XYZ250201P240", 1, 1.00, -100.0, row_id=3),
+            ]
+        )
+        points = capital_timeline(cycles[0], date(2025, 1, 2))
+        point = points[0]
+        self.assertAlmostEqual(point.spread_collateral, 0.0)
+        self.assertAlmostEqual(point.put_collateral, 23000.0)  # full naked CSP
+        self.assertAlmostEqual(point.long_premium, 200.0)  # both longs, at their own debit
+
+
+class TestNetAdjustedCostBasis(unittest.TestCase):
+    def test_assignment_alone_nets_the_put_premium_against_strike(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-11-17", STO, "-MU251121P230", -1, 4.00, 399.33, row_id=1),
+                tx("2025-11-21", ASSIGNED, "-MU251121P230", 1, None, 0.0, row_id=2, as_of="2025-11-20"),
+            ]
+        )
+        cycle = cycles[0]
+        lot = cycle.share_lots[0]
+        self.assertEqual(lot.basis_per_share, 230.0)  # tax basis: untouched
+        expected = 230.0 - 399.33 / 100.0
+        self.assertAlmostEqual(net_adjusted_cost_basis(cycle, lot), expected, places=4)
+
+    def test_a_covered_call_sold_after_assignment_lowers_the_basis_further(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-11-17", STO, "-MU251121P230", -1, 4.00, 399.33, row_id=1),
+                tx("2025-11-21", ASSIGNED, "-MU251121P230", 1, None, 0.0, row_id=2, as_of="2025-11-20"),
+                tx("2025-11-24", STO, "-MU251128C235", -1, 2.00, 199.33, row_id=3),
+            ]
+        )
+        cycle = cycles[0]
+        lot = cycle.share_lots[0]
+        expected = 230.0 - (399.33 + 199.33) / 100.0
+        self.assertAlmostEqual(net_adjusted_cost_basis(cycle, lot), expected, places=4)
+        # Tax basis is unmoved by the call -- only the adjusted figure reacts.
+        self.assertEqual(lot.basis_per_share, 230.0)
+
+    def test_lower_net_cash_received_raises_the_adjusted_basis(self):
+        """Two otherwise-identical assignments, one whose STO premium was
+        eaten more by fees (lower ``amount``): the one that netted less cash
+        must show the worse (higher) adjusted basis -- confirms fees are
+        reflected exactly once (through the already fee-net ``amount``), not
+        zero times and not twice.
+        """
+        higher_net, _ = build_cycles(
+            [
+                tx("2025-11-17", STO, "-MU251121P230", -1, 4.00, 399.33, row_id=1),
+                tx("2025-11-21", ASSIGNED, "-MU251121P230", 1, None, 0.0, row_id=2, as_of="2025-11-20"),
+            ]
+        )
+        lower_net, _ = build_cycles(
+            [
+                tx("2025-11-17", STO, "-MU251121P230", -1, 4.00, 390.00, row_id=1, fees=9.33),
+                tx("2025-11-21", ASSIGNED, "-MU251121P230", 1, None, 0.0, row_id=2, as_of="2025-11-20"),
+            ]
+        )
+        basis_higher_net = net_adjusted_cost_basis(higher_net[0], higher_net[0].share_lots[0])
+        basis_lower_net = net_adjusted_cost_basis(lower_net[0], lower_net[0].share_lots[0])
+        self.assertGreater(basis_lower_net, basis_higher_net)
+
+    def test_concurrent_lots_split_the_cycles_net_premium_pro_rata(self):
+        """Two partial assignments at different strikes, neither sold yet: the
+        cycle's total net premium is allocated by share count, not "whichever
+        leg happened to produce this lot" -- both lots get the same $/share
+        adjustment here since both are 100-share lots.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250201P100", -1, 3.00, 300.0, row_id=1),
+                tx("2025-02-01", ASSIGNED, "-XYZ250201P100", 1, None, 0.0, row_id=2, as_of="2025-02-01"),
+                tx("2025-01-01", STO, "-XYZ250301P105", -1, 2.00, 200.0, row_id=3),
+                tx("2025-03-01", ASSIGNED, "-XYZ250301P105", 1, None, 0.0, row_id=4, as_of="2025-03-01"),
+            ]
+        )
+        cycle = cycles[0]
+        self.assertEqual(len(cycle.share_lots), 2)
+        lot_100 = next(lot for lot in cycle.share_lots if lot.basis_per_share == 100.0)
+        lot_105 = next(lot for lot in cycle.share_lots if lot.basis_per_share == 105.0)
+        # (300 + 200) split 50/50 across two 100-share lots = 250 each.
+        self.assertAlmostEqual(net_adjusted_cost_basis(cycle, lot_100), 100.0 - 250.0 / 100.0, places=4)
+        self.assertAlmostEqual(net_adjusted_cost_basis(cycle, lot_105), 105.0 - 250.0 / 100.0, places=4)
+
+    def test_unknown_basis_lot_returns_none(self):
+        """A PRE_HISTORY lot (stock the export never saw bought) has no strike
+        to net against -- None, not a fabricated number.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-09-15", STO, "-QQQ250917C588", -1, 3.32, 331.33, row_id=1),
+                tx("2025-09-18", ASSIGNED, "-QQQ250917C588", 1, None, 0.0, row_id=2, as_of="2025-09-17"),
+            ]
+        )
+        cycle = cycles[0]
+        lot = next(lot for lot in cycle.share_lots if lot.basis_per_share is None)
+        self.assertIsNone(net_adjusted_cost_basis(cycle, lot))
+
+
+class TestDividendAttribution(unittest.TestCase):
+    def test_dividend_transactions_filters_out_everything_else(self):
+        rows = [
+            tx("2025-01-15", "OTHER", "XYZ", 0, amount=25.0, row_id=1, action_raw="DIVIDEND RECEIVED XYZ"),
+            tx("2025-01-16", "OTHER", "XYZ", 0, amount=-1.50, row_id=2, action_raw="FEE CHARGED"),
+            tx("2025-01-17", STO, "-XYZ250201P100", -1, 3.00, 300.0, row_id=3),
+        ]
+        dividends = dividend_transactions(rows)
+        self.assertEqual(len(dividends), 1)
+        self.assertEqual(dividends[0].row_id, 1)
+        self.assertEqual(dividends[0].action, OTHER)
+
+    def test_dividend_inside_the_cycle_window_is_attributed(self):
+        transactions = [
+            tx("2025-01-01", STO, "-XYZ250201P100", -1, 3.00, 300.0, row_id=1),
+            tx("2025-02-01", ASSIGNED, "-XYZ250201P100", 1, None, 0.0, row_id=2, as_of="2025-02-01"),
+            tx("2025-02-15", "OTHER", "XYZ", 0, amount=12.50, row_id=3, action_raw="DIVIDEND RECEIVED XYZ"),
+        ]
+        cycles, _ = build_cycles(transactions)
+        result = dividends_by_cycle(cycles, transactions)
+        self.assertAlmostEqual(result[cycles[0].cycle_id], 12.50)
+
+    def test_dividend_before_the_cycle_opened_is_not_attributed(self):
+        transactions = [
+            tx("2025-01-01", "OTHER", "XYZ", 0, amount=12.50, row_id=1, action_raw="DIVIDEND RECEIVED XYZ"),
+            tx("2025-06-01", STO, "-XYZ250701P100", -1, 3.00, 300.0, row_id=2),
+            tx("2025-07-01", EXPIRED, "-XYZ250701P100", 1, None, 0.0, row_id=3, as_of="2025-07-01"),
+        ]
+        cycles, _ = build_cycles(transactions)
+        result = dividends_by_cycle(cycles, transactions)
+        self.assertEqual(result, {})
+
+    def test_dividend_for_a_different_ticker_is_ignored(self):
+        transactions = [
+            tx("2025-01-01", STO, "-XYZ250201P100", -1, 3.00, 300.0, row_id=1),
+            tx("2025-02-01", EXPIRED, "-XYZ250201P100", 1, None, 0.0, row_id=2, as_of="2025-02-01"),
+            tx("2025-01-15", "OTHER", "ABC", 0, amount=12.50, row_id=3, action_raw="DIVIDEND RECEIVED ABC"),
+        ]
+        cycles, _ = build_cycles(transactions)
+        result = dividends_by_cycle(cycles, transactions)
+        self.assertEqual(result, {})
+
+    def test_dividend_on_the_cycles_last_day_is_still_included(self):
+        """The window's upper bound is inclusive of end_date."""
+        transactions = [
+            tx("2025-01-01", STO, "-XYZ250201P100", -1, 3.00, 300.0, row_id=1),
+            tx("2025-02-01", EXPIRED, "-XYZ250201P100", 1, None, 0.0, row_id=2, as_of="2025-02-01"),
+            tx("2025-02-01", "OTHER", "XYZ", 0, amount=12.50, row_id=3, action_raw="DIVIDEND RECEIVED XYZ"),
+        ]
+        cycles, _ = build_cycles(transactions)
+        self.assertEqual(cycles[0].end_date, date(2025, 2, 1))
+        result = dividends_by_cycle(cycles, transactions)
+        self.assertAlmostEqual(result[cycles[0].cycle_id], 12.50)
+
+    def test_dividend_routes_to_the_correct_one_of_two_sequential_cycles(self):
+        """Same ticker, two separate campaigns with a flat gap between them:
+        each dividend must land in its own cycle's window, never the other's.
+        """
+        transactions = [
+            tx("2025-01-01", STO, "-XYZ250201P100", -1, 3.00, 300.0, row_id=1),
+            tx("2025-02-01", EXPIRED, "-XYZ250201P100", 1, None, 0.0, row_id=2, as_of="2025-02-01"),
+            tx("2025-01-15", "OTHER", "XYZ", 0, amount=10.0, row_id=3, action_raw="DIVIDEND RECEIVED XYZ"),
+            tx("2025-06-01", STO, "-XYZ250701P100", -1, 3.00, 300.0, row_id=4),
+            tx("2025-07-01", EXPIRED, "-XYZ250701P100", 1, None, 0.0, row_id=5, as_of="2025-07-01"),
+            tx("2025-06-15", "OTHER", "XYZ", 0, amount=20.0, row_id=6, action_raw="DIVIDEND RECEIVED XYZ"),
+        ]
+        cycles, _ = build_cycles(transactions)
+        self.assertEqual(len(cycles), 2)
+        result = dividends_by_cycle(cycles, transactions)
+        self.assertAlmostEqual(result[cycles[0].cycle_id], 10.0)
+        self.assertAlmostEqual(result[cycles[1].cycle_id], 20.0)
+
+
+class TestDualTrackReturns(unittest.TestCase):
+    def test_net_option_yield_uses_initial_collateral_not_the_time_weighted_average(self):
+        """Same fixture as test_three_roi_denominators_are_distinct_when_size_changes:
+        initial_collateral ($10,000) < avg_collateral, so Net Option Yield (on
+        initial) must differ from the existing Wheel ROC (on the average).
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-MU250131P100", -1, 1.00, 99.33, row_id=1),
+                tx("2025-01-10", STO, "-MU250131P100", -3, 1.00, 299.01, row_id=2),
+                tx("2025-01-31", EXPIRED, "-MU250131P100", 4, None, 0.0, row_id=3, as_of="2025-01-31"),
+            ]
+        )
+        metrics = cycle_metrics(cycles[0], date(2025, 1, 31))
+        expected = 100.0 * metrics.option_realized_pl / metrics.initial_collateral
+        self.assertAlmostEqual(metrics.net_option_yield_pct, expected, places=6)
+        self.assertNotAlmostEqual(metrics.net_option_yield_pct, metrics.roi_on_avg_wheel_pct, places=2)
+
+    def test_annualized_net_option_yield_scales_by_365_over_days_active(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-09-19", STO, "-MU250926P150", -1, 3.35, 334.33, row_id=1),
+                tx("2025-09-26", EXPIRED, "-MU250926P150", 1, None, 0.0, row_id=2, as_of="2025-09-26"),
+            ]
+        )
+        metrics = cycle_metrics(cycles[0], date(2025, 9, 26))
+        expected = metrics.net_option_yield_pct * (365.0 / metrics.days_active)
+        self.assertAlmostEqual(metrics.annualized_net_option_yield_pct, expected, places=6)
+
+    def test_total_position_roi_folds_in_stock_unrealized_and_dividends(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-11-17", STO, "-MU251121P230", -1, 4.00, 399.33, row_id=1),
+                tx("2025-11-21", ASSIGNED, "-MU251121P230", 1, None, 0.0, row_id=2, as_of="2025-11-20"),
+            ]
+        )
+        cycle = cycles[0]
+        through = date(2025, 12, 1)
+        metrics = cycle_metrics(cycle, through, current_price=240.0, dividends=15.0)
+        self.assertAlmostEqual(metrics.stock_unrealized_pl, (240.0 - 230.0) * 100)
+        self.assertAlmostEqual(metrics.dividends_received, 15.0)
+        expected_pl = metrics.option_realized_pl + metrics.stock_realized_pl + metrics.stock_unrealized_pl + 15.0
+        expected_roi = 100.0 * expected_pl / metrics.initial_collateral
+        self.assertAlmostEqual(metrics.total_position_roi_pct, expected_roi, places=6)
+
+    def test_total_position_roi_defaults_ignore_unrealized_and_dividends(self):
+        """No current_price/dividends supplied -- Total Position ROI must
+        collapse to realized-only, never silently assume a gain.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-11-17", STO, "-MU251121P230", -1, 4.00, 399.33, row_id=1),
+                tx("2025-11-21", ASSIGNED, "-MU251121P230", 1, None, 0.0, row_id=2, as_of="2025-11-20"),
+            ]
+        )
+        cycle = cycles[0]
+        metrics = cycle_metrics(cycle, date(2025, 12, 1))
+        self.assertIsNone(metrics.stock_unrealized_pl)
+        self.assertEqual(metrics.dividends_received, 0.0)
+        expected_roi = 100.0 * (metrics.option_realized_pl + metrics.stock_realized_pl) / metrics.initial_collateral
+        self.assertAlmostEqual(metrics.total_position_roi_pct, expected_roi, places=6)
+
+    def test_stock_unrealized_pl_is_none_without_shares(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-09-19", STO, "-MU250926P150", -1, 3.35, 334.33, row_id=1),
+                tx("2025-09-26", EXPIRED, "-MU250926P150", 1, None, 0.0, row_id=2, as_of="2025-09-26"),
+            ]
+        )
+        metrics = cycle_metrics(cycles[0], date(2025, 9, 26), current_price=200.0)
+        self.assertIsNone(metrics.stock_unrealized_pl)
+
+    def test_stock_unrealized_pl_is_none_without_a_price_even_with_shares_held(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-11-17", STO, "-MU251121P230", -1, 4.00, 399.33, row_id=1),
+                tx("2025-11-21", ASSIGNED, "-MU251121P230", 1, None, 0.0, row_id=2, as_of="2025-11-20"),
+            ]
+        )
+        metrics = cycle_metrics(cycles[0], date(2025, 12, 1))  # no current_price
+        self.assertIsNone(metrics.stock_unrealized_pl)
+
+    def test_long_leg_unrealized_pl_is_always_none(self):
+        """Explicit placeholder -- mark-to-market for an open long option is
+        out of scope; the field must never silently become a real number.
+        """
+        cycles, _ = build_cycles(
+            [tx("2025-01-01", BTO, "-XYZ250601P100", 1, 10.00, -1000.0, row_id=1)]
+        )
+        metrics = cycle_metrics(cycles[0], date(2025, 1, 31))
+        self.assertIsNone(metrics.long_leg_unrealized_pl)
 
 
 class TestCapitalSeriesGaps(unittest.TestCase):

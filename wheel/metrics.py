@@ -48,15 +48,27 @@ as its own line rather than asserting a number with no visible components.
 Capital for a long leg (``long_premium``) is the actual debit paid, decaying to
 $0 the day it closes -- never the option's notional -- so a protective put's
 cost lives in the P/L numerator, not as inflated capital in the denominator.
-A short leg that happens to be one side of a defined-risk spread still gets
-full cash-secured-put/covered-call collateral, because nothing here pairs
-legs into spreads; a real broker's reduced spread margin is not something this
-data model can see. That is a known, deliberate limitation, not a bug -- see
-:func:`capital_timeline`.
+A short leg paired into a same-day :class:`~wheel.engine.Spread` (short + long,
+same underlying/right/expiry, opened together -- see :func:`capital_timeline`
+and ``wheel.engine.WheelEngine._detect_spreads``) reports the netted
+``|short strike - long strike| x 100`` collateral for its paired portion instead
+of the full CSP/covered-call figure; an unpaired short leg, or one in an
+ambiguous multi-candidate group, is unaffected and still gets full collateral.
 
 Both variants use the time-weighted average collateral as their denominator,
 which is the only one that correctly credits a position for freeing capital
 early, and both annualize by scaling to ``DAYS_PER_YEAR / days_active``.
+
+**Dual-track returns** -- ``net_option_yield_pct`` and ``total_position_roi_pct``
+(with their annualized forms) sit alongside the pair above, quoted against
+*initial* collateral rather than the time-weighted average. Net Option Yield is
+``option_realized_pl / initial_collateral``, the same numerator as Wheel ROC on a
+different denominator. Total Position ROI adds ``stock_realized_pl``,
+``stock_unrealized_pl`` (shares still held, marked to the latest fetched price --
+see :mod:`wheel.marketdata`) and ``dividends_received`` (see
+:func:`dividends_by_cycle`) on top -- everything except an open long option's
+unrealized P/L, which stays ``None`` (``long_leg_unrealized_pl``): no options-quote
+feed exists anywhere in this project to mark one to market.
 """
 
 from __future__ import annotations
@@ -65,6 +77,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Iterable, Sequence
 
+from wheel.cashflow import dividend_transactions
 from wheel.engine import (
     ACTIVE,
     COVERED_CALL,
@@ -73,7 +86,9 @@ from wheel.engine import (
     SHORT,
     WHEEL_STRATEGIES,
     Cycle,
+    ShareLot,
 )
+from wheel.parser import Transaction
 
 DAYS_PER_YEAR = 365.0
 
@@ -92,47 +107,96 @@ class CapitalPoint:
     stock_basis: float = 0.0  # cost basis of shares held
     long_premium: float = 0.0  # debit tied up in long options
     call_collateral: float = 0.0  # short calls with no tracked shares (proxy)
+    spread_collateral: float = 0.0  # netted (short strike - long strike) x 100 for paired legs
 
     @property
     def total(self) -> float:
-        return self.put_collateral + self.stock_basis + self.long_premium + self.call_collateral
+        return (
+            self.put_collateral
+            + self.stock_basis
+            + self.long_premium
+            + self.call_collateral
+            + self.spread_collateral
+        )
+
+
+def _active_spread_contracts(spread, leg_by_id, day: date) -> float:
+    """How much of ``spread``'s paired quantity is still protected on ``day``.
+
+    A spread's netting only holds while *both* legs remain open -- if one side
+    closes early the other reverts to its own naked formula for whatever
+    remains -- so this is capped by both legs' own remaining contracts, not
+    just the quantity paired at open time.
+    """
+    if day < spread.open_date:
+        return 0.0
+    short_leg = leg_by_id.get(spread.short_leg_id)
+    long_leg = leg_by_id.get(spread.long_leg_id)
+    if short_leg is None or long_leg is None:
+        return 0.0
+    return min(
+        spread.paired_contracts,
+        short_leg.remaining_contracts_on(day),
+        long_leg.remaining_contracts_on(day),
+    )
 
 
 def capital_timeline(cycle: Cycle, through: date) -> list[CapitalPoint]:
     """Daily committed capital for a cycle, from its start through ``through``.
 
-    ``long_premium`` (a protective put, or the long leg of a credit-spread
-    hedge) is the actual debit paid per contract while the leg is open, never
-    the option's notional -- it drops to $0 the day it closes, at which point
-    its cost is already accounted for in ``option_realized_pl`` instead.
+    ``long_premium`` (a protective put, or the unpaired portion of a
+    credit-spread's long leg) is the actual debit paid per contract while the
+    leg is open, never the option's notional -- it drops to $0 the day it
+    closes, at which point its cost is already accounted for in
+    ``option_realized_pl`` instead.
 
-    A short leg gets full cash-secured-put or covered-call collateral even
-    when it is economically one side of a defined-risk spread: this model has
-    no concept of two legs being paired into one spread, so it cannot net a
-    spread down to its true (smaller) margin requirement. That overstates
-    capital -- and understates Wheel ROC -- for a hedged position relative to
-    what a broker would actually require. Deliberate, not a bug: getting this
-    right needs matching legs by underlying/right/expiry/side/timing, which is
-    ambiguous enough (multiple concurrent spreads, rolls, partial fills) that
-    a wrong pairing would be worse than a conservative overstatement.
+    A short leg gets full cash-secured-put or covered-call collateral for
+    whatever portion of it is *not* paired into a :class:`~wheel.engine.Spread`
+    that day. The paired portion instead contributes to ``spread_collateral``
+    at the netted ``(short strike - long strike) x 100`` rate -- see
+    :class:`~wheel.engine.Spread` and :func:`_active_spread_contracts`.
+    Pairing is same-day-open only and never ambiguous (see
+    ``WheelEngine._detect_spreads``), so this never guesses which legs belong
+    together; a short leg with no same-day long partner still gets full
+    collateral, unchanged from before spreads existed.
     """
     end = cycle.end_date or through
     if end < cycle.start_date:
         end = cycle.start_date
 
+    leg_by_id = {leg.leg_id: leg for leg in cycle.legs}
+
     points: list[CapitalPoint] = []
     day = cycle.start_date
     while day <= end:
+        spread_collateral = 0.0
+        protected: dict[str, float] = {}
+        for spread in cycle.spreads:
+            active = _active_spread_contracts(spread, leg_by_id, day)
+            if active <= 1e-9:
+                continue
+            spread_collateral += active * spread.collateral_per_contract
+            protected[spread.short_leg_id] = protected.get(spread.short_leg_id, 0.0) + active
+            protected[spread.long_leg_id] = protected.get(spread.long_leg_id, 0.0) + active
+
+        put_collateral = call_collateral = long_premium = 0.0
+        for leg in cycle.legs:
+            naked = max(leg.remaining_contracts_on(day) - protected.get(leg.leg_id, 0.0), 0.0)
+            contribution = naked * leg.collateral_per_contract
+            if leg.strategy == CSP:
+                put_collateral += contribution
+            elif leg.strategy == COVERED_CALL and not leg.shares_tracked:
+                call_collateral += contribution
+            elif leg.side == LONG:
+                long_premium += contribution
+
         points.append(
             CapitalPoint(
                 day=day,
-                put_collateral=sum(leg.collateral_on(day) for leg in cycle.legs if leg.strategy == CSP),
-                call_collateral=sum(
-                    leg.collateral_on(day)
-                    for leg in cycle.legs
-                    if leg.strategy == COVERED_CALL and not leg.shares_tracked
-                ),
-                long_premium=sum(leg.collateral_on(day) for leg in cycle.legs if leg.side == LONG),
+                put_collateral=put_collateral,
+                call_collateral=call_collateral,
+                long_premium=long_premium,
+                spread_collateral=spread_collateral,
                 stock_basis=sum(lot.capital_on(day) for lot in cycle.share_lots),
             )
         )
@@ -148,6 +212,84 @@ def _time_weighted_average(points: Sequence[CapitalPoint]) -> float:
     """
     engaged = [point.total for point in points if point.total > 1e-9]
     return sum(engaged) / len(engaged) if engaged else 0.0
+
+
+# --------------------------------------------------------------------------
+# Cost basis
+# --------------------------------------------------------------------------
+
+
+def net_adjusted_cost_basis(cycle: Cycle, lot: ShareLot) -> float | None:
+    """The wheel's own break-even per share: strike minus every dollar of net
+    option cash flow the cycle has produced, allocated to this lot.
+
+    Distinct from ``lot.basis_per_share`` (the raw tax-lot basis -- the bare
+    assignment or purchase price, exactly what a 1099-B would show) which
+    this function never touches or reads back into: the two numbers answer
+    different questions and both stay available side by side.
+
+    The formula is ``strike - net premiums/share + fees/share``, but every
+    cash figure already on a leg (``open_cash``, ``LegClose.cash``) is the
+    broker's own Amount, already net of commission and fees -- see
+    ``wheel/parser.py``. Reconstructing gross premium and then subtracting
+    fees back out algebraically collapses to using the already-fee-net total
+    directly (``-gross/share + fees/share == -(gross-fees)/share ==
+    -net/share``), so that is what this does; adding a fee term on top of the
+    already-fee-net total would double the fee's cost, the same trap this
+    module's docstring warns about elsewhere.
+
+    Cumulative and whole-cycle: every roll, every covered call sold after
+    assignment, folds into the same running total, not just the leg that
+    produced this particular lot. When a cycle holds more than one concurrent
+    lot (e.g. two partial assignments at different strikes before either
+    sells), the cycle's net premium is allocated pro-rata by share count,
+    against every share the cycle's lots ever held -- not just what remains
+    today -- so the allocation stays stable as shares are later sold off.
+
+    ``None`` when the lot's own basis is unknown (a ``PRE_HISTORY`` lot, see
+    ``wheel/engine.py``): there is no strike to net against.
+    """
+    if lot.basis_per_share is None or lot.shares <= 0:
+        return None
+    total_shares = sum(other.shares for other in cycle.share_lots)
+    if total_shares <= 0:
+        return None
+    net_cash_flow = sum(leg.open_cash + sum(close.cash for close in leg.closes) for leg in cycle.legs)
+    allocated = net_cash_flow * (lot.shares / total_shares)
+    return lot.basis_per_share - allocated / lot.shares
+
+
+# --------------------------------------------------------------------------
+# Dividends
+# --------------------------------------------------------------------------
+
+
+def dividends_by_cycle(cycles: Sequence[Cycle], transactions: Sequence[Transaction]) -> dict[str, float]:
+    """Attribute every dividend transaction to the one cycle that was open
+    when it posted, keyed by ``cycle_id`` -- feeds Total Position ROI's
+    ``dividends`` argument.
+
+    A dividend row carries the underlying's own ticker (never an option
+    symbol), so it is first grouped by ``underlying``, then matched against
+    that ticker's cycles by ``[start_date, end_date or still-open]``. On the
+    rare day one cycle closes and another for the same ticker opens, the
+    earlier (closing) cycle claims it: cycles are walked in their existing,
+    chronological order and the first whole window that contains the date
+    wins, and a later cycle for the same ticker can never start before the
+    earlier one's own end_date.
+    """
+    by_underlying: dict[str, list[Cycle]] = {}
+    for cycle in cycles:
+        by_underlying.setdefault(cycle.underlying, []).append(cycle)
+
+    result: dict[str, float] = {}
+    for dividend in dividend_transactions(transactions):
+        for cycle in by_underlying.get(dividend.underlying, []):
+            end = cycle.end_date
+            if cycle.start_date <= dividend.event_date and (end is None or dividend.event_date <= end):
+                result[cycle.cycle_id] = result.get(cycle.cycle_id, 0.0) + dividend.amount
+                break
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -189,6 +331,21 @@ class CycleMetrics:
     roi_on_avg_wheel_pct: float | None = None  # option P/L only, vs time-weighted avg collateral
     annualized_wheel_roc_pct: float | None = None  # the headline Wheel ROC: option P/L only
 
+    # Dual-track pair, reported side by side with the figures above rather
+    # than replacing them -- see the module docstring's "Dual-track returns"
+    # section. Both are quoted against initial_collateral, not the
+    # time-weighted average roi_on_avg_wheel_pct/annualized_wheel_roc_pct use.
+    dividends_received: float = 0.0
+    stock_unrealized_pl: float | None = None  # None: no shares held, or no price available
+    # Mark-to-market for an *open* long put/call is out of scope -- no options
+    # quote feed exists anywhere in this project. Always None; present so a
+    # caller can display "not available" rather than inferring absence.
+    long_leg_unrealized_pl: None = None
+    net_option_yield_pct: float | None = None  # option_realized_pl / initial_collateral
+    annualized_net_option_yield_pct: float | None = None
+    total_position_roi_pct: float | None = None  # everything (incl. unrealized stock, dividends) / initial_collateral
+    annualized_total_position_roi_pct: float | None = None
+
     legs_total: int = 0
     legs_open: int = 0
     rolls: int = 0
@@ -218,8 +375,22 @@ def _safe_pct(numerator: float, denominator: float) -> float | None:
     return 100.0 * numerator / denominator if denominator > 1e-9 else None
 
 
-def cycle_metrics(cycle: Cycle, through: date) -> CycleMetrics:
-    """Compute every headline number for one cycle."""
+def cycle_metrics(
+    cycle: Cycle,
+    through: date,
+    *,
+    current_price: float | None = None,
+    dividends: float = 0.0,
+) -> CycleMetrics:
+    """Compute every headline number for one cycle.
+
+    ``current_price`` and ``dividends`` are optional and default to values
+    that leave the dual-track fields at their safe "unknown"/zero state --
+    every existing call site keeps working unchanged. A caller wanting Total
+    Position ROI to reflect open shares and dividends passes the ticker's
+    latest close (see ``wheel.marketdata``) and this cycle's own dividend
+    total (see ``wheel.cashflow.dividend_transactions``).
+    """
     points = capital_timeline(cycle, through)
     end = cycle.end_date or through
     days_active = max((end - cycle.start_date).days, 0) or 1
@@ -263,6 +434,30 @@ def cycle_metrics(cycle: Cycle, through: date) -> CycleMetrics:
     if average > 1e-9:
         annualized_wheel_roc = 100.0 * (option_realized / average) * (DAYS_PER_YEAR / days_active)
 
+    # Stock Unrealized P&L: mark every share still held to `current_price`.
+    # None (not 0.0) when nothing is held or no price was supplied -- both are
+    # "unknown", never "no gain" -- see the module-level "None means unknown"
+    # convention _safe_pct/win_rate_pct already use.
+    shares_held = sum(lot.remaining for lot in cycle.share_lots if lot.remaining > 1e-9)
+    stock_unrealized: float | None = None
+    if shares_held > 1e-9 and current_price is not None:
+        stock_unrealized = sum(
+            (current_price - lot.basis_per_share) * lot.remaining
+            for lot in cycle.share_lots
+            if lot.remaining > 1e-9 and lot.basis_per_share is not None
+        )
+
+    net_option_yield_pct = _safe_pct(option_realized, initial)
+    annualized_net_option_yield = (
+        net_option_yield_pct * (DAYS_PER_YEAR / days_active) if net_option_yield_pct is not None else None
+    )
+
+    total_position_pl = option_realized + stock_realized + (stock_unrealized or 0.0) + dividends
+    total_position_roi_pct = _safe_pct(total_position_pl, initial)
+    annualized_total_position_roi = (
+        total_position_roi_pct * (DAYS_PER_YEAR / days_active) if total_position_roi_pct is not None else None
+    )
+
     return CycleMetrics(
         cycle_id=cycle.cycle_id,
         underlying=cycle.underlying,
@@ -292,6 +487,12 @@ def cycle_metrics(cycle: Cycle, through: date) -> CycleMetrics:
         roi_on_peak_pct=_safe_pct(net_realized, peak),
         roi_on_avg_wheel_pct=_safe_pct(option_realized, average),
         annualized_wheel_roc_pct=annualized_wheel_roc,
+        dividends_received=dividends,
+        stock_unrealized_pl=stock_unrealized,
+        net_option_yield_pct=net_option_yield_pct,
+        annualized_net_option_yield_pct=annualized_net_option_yield,
+        total_position_roi_pct=total_position_roi_pct,
+        annualized_total_position_roi_pct=annualized_total_position_roi,
         legs_total=len(cycle.legs),
         legs_open=sum(1 for leg in cycle.legs if leg.is_open),
         rolls=len(cycle.rolls),
@@ -333,6 +534,19 @@ class PortfolioMetrics:
     avg_capital: float = 0.0
     annualized_wheel_roc_pct: float | None = None  # the headline Wheel ROC: option P/L only
     roi_on_avg_wheel_pct: float | None = None
+
+    # Dual-track pair, summed from cycle absolutes -- never averaged from each
+    # cycle's own percentage -- and quoted against total_initial_collateral
+    # (the sum of every cycle's own initial_collateral), a different
+    # denominator concept from avg_capital above. See CycleMetrics for why
+    # each field exists.
+    total_initial_collateral: float = 0.0
+    dividends_received: float = 0.0
+    stock_unrealized_pl: float = 0.0
+    net_option_yield_pct: float | None = None
+    annualized_net_option_yield_pct: float | None = None
+    total_position_roi_pct: float | None = None
+    annualized_total_position_roi_pct: float | None = None
 
     total_legs: int = 0
     open_legs: int = 0
@@ -379,30 +593,33 @@ def portfolio_capital_series(
     buckets: dict[date, list[float]] = {}
     for cycle in cycles:
         for point in capital_timeline(cycle, through):
-            slot = buckets.setdefault(point.day, [0.0, 0.0, 0.0, 0.0])
+            slot = buckets.setdefault(point.day, [0.0, 0.0, 0.0, 0.0, 0.0])
             slot[0] += point.put_collateral
             slot[1] += point.stock_basis
             slot[2] += point.long_premium
             slot[3] += point.call_collateral
+            slot[4] += point.spread_collateral
 
     if not buckets:
         return []
 
-    empty = [0.0, 0.0, 0.0, 0.0]
+    empty = [0.0, 0.0, 0.0, 0.0, 0.0]
     series: list[CapitalPoint] = []
     day, last = min(buckets), max(buckets)
     while day <= last:
-        put, stock, long_premium, call = buckets.get(day, empty)
+        put, stock, long_premium, call, spread = buckets.get(day, empty)
         series.append(
             # Keyword arguments on purpose: the dataclass orders these fields
-            # put/stock/long/call while the JSON payload uses put/stock/call/long,
-            # and a positional call here would silently swap the last two.
+            # put/stock/long/call/spread while the JSON payload uses
+            # put/stock/call/long, and a positional call here would silently
+            # swap fields.
             CapitalPoint(
                 day=day,
                 put_collateral=put,
                 stock_basis=stock,
                 long_premium=long_premium,
                 call_collateral=call,
+                spread_collateral=spread,
             )
         )
         day += timedelta(days=1)
@@ -418,6 +635,8 @@ def portfolio_metrics(
     *,
     capital_cycles: Sequence[Cycle] | None = None,
     since: date | None = None,
+    current_prices: dict[str, float] | None = None,
+    dividends_by_cycle: dict[str, float] | None = None,
 ) -> PortfolioMetrics:
     """Roll cycle-level numbers up to the account level.
 
@@ -433,8 +652,23 @@ def portfolio_metrics(
     The annualized figure is computed against the portfolio's own time-weighted
     average capital rather than by averaging per-cycle percentages, which would
     weight a one-day $1,400 trade the same as a two-month $60,000 one.
+
+    ``current_prices`` (ticker -> latest close) and ``dividends_by_cycle``
+    (cycle_id -> dividends received) feed the same-named ``cycle_metrics``
+    keyword arguments for Total Position ROI; both default to empty, which
+    leaves the dual-track fields at their safe defaults.
     """
-    per_cycle = [cycle_metrics(cycle, through) for cycle in cycles]
+    prices = current_prices or {}
+    dividends = dividends_by_cycle or {}
+    per_cycle = [
+        cycle_metrics(
+            cycle,
+            through,
+            current_price=prices.get(cycle.underlying),
+            dividends=dividends.get(cycle.cycle_id, 0.0),
+        )
+        for cycle in cycles
+    ]
     series = portfolio_capital_series(
         capital_cycles if capital_cycles is not None else cycles, through, since
     )
@@ -467,6 +701,9 @@ def portfolio_metrics(
         result.assignments += metric.assignments
         result.wins += metric.wins
         result.losses += metric.losses
+        result.total_initial_collateral += metric.initial_collateral
+        result.dividends_received += metric.dividends_received
+        result.stock_unrealized_pl += metric.stock_unrealized_pl or 0.0
 
     result.capital_deployed_now = series[-1].total if series else 0.0
     result.peak_capital = max((point.total for point in series), default=0.0)
@@ -475,6 +712,22 @@ def portfolio_metrics(
     if result.avg_capital > 1e-9:
         result.roi_on_avg_wheel_pct = 100.0 * result.option_realized_pl / result.avg_capital
         result.annualized_wheel_roc_pct = result.roi_on_avg_wheel_pct * (
+            DAYS_PER_YEAR / result.days_span
+        )
+
+    if result.total_initial_collateral > 1e-9:
+        result.net_option_yield_pct = 100.0 * result.option_realized_pl / result.total_initial_collateral
+        result.annualized_net_option_yield_pct = result.net_option_yield_pct * (
+            DAYS_PER_YEAR / result.days_span
+        )
+        total_position_pl = (
+            result.option_realized_pl
+            + result.stock_realized_pl
+            + result.stock_unrealized_pl
+            + result.dividends_received
+        )
+        result.total_position_roi_pct = 100.0 * total_position_pl / result.total_initial_collateral
+        result.annualized_total_position_roi_pct = result.total_position_roi_pct * (
             DAYS_PER_YEAR / result.days_span
         )
 
@@ -496,6 +749,8 @@ def ticker_summary(
     *,
     capital_cycles: Sequence[Cycle] | None = None,
     since: date | None = None,
+    current_prices: dict[str, float] | None = None,
+    dividends_by_cycle: dict[str, float] | None = None,
 ) -> list[dict]:
     """Per-underlying rollup used by the P/L and premium charts.
 
@@ -512,6 +767,9 @@ def ticker_summary(
     make it vanish from the P&L and ROC charts precisely when it did nothing,
     which is the opposite of what a capital-utilization view is for.
     """
+    prices = current_prices or {}
+    dividends = dividends_by_cycle or {}
+
     grouped: dict[str, list[Cycle]] = {}
     for cycle in cycles:
         grouped.setdefault(cycle.underlying, []).append(cycle)
@@ -524,11 +782,25 @@ def ticker_summary(
     for underlying in set(grouped) | set(capital_grouped):
         group = grouped.get(underlying, [])
         cap_group = capital_grouped.get(underlying, group)
-        metrics = [cycle_metrics(cycle, through) for cycle in group]
+        metrics = [
+            cycle_metrics(
+                cycle,
+                through,
+                current_price=prices.get(underlying),
+                dividends=dividends.get(cycle.cycle_id, 0.0),
+            )
+            for cycle in group
+        ]
         series = portfolio_capital_series(cap_group, through, since)
         average = _time_weighted_average(series)
         net = sum(metric.net_realized_pl for metric in metrics)
         option_net = sum(metric.option_realized_pl for metric in metrics)
+        total_initial = sum(metric.initial_collateral for metric in metrics)
+        dividends_total = sum(metric.dividends_received for metric in metrics)
+        stock_unrealized_total = sum(metric.stock_unrealized_pl or 0.0 for metric in metrics)
+        stock_realized_total = sum(metric.stock_realized_pl for metric in metrics)
+        total_position_pl = option_net + stock_realized_total + stock_unrealized_total + dividends_total
+        total_position_roi_pct = _safe_pct(total_position_pl, total_initial)
         if metrics:
             span = max((through - min(metric.start_date for metric in metrics)).days, 1)
         elif series:
@@ -568,6 +840,19 @@ def ticker_summary(
                     _safe_pct(option_net, average) * (DAYS_PER_YEAR / span)
                     if average > 1e-9
                     else None
+                ),
+                "total_initial_collateral": total_initial,
+                "dividends_received": dividends_total,
+                "stock_unrealized_pl": stock_unrealized_total,
+                "net_option_yield_pct": _safe_pct(option_net, total_initial),
+                "annualized_net_option_yield_pct": (
+                    _safe_pct(option_net, total_initial) * (DAYS_PER_YEAR / span)
+                    if total_initial > 1e-9
+                    else None
+                ),
+                "total_position_roi_pct": total_position_roi_pct,
+                "annualized_total_position_roi_pct": (
+                    total_position_roi_pct * (DAYS_PER_YEAR / span) if total_initial > 1e-9 else None
                 ),
             }
         )
@@ -620,6 +905,8 @@ def leg_rows(cycle: Cycle) -> list[dict]:
     """Flatten a cycle's legs for the detail table and timeline chart."""
     rows: list[dict] = []
     for leg in cycle.legs:
+        paired_contracts = sum(leg.paired_contracts.values())
+        naked_contracts = leg.contracts - paired_contracts
         rows.append(
             {
                 "leg_id": leg.leg_id,
@@ -644,7 +931,14 @@ def leg_rows(cycle: Cycle) -> list[dict]:
                 "open_premium": leg.open_premium,
                 "fees": leg.total_fees,
                 "days_held": leg.days_held,
-                "collateral": leg.collateral_per_contract * leg.contracts,
+                # Naked-only: contracts paired into a Spread report $0 extra
+                # here, since their (smaller, netted) collateral is already
+                # counted once at the Spread's own level -- see
+                # wheel.metrics.capital_timeline and payload["spreads"].
+                "collateral": leg.collateral_per_contract * naked_contracts,
+                "paired_contracts": paired_contracts,
+                "naked_contracts": naked_contracts,
+                "spread_ids": list(leg.paired_contracts.keys()),
                 "opened_by_roll": leg.open_roll_id,
                 "is_wheel_leg": leg.strategy in WHEEL_STRATEGIES,
                 "closes": [

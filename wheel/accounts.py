@@ -110,6 +110,7 @@ from datetime import date
 from typing import TYPE_CHECKING, Any, Sequence
 
 from wheel import benchmark as bm
+from wheel import cashflow as cf
 from wheel.api import Dashboard, Filters, discover_exports, discover_multi_account_exports
 from wheel.positions import discover_position_snapshots, latest_snapshot_per_account, load_snapshots
 
@@ -603,6 +604,7 @@ class AccountRegistry:
             "tickers": _combine_tickers(payloads),
             "capital_series": capital_series,
             "pnl_series": _combine_pnl_series(payloads),
+            "cash_flow": _combine_cash_flow(payloads, capital_series),
             "reconciliation": _combine_reconciliation(payloads),
             "net_worth": net_worth,
             "benchmark": _combine_benchmark(payloads),
@@ -684,14 +686,18 @@ def _combine_capital_series(payloads: dict[str, dict]) -> list[dict]:
     buckets: dict[str, dict[str, float]] = {}
     for payload in payloads.values():
         for point in payload["capital_series"]:
-            bucket = buckets.setdefault(point["date"], {"put": 0.0, "stock": 0.0, "call": 0.0, "long": 0.0})
-            for field_name in ("put", "stock", "call", "long"):
+            bucket = buckets.setdefault(
+                point["date"], {"put": 0.0, "stock": 0.0, "call": 0.0, "long": 0.0, "spread": 0.0}
+            )
+            for field_name in ("put", "stock", "call", "long", "spread"):
                 bucket[field_name] += point.get(field_name) or 0.0
 
     series: list[dict] = []
     for day in sorted(buckets):
         values = buckets[day]
-        total = round(values["put"] + values["stock"] + values["call"] + values["long"], 2)
+        total = round(
+            values["put"] + values["stock"] + values["call"] + values["long"] + values["spread"], 2
+        )
         series.append(
             {
                 "date": day,
@@ -699,6 +705,7 @@ def _combine_capital_series(payloads: dict[str, dict]) -> list[dict]:
                 "stock": round(values["stock"], 2),
                 "call": round(values["call"], 2),
                 "long": round(values["long"], 2),
+                "spread": round(values["spread"], 2),
                 "total": total,
             }
         )
@@ -738,6 +745,51 @@ def _combine_pnl_series(payloads: dict[str, dict]) -> list[dict]:
     return series
 
 
+def _combine_cash_flow(payloads: dict[str, dict], capital_series: list[dict]) -> dict[str, Any]:
+    """Sum every account's monthly credits/debits/fees by calendar month, then
+    recompute average collateral and monthly yield from the already-combined
+    ``capital_series`` -- never by averaging each account's own monthly yield
+    %, which would weight a small account the same as a large one. Same
+    principle ``_combine_portfolio`` applies to ROI/ROC, one level down.
+    """
+    buckets: dict[str, dict[str, float]] = {}
+    for payload in payloads.values():
+        for row in payload["cash_flow"]["months"]:
+            bucket = buckets.setdefault(
+                row["period"], {"year": row["year"], "month": row["month"], "credits": 0.0, "debits": 0.0, "fees": 0.0}
+            )
+            bucket["credits"] += row["gross_credits"]
+            bucket["debits"] += row["gross_debits"]
+            bucket["fees"] += row["fees"]
+
+    capital_points = [(date.fromisoformat(point["date"]), point["total"]) for point in capital_series]
+
+    rows: list[dict] = []
+    for period in sorted(buckets):
+        bucket = buckets[period]
+        avg_collateral = cf.month_average_collateral(capital_points, bucket["year"], bucket["month"])
+        net = bucket["credits"] - bucket["debits"] - bucket["fees"]
+        rows.append(
+            {
+                "year": bucket["year"],
+                "month": bucket["month"],
+                "period": period,
+                "gross_credits": round(bucket["credits"], 2),
+                "gross_debits": round(bucket["debits"], 2),
+                "fees": round(bucket["fees"], 2),
+                "net_cash_flow": round(net, 2),
+                "avg_collateral": round(avg_collateral, 2),
+                "monthly_yield_pct": round(100.0 * net / avg_collateral, 4) if avg_collateral > 1e-9 else None,
+            }
+        )
+
+    throughs = [
+        date.fromisoformat(payload["meta"]["through"]) for payload in payloads.values() if payload["meta"]["through"]
+    ]
+    through = max(throughs) if throughs else date.today()
+    return {"months": rows, "trailing": cf.trailing_metrics(rows, through)}
+
+
 def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) -> dict[str, Any]:
     portfolios = [payload["portfolio"] for payload in payloads.values()]
     first_dates = [p["first_date"] for p in portfolios if p["first_date"]]
@@ -764,6 +816,9 @@ def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) ->
         "assignments": sum(p["assignments"] for p in portfolios),
         "wins": sum(p["wins"] for p in portfolios),
         "losses": sum(p["losses"] for p in portfolios),
+        "total_initial_collateral": sum(p["total_initial_collateral"] for p in portfolios),
+        "dividends_received": sum(p["dividends_received"] for p in portfolios),
+        "stock_unrealized_pl": sum(p["stock_unrealized_pl"] for p in portfolios),
     }
 
     combined["days_span"] = (
@@ -803,6 +858,31 @@ def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) ->
         combined["roi_on_avg_wheel_pct"] = None
         combined["annualized_wheel_roc_pct"] = None
 
+    # Dual-track pair, quoted against total_initial_collateral -- the sum of
+    # every account's own summed-per-cycle initial collateral, a different
+    # denominator from avg_capital above -- and, like every other combined
+    # figure here, recomputed from the combined absolutes rather than
+    # averaging each account's own percentage.
+    if combined["total_initial_collateral"] > 1e-9 and combined["days_span"]:
+        scale = 365.0 / combined["days_span"]
+        net_option_yield = 100.0 * combined["option_realized_pl"] / combined["total_initial_collateral"]
+        total_position_pl = (
+            combined["option_realized_pl"]
+            + combined["stock_realized_pl"]
+            + combined["stock_unrealized_pl"]
+            + combined["dividends_received"]
+        )
+        total_position_roi = 100.0 * total_position_pl / combined["total_initial_collateral"]
+        combined["net_option_yield_pct"] = round(net_option_yield, 2)
+        combined["annualized_net_option_yield_pct"] = round(net_option_yield * scale, 2)
+        combined["total_position_roi_pct"] = round(total_position_roi, 2)
+        combined["annualized_total_position_roi_pct"] = round(total_position_roi * scale, 2)
+    else:
+        combined["net_option_yield_pct"] = None
+        combined["annualized_net_option_yield_pct"] = None
+        combined["total_position_roi_pct"] = None
+        combined["annualized_total_position_roi_pct"] = None
+
     for money_key in (
         "premium_received",
         "premium_paid",
@@ -813,6 +893,9 @@ def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) ->
         "net_realized_pl",
         "open_premium",
         "fees",
+        "total_initial_collateral",
+        "dividends_received",
+        "stock_unrealized_pl",
     ):
         combined[money_key] = round(combined[money_key], 2)
 

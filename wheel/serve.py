@@ -1,6 +1,6 @@
 """Zero-dependency dashboard server.
 
-    python -m wheel.serve [--csv FILE] [--port 8765] [--no-browser]
+    python -m wheel.serve [--csv FILE] [--port 8765] [--no-browser] [--reopen-browser]
 
 Routes
 ------
@@ -28,7 +28,9 @@ import json
 import os
 import re
 import sys
+import tempfile
 import threading
+import time
 import webbrowser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -355,19 +357,34 @@ class Handler(BaseHTTPRequestHandler):
         """Keep the multi-account registry's "default" account pointed at
         whatever ``DashboardState`` currently has active, so an upload or a
         dataset switch is reflected in ``/api/dashboard``/``/api/accounts``
-        without a second, redundant file scan.
+        without a second, redundant file scan -- then rescan every account
+        folder for anything new.
 
-        A ``ValueError`` here means the default account (loose files in the
-        project root/``data``) is genuinely empty -- a user who keeps every
-        account in its own ``data/<account>/`` subfolder, say. That's fine;
-        the registry's own discovery already omits "default" from the account
-        list in that case, so there's simply nothing to sync.
+        A ``ValueError`` from ``state.get()`` means the default account (loose
+        files in the project root/``data``) is genuinely empty -- a user who
+        keeps every account in its own ``data/<account>/`` subfolder, say.
+        That's fine; the registry's own discovery already omits "default" from
+        the account list in that case, so there's simply nothing to point it at.
+
+        ``set_default_dashboard`` only forces a full ``refresh()`` when the
+        default bucket's own dashboard identity changes -- a new or edited file
+        directly in the project root/``data``. A new file dropped into an
+        *existing* ``data/<account>/`` subfolder, or a brand-new subfolder,
+        never touches that identity, so it would otherwise stay invisible
+        until the process restarts. ``refresh()`` is called unconditionally
+        here to close that gap; it is cheap when nothing changed (its own
+        fingerprint is just file mtimes) and only re-parses the accounts whose
+        files actually moved, so paying for a stat pass on every request
+        (dashboard load, account switch, a plain page refresh) is worth always
+        seeing whatever is on disk right now.
         """
         try:
             dashboard = self.state.get()
         except ValueError:
-            return
-        self.registry.set_default_dashboard(dashboard)
+            dashboard = None
+        if dashboard is not None:
+            self.registry.set_default_dashboard(dashboard)
+        self.registry.refresh()
 
     def log_message(self, fmt: str, *args) -> None:
         # One tidy line per request instead of BaseHTTPRequestHandler's noise.
@@ -656,8 +673,41 @@ def _preferred_account(registry: AccountRegistry) -> str:
     return DEFAULT_ACCOUNT_ID if DEFAULT_ACCOUNT_ID in ids else "combined"
 
 
+# How long a "the browser tab is probably still open" marker stays valid.
+# Restarting the dev server (edit -> Ctrl-C -> rerun) is the common case
+# during development, and popping a fresh tab on every restart -- with the
+# old one now just a dead "connection refused" page until the new server
+# binds the port -- clutters the browser for no reason: the same tab starts
+# working again the moment it does, so there's nothing a new tab offers that
+# a refresh doesn't. The marker expires rather than lasting forever so a
+# genuinely new session (the next day, after a reboot) still gets a tab.
+_BROWSER_MARKER_TTL = 6 * 3600
+
+
+def _browser_marker_path(port: int) -> str:
+    return os.path.join(tempfile.gettempdir(), f"wheel-dashboard-{port}.opened")
+
+
+def _recently_opened(port: int) -> bool:
+    try:
+        return time.time() - os.path.getmtime(_browser_marker_path(port)) < _BROWSER_MARKER_TTL
+    except OSError:
+        return False
+
+
+def _mark_opened(port: int) -> None:
+    try:
+        with open(_browser_marker_path(port), "w", encoding="utf-8") as handle:
+            handle.write(repr(time.time()))
+    except OSError:
+        pass  # best-effort -- a marker that fails to write just means the next restart opens a tab again
+
+
 def serve(
-    csv_path: str | list[str] | None = None, port: int = 8765, open_browser: bool = True
+    csv_path: str | list[str] | None = None,
+    port: int = 8765,
+    open_browser: bool = True,
+    reopen_browser: bool = False,
 ) -> None:
     if csv_path is None:
         csv_path = discover_exports()
@@ -707,8 +757,11 @@ def serve(
     )
     print(f"\n  Dashboard on  {url}\n  Ctrl-C to stop.\n")
 
-    if open_browser:
+    if open_browser and (reopen_browser or not _recently_opened(port)):
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+        _mark_opened(port)
+    elif open_browser:
+        print(f"  (tab already open from a recent run -- refresh {url}, or pass --reopen-browser)\n")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -727,8 +780,14 @@ def main() -> None:
     )
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-browser", action="store_true", help="do not open a browser window")
+    parser.add_argument(
+        "--reopen-browser",
+        action="store_true",
+        help="open a browser tab even if this dashboard was already opened recently "
+        "(by default, restarting within a few hours skips it -- see --no-browser to skip always)",
+    )
     args = parser.parse_args()
-    serve(args.csv, args.port, open_browser=not args.no_browser)
+    serve(args.csv, args.port, open_browser=not args.no_browser, reopen_browser=args.reopen_browser)
 
 
 if __name__ == "__main__":

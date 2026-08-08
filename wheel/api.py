@@ -9,17 +9,21 @@ derived from the same slice, so the numbers always agree with each other.
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime
 from typing import Any, Sequence
 
 from wheel import benchmark as bm
+from wheel import cashflow as cf
 from wheel import marketdata
 from wheel.engine import Cycle, WheelEngine, build_cycles
 from wheel.metrics import (
     capital_timeline,
     cycle_metrics,
+    dividends_by_cycle,
     leg_rows,
+    net_adjusted_cost_basis,
     portfolio_capital_series,
     portfolio_metrics,
     realized_pl_series,
@@ -190,18 +194,26 @@ def _capital_point(point) -> dict[str, Any]:
     stock = _money(point.stock_basis)
     call = _money(point.call_collateral)
     long_premium = _money(point.long_premium)
+    spread = _money(point.spread_collateral)
     return {
         "date": _iso(point.day),
         "put": put,
         "stock": stock,
         "call": call,
         "long": long_premium,
-        "total": round(put + stock + call + long_premium, 2),
+        "spread": spread,
+        "total": round(put + stock + call + long_premium + spread, 2),
     }
 
 
-def _cycle_payload(cycle: Cycle, through: date) -> dict[str, Any]:
-    metrics = cycle_metrics(cycle, through)
+def _cycle_payload(
+    cycle: Cycle,
+    through: date,
+    *,
+    current_price: float | None = None,
+    dividends: float = 0.0,
+) -> dict[str, Any]:
+    metrics = cycle_metrics(cycle, through, current_price=current_price, dividends=dividends)
     payload = {key: value for key, value in asdict(metrics).items()}
     payload["start_date"] = _iso(metrics.start_date)
     payload["end_date"] = _iso(metrics.end_date)
@@ -246,7 +258,8 @@ def _cycle_payload(cycle: Cycle, through: date) -> dict[str, Any]:
             "lot_id": lot.lot_id,
             "acquired": _iso(lot.acquired),
             "shares": lot.shares,
-            "basis_per_share": lot.basis_per_share,
+            "basis_per_share": lot.basis_per_share,  # tax basis: raw assignment/purchase price
+            "net_adjusted_cost_basis": _money(net_adjusted_cost_basis(cycle, lot)),
             "remaining": lot.remaining,
             "source": lot.source,
             "synthetic": lot.synthetic,
@@ -254,6 +267,23 @@ def _cycle_payload(cycle: Cycle, through: date) -> dict[str, Any]:
             "cost": _money(lot.cost),
         }
         for lot in cycle.share_lots
+    ]
+    payload["spreads"] = [
+        {
+            "spread_id": spread.spread_id,
+            "right": spread.right,
+            "expiry": _iso(spread.expiry),
+            "open_date": _iso(spread.open_date),
+            "short_leg_id": spread.short_leg_id,
+            "long_leg_id": spread.long_leg_id,
+            "paired_contracts": spread.paired_contracts,
+            "short_strike": spread.short_strike,
+            "long_strike": spread.long_strike,
+            "collateral": _money(spread.collateral_per_contract * spread.paired_contracts),
+            "net_credit": _money(spread.net_credit),
+            "capital_estimated": spread.capital_estimated,
+        }
+        for spread in cycle.spreads
     ]
     payload["capital"] = [_capital_point(point) for point in capital_timeline(cycle, through)]
     return payload
@@ -400,6 +430,54 @@ class Dashboard:
                 ]
         self._net_worth = self._build_net_worth()
         self._benchmark = self._build_benchmark()
+        # Lazily populated on the first build() call and reused after that --
+        # get_price_series() does disk I/O and a freshness check even when it
+        # skips the network fetch, and build() runs once per filter change
+        # from the frontend, so re-fetching every ticker on every call would
+        # multiply that cost by however many times the user adjusts a filter.
+        self._price_cache: dict[str, float | None] | None = None
+        self._price_warnings: list[str] = []
+
+    # ---- market data ----
+
+    def _current_prices(self) -> dict[str, float | None]:
+        """Latest close for every ticker this dashboard holds open shares in.
+
+        Computed once per Dashboard instance, not once per build() -- see the
+        comment in __init__. A ticker whose fetch fails yields ``None`` for
+        that ticker only (wheel.marketdata never raises), which flows through
+        to that cycle's stock_unrealized_pl as "unavailable," not a crash.
+
+        Fetched in parallel, not one ticker at a time: each is an independent
+        network round trip (its own URL, its own cache file under
+        ``data/prices/``), so nothing about them requires serializing, and a
+        cold cache with a few dozen tickers turned a single-digit-second page
+        load into a multi-second one when fetched sequentially. ``pool.map``
+        keeps `tickers`' order, so building `prices`/`warnings` from the
+        zipped results needs no lock -- every dict/list write still happens
+        on this thread, only the network wait itself overlaps.
+        """
+        if self._price_cache is not None:
+            return self._price_cache
+
+        tickers = sorted(
+            {
+                cycle.underlying
+                for cycle in self.all_cycles
+                if any(lot.remaining > 1e-9 for lot in cycle.share_lots)
+            }
+        )
+        prices: dict[str, float | None] = {}
+        warnings: list[str] = []
+        if tickers:
+            with ThreadPoolExecutor(max_workers=min(8, len(tickers))) as pool:
+                for ticker, (points, ticker_warnings) in zip(tickers, pool.map(marketdata.get_price_series, tickers)):
+                    warnings.extend(ticker_warnings)
+                    prices[ticker] = points[-1].close if points else None
+
+        self._price_cache = prices
+        self._price_warnings = warnings
+        return prices
 
     # ---- metadata ----
 
@@ -553,7 +631,7 @@ class Dashboard:
         )
         all_events = [opening_event] + [event for event in events if event.date > opening_day]
 
-        price_points, market_warnings = marketdata.get_price_series()
+        price_points, market_warnings = marketdata.get_price_series("SPY")
         warnings.extend(market_warnings)
 
         def price_lookup(day: date):
@@ -637,8 +715,37 @@ class Dashboard:
         if filters.statuses:
             capital_cycles = [cycle for cycle in capital_cycles if cycle.status in filters.statuses]
 
-        portfolio = portfolio_metrics(cycles, through, capital_cycles=capital_cycles, since=since)
+        # Stock Unrealized P&L (current_prices) and Total Position ROI's
+        # dividend term (dividends) both apply to `cycles` -- the same
+        # ticker/date/status-filtered set every other P&L figure here uses --
+        # not `capital_cycles`, so a filtered-out ticker's dividends and
+        # unrealized gains don't leak into the figures on screen.
+        current_prices = self._current_prices()
+        dividends = dividends_by_cycle(cycles, transactions)
+
+        portfolio = portfolio_metrics(
+            cycles,
+            through,
+            capital_cycles=capital_cycles,
+            since=since,
+            current_prices=current_prices,
+            dividends_by_cycle=dividends,
+        )
         capital = portfolio_capital_series(capital_cycles, through, since)
+
+        # Cash flow is dated to each row's own event_date, not to the cycle it
+        # eventually belongs to, so it is built straight from the (ticker/date)
+        # filtered transaction slice -- the same one `cycles` came from -- rather
+        # than from `cycles` itself. Collateral for the yield-% denominator reuses
+        # `capital`, the same series the "Capital deployed" chart already shows,
+        # so the two agree with each other.
+        cash_flow_rows = cf.monthly_cashflow_series(
+            transactions, [(point.day, point.total) for point in capital], through, since
+        )
+        cash_flow = {
+            "months": cash_flow_rows,
+            "trailing": cf.trailing_metrics(cash_flow_rows, through),
+        }
 
         return {
             "meta": {
@@ -671,6 +778,7 @@ class Dashboard:
                 ],
                 "engine_warnings": engine.warnings,
                 "unmatched_closes": engine.unmatched_closes,
+                "market_data_warnings": self._price_warnings,
                 "filters": {
                     "tickers": filters.tickers,
                     "start": _iso(filters.start),
@@ -687,16 +795,32 @@ class Dashboard:
                 "last_date": _iso(portfolio.last_date),
                 "win_rate_pct": portfolio.win_rate_pct,
             },
-            "cycles": [_cycle_payload(cycle, through) for cycle in cycles],
+            "cycles": [
+                _cycle_payload(
+                    cycle,
+                    through,
+                    current_price=current_prices.get(cycle.underlying),
+                    dividends=dividends.get(cycle.cycle_id, 0.0),
+                )
+                for cycle in cycles
+            ],
             "tickers": [
                 {key: (_money(value) if isinstance(value, float) else value) for key, value in row.items()}
-                for row in ticker_summary(cycles, through, capital_cycles=capital_cycles, since=since)
+                for row in ticker_summary(
+                    cycles,
+                    through,
+                    capital_cycles=capital_cycles,
+                    since=since,
+                    current_prices=current_prices,
+                    dividends_by_cycle=dividends,
+                )
             ],
             "capital_series": [
                 _capital_point(point)
                 for point in capital
             ],
             "pnl_series": realized_pl_series(cycles),
+            "cash_flow": cash_flow,
             "reconciliation": _reconciliation(
                 transactions, built_cycles, self.reports, engine.unmatched_cash
             ),

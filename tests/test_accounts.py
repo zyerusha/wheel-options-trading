@@ -237,6 +237,55 @@ class TestAccountRegistry(unittest.TestCase):
         self.assertAlmostEqual(portfolio["roi_on_avg_wheel_pct"], expected_roi, places=2)
         self.assertGreater(abs(portfolio["roi_on_avg_wheel_pct"] - naive_average_roi), 0.5)
 
+    def test_combined_net_option_yield_and_total_position_roi_are_summed_not_averaged(self):
+        """Same principle as test_combined_roi_is_capital_weighted_not_averaged,
+        one level over: both dual-track fields are quoted against
+        total_initial_collateral, the sum of each account's own summed
+        per-cycle initial collateral -- never each account's own percentage
+        averaged together.
+        """
+        combined = self.registry.build("combined")
+        portfolio = combined["portfolio"]
+
+        expected_total_initial = self.IRA_COLLATERAL + self.TAXABLE_COLLATERAL
+        self.assertAlmostEqual(portfolio["total_initial_collateral"], expected_total_initial, places=2)
+
+        net_pl = self.IRA_PREMIUM + self.TAXABLE_PREMIUM
+        expected_net_option_yield = 100.0 * net_pl / expected_total_initial
+        self.assertAlmostEqual(portfolio["net_option_yield_pct"], expected_net_option_yield, places=2)
+
+        # No stock, no dividends, no unrealized P&L in this fixture -- both
+        # of the dual-track pair's numerators collapse to the same figure.
+        self.assertAlmostEqual(portfolio["total_position_roi_pct"], expected_net_option_yield, places=2)
+        self.assertAlmostEqual(portfolio["dividends_received"], 0.0, places=2)
+        self.assertAlmostEqual(portfolio["stock_unrealized_pl"], 0.0, places=2)
+
+        # The naive average of each account's own yield -- close to, but not
+        # exactly, the sum-weighted figure above, since these two accounts'
+        # collateral sizes are similar (unlike the time-weighted-average ROC
+        # test, a sum-of-collateral denominator only diverges sharply from a
+        # naive average when account sizes differ a lot; the exact-value
+        # assertions above are the real correctness check here).
+        ira_yield = 100.0 * self.IRA_PREMIUM / self.IRA_COLLATERAL
+        taxable_yield = 100.0 * self.TAXABLE_PREMIUM / self.TAXABLE_COLLATERAL
+        naive_average = (ira_yield + taxable_yield) / 2
+        self.assertNotAlmostEqual(portfolio["net_option_yield_pct"], naive_average, places=2)
+
+    def test_combined_capital_series_spread_component_sums_across_accounts(self):
+        """Every account's own capital_series already carries a "spread" key
+        (net credit-spread collateral) -- the combined series must sum it
+        like every other component, or a spread-heavy account's collateral
+        would silently vanish from the Combined capital chart.
+        """
+        combined = self.registry.build("combined")
+        for point in combined["capital_series"]:
+            self.assertIn("spread", point)
+            self.assertAlmostEqual(
+                point["total"],
+                round(point["put"] + point["stock"] + point["call"] + point["long"] + point["spread"], 2),
+                places=2,
+            )
+
     def test_refresh_picks_up_a_newly_added_account_folder(self):
         self.assertEqual(len(self.registry.list_accounts()), 2)
         new_dir = os.path.join(self.data_dir, "third")
