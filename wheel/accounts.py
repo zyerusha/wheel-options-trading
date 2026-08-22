@@ -81,6 +81,22 @@ Three knobs in the optional ``data/accounts.json`` shape this:
   ``wheel/static/app.js``'s ``#preset`` select already understands
   (``applyPreset``), so a value outside that set is rejected up front with a
   warning rather than reaching the frontend as an unparsable range.
+* ``"opening_balances"`` -- ``{"<folder>": {"date": "YYYY-MM-DD", "balance":
+  <number>}, ...}`` -- a manual starting point for the S&P 500 benchmark
+  comparison (``Dashboard._build_benchmark()``), keyed the same way as
+  ``"folders"``. That comparison needs two Portfolio Positions snapshots,
+  taken on different dates, to have both an opening and a terminal value to
+  measure a return between -- an account with only one snapshot on file (the
+  common case for a while after first setting this up) can't compute one yet.
+  An entry here stands in for the missing earlier snapshot: "the account was
+  worth this much on this date" (from your own records -- a statement, a
+  memory, whatever you trust), letting the comparison run against one real
+  snapshot instead of two. It's also honored ahead of a real snapshot when
+  its date is *earlier* than the earliest one on file, stretching the
+  comparison window further back than your Positions export history alone
+  would allow. Never used for anything but the benchmark comparison --
+  Total value, Capital deployed, and every other current-state figure still
+  come only from real, itemized Positions data.
 
 See :func:`load_account_config` and :class:`AccountConfig`. Whichever way an
 account number is resolved, ``Dashboard.__init__``'s ``account_number``
@@ -112,12 +128,21 @@ from typing import TYPE_CHECKING, Any, Sequence
 from wheel import benchmark as bm
 from wheel import cashflow as cf
 from wheel.api import Dashboard, Filters, discover_exports, discover_multi_account_exports
-from wheel.positions import discover_position_snapshots, latest_snapshot_per_account, load_snapshots
+from wheel.metrics import roi_and_annualized, time_weighted_average
+from wheel.positions import discover_position_snapshots, latest_snapshot, latest_snapshot_per_account, load_snapshots
 
 if TYPE_CHECKING:  # pragma: no cover
     pass
 
 DEFAULT_ACCOUNT_ID = "default"
+# The Combined-aggregate-view sentinel -- a real account id or number can
+# never equal this (see _unique_account_id/build() below), the same
+# reservation DEFAULT_ACCOUNT_ID already gets. A single shared constant
+# rather than the raw string repeated at every comparison site (here, in
+# wheel/serve.py, and in wheel/static/app.js) so a typo'd comparison fails
+# fast (NameError/ReferenceError) instead of silently falling through to
+# per-account lookup.
+COMBINED_ACCOUNT_ID = "combined"
 ACCOUNT_CONFIG_FILENAME = "accounts.json"
 
 # Every preset wheel/static/app.js's #preset select understands: "all", "ytd",
@@ -172,6 +197,24 @@ def discover_account_dirs(
     return dirs
 
 
+def _lookup_ci(mapping: dict[str, Any], key: str) -> Any | None:
+    """``mapping[key]``, matched case-insensitively -- exact match first (the
+    common case, and the only one that's O(1)), then a lowercase-key scan.
+
+    Shared by every case-insensitive config lookup in this module (folder
+    names, and account ids that may equally be folder names) rather than each
+    re-implementing the same "Windows treats filenames case-insensitively"
+    exact-then-scan fallback by hand.
+    """
+    if key in mapping:
+        return mapping[key]
+    key_lower = key.lower()
+    for candidate, value in mapping.items():
+        if candidate.lower() == key_lower:
+            return value
+    return None
+
+
 @dataclass(frozen=True)
 class AccountConfig:
     """Parsed ``data/accounts.json``. Every field is optional and defaults empty."""
@@ -180,6 +223,7 @@ class AccountConfig:
     ignore: list[str] = field(default_factory=list)  # account number or "Account name", verbatim
     default_account: str | None = None  # account id the UI should open to, instead of "combined"
     default_range: str | None = None  # date-range preset the UI should open to, instead of "All"
+    opening_balances: dict[str, tuple[date, float]] = field(default_factory=dict)  # folder id -> (date, balance)
 
     def folder_account(self, folder_id: str) -> str | None:
         """``folders[folder_id]``, matched case-insensitively.
@@ -190,13 +234,13 @@ class AccountConfig:
         should still find an actual folder named ``Joint`` rather than
         silently failing to match.
         """
-        if folder_id in self.folders:
-            return self.folders[folder_id]
-        folder_id_lower = folder_id.lower()
-        for key, value in self.folders.items():
-            if key.lower() == folder_id_lower:
-                return value
-        return None
+        return _lookup_ci(self.folders, folder_id)
+
+    def opening_balance(self, folder_id: str) -> tuple[date, float] | None:
+        """``opening_balances[folder_id]``, matched case-insensitively -- see
+        :meth:`folder_account` for why case-insensitive matching matters here.
+        """
+        return _lookup_ci(self.opening_balances, folder_id)
 
 
 def load_account_config(base_dir: str) -> tuple[AccountConfig, list[str]]:
@@ -263,12 +307,53 @@ def load_account_config(base_dir: str) -> tuple[AccountConfig, list[str]]:
                 "all/ytd/1y/3y/5y/year:YYYY/<day count>; ignoring"
             )
 
-    unknown_keys = set(raw) - {"folders", "ignore", "default_account", "default_range"}
+    opening_balances_raw = raw.get("opening_balances", {})
+    opening_balances: dict[str, tuple[date, float]] = {}
+    if isinstance(opening_balances_raw, dict):
+        for folder, entry in opening_balances_raw.items():
+            if not isinstance(folder, str):
+                warnings.append(f"{ACCOUNT_CONFIG_FILENAME}: skipped invalid opening_balances entry {folder!r}")
+                continue
+            if not isinstance(entry, dict):
+                warnings.append(
+                    f"{ACCOUNT_CONFIG_FILENAME}: opening_balances['{folder}'] must be an object "
+                    "with 'date' and 'balance'; ignoring"
+                )
+                continue
+            entry_date_raw = entry.get("date")
+            balance_raw = entry.get("balance")
+            entry_date: date | None = None
+            if isinstance(entry_date_raw, str):
+                try:
+                    entry_date = date.fromisoformat(entry_date_raw.strip())
+                except ValueError:
+                    entry_date = None
+            balance_valid = isinstance(balance_raw, (int, float)) and not isinstance(balance_raw, bool)
+            if entry_date is None or not balance_valid:
+                warnings.append(
+                    f"{ACCOUNT_CONFIG_FILENAME}: opening_balances['{folder}'] needs a 'date' in YYYY-MM-DD "
+                    "form and a numeric 'balance'; ignoring"
+                )
+                continue
+            opening_balances[folder] = (entry_date, float(balance_raw))
+    elif "opening_balances" in raw:
+        warnings.append(
+            f"{ACCOUNT_CONFIG_FILENAME}: 'opening_balances' must be an object of "
+            "folder -> {date, balance}; ignoring"
+        )
+
+    unknown_keys = set(raw) - {"folders", "ignore", "default_account", "default_range", "opening_balances"}
     if unknown_keys:
         warnings.append(f"{ACCOUNT_CONFIG_FILENAME}: ignoring unknown key(s) {', '.join(sorted(unknown_keys))}")
 
     return (
-        AccountConfig(folders=folders, ignore=ignore, default_account=default_account, default_range=default_range),
+        AccountConfig(
+            folders=folders,
+            ignore=ignore,
+            default_account=default_account,
+            default_range=default_range,
+            opening_balances=opening_balances,
+        ),
         warnings,
     )
 
@@ -298,15 +383,55 @@ def _slugify(text: str) -> str:
     return slug or "account"
 
 
+def _reserved_account_id(candidate: str) -> bool:
+    """Is ``candidate`` a sentinel that a real account id must never equal?
+
+    ``DEFAULT_ACCOUNT_ID`` is matched exactly (it is always lowercase and
+    generated, never user-typed); ``COMBINED_ACCOUNT_ID`` is matched
+    case-insensitively, the same casing tolerance ``build()`` itself applies
+    when routing a request to the aggregate view -- a folder or auto-discovered
+    account named ``Combined``/``COMBINED`` would otherwise be silently
+    unreachable on its own tab forever.
+    """
+    return candidate == DEFAULT_ACCOUNT_ID or candidate.lower() == COMBINED_ACCOUNT_ID
+
+
 def _unique_account_id(base: str, taken: dict) -> str:
     """``base``, or ``base-2``/``base-3``/... if it collides with an existing
-    account id (including the reserved ``"default"``).
+    account id or a reserved sentinel (``"default"``, ``"combined"``).
+
+    For auto-discovered, positions-only accounts (a Positions file naming a
+    real account with no folder of its own -- see ``AccountRegistry.refresh``)
+    slugified straight from the account's own name/number, so either sentinel
+    is a genuine, if rare, possible collision -- unlike a folder's own id
+    (:func:`_unique_folder_account_id`), which is allowed to legitimately
+    equal ``"default"``.
     """
-    if base != DEFAULT_ACCOUNT_ID and base not in taken:
+    if not _reserved_account_id(base) and base not in taken:
         return base
     n = 2
     candidate = f"{base}-{n}"
-    while candidate in taken or candidate == DEFAULT_ACCOUNT_ID:
+    while candidate in taken or _reserved_account_id(candidate):
+        n += 1
+        candidate = f"{base}-{n}"
+    return candidate
+
+
+def _unique_folder_account_id(base: str, taken: dict) -> str:
+    """``base`` (a folder id), or ``base-2``/``base-3``/... if it collides
+    with the reserved ``COMBINED_ACCOUNT_ID`` sentinel or an account already
+    registered under that id.
+
+    Unlike :func:`_unique_account_id`, a folder id is allowed to equal
+    ``DEFAULT_ACCOUNT_ID`` unchanged -- that's the implicit default bucket's
+    own, legitimate identity (``discover_account_dirs`` always creates one
+    ``AccountDir`` with exactly that id), not a collision to rename away from.
+    """
+    if base.lower() != COMBINED_ACCOUNT_ID and base not in taken:
+        return base
+    n = 2
+    candidate = f"{base}-{n}"
+    while candidate in taken or candidate.lower() == COMBINED_ACCOUNT_ID:
         n += 1
         candidate = f"{base}-{n}"
     return candidate
@@ -315,8 +440,8 @@ def _unique_account_id(base: str, taken: dict) -> str:
 def _dashboard_account_name(dashboard: Dashboard) -> str | None:
     if not dashboard.snapshots:
         return None
-    latest = max(latest_snapshot_per_account(dashboard.snapshots).values(), key=lambda snapshot: snapshot.as_of)
-    return latest.account_name
+    latest = latest_snapshot(dashboard.snapshots)
+    return latest.account_name if latest else None
 
 
 def _resolve_account_number(account_dir: AccountDir, configured_number: str | None = None) -> str | None:
@@ -337,9 +462,8 @@ def _resolve_account_number(account_dir: AccountDir, configured_number: str | No
         snapshots, _ = load_snapshots(account_dir.position_paths)
     except Exception:
         return None
-    if not snapshots:
-        return None
-    return max(latest_snapshot_per_account(snapshots).values(), key=lambda snapshot: snapshot.as_of).account_number
+    latest = latest_snapshot(snapshots)
+    return latest.account_number if latest else None
 
 
 class AccountRegistry:
@@ -373,11 +497,21 @@ class AccountRegistry:
         self.refresh(force=True)
 
     def _subfolder_fingerprint(self) -> tuple:
-        """mtimes of every subfolder account's files, plus ``accounts.json``'s
-        own mtime so editing the config alone (no CSV touched) still triggers
-        a rebuild -- the default account's own staleness is handled by
-        whatever supplies it via :meth:`set_default_dashboard`, not by this
-        fingerprint.
+        """mtimes of every subfolder account's own CSV files, plus
+        ``accounts.json``'s own mtime so editing the config alone (no CSV
+        touched) still triggers a rebuild -- the default account's own
+        staleness is handled by whatever supplies it via
+        :meth:`set_default_dashboard`, not by this fingerprint.
+
+        Deliberately cheap: every ``.csv``'s own name and mtime, from a plain
+        directory listing -- never opened, so computing this fingerprint
+        never re-runs the header-sniffing ``discover_exports()``/
+        ``discover_position_snapshots()`` do (open + read the first 4KB of
+        every candidate file), on every single request via ``refresh()``,
+        just to answer "has anything changed since last time." That real,
+        header-based discovery still runs, exactly once, on the "yes,
+        something changed" branch below (``discover_account_dirs``) -- this
+        fingerprint's only job is deciding whether that's needed at all.
         """
         parts = []
         if os.path.isdir(self.base_dir):
@@ -385,8 +519,13 @@ class AccountRegistry:
                 path = os.path.join(self.base_dir, entry)
                 if not os.path.isdir(path):
                     continue
-                files = discover_exports([path]) + discover_position_snapshots([path])
-                parts.append((entry, tuple((f, os.path.getmtime(f)) for f in files)))
+                try:
+                    files = sorted(name for name in os.listdir(path) if name.lower().endswith(".csv"))
+                    parts.append(
+                        (entry, tuple((name, os.path.getmtime(os.path.join(path, name))) for name in files))
+                    )
+                except OSError:
+                    parts.append((entry, ()))
         config_path = os.path.join(self.base_dir, ACCOUNT_CONFIG_FILENAME)
         config_stamp = os.path.getmtime(config_path) if os.path.isfile(config_path) else None
         return (tuple(parts), config_stamp)
@@ -401,6 +540,76 @@ class AccountRegistry:
             config, config_warnings = load_account_config(self.base_dir)
             all_position_paths = sorted({path for account_dir in account_dirs for path in account_dir.position_paths})
 
+            accounts: dict[str, Dashboard] = {}
+            warnings: list[str] = list(config_warnings)
+            claimed_numbers: set[str] = set()
+            number_to_id: dict[str, str] = {}  # lets "default_account" name an account number, not just an id
+
+            # The externally managed "default" dashboard (serve.py's uploader,
+            # via set_default_dashboard) owns that folder's identity outright
+            # when present, and is handled once, up front -- never through the
+            # number-based merge loop below, whose merge branch rebuilds a
+            # fresh Dashboard from the union of every matching folder's files.
+            # Running "default" through that when a live dashboard exists
+            # would silently discard whatever upload/select state exists only
+            # in memory (e.g. files chosen but not yet reflected on disk in
+            # exactly the shape the merge expects) the moment its account
+            # number happens to also match another folder's.
+            default_dir = next((d for d in account_dirs if d.id == DEFAULT_ACCOUNT_ID), None)
+            grouping_dirs = account_dirs
+            if default_dir is not None and self._default_dashboard is not None:
+                grouping_dirs = [d for d in account_dirs if d.id != DEFAULT_ACCOUNT_ID]
+                default_number = _resolve_account_number(default_dir, config.folder_account(DEFAULT_ACCOUNT_ID))
+                # A number resolved from nothing but a loose, shared "all
+                # accounts" Positions file (no transaction history of its
+                # own -- self._default_dashboard.csv_paths is empty) is weak
+                # evidence: it just means some account's row in that shared
+                # file happened to have the latest `as_of` timestamp, not
+                # that this really is the default bucket's account. If a
+                # real folder independently resolves to the same number,
+                # that folder's own dedicated history must win -- otherwise
+                # the empty default's claim silently drops the folder's
+                # whole transaction history in the "already covered" branch
+                # below instead of merging with or deferring to it.
+                default_redundant = False
+                if default_number and not self._default_dashboard.csv_paths:
+                    other_numbers = {
+                        _resolve_account_number(d, config.folder_account(d.id)) for d in grouping_dirs
+                    }
+                    if default_number in other_numbers:
+                        # The colliding folder wins the number (see comment
+                        # above); a history-less default now has nothing of
+                        # its own to contribute for this account, since that
+                        # folder's Dashboard -- resolved via a configured
+                        # number -- already widens its own search to every
+                        # Positions file on disk (see `position_paths =
+                        # all_position_paths if configured_number else ...`
+                        # below). Registering "default" here too would just
+                        # report that same folder's net worth a second time
+                        # under a different id, double-counting it in
+                        # Combined -- so it's dropped rather than kept as a
+                        # harmless-looking duplicate.
+                        default_number = None
+                        default_redundant = True
+                if default_number:
+                    claimed_numbers.add(default_number)
+                    number_to_id[default_number] = DEFAULT_ACCOUNT_ID
+                # A 'folders'/'opening_balances' entry for "default" has no
+                # effect while a live dashboard owns it (that Dashboard was
+                # already built by DashboardState, with no knowledge of this
+                # config) -- surfaced as a warning rather than a silent no-op.
+                if config.folder_account(DEFAULT_ACCOUNT_ID) or config.opening_balance(DEFAULT_ACCOUNT_ID):
+                    warnings.append(
+                        f"{ACCOUNT_CONFIG_FILENAME}: 'folders'/'opening_balances' entries for the "
+                        "'default' account have no effect while an uploaded or selected dataset is "
+                        "active for it"
+                    )
+                if not default_redundant and not (
+                    default_number
+                    and _is_ignored(default_number, _dashboard_account_name(self._default_dashboard), config.ignore)
+                ):
+                    accounts[DEFAULT_ACCOUNT_ID] = self._default_dashboard
+
             # Two folders can describe the SAME real brokerage account -- most
             # often stray files left in data/ root from before an account got
             # its own data/<account>/ folder (or an upload that landed in the
@@ -412,15 +621,10 @@ class AccountRegistry:
             # in Combined. A folder with no Positions snapshot yet has no
             # verifiable identity and stands alone, keyed by its own folder id.
             groups: dict[str, list[AccountDir]] = {}
-            for account_dir in account_dirs:
+            for account_dir in grouping_dirs:
                 number = _resolve_account_number(account_dir, config.folder_account(account_dir.id))
                 key = f"#{number}" if number else f"@{account_dir.id}"
                 groups.setdefault(key, []).append(account_dir)
-
-            accounts: dict[str, Dashboard] = {}
-            warnings: list[str] = list(config_warnings)
-            claimed_numbers: set[str] = set()
-            number_to_id: dict[str, str] = {}  # lets "default_account" name an account number, not just an id
 
             # A multi-account export (e.g. an "Accounts_History.csv" download)
             # is deliberately excluded from discover_exports/looks_like_export
@@ -437,6 +641,20 @@ class AccountRegistry:
                 )
 
             for key, dirs in groups.items():
+                resolved_number = key[1:] if key.startswith("#") else None
+                if resolved_number and resolved_number in claimed_numbers:
+                    # Already covered by the live "default" dashboard set aside
+                    # above -- registering this folder separately too would
+                    # double-count the same real account in Combined, exactly
+                    # what the merge logic just below exists to prevent.
+                    ids = sorted(d.id for d in dirs)
+                    warnings.append(
+                        f"account {resolved_number} in {', '.join(ids)} is already covered by the "
+                        "active 'default' dataset -- not registered separately, to avoid "
+                        "double-counting in Combined"
+                    )
+                    continue
+
                 if len(dirs) == 1:
                     account_dir = dirs[0]
                 else:
@@ -457,7 +675,6 @@ class AccountRegistry:
                         f"merged into '{primary.id}' rather than counted twice in Combined"
                     )
 
-                resolved_number = key[1:] if key.startswith("#") else None
                 configured_number = config.folder_account(account_dir.id)
                 # A configured folder's own Positions data may live only in a
                 # shared/"all accounts" download rather than a file inside its
@@ -466,14 +683,6 @@ class AccountRegistry:
                 # only this folder's own rows out of whatever it finds.
                 position_paths = all_position_paths if configured_number else account_dir.position_paths
 
-                if account_dir.id == DEFAULT_ACCOUNT_ID and self._default_dashboard is not None:
-                    if resolved_number:
-                        claimed_numbers.add(resolved_number)
-                        number_to_id[resolved_number] = DEFAULT_ACCOUNT_ID
-                        if _is_ignored(resolved_number, _dashboard_account_name(self._default_dashboard), config.ignore):
-                            continue
-                    accounts[DEFAULT_ACCOUNT_ID] = self._default_dashboard
-                    continue
                 if not account_dir.history_paths and not position_paths:
                     continue
                 try:
@@ -481,17 +690,27 @@ class AccountRegistry:
                         account_dir.history_paths,
                         position_paths=position_paths,
                         account_number=resolved_number,
+                        opening_balance=config.opening_balance(account_dir.id),
                     )
                 except ValueError as error:
                     warnings.append(f"account '{account_dir.id}': {error}")
                     continue
 
+                # A folder can be named "combined" -- disambiguate rather than
+                # register an account under a reserved id that build() would
+                # silently route to the aggregate view forever.
+                account_id = _unique_folder_account_id(account_dir.id, accounts)
+                if account_id != account_dir.id:
+                    warnings.append(
+                        f"account '{account_dir.id}' collides with a reserved account id -- "
+                        f"registered as '{account_id}' instead"
+                    )
                 if resolved_number:
                     claimed_numbers.add(resolved_number)
-                    number_to_id[resolved_number] = account_dir.id
+                    number_to_id[resolved_number] = account_id
                 if _is_ignored(resolved_number, _dashboard_account_name(dashboard), config.ignore):
                     continue
-                accounts[account_dir.id] = dashboard
+                accounts[account_id] = dashboard
 
             # Every OTHER real account any Positions file mentions, with no
             # folder of its own -- e.g. a linked account that only ever shows
@@ -533,7 +752,19 @@ class AccountRegistry:
             default_account_id = config.default_account
             if default_account_id and default_account_id not in accounts:
                 default_account_id = number_to_id.get(default_account_id, default_account_id)
-            if default_account_id and default_account_id not in accounts and default_account_id != "combined":
+            if default_account_id and default_account_id not in accounts:
+                # Case-insensitive fallback -- same reasoning as
+                # AccountConfig.folder_account()/opening_balance(): a
+                # data/<folder>/'s casing is whatever the OS happened to
+                # create, and an id (as opposed to a number, already handled
+                # above) shouldn't have to match it exactly either.
+                by_lower = {account_id.lower(): account_id for account_id in accounts}
+                default_account_id = by_lower.get(default_account_id.lower(), default_account_id)
+            if (
+                default_account_id
+                and default_account_id not in accounts
+                and default_account_id.lower() != COMBINED_ACCOUNT_ID
+            ):
                 warnings.append(
                     f"{ACCOUNT_CONFIG_FILENAME}: default_account '{config.default_account}' is not a known "
                     "account id or number; falling back to Combined"
@@ -557,11 +788,8 @@ class AccountRegistry:
         rows: list[dict[str, Any]] = []
         for account_id, dashboard in self._accounts.items():
             account_number = account_name = None
-            if dashboard.snapshots:
-                latest = max(
-                    latest_snapshot_per_account(dashboard.snapshots).values(),
-                    key=lambda snapshot: snapshot.as_of,
-                )
+            latest = latest_snapshot(dashboard.snapshots)
+            if latest is not None:
                 account_number, account_name = latest.account_number, latest.account_name
             label = account_name or ("Combined default" if account_id == DEFAULT_ACCOUNT_ID else account_id)
             rows.append(
@@ -579,7 +807,7 @@ class AccountRegistry:
         return rows
 
     def build(self, account_id: str | None, filters: Filters | None = None) -> dict[str, Any]:
-        if not account_id or account_id.lower() == "combined":
+        if not account_id or account_id.lower() == COMBINED_ACCOUNT_ID:
             return self._build_combined(filters)
         payload = self.get(account_id).build(filters)
         payload["meta"] = {**payload["meta"], "account_id": account_id}
@@ -605,9 +833,11 @@ class AccountRegistry:
             "capital_series": capital_series,
             "pnl_series": _combine_pnl_series(payloads),
             "cash_flow": _combine_cash_flow(payloads, capital_series),
+            "wheel_state": _combine_wheel_state(payloads),
             "reconciliation": _combine_reconciliation(payloads),
             "net_worth": net_worth,
             "benchmark": _combine_benchmark(payloads),
+            "wheel_return": _combine_wheel_return(payloads),
         }
 
 
@@ -647,7 +877,7 @@ def _combine_meta(
             {**item, "account_id": account_id} for account_id, p in payloads.items() for item in p["meta"]["unmatched_closes"]
         ],
         "filters": next(iter(metas))["filters"] if metas else {},
-        "account_id": "combined",
+        "account_id": COMBINED_ACCOUNT_ID,
         "account_labels": labels,
         "accounts_included": list(payloads.keys()),
     }
@@ -687,9 +917,10 @@ def _combine_capital_series(payloads: dict[str, dict]) -> list[dict]:
     for payload in payloads.values():
         for point in payload["capital_series"]:
             bucket = buckets.setdefault(
-                point["date"], {"put": 0.0, "stock": 0.0, "call": 0.0, "long": 0.0, "spread": 0.0}
+                point["date"],
+                {"put": 0.0, "stock": 0.0, "call": 0.0, "long": 0.0, "spread": 0.0, "idle_stock": 0.0},
             )
-            for field_name in ("put", "stock", "call", "long", "spread"):
+            for field_name in ("put", "stock", "call", "long", "spread", "idle_stock"):
                 bucket[field_name] += point.get(field_name) or 0.0
 
     series: list[dict] = []
@@ -707,6 +938,7 @@ def _combine_capital_series(payloads: dict[str, dict]) -> list[dict]:
                 "long": round(values["long"], 2),
                 "spread": round(values["spread"], 2),
                 "total": total,
+                "idle_stock": round(values["idle_stock"], 2),
             }
         )
     return series
@@ -787,7 +1019,42 @@ def _combine_cash_flow(payloads: dict[str, dict], capital_series: list[dict]) ->
         date.fromisoformat(payload["meta"]["through"]) for payload in payloads.values() if payload["meta"]["through"]
     ]
     through = max(throughs) if throughs else date.today()
-    return {"months": rows, "trailing": cf.trailing_metrics(rows, through)}
+    return {"months": rows, "trailing": cf.range_summary(rows, capital_points, through)}
+
+
+def _combine_wheel_state(payloads: dict[str, dict]) -> dict[str, Any]:
+    """Sum every account's own wheel-state buckets -- amounts and cycle
+    counts add, ticker sets union, since each account's cycles are distinct
+    positions (no cross-account collision to dedupe, unlike combined cycle
+    ids elsewhere in this module). ``active_cycles`` sums the same way: each
+    account already reports its own unique count, and accounts don't share
+    cycles.
+    """
+    keys = ("puts", "calls", "holding", "other")
+    buckets: dict[str, dict[str, Any]] = {
+        key: {"amount": 0.0, "cycles": 0, "tickers": set()} for key in keys
+    }
+    active_cycles = 0
+    for payload in payloads.values():
+        state = payload.get("wheel_state") or {}
+        for key in keys:
+            bucket = (state.get("buckets") or {}).get(key) or {}
+            buckets[key]["amount"] += bucket.get("amount", 0.0)
+            buckets[key]["cycles"] += bucket.get("cycles", 0)
+            buckets[key]["tickers"].update(bucket.get("tickers", []))
+        active_cycles += state.get("active_cycles", 0)
+
+    return {
+        "buckets": {
+            key: {
+                "amount": round(bucket["amount"], 2),
+                "cycles": bucket["cycles"],
+                "tickers": sorted(bucket["tickers"]),
+            }
+            for key, bucket in buckets.items()
+        },
+        "active_cycles": active_cycles,
+    }
 
 
 def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) -> dict[str, Any]:
@@ -826,6 +1093,9 @@ def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) ->
         if combined["first_date"] and combined["last_date"]
         else 0
     )
+    combined["profit_per_day"] = (
+        combined["option_realized_pl"] / combined["days_span"] if combined["days_span"] else 0.0
+    )
     decided = combined["wins"] + combined["losses"]
     combined["win_rate_pct"] = round(100.0 * combined["wins"] / decided, 2) if decided else None
 
@@ -843,45 +1113,51 @@ def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) ->
     # ROI/ROC are recomputed from the combined capital series' own time-weighted
     # average -- never averaged from each account's own percentage. See module
     # docstring: averaging would weight a small account the same as a large one.
-    engaged = [point["total"] for point in capital_series if point["total"] and point["total"] > 1e-9]
-    avg_capital = sum(engaged) / len(engaged) if engaged else 0.0
+    avg_capital = time_weighted_average(capital_series, value=lambda point: point["total"])
     combined["capital_deployed_now"] = round(capital_series[-1]["total"], 2) if capital_series else 0.0
     combined["peak_capital"] = round(max((point["total"] for point in capital_series), default=0.0), 2)
     combined["avg_capital"] = round(avg_capital, 2)
 
-    if avg_capital > 1e-9 and combined["days_span"]:
-        roi_wheel = 100.0 * combined["option_realized_pl"] / avg_capital
-        scale = 365.0 / combined["days_span"]
-        combined["roi_on_avg_wheel_pct"] = round(roi_wheel, 2)
-        combined["annualized_wheel_roc_pct"] = round(roi_wheel * scale, 2)
-    else:
-        combined["roi_on_avg_wheel_pct"] = None
-        combined["annualized_wheel_roc_pct"] = None
+    combined["roi_on_avg_wheel_pct"], combined["annualized_wheel_roc_pct"] = roi_and_annualized(
+        combined["option_realized_pl"], avg_capital, combined["days_span"]
+    )
+
+    # Same figures again, narrowed to capital actually backing an open put or
+    # covered call (see wheel/metrics.py's CapitalPoint.working_capital and
+    # PortfolioMetrics.avg_active_capital) -- recomputed from the combined
+    # series' own `total - idle_stock` per day, for the same averaging-bias
+    # reason as avg_capital above.
+    def active_capital(point: dict) -> float:
+        return point["total"] - (point.get("idle_stock") or 0.0)
+
+    avg_active_capital = time_weighted_average(capital_series, value=active_capital)
+    combined["active_capital_deployed_now"] = round(active_capital(capital_series[-1]), 2) if capital_series else 0.0
+    combined["peak_active_capital"] = round(
+        max((active_capital(point) for point in capital_series), default=0.0), 2
+    )
+    combined["avg_active_capital"] = round(avg_active_capital, 2)
+
+    combined["roi_on_avg_active_capital_pct"], combined["annualized_active_wheel_roc_pct"] = roi_and_annualized(
+        combined["option_realized_pl"], avg_active_capital, combined["days_span"]
+    )
 
     # Dual-track pair, quoted against total_initial_collateral -- the sum of
     # every account's own summed-per-cycle initial collateral, a different
     # denominator from avg_capital above -- and, like every other combined
     # figure here, recomputed from the combined absolutes rather than
     # averaging each account's own percentage.
-    if combined["total_initial_collateral"] > 1e-9 and combined["days_span"]:
-        scale = 365.0 / combined["days_span"]
-        net_option_yield = 100.0 * combined["option_realized_pl"] / combined["total_initial_collateral"]
-        total_position_pl = (
-            combined["option_realized_pl"]
-            + combined["stock_realized_pl"]
-            + combined["stock_unrealized_pl"]
-            + combined["dividends_received"]
-        )
-        total_position_roi = 100.0 * total_position_pl / combined["total_initial_collateral"]
-        combined["net_option_yield_pct"] = round(net_option_yield, 2)
-        combined["annualized_net_option_yield_pct"] = round(net_option_yield * scale, 2)
-        combined["total_position_roi_pct"] = round(total_position_roi, 2)
-        combined["annualized_total_position_roi_pct"] = round(total_position_roi * scale, 2)
-    else:
-        combined["net_option_yield_pct"] = None
-        combined["annualized_net_option_yield_pct"] = None
-        combined["total_position_roi_pct"] = None
-        combined["annualized_total_position_roi_pct"] = None
+    combined["net_option_yield_pct"], combined["annualized_net_option_yield_pct"] = roi_and_annualized(
+        combined["option_realized_pl"], combined["total_initial_collateral"], combined["days_span"]
+    )
+    total_position_pl = (
+        combined["option_realized_pl"]
+        + combined["stock_realized_pl"]
+        + combined["stock_unrealized_pl"]
+        + combined["dividends_received"]
+    )
+    combined["total_position_roi_pct"], combined["annualized_total_position_roi_pct"] = roi_and_annualized(
+        total_position_pl, combined["total_initial_collateral"], combined["days_span"]
+    )
 
     for money_key in (
         "premium_received",
@@ -896,6 +1172,7 @@ def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) ->
         "total_initial_collateral",
         "dividends_received",
         "stock_unrealized_pl",
+        "profit_per_day",
     ):
         combined[money_key] = round(combined[money_key], 2)
 
@@ -954,6 +1231,35 @@ def _combine_net_worth(payloads: dict[str, dict]) -> dict[str, Any]:
     }
 
 
+def _sparse_series_by_date(series: Sequence[dict], key: str) -> list[tuple[date, float]]:
+    """``(date, value)`` pairs from a per-account benchmark/net-worth series,
+    sorted and with unknown (``None``) values dropped -- the raw material for
+    :func:`_forward_fill_at`.
+    """
+    points = [(date.fromisoformat(row["as_of"]), row[key]) for row in series if row.get(key) is not None]
+    points.sort(key=lambda item: item[0])
+    return points
+
+
+def _forward_fill_at(points: list[tuple[date, float]], as_of: date) -> float | None:
+    """The last known value at or before ``as_of``, or ``None`` if ``points``
+    has nothing that early yet.
+
+    Used to combine two accounts' independently-sampled Positions-snapshot
+    series: account A's own value on a date only account B happened to
+    snapshot is not "unknown" (which would understate the combined total on
+    every date the accounts' snapshots don't land on exactly the same day)
+    -- it is A's own last real reading, carried forward, same as any other
+    infrequently-sampled time series.
+    """
+    value = None
+    for point_date, point_value in points:
+        if point_date > as_of:
+            break
+        value = point_value
+    return value
+
+
 def _combine_benchmark(payloads: dict[str, dict]) -> dict[str, Any]:
     entries = [(account_id, payload["benchmark"]) for account_id, payload in payloads.items()]
     warnings = [f"[{account_id}] {w}" for account_id, benchmark_payload in entries for w in benchmark_payload["warnings"]]
@@ -987,24 +1293,45 @@ def _combine_benchmark(payloads: dict[str, dict]) -> dict[str, Any]:
 
     result = bm.compare_to_benchmark(pooled_events, actual_terminal_value, benchmark_terminal_value, as_of)
 
-    series_by_date: dict[str, dict[str, Any]] = {}
-    for account_id, benchmark_payload in available:
-        for point in benchmark_payload["series"]:
-            bucket = series_by_date.setdefault(point["as_of"], {"actual": 0.0, "benchmark": 0.0, "benchmark_known": True})
-            bucket["actual"] += point["actual_value"] or 0.0
-            if point["benchmark_value"] is None:
-                bucket["benchmark_known"] = False
-            else:
-                bucket["benchmark"] += point["benchmark_value"]
+    # Each account's own series only has a point on the dates *it* happened to
+    # snapshot -- summing by exact date match would silently drop (or
+    # understate) every day the accounts' Positions exports weren't taken on
+    # the same day, which is the common case, not the exception. Forward-fill
+    # each account's own last-known value across the *union* of every
+    # account's snapshot dates instead, so the combined total on any given
+    # day reflects every account's most recent real reading, not just
+    # whichever accounts happened to snapshot that exact day.
+    actual_by_account = {account_id: _sparse_series_by_date(bp["series"], "actual_value") for account_id, bp in available}
+    benchmark_by_account = {
+        account_id: _sparse_series_by_date(bp["series"], "benchmark_value") for account_id, bp in available
+    }
+    all_dates = sorted({date.fromisoformat(point["as_of"]) for _, bp in available for point in bp["series"]})
 
-    series = [
-        {
-            "as_of": day,
-            "actual_value": round(values["actual"], 2),
-            "benchmark_value": round(values["benchmark"], 2) if values["benchmark_known"] else None,
-        }
-        for day, values in sorted(series_by_date.items())
-    ]
+    series = []
+    for day in all_dates:
+        actual_total = 0.0
+        actual_known = False
+        benchmark_total = 0.0
+        benchmark_known = True
+        for account_id, _ in available:
+            actual_value = _forward_fill_at(actual_by_account[account_id], day)
+            if actual_value is not None:
+                actual_total += actual_value
+                actual_known = True
+            benchmark_value = _forward_fill_at(benchmark_by_account[account_id], day)
+            if benchmark_value is None:
+                benchmark_known = False
+            else:
+                benchmark_total += benchmark_value
+        if not actual_known:
+            continue
+        series.append(
+            {
+                "as_of": day.isoformat(),
+                "actual_value": round(actual_total, 2),
+                "benchmark_value": round(benchmark_total, 2) if benchmark_known else None,
+            }
+        )
 
     return {
         "available": True,
@@ -1025,4 +1352,58 @@ def _combine_benchmark(payloads: dict[str, dict]) -> dict[str, Any]:
         },
         "value_added": round(result.value_added, 2) if result.value_added is not None else None,
         "series": series,
+    }
+
+
+def _combine_wheel_return(payloads: dict[str, dict]) -> dict[str, Any]:
+    """Same pooling pattern as ``_combine_benchmark`` above, minus the SPY
+    replay: every account's own wheel-only cash-flow events are pooled and
+    the XIRR resolved once, over the combined timeline -- never averaged
+    from each account's own percentage, which would weight a small account
+    the same as a large one (see this module's own docstring).
+    """
+    entries = [(account_id, payload["wheel_return"]) for account_id, payload in payloads.items()]
+    warnings = [f"[{account_id}] {w}" for account_id, wr in entries for w in wr["warnings"]]
+    available = [(account_id, wr) for account_id, wr in entries if wr["available"]]
+
+    if not available:
+        return {
+            "available": False,
+            "warnings": warnings or ["no account has enough wheel activity yet to compute a return"],
+        }
+
+    pooled_events: list[bm.CashFlowEvent] = []
+    for account_id, wr in available:
+        for event in wr["cash_flow_events"]:
+            pooled_events.append(
+                bm.CashFlowEvent(
+                    date=date.fromisoformat(event["date"]),
+                    amount=event["amount"],
+                    label=f"[{account_id}] {event['label']}",
+                    source=account_id,
+                    kind="WHEEL",
+                )
+            )
+
+    as_of = max(date.fromisoformat(wr["as_of"]) for _, wr in available)
+    terminal_value = sum(wr["terminal_value"] for _, wr in available)
+    result = bm.compare_to_benchmark(pooled_events, terminal_value, None, as_of)
+
+    if result.actual_xirr_pct is None:
+        return {
+            "available": False,
+            "warnings": warnings
+            + ["combined wheel cash flows don't yet have enough sign variation (money in AND money out) to solve for a rate"],
+        }
+
+    return {
+        "available": True,
+        "warnings": warnings,
+        "as_of": as_of.isoformat(),
+        "terminal_value": round(terminal_value, 2),
+        "xirr_pct": round(result.actual_xirr_pct, 2),
+        "cash_flow_events": [
+            {"date": event.date.isoformat(), "amount": round(event.amount, 2), "label": event.label}
+            for event in sorted(pooled_events, key=lambda event: event.date)
+        ],
     }

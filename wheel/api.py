@@ -18,6 +18,7 @@ from wheel import benchmark as bm
 from wheel import cashflow as cf
 from wheel import marketdata
 from wheel.engine import Cycle, WheelEngine, build_cycles
+from wheel.fileio import peek_text
 from wheel.metrics import (
     capital_timeline,
     cycle_metrics,
@@ -28,6 +29,9 @@ from wheel.metrics import (
     portfolio_metrics,
     realized_pl_series,
     ticker_summary,
+    wheel_cash_flow_events,
+    wheel_state_breakdown,
+    wheel_terminal_value,
 )
 from wheel.parser import (
     OPTION_ACTIONS,
@@ -37,17 +41,15 @@ from wheel.parser import (
     Transaction,
     parse_exports,
 )
-from wheel.positions import discover_position_snapshots, latest_snapshot_per_account, load_snapshots
+from wheel.positions import discover_position_snapshots, latest_snapshot, latest_snapshot_per_account, load_snapshots
 
 EXPORT_DIRS = (".", "data")
 
 
 def _find_history_header(path: str) -> str | None:
     """The 'Run Date...' header line of a broker export, if this file has one."""
-    try:
-        with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
-            head = handle.read(4096)
-    except OSError:
+    head = peek_text(path)
+    if head is None:
         return None
     return next((line for line in head.splitlines() if line.lower().startswith("run date")), None)
 
@@ -195,6 +197,7 @@ def _capital_point(point) -> dict[str, Any]:
     call = _money(point.call_collateral)
     long_premium = _money(point.long_premium)
     spread = _money(point.spread_collateral)
+    idle_stock = _money(point.idle_stock_basis)
     return {
         "date": _iso(point.day),
         "put": put,
@@ -203,6 +206,10 @@ def _capital_point(point) -> dict[str, Any]:
         "long": long_premium,
         "spread": spread,
         "total": round(put + stock + call + long_premium + spread, 2),
+        # Slice of `stock` with no covered call currently written against it
+        # -- see CapitalPoint.working_capital. `total - idle_stock` is the
+        # capital actually backing an open put or covered call that day.
+        "idle_stock": idle_stock,
     }
 
 
@@ -380,7 +387,15 @@ class Dashboard:
         csv_path: str | Sequence[str] | None = None,
         position_paths: str | Sequence[str] | None = None,
         account_number: str | None = None,
+        opening_balance: tuple[date, float] | None = None,
     ):
+        # A manual stand-in for a real, earlier Positions snapshot -- see
+        # data/accounts.json's "opening_balances" (wheel/accounts.py's module
+        # docstring) and _build_benchmark() below, the only place this is
+        # used. Never touches self.snapshots or anything derived from it --
+        # Total value, Capital deployed, and every other current-state figure
+        # still come only from real, itemized Positions data.
+        self.opening_balance = opening_balance
         if csv_path is None:
             csv_path = discover_exports()
         paths = [csv_path] if isinstance(csv_path, str) else list(csv_path)
@@ -437,6 +452,10 @@ class Dashboard:
         # multiply that cost by however many times the user adjusts a filter.
         self._price_cache: dict[str, float | None] | None = None
         self._price_warnings: list[str] = []
+        # Lazily built on the first build() call too -- it needs current_prices,
+        # which needs the same network fetch _price_cache above is guarding
+        # against repeating, so it can't be computed any earlier than that.
+        self._wheel_return: dict[str, Any] | None = None
 
     # ---- market data ----
 
@@ -595,38 +614,55 @@ class Dashboard:
                 "warnings": ["no Portfolio Positions snapshot found for this account"],
             }
 
-        latest_by_account = latest_snapshot_per_account(self.snapshots)
-        primary_account = max(latest_by_account.values(), key=lambda snapshot: snapshot.as_of).account_number
+        primary_account = latest_snapshot(self.snapshots).account_number
         account_snapshots = sorted(
             (s for s in self.snapshots if s.account_number == primary_account),
             key=lambda snapshot: snapshot.as_of,
         )
 
-        if len(account_snapshots) < 2:
+        # The opening point this comparison measures from: a real, earlier
+        # snapshot if two or more are on file, or `self.opening_balance` --
+        # data/accounts.json's "opening_balances" -- standing in for one that
+        # isn't. The configured value also wins over the earliest real
+        # snapshot when its own date comes first, stretching the comparison
+        # window further back than the Positions export history alone would
+        # allow (a later real "opening" is strictly worse than an earlier
+        # configured one).
+        earliest_real = account_snapshots[0].as_of.date()
+        if self.opening_balance and self.opening_balance[0] < earliest_real:
+            opening_day, opening_value = self.opening_balance
+            opening_label = "Opening balance (configured in accounts.json)"
+            opening_source = "accounts.json"
+        elif len(account_snapshots) >= 2:
+            opening_day = earliest_real
+            opening_value = account_snapshots[0].total_value
+            opening_label = "Opening balance (first available snapshot)"
+            opening_source = account_snapshots[0].source
+        else:
             return {
                 "available": False,
                 "warnings": [
-                    "at least two Portfolio Positions snapshots, taken on different "
-                    "dates, are needed to compute a return -- only one is available so far"
+                    "at least two Portfolio Positions snapshots, taken on different dates, are "
+                    "needed to compute a return -- only one is available so far (or add an "
+                    "'opening_balances' entry for this account to data/accounts.json to supply "
+                    "an earlier starting point manually)"
                 ],
             }
 
         events, warnings = bm.external_cashflows(self.transactions)
-        first_snapshot = account_snapshots[0]
         as_of = account_snapshots[-1].as_of.date()
 
         # The tracked transaction history rarely reaches back to when the account
-        # was first funded, so the account's value at the earliest available
-        # snapshot stands in for an opening investment made on that date. Without
+        # was first funded, so the account's value at the opening day (real or
+        # configured) stands in for an investment made on that date. Without
         # it, XIRR would see only cash moved after that point and ignore whatever
         # balance was already in place -- understating invested capital, or with
         # no external transfers on record at all, making the return uncomputable.
-        opening_day = first_snapshot.as_of.date()
         opening_event = bm.CashFlowEvent(
             date=opening_day,
-            amount=first_snapshot.total_value,
-            label="Opening balance (first available snapshot)",
-            source=first_snapshot.source,
+            amount=opening_value,
+            label=opening_label,
+            source=opening_source,
             kind="OPENING_BALANCE",
         )
         all_events = [opening_event] + [event for event in events if event.date > opening_day]
@@ -637,13 +673,34 @@ class Dashboard:
         def price_lookup(day: date):
             return marketdata.price_on_or_before(price_points, day)
 
-        valuation_dates = [snapshot.as_of.date() for snapshot in account_snapshots]
+        valuation_dates = sorted({opening_day, *(snapshot.as_of.date() for snapshot in account_snapshots)})
         benchmark_values = bm.simulate_benchmark_series(all_events, valuation_dates, price_lookup)
 
         actual_terminal_value = account_snapshots[-1].total_value
         benchmark_terminal_value = benchmark_values.get(as_of)
 
         result = bm.compare_to_benchmark(all_events, actual_terminal_value, benchmark_terminal_value, as_of)
+
+        series = [
+            {
+                "as_of": snapshot.as_of.date().isoformat(),
+                "actual_value": _money(snapshot.total_value),
+                "benchmark_value": _money(benchmark_values.get(snapshot.as_of.date())),
+            }
+            for snapshot in account_snapshots
+        ]
+        if opening_day < earliest_real:
+            # A configured opening point that reaches earlier than any real
+            # snapshot -- give the growth-over-time chart a starting point to
+            # draw from too, not just the return math above.
+            series.insert(
+                0,
+                {
+                    "as_of": opening_day.isoformat(),
+                    "actual_value": _money(opening_value),
+                    "benchmark_value": _money(benchmark_values.get(opening_day)),
+                },
+            )
 
         return {
             "available": True,
@@ -668,13 +725,61 @@ class Dashboard:
                 "xirr_pct": _money(result.benchmark_xirr_pct),
             },
             "value_added": _money(result.value_added),
-            "series": [
-                {
-                    "as_of": snapshot.as_of.date().isoformat(),
-                    "actual_value": _money(snapshot.total_value),
-                    "benchmark_value": _money(benchmark_values.get(snapshot.as_of.date())),
-                }
-                for snapshot in account_snapshots
+            "series": series,
+        }
+
+    def _build_wheel_return(self, current_prices: dict[str, float]) -> dict[str, Any]:
+        """Money-weighted (XIRR) return isolated to just the wheel -- see
+        ``wheel.metrics.wheel_cash_flow_events``/``wheel_terminal_value`` for
+        what counts and why (option legs and assignment-sourced share lots
+        only; every other holding in the account -- buy-and-hold ETFs,
+        non-wheel stock, dividends -- is excluded, unlike ``_build_benchmark``'s
+        whole-account figure, which only sees a single terminal total_value
+        with no notion of "which dollars are wheel dollars").
+
+        Uses ``self.all_cycles`` -- every cycle ever built from this
+        account's full history -- independent of whatever ticker/date
+        filters are active on this particular ``build()`` call, the same
+        "fact about a moment in time, not a slice of the transaction window"
+        reasoning ``_build_net_worth``/``_build_benchmark`` already follow.
+        """
+        events = wheel_cash_flow_events(self.all_cycles)
+        if len(events) < 2:
+            return {
+                "available": False,
+                "warnings": [
+                    "not enough wheel activity yet to compute a return -- need at least one "
+                    "full open/close (or assignment) on record"
+                ],
+            }
+
+        through = self.last_date or date.today()
+        terminal_value = wheel_terminal_value(self.all_cycles, through, current_prices)
+        cash_flow_events = [
+            bm.CashFlowEvent(date=event_date, amount=amount, label=label, source="wheel", kind="WHEEL")
+            for event_date, amount, label in events
+        ]
+        result = bm.compare_to_benchmark(cash_flow_events, terminal_value, None, through)
+
+        if result.actual_xirr_pct is None:
+            return {
+                "available": False,
+                "warnings": [
+                    "wheel cash flows don't yet have enough sign variation (money in AND "
+                    "money out) to solve for a rate -- typically means every tracked "
+                    "position is still open"
+                ],
+            }
+
+        return {
+            "available": True,
+            "warnings": [],
+            "as_of": through.isoformat(),
+            "terminal_value": _money(result.actual_terminal_value),
+            "xirr_pct": _money(result.actual_xirr_pct),
+            "cash_flow_events": [
+                {"date": event.date.isoformat(), "amount": _money(event.amount), "label": event.label}
+                for event in sorted(cash_flow_events, key=lambda event: event.date)
             ],
         }
 
@@ -715,6 +820,37 @@ class Dashboard:
         if filters.statuses:
             capital_cycles = [cycle for cycle in capital_cycles if cycle.status in filters.statuses]
 
+        # The capital snapshot reaches at least as far as the latest Positions
+        # export, even past `through` -- `through` is pinned to the last
+        # *transaction*, so a day with a fresh account download but no trade
+        # (the common case: most days nothing happens) would otherwise have no
+        # capital_series point for that date at all, and the frontend's
+        # "not deployed" overlay (which matches a Positions snapshot date
+        # against an exact capital_series day -- see notDeployedByDate in
+        # app.js) would silently fail to show anything for it.
+        #
+        # Gated on `through >= self.last_date`, not on `filters.end is None`:
+        # every non-"all history" preset (ytd, last 30 days, ...) sets
+        # `filters.end` explicitly to `meta.data_last_date` (app.js's
+        # applyPreset()), so gating on "no explicit end" would mean this
+        # almost never fires under the app's own default view. What actually
+        # distinguishes "stop exactly here" from "this happens to be as far
+        # as the data goes" is whether `through` reaches the account's true
+        # latest transaction (`self.last_date`, unfiltered by ticker/date) --
+        # a deliberately historical window (a past calendar year, a ticker
+        # filter whose last trade predates other tickers' activity) sits
+        # strictly before it and is left alone.
+        #
+        # Kept as a separate variable (not a `through` reassignment) so P&L
+        # figures -- days_span and everything annualized against it -- stay
+        # anchored to real trading activity, not inflated by trade-free days
+        # that exist only because an export happened to be downloaded.
+        capital_through = through
+        if self.snapshots and through >= (self.last_date or through):
+            latest_snapshot_date = max(s.as_of.date() for s in self.snapshots)
+            if latest_snapshot_date > capital_through:
+                capital_through = latest_snapshot_date
+
         # Stock Unrealized P&L (current_prices) and Total Position ROI's
         # dividend term (dividends) both apply to `cycles` -- the same
         # ticker/date/status-filtered set every other P&L figure here uses --
@@ -722,6 +858,8 @@ class Dashboard:
         # unrealized gains don't leak into the figures on screen.
         current_prices = self._current_prices()
         dividends = dividends_by_cycle(cycles, transactions)
+        if self._wheel_return is None:
+            self._wheel_return = self._build_wheel_return(current_prices)
 
         portfolio = portfolio_metrics(
             cycles,
@@ -730,8 +868,14 @@ class Dashboard:
             since=since,
             current_prices=current_prices,
             dividends_by_cycle=dividends,
+            capital_through=capital_through,
         )
-        capital = portfolio_capital_series(capital_cycles, through, since)
+        capital = portfolio_capital_series(capital_cycles, capital_through, since)
+        # "Right now," not "since": uses capital_cycles directly (uncropped by
+        # `since`), the same state-scoped set capital_deployed_now/avg_capital/
+        # peak_capital already use -- a single current-moment snapshot has no
+        # display-crop analog the way a time series does.
+        wheel_state = wheel_state_breakdown(capital_cycles, capital_through)
 
         # Cash flow is dated to each row's own event_date, not to the cycle it
         # eventually belongs to, so it is built straight from the (ticker/date)
@@ -739,12 +883,11 @@ class Dashboard:
         # than from `cycles` itself. Collateral for the yield-% denominator reuses
         # `capital`, the same series the "Capital deployed" chart already shows,
         # so the two agree with each other.
-        cash_flow_rows = cf.monthly_cashflow_series(
-            transactions, [(point.day, point.total) for point in capital], through, since
-        )
+        capital_points = [(point.day, point.total) for point in capital]
+        cash_flow_rows = cf.monthly_cashflow_series(transactions, capital_points, through, since)
         cash_flow = {
             "months": cash_flow_rows,
-            "trailing": cf.trailing_metrics(cash_flow_rows, through),
+            "trailing": cf.range_summary(cash_flow_rows, capital_points, through),
         }
 
         return {
@@ -821,9 +964,11 @@ class Dashboard:
             ],
             "pnl_series": realized_pl_series(cycles),
             "cash_flow": cash_flow,
+            "wheel_state": wheel_state,
             "reconciliation": _reconciliation(
                 transactions, built_cycles, self.reports, engine.unmatched_cash
             ),
             "net_worth": self._net_worth,
             "benchmark": self._benchmark,
+            "wheel_return": self._wheel_return,
         }

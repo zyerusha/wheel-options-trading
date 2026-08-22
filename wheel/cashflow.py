@@ -51,6 +51,7 @@ from datetime import date
 from typing import Sequence
 
 from wheel.parser import BTC, BTO, OTHER, STC, STO, Transaction
+from wheel.statmath import time_weighted_average
 
 OPTION_CASH_ACTIONS = frozenset({STO, BTC, BTO, STC})
 
@@ -163,17 +164,12 @@ def _next_month(year: int, month: int) -> tuple[int, int]:
     return (year + 1, 1) if month == 12 else (year, month + 1)
 
 
-def _months_before(year: int, month: int, delta: int) -> tuple[int, int]:
-    index = year * 12 + (month - 1) - delta
-    return index // 12, index % 12 + 1
-
-
 def month_average_collateral(capital_points: Sequence[tuple[date, float]], year: int, month: int) -> float:
     """Time-weighted average committed capital over the days of one calendar
-    month -- the same ``_time_weighted_average`` idiom as
-    ``wheel.metrics``, just re-scoped from a cycle's lifetime to one month.
-    Days at zero capital are excluded, so a month that closes a position on
-    the 3rd and opens nothing else isn't diluted by 27 empty days.
+    month -- ``wheel.statmath.time_weighted_average``, re-scoped from a
+    cycle's lifetime to one month. Days at zero capital are excluded, so a
+    month that closes a position on the 3rd and opens nothing else isn't
+    diluted by 27 empty days.
 
     Public (not underscore-prefixed): ``wheel.accounts``'s Combined view calls
     this directly against its own already-combined capital series rather than
@@ -181,8 +177,8 @@ def month_average_collateral(capital_points: Sequence[tuple[date, float]], year:
     why combined figures are always recomputed from combined absolutes.
     """
     start, end = _month_bounds(year, month)
-    engaged = [total for day, total in capital_points if start <= day <= end and total > 1e-9]
-    return sum(engaged) / len(engaged) if engaged else 0.0
+    in_month = [(day, total) for day, total in capital_points if start <= day <= end]
+    return time_weighted_average(in_month, value=lambda point: point[1])
 
 
 def monthly_cashflow_series(
@@ -261,66 +257,57 @@ def monthly_cashflow_series(
 
 
 # --------------------------------------------------------------------------
-# Trailing metrics
+# Range summary
 # --------------------------------------------------------------------------
 
 
-def trailing_metrics(rows: Sequence[dict], as_of: date, window_months: int = 12) -> dict:
-    """TTM cash flow, average monthly income, and annualized cash-on-cash
-    return, over the ``window_months`` calendar months ending at ``as_of``'s
-    own month (inclusive).
+def range_summary(rows: Sequence[dict], capital_points: Sequence[tuple[date, float]], as_of: date) -> dict:
+    """Cash flow, average monthly income, and annualized cash-on-cash return
+    over the SAME range already shown in ``rows`` -- whatever date filter is
+    currently selected, not a fixed trailing-12-month lookback. Widen or
+    narrow the dashboard's date range and this summary moves with it, exactly
+    as the Monthly Breakdown table above it does, because both are built from
+    the same ``rows``.
 
-    When fewer than ``window_months`` months of history exist, the window
-    (and therefore ``months_counted``) simply comes up short rather than
-    padding with zeros -- padding would understate ``avg_monthly_income`` for
-    an account only a few months old, exactly when that figure is least
-    reliable and most likely to be looked at.
-
-    ``trailing_avg_collateral`` is the mean of each window month's own average
-    collateral, skipping months with none committed -- the same "don't dilute
-    with zero-capital periods" principle as
-    ``wheel.metrics._time_weighted_average``, just applied to monthly
-    averages instead of daily totals. The annualized figure scales
-    ``avg_monthly_income`` up to a full year (``x 12``) against that capital
-    base, mirroring how ``annualized_wheel_roc_pct`` scales a period return to
-    ``DAYS_PER_YEAR / days_active`` in ``wheel.metrics`` -- same idea, monthly
-    cadence instead of daily.
+    ``avg_collateral`` is a single time-weighted average over every day in
+    ``capital_points`` -- the same series, and the same
+    ``wheel.statmath.time_weighted_average``, that
+    ``wheel.metrics.portfolio_metrics`` uses for Annualized Wheel ROC's own
+    denominator. Deliberately not the mean of each month's own average: that
+    would silently diverge from ROC's figure even over an identical window,
+    since a month with capital deployed for 3 days counts the same as one
+    with 30 in an average of averages, but not in a true time-weighted one.
+    The annualized figure scales ``avg_monthly_income`` up to a full year
+    (``x 12``) against that capital base -- correct regardless of how many
+    months are actually in ``rows``, since "average dollars per month" is
+    already a monthly rate before the scaling.
     """
     if not rows:
         return {
             "as_of": as_of.isoformat(),
-            "window_months": window_months,
             "months_counted": 0,
-            "ttm_cash_flow": 0.0,
+            "cash_flow": 0.0,
             "avg_monthly_income": None,
-            "trailing_avg_collateral": 0.0,
+            "avg_collateral": 0.0,
             "annualized_cash_on_cash_return_pct": None,
         }
 
-    cutoff = _months_before(as_of.year, as_of.month, window_months - 1)
-    upper = (as_of.year, as_of.month)
-    window = [row for row in rows if cutoff <= (row["year"], row["month"]) <= upper]
+    months_counted = len(rows)
+    cash_flow = sum(row["net_cash_flow"] for row in rows)
+    avg_monthly_income = cash_flow / months_counted
 
-    months_counted = len(window)
-    ttm_cash_flow = sum(row["net_cash_flow"] for row in window)
-    avg_monthly_income = ttm_cash_flow / months_counted if months_counted else None
-
-    engaged = [row["avg_collateral"] for row in window if row["avg_collateral"] > 1e-9]
-    trailing_avg_collateral = sum(engaged) / len(engaged) if engaged else 0.0
+    avg_collateral = time_weighted_average(capital_points, value=lambda point: point[1])
 
     annualized_cash_on_cash_return_pct = None
-    if avg_monthly_income is not None and trailing_avg_collateral > 1e-9:
-        annualized_cash_on_cash_return_pct = round(
-            100.0 * (avg_monthly_income * 12.0) / trailing_avg_collateral, 4
-        )
+    if avg_collateral > 1e-9:
+        annualized_cash_on_cash_return_pct = round(100.0 * (avg_monthly_income * 12.0) / avg_collateral, 4)
 
     return {
         "as_of": as_of.isoformat(),
-        "window_months": window_months,
         "months_counted": months_counted,
-        "ttm_cash_flow": round(ttm_cash_flow, 2),
-        "avg_monthly_income": round(avg_monthly_income, 2) if avg_monthly_income is not None else None,
-        "trailing_avg_collateral": round(trailing_avg_collateral, 2),
+        "cash_flow": round(cash_flow, 2),
+        "avg_monthly_income": round(avg_monthly_income, 2),
+        "avg_collateral": round(avg_collateral, 2),
         "annualized_cash_on_cash_return_pct": annualized_cash_on_cash_return_pct,
     }
 
@@ -374,13 +361,13 @@ def format_ascii_chart(rows: Sequence[dict], *, width: int = 30) -> str:
     return "\n".join(lines)
 
 
-def format_report(rows: Sequence[dict], trailing: dict) -> str:
-    """The full terminal report: table, month-over-month bar chart, trailing
-    metrics -- everything :func:`monthly_cashflow_series` and
-    :func:`trailing_metrics` produce, in one printable block.
+def format_report(rows: Sequence[dict], summary: dict) -> str:
+    """The full terminal report: table, month-over-month bar chart, range
+    summary -- everything :func:`monthly_cashflow_series` and
+    :func:`range_summary` produce, in one printable block.
     """
-    avg_income = trailing["avg_monthly_income"]
-    coc = trailing["annualized_cash_on_cash_return_pct"]
+    avg_income = summary["avg_monthly_income"]
+    coc = summary["annualized_cash_on_cash_return_pct"]
     lines = [
         "Monthly Cash Flow -- Wheel Strategy",
         "=" * 36,
@@ -391,10 +378,9 @@ def format_report(rows: Sequence[dict], trailing: dict) -> str:
         "-" * 31,
         format_ascii_chart(rows),
         "",
-        f"Trailing metrics (as of {trailing['as_of']})",
+        f"Summary over this range (as of {summary['as_of']}, {summary['months_counted']} month(s))",
         "-" * 31,
-        f"TTM cash flow:            {trailing['ttm_cash_flow']:,.2f}"
-        f"  ({trailing['months_counted']} of {trailing['window_months']} months)",
+        f"Cash flow:                {summary['cash_flow']:,.2f}",
         "Avg monthly income:       " + ("n/a" if avg_income is None else f"{avg_income:,.2f}"),
         "Annualized cash-on-cash:  " + ("n/a" if coc is None else f"{coc:.2f}%"),
     ]
@@ -417,8 +403,8 @@ def _build_report(csv_paths: Sequence[str] | None = None) -> str:
     capital = portfolio_capital_series(dashboard.all_cycles, through)
     capital_points = [(point.day, point.total) for point in capital]
     rows = monthly_cashflow_series(transactions, capital_points, through)
-    trailing = trailing_metrics(rows, through)
-    return format_report(rows, trailing)
+    summary = range_summary(rows, capital_points, through)
+    return format_report(rows, summary)
 
 
 def main() -> None:

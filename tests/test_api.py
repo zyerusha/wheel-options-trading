@@ -12,13 +12,33 @@ from datetime import date
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from wheel import api as api_module  # noqa: E402
-from wheel.api import Dashboard  # noqa: E402
+from wheel.api import Dashboard, Filters  # noqa: E402
 from wheel.marketdata import PricePoint  # noqa: E402
 
 HISTORY_HEADER = (
     "Run Date,Action,Symbol,Description,Type,Quantity,Price ($),Commission ($),"
     "Fees ($),Accrued Interest ($),Amount ($),Cash Balance ($),Settlement Date"
 )
+POSITIONS_HEADER = (
+    "Account number,Account name,Symbol,Description,Quantity,Last price,Last price change,"
+    "Current value,Today's gain/loss dollar,Today's gain/loss percent,Total gain/loss dollar,"
+    "Total gain/loss percent,Percent of account,Cost basis total,Average cost basis,Type"
+)
+
+
+def _write_positions_csv(path: str, account_number: str, cash_value: float, as_of: str) -> None:
+    """A single cash-only position row -- ``total_value`` == ``cash_value``,
+    so the test's expected "not deployed" figure is unambiguous.
+    """
+    row = (
+        f'{account_number},"Test Account",SPAXX**,"MONEY MARKET",{cash_value},$1.00,,'
+        f"${cash_value:.2f},,,,,100.00%,${cash_value:.2f},$1.00,Cash,"
+    )
+    with open(path, "w", encoding="utf-8-sig", newline="") as handle:
+        handle.write(POSITIONS_HEADER + "\n")
+        handle.write(row + "\n")
+        handle.write("\n")
+        handle.write(f'"Date downloaded {as_of} 5:00 p.m ET"\n')
 
 
 def _assigned_put_rows(symbol: str, underlying: str, open_date: str, assign_date: str, as_of: str) -> list[str]:
@@ -142,6 +162,55 @@ class TestCurrentPrices(unittest.TestCase):
             finally:
                 api_module.marketdata.get_price_series = original
             self.assertEqual(prices, {})
+
+
+class TestCapitalThroughExtendsToPositionsSnapshot(unittest.TestCase):
+    """A same-day account refresh with no trade -- the common case, most days
+    nothing happens -- must still land on the capital chart, not vanish
+    because `through` is pinned to the last transaction. Regression coverage
+    for the `capital_through` plumbing in `Dashboard.build()`.
+    """
+
+    def _dashboard(self, tmp: str) -> Dashboard:
+        history_path = os.path.join(tmp, "History_for_Account.csv")
+        _write_history_csv(
+            history_path,
+            [
+                # $10,000 collateral, never closed.
+                '08/01/2026,"YOU SOLD OPENING TRANSACTION PUT (MU) ...",-MU260901P100,'
+                '"PUT ...",Cash,-1,3.00,0,0,,300.00,10000.00,08/01/2026',
+                # A later, unrelated event -- just to make `self.last_date`
+                # (2026-08-07) land before the Positions snapshot
+                # (2026-08-08) while staying after the CSP's own open date.
+                '08/07/2026,"DIVIDEND RECEIVED MU",MU,"MU DESCRIPTION",Cash,,,0,0,,5.00,10005.00,08/07/2026',
+            ],
+        )
+        positions_path = os.path.join(tmp, "Portfolio_Positions.csv")
+        _write_positions_csv(positions_path, "111111111", 50000.0, "Aug-08-2026")
+        return Dashboard(history_path, position_paths=[positions_path])
+
+    def test_all_history_view_extends_capital_series_to_the_snapshot_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dashboard = self._dashboard(tmp)
+            data = dashboard.build()  # no filters -- through == self.last_date
+
+            self.assertEqual(data["net_worth"]["timeline"][0]["as_of"], "2026-08-08")
+            last_point = data["capital_series"][-1]
+            self.assertEqual(last_point["date"], "2026-08-08")
+            self.assertAlmostEqual(last_point["total"], 10000.0, places=2)  # unchanged, just carried forward
+            self.assertAlmostEqual(data["portfolio"]["capital_deployed_now"], 10000.0, places=2)
+
+            # The extension must not leak into days_span/annualization -- those
+            # stay anchored to `through` (2026-08-07), not `capital_through`.
+            self.assertEqual(data["portfolio"]["days_span"], 6)  # Aug 1 -> Aug 7
+
+    def test_explicit_historical_end_filter_is_not_overridden(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dashboard = self._dashboard(tmp)
+            data = dashboard.build(Filters(end=date(2026, 8, 3)))  # before self.last_date
+
+            last_point = data["capital_series"][-1]
+            self.assertEqual(last_point["date"], "2026-08-03")  # not stretched to the snapshot date
 
 
 if __name__ == "__main__":

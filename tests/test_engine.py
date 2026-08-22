@@ -157,6 +157,28 @@ class TestPartialFillsAndFIFO(unittest.TestCase):
         self.assertEqual(len(engine.unmatched_closes), 1)
         self.assertEqual(engine.unmatched_closes[0]["contracts"], 2)
 
+    def test_close_larger_than_position_prorates_cash_by_full_size_not_matched_size(self):
+        """The single visible contract must absorb only 1/3 of the buy-back's
+        cost, not all of it, even though only 1 of the 3 contracts this BTC
+        closes has a known opening leg (the other 2 were opened before this
+        export's window). Dividing the row's cash by the matched count instead
+        of the requested count would load the whole 3-contract cost onto the
+        1 visible contract, tripling its apparent realized P/L.
+        """
+        cycles, engine = build_cycles(
+            [
+                tx("2025-10-10", STO, "-MU251024P180", -1, 7.40, 739.33),
+                tx("2025-10-17", BTC, "-MU251024P180", 3, 1.12, -338.01),
+            ]
+        )
+        leg = cycles[0].legs[0]
+        per_contract_cost = -338.01 / 3
+        self.assertAlmostEqual(leg.realized_pl, 739.33 + per_contract_cost, places=2)
+        # The excluded 2 contracts' own share of the cash is tracked, not
+        # dropped -- the reconciliation total still balances exactly.
+        self.assertAlmostEqual(engine.unmatched_cash, per_contract_cost * 2, places=2)
+        self.assertAlmostEqual(engine.unmatched_closes[0]["cash"], per_contract_cost * 2, places=2)
+
     def test_same_day_open_and_close(self):
         """A 0-DTE style open-then-close on one day must still match its lot."""
         cycles, engine = build_cycles(

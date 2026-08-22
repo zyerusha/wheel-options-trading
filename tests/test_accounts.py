@@ -23,6 +23,7 @@ from wheel.accounts import (  # noqa: E402
     discover_account_dirs,
     load_account_config,
 )
+from wheel.api import Dashboard  # noqa: E402
 
 HISTORY_HEADER = (
     "Run Date,Action,Symbol,Description,Type,Quantity,Price ($),Commission ($),"
@@ -539,6 +540,317 @@ class TestAccountConfig(unittest.TestCase):
     def test_no_default_range_configured(self):
         registry = AccountRegistry(base_dir=self.data_dir, extra_dirs=())
         self.assertIsNone(registry.default_range)
+
+    def test_opening_balance_lookup_matches_case_insensitively(self):
+        config = AccountConfig(opening_balances={"IRA": (date(2024, 1, 1), 50000.0)})
+        self.assertEqual(config.opening_balance("ira"), (date(2024, 1, 1), 50000.0))
+        self.assertEqual(config.opening_balance("IRA"), (date(2024, 1, 1), 50000.0))
+        self.assertIsNone(config.opening_balance("other"))
+
+    def test_opening_balances_loaded_from_json(self):
+        self._write_config({"opening_balances": {"ira": {"date": "2024-01-01", "balance": 50000}}})
+        config, warnings = load_account_config(self.data_dir)
+        self.assertEqual(config.opening_balances, {"ira": (date(2024, 1, 1), 50000.0)})
+        self.assertEqual(warnings, [])
+
+    def test_opening_balances_invalid_entries_are_skipped_with_a_warning(self):
+        self._write_config(
+            {
+                "opening_balances": {
+                    "ira": {"date": "not-a-date", "balance": 50000},
+                    "roth-ira": {"date": "2024-01-01", "balance": "fifty thousand"},
+                    "other": "not an object",
+                }
+            }
+        )
+        config, warnings = load_account_config(self.data_dir)
+        self.assertEqual(config.opening_balances, {})
+        self.assertEqual(len(warnings), 3)
+
+    def test_opening_balance_unblocks_benchmark_with_only_one_real_snapshot(self):
+        """The 'ira' folder's own Positions file (see setUp) has exactly one
+        snapshot -- not enough on its own to compute a benchmark return. A
+        configured opening_balances entry dated before it must unblock the
+        comparison without needing a second real Positions export.
+        """
+        registry = AccountRegistry(base_dir=self.data_dir, extra_dirs=())
+        baseline = registry.build("ira")
+        self.assertFalse(baseline["benchmark"]["available"])
+
+        self._write_config({"opening_balances": {"ira": {"date": "2025-01-01", "balance": 10000}}})
+        registry.refresh(force=True)
+        payload = registry.build("ira")
+
+        self.assertTrue(payload["benchmark"]["available"])
+        opening = payload["benchmark"]["cash_flow_events"][0]
+        self.assertEqual(opening["label"], "Opening balance (configured in accounts.json)")
+        self.assertEqual(opening["date"], "2025-01-01")
+        self.assertAlmostEqual(opening["amount"], 10000.0, places=2)
+
+    def test_opening_balance_is_ignored_when_not_earlier_than_the_real_snapshot(self):
+        """A configured date on or after the one real snapshot on file (Sep
+        25, 2025 -- see setUp) adds nothing a real snapshot doesn't already
+        have, and must not paper over "not enough snapshots yet".
+        """
+        self._write_config({"opening_balances": {"ira": {"date": "2025-12-01", "balance": 10000}}})
+        registry = AccountRegistry(base_dir=self.data_dir, extra_dirs=())
+        payload = registry.build("ira")
+        self.assertFalse(payload["benchmark"]["available"])
+
+
+class TestCombinedWheelState(unittest.TestCase):
+    """Two accounts, each contributing a different wheel-state bucket, so the
+    Combined view has to sum them rather than pick one or overwrite the other.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.data_dir = os.path.join(self.tmp.name, "data")
+        ira_dir = os.path.join(self.data_dir, "ira")
+        taxable_dir = os.path.join(self.data_dir, "taxable")
+        os.makedirs(ira_dir)
+        os.makedirs(taxable_dir)
+
+        # ira: a lone open CSP, still active -- Cash-Secured Puts bucket.
+        write_history_csv(
+            os.path.join(ira_dir, "History_for_Account.csv"),
+            [
+                '09/19/2025,"YOU SOLD OPENING TRANSACTION PUT (MU) ...",-MU250926P150,'
+                '"PUT ...",Cash,-1,3.35,0,0,,334.33,10000.00,09/19/2025',
+                # Keeps this account's own "through" resolving after the filter
+                # window below (Nov 1) even though the CSP itself opened
+                # earlier -- exactly the real scenario: some later ledger
+                # activity anchors "through" into the window while the
+                # position that matters predates it and is still active.
+                '11/15/2025,"DIVIDEND RECEIVED MU",MU,"MU DESCRIPTION",Cash,,,0,0,,5.00,10005.00,11/15/2025',
+            ],
+        )
+        write_positions_csv(
+            os.path.join(ira_dir, "Portfolio_Positions.csv"),
+            "111111111",
+            "IRA",
+            [positions_row("111111111", "IRA", "MU", 15000.0)],
+            "Sep-19-2025",
+        )
+
+        # taxable: assigned shares with an open covered call -- Covered Calls
+        # bucket carries the shares' cost basis (the whole point being tested:
+        # this cycle's stock capital must NOT land in Holding Shares).
+        write_history_csv(
+            os.path.join(taxable_dir, "History_for_Account.csv"),
+            [
+                '10/01/2025,"YOU SOLD OPENING TRANSACTION PUT (WFC) ...",-WFC251010P50,'
+                '"PUT ...",Cash,-1,2.00,0,0,,200.00,20000.00,10/01/2025',
+                '10/10/2025,"ASSIGNED PUT as of Oct-10-2025",-WFC251010P50,"PUT ...",'
+                "Cash,1,,0,0,,0.00,19800.00,10/10/2025",
+                '10/15/2025,"YOU SOLD OPENING TRANSACTION CALL (WFC) ...",-WFC251101C55,'
+                '"CALL ...",Cash,-1,1.50,0,0,,150.00,19950.00,10/15/2025',
+                # Same day as ira's dividend below: keeps both accounts'
+                # independently-computed "through" aligned, so the combined
+                # capital series (bucketed by exact date, see
+                # _combine_capital_series) has both accounts represented on
+                # its last day. Misaligned per-account "through" dates are a
+                # separate, pre-existing concern in the combine layer, not
+                # something this fix touches.
+                '11/15/2025,"DIVIDEND RECEIVED WFC",WFC,"WFC DESCRIPTION",Cash,,,0,0,,3.00,19953.00,11/15/2025',
+            ],
+        )
+        write_positions_csv(
+            os.path.join(taxable_dir, "Portfolio_Positions.csv"),
+            "222222222",
+            "Taxable",
+            [positions_row("222222222", "Taxable", "WFC", 5000.0)],
+            "Oct-15-2025",
+        )
+
+        self.registry = AccountRegistry(base_dir=self.data_dir, extra_dirs=())
+
+    def test_combined_wheel_state_sums_across_accounts(self):
+        combined = self.registry.build("combined")
+        buckets = combined["wheel_state"]["buckets"]
+
+        self.assertAlmostEqual(buckets["puts"]["amount"], 15000.0, places=2)  # ira's CSP
+        self.assertEqual(buckets["puts"]["tickers"], ["MU"])
+
+        self.assertAlmostEqual(buckets["calls"]["amount"], 5000.0, places=2)  # taxable's shares
+        self.assertEqual(buckets["calls"]["tickers"], ["WFC"])
+        self.assertAlmostEqual(buckets["holding"]["amount"], 0.0, places=2)
+
+        self.assertEqual(combined["wheel_state"]["active_cycles"], 2)
+
+    def test_single_account_wheel_state_matches_its_own_slice(self):
+        ira_only = self.registry.build("ira")
+        self.assertAlmostEqual(ira_only["wheel_state"]["buckets"]["puts"]["amount"], 15000.0, places=2)
+        self.assertEqual(ira_only["wheel_state"]["active_cycles"], 1)
+
+        taxable_only = self.registry.build("taxable")
+        self.assertAlmostEqual(taxable_only["wheel_state"]["buckets"]["calls"]["amount"], 5000.0, places=2)
+        self.assertEqual(taxable_only["wheel_state"]["active_cycles"], 1)
+
+    def test_wheel_state_capital_matches_capital_deployed_now_under_a_date_filter(self):
+        """The regression this whole feature exists to guard: filtering to a
+        window that starts after both positions opened must not change either
+        figure -- both are state snapshots, not window-scoped event counts.
+        """
+        from wheel.accounts import Filters
+
+        filtered = self.registry.build("combined", Filters(start=date(2025, 11, 1)))
+        buckets = filtered["wheel_state"]["buckets"]
+        total = sum(bucket["amount"] for bucket in buckets.values())
+        self.assertAlmostEqual(total, filtered["portfolio"]["capital_deployed_now"], places=2)
+        self.assertAlmostEqual(total, 20000.0, places=2)  # unchanged from the unfiltered view
+
+
+class TestReservedAccountIds(unittest.TestCase):
+    """A folder or auto-discovered account must never end up registered
+    under the reserved "combined" id -- build() would silently route every
+    request for it to the aggregate view instead of its own dashboard.
+    """
+
+    def test_folder_named_combined_is_disambiguated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = os.path.join(tmp, "data")
+            combined_dir = os.path.join(data_dir, "combined")
+            os.makedirs(combined_dir)
+            write_history_csv(
+                os.path.join(combined_dir, "History_for_Account.csv"),
+                csp_round_trip_rows("-MU250926P150", "09/19/2025", "09/25/2025", 3.35, 0.95),
+            )
+            write_positions_csv(
+                os.path.join(combined_dir, "Portfolio_Positions.csv"),
+                "111111111", "Some Account",
+                [positions_row("111111111", "Some Account", "MU", 15000.0)],
+                "Sep-25-2025",
+            )
+
+            registry = AccountRegistry(base_dir=data_dir, extra_dirs=())
+            ids = {row["id"] for row in registry.list_accounts()}
+            self.assertNotIn("combined", ids)
+            # Renamed, not dropped -- the account's own data is still reachable.
+            renamed = next(i for i in ids if i.startswith("combined-"))
+            payload = registry.build(renamed)
+            self.assertEqual(payload["portfolio"]["cycles"], 1)
+            # "combined" itself still means the aggregate view, not this account.
+            self.assertTrue(registry.build("combined")["meta"]["combined"])
+
+
+class TestLiveDefaultDashboardMerge(unittest.TestCase):
+    """When the default bucket's own account number matches a named folder's,
+    the live (externally managed, e.g. just-uploaded) default Dashboard must
+    win -- not get silently discarded in favor of a fresh rebuild from disk,
+    and the named folder must not also register separately (which would
+    double-count the same real account in Combined).
+    """
+
+    def test_default_dashboard_identity_is_preserved_on_merge(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = os.path.join(tmp, "data")
+            ira_dir = os.path.join(data_dir, "ira")
+            os.makedirs(ira_dir)
+
+            history_rows = csp_round_trip_rows("-MU250926P150", "09/19/2025", "09/25/2025", 3.35, 0.95)
+            position_rows = [positions_row("111111111", "Some Account", "MU", 15000.0)]
+
+            default_history = os.path.join(data_dir, "History_for_Account.csv")
+            default_positions = os.path.join(data_dir, "Portfolio_Positions.csv")
+            write_history_csv(default_history, history_rows)
+            write_positions_csv(default_positions, "111111111", "Some Account", position_rows, "Sep-25-2025")
+            write_history_csv(os.path.join(ira_dir, "History_for_Account.csv"), history_rows)
+            write_positions_csv(
+                os.path.join(ira_dir, "Portfolio_Positions.csv"),
+                "111111111", "Some Account", position_rows, "Sep-25-2025",
+            )
+
+            registry = AccountRegistry(base_dir=data_dir, extra_dirs=())
+            live_dashboard = Dashboard([default_history], position_paths=[default_positions])
+            registry.set_default_dashboard(live_dashboard)
+
+            self.assertIs(registry.get(DEFAULT_ACCOUNT_ID), live_dashboard)
+            # 'ira' shares the same account number -- it must not also show
+            # up as its own separate account.
+            ids = {row["id"] for row in registry.list_accounts()}
+            self.assertEqual(ids, {DEFAULT_ACCOUNT_ID})
+
+            combined = registry.build("combined")
+            self.assertEqual(combined["portfolio"]["cycles"], 1)
+
+
+class TestDefaultAccountCaseInsensitive(unittest.TestCase):
+    def test_default_account_matches_folder_casing_insensitively(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = os.path.join(tmp, "data")
+            joint_dir = os.path.join(data_dir, "Joint")
+            os.makedirs(joint_dir)
+            write_history_csv(
+                os.path.join(joint_dir, "History_for_Account.csv"),
+                csp_round_trip_rows("-MU250926P150", "09/19/2025", "09/25/2025", 3.35, 0.95),
+            )
+            write_positions_csv(
+                os.path.join(joint_dir, "Portfolio_Positions.csv"),
+                "111111111", "Joint Account",
+                [positions_row("111111111", "Joint Account", "MU", 15000.0)],
+                "Sep-25-2025",
+            )
+            with open(os.path.join(data_dir, "accounts.json"), "w", encoding="utf-8") as handle:
+                json.dump({"default_account": "JOINT"}, handle)
+
+            registry = AccountRegistry(base_dir=data_dir, extra_dirs=())
+            self.assertEqual(registry.default_account_id, "Joint")
+
+
+class TestCombineBenchmarkDateAlignment(unittest.TestCase):
+    """Each account's own benchmark series only has a point on the dates it
+    happened to snapshot -- summing by exact date match silently drops (or
+    understates) every day two accounts' Positions exports weren't taken on
+    the same day, which is the common case. The combined series must
+    forward-fill each account's last-known value instead.
+    """
+
+    @staticmethod
+    def _benchmark_payload(series):
+        return {
+            "available": True,
+            "warnings": [],
+            "as_of": series[-1]["as_of"],
+            "cash_flow_events": [
+                {"date": "2026-01-01", "amount": 10000.0, "label": "Opening balance", "kind": "OPENING_BALANCE"}
+            ],
+            "actual": {"terminal_value": series[-1]["actual_value"], "xirr_pct": None},
+            "benchmark": {"name": "SPY", "terminal_value": series[-1]["benchmark_value"], "xirr_pct": None},
+            "value_added": None,
+            "series": series,
+        }
+
+    def test_combined_series_forward_fills_across_misaligned_snapshot_dates(self):
+        from wheel.accounts import _combine_benchmark
+
+        payloads = {
+            "a": {
+                "benchmark": self._benchmark_payload(
+                    [{"as_of": "2026-06-01", "actual_value": 50000.0, "benchmark_value": 48000.0}]
+                )
+            },
+            "b": {
+                "benchmark": self._benchmark_payload(
+                    [{"as_of": "2026-07-15", "actual_value": 30000.0, "benchmark_value": 29000.0}]
+                )
+            },
+        }
+
+        combined = _combine_benchmark(payloads)
+        self.assertTrue(combined["available"])
+        series = {point["as_of"]: point for point in combined["series"]}
+
+        # Both dates are represented -- not just whichever account happened
+        # to snapshot that exact day.
+        self.assertEqual(set(series), {"2026-06-01", "2026-07-15"})
+        # 'b' has no snapshot yet as of 'a's date -- only 'a' contributes.
+        self.assertAlmostEqual(series["2026-06-01"]["actual_value"], 50000.0, places=2)
+        # By 'b's date, 'a's last-known value (50000) is forward-filled and
+        # summed with 'b's own real reading -- never silently just 30000.
+        self.assertAlmostEqual(series["2026-07-15"]["actual_value"], 80000.0, places=2)
+        self.assertAlmostEqual(series["2026-07-15"]["benchmark_value"], 48000.0 + 29000.0, places=2)
 
 
 if __name__ == "__main__":

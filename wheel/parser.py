@@ -40,6 +40,8 @@ from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from typing import Iterable, Iterator, Sequence
 
+from wheel.fileio import find_line
+
 # --------------------------------------------------------------------------
 # Action vocabulary
 # --------------------------------------------------------------------------
@@ -395,10 +397,7 @@ def _read_rows(path: str) -> tuple[list[dict], dict[str, str]]:
     with open(path, "r", encoding="utf-8-sig", newline="") as handle:
         lines = handle.read().splitlines()
 
-    header_index = next(
-        (i for i, line in enumerate(lines) if _HEADER_KEY in line.lower().split(",")[0]),
-        None,
-    )
+    header_index = find_line(lines, lambda line: _HEADER_KEY in line.lower().split(",")[0])
     if header_index is None:
         raise FidelityFormatError(f"no 'Run Date' header row found in {path!r}")
 

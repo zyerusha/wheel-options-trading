@@ -690,23 +690,34 @@ class WheelEngine:
         cycle = self._active_cycle.get(underlying) or self._cycle_for(underlying, row.event_date)
         total_available = sum(leg.remaining_contracts for leg in lots)
         matched = min(wanted, total_available)
+
+        # Per-contract cash is always the row's own total spread over the *full*
+        # requested size, never just the portion that matched a known lot.  A
+        # single BTC of 3 contracts at a uniform fill price still costs 1/3 of
+        # the row's Amount per contract even when this export only shows 1 of
+        # those 3 as open (the other 2 were opened before the window) --
+        # dividing by `matched` instead would load the whole 3-contract cost
+        # onto the 1 visible contract, tripling its apparent realized P/L.
+        cash_per_contract = row.amount / wanted if wanted else 0.0
+        fees_per_contract = row.total_fees / wanted if wanted else 0.0
+
         if wanted - total_available > 1e-9:
+            excess_contracts = wanted - total_available
+            excess_cash = cash_per_contract * excess_contracts
+            self.unmatched_cash += excess_cash
             self.unmatched_closes.append(
                 {
                     "date": row.event_date.isoformat(),
                     "symbol": row.occ_symbol,
                     "action": row.action,
-                    "contracts": wanted - total_available,
-                    "cash": 0.0,
+                    "contracts": excess_contracts,
+                    "cash": round(excess_cash, 2),
                     "reason": (
-                        "close exceeds open position; its full cash is allocated "
-                        "across the contracts that did match"
+                        "close exceeds open position; its pro-rata share of cash "
+                        "has no matching lot and is excluded from any leg's P/L"
                     ),
                 }
             )
-
-        cash_per_contract = row.amount / matched if matched else 0.0
-        fees_per_contract = row.total_fees / matched if matched else 0.0
 
         records: list[dict] = []
         remaining = matched

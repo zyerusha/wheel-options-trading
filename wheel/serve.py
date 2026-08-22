@@ -38,7 +38,7 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from wheel.accounts import DEFAULT_ACCOUNT_ID, AccountRegistry  # noqa: E402
+from wheel.accounts import COMBINED_ACCOUNT_ID, DEFAULT_ACCOUNT_ID, AccountRegistry  # noqa: E402
 from wheel.api import (  # noqa: E402
     Dashboard,
     Filters,
@@ -120,6 +120,78 @@ def _find_existing_duplicate(body: bytes) -> str | None:
         if same:
             return path
     return None
+
+
+def _write_uploads(target_dir: str, files: list[tuple[str, bytes]], written: list[str]) -> list[str]:
+    """Write ``files`` into ``target_dir`` (deduping against files already on
+    disk anywhere under ``data/`` or the project root -- see
+    :func:`_find_existing_duplicate`), then reject the batch as a whole if it
+    contains a multi-account export or anything unrecognized.
+
+    Shared by :meth:`DashboardState.accept_uploads` (the default bucket) and
+    :meth:`Handler._accept_account_upload` (a named account's own folder) --
+    the two differ only in which directory this writes into and what happens
+    to ``resolved`` afterward (one activates it as the transaction-history
+    dataset; the other just needs the registry to notice new files exist).
+
+    ``written`` is populated in place with every freshly created path (not
+    ones reused from an existing duplicate) as this function goes, rather
+    than returned alongside ``resolved`` -- so it stays populated for the
+    caller to roll back even when this function raises partway through (this
+    function does not roll anything back itself, since a caller that goes on
+    to run its own validation after this returns needs those same files
+    rolled back on *that* validation's failure too; see
+    :func:`_rollback_uploads`).
+    """
+    if not files:
+        raise DatasetError("no file content was sent")
+
+    os.makedirs(target_dir, exist_ok=True)
+    resolved: list[str] = []  # this upload's files, written or reused from an existing duplicate
+    for filename, body in files:
+        if not body:
+            raise DatasetError(f"{filename or 'upload'} was empty")
+        duplicate = _find_existing_duplicate(body)
+        if duplicate:
+            resolved.append(duplicate)
+            continue
+        name = safe_filename(filename)
+        target = os.path.join(target_dir, name)
+        if os.path.exists(target):
+            stem, extension = os.path.splitext(name)
+            target = os.path.join(target_dir, f"{stem}-{datetime.now():%Y%m%d-%H%M%S%f}{extension}")
+        with open(target, "wb") as handle:
+            handle.write(body)
+        written.append(target)
+        resolved.append(target)
+
+    multi_account = [path for path in resolved if looks_like_multi_account_export(path)]
+    if multi_account:
+        names = ", ".join(os.path.basename(path) for path in multi_account)
+        raise DatasetError(
+            f"{names}: this looks like Fidelity's multi-account transaction history export "
+            "(separate 'Account'/'Account Number' columns) -- not supported yet. "
+            "Download a per-account History_for_Account_*.csv export instead."
+        )
+
+    unrecognized = [path for path in resolved if not looks_like_export(path) and not looks_like_position_snapshot(path)]
+    if unrecognized:
+        names = ", ".join(os.path.basename(path) for path in unrecognized)
+        raise DatasetError(f"not a recognized Fidelity export: {names}")
+
+    return resolved
+
+
+def _rollback_uploads(written: list[str]) -> None:
+    """Remove every freshly written file in ``written`` -- best-effort, since
+    a file that's already gone (or was never writable to begin with) leaves
+    nothing to roll back.
+    """
+    for path in written:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 class DashboardState:
@@ -234,13 +306,23 @@ class DashboardState:
         exports out of it, since those are never "activated" the same way (see
         the class docstring). ``position_paths=None`` still auto-discovers
         whatever Positions exports already exist on disk.
+
+        An empty ``paths`` means "no transaction-history change requested" --
+        the legitimate positions-only-upload case (see ``accept_uploads``'s
+        own docstring), where there is nothing transaction-shaped to
+        validate. A *non-empty* ``paths`` that parses to zero transactions is
+        always rejected, regardless of what Positions snapshots happen to
+        already exist elsewhere in the project: ``Dashboard(paths)`` auto-
+        discovers every Positions file on disk project-wide (not just ones
+        related to this selection), so checking ``dashboard.snapshots`` here
+        would validate an unrelated fact rather than this actual upload.
         """
         try:
             dashboard = Dashboard(paths)
         except Exception as error:
             raise DatasetError(f"{type(error).__name__}: {error}") from error
-        if not dashboard.transactions and not dashboard.snapshots:
-            raise DatasetError("parsed successfully but contains no transactions or positions")
+        if paths and not dashboard.transactions:
+            raise DatasetError("parsed successfully but contains no transactions")
         return dashboard
 
     def _activate(self, paths: list[str], dashboard: Dashboard) -> None:
@@ -282,47 +364,9 @@ class DashboardState:
         requires ``keep_current`` nor disturbs whatever transaction-history
         exports are currently active.
         """
-        if not files:
-            raise DatasetError("no file content was sent")
-
-        os.makedirs(UPLOAD_DIR, exist_ok=True)
         written: list[str] = []  # freshly created files -- rolled back on failure
-        resolved: list[str] = []  # this upload's files, written or reused from an existing duplicate
         try:
-            for filename, body in files:
-                if not body:
-                    raise DatasetError(f"{filename or 'upload'} was empty")
-                duplicate = _find_existing_duplicate(body)
-                if duplicate:
-                    resolved.append(duplicate)
-                    continue
-                name = safe_filename(filename)
-                target = os.path.join(UPLOAD_DIR, name)
-                if os.path.exists(target):
-                    stem, extension = os.path.splitext(name)
-                    target = os.path.join(
-                        UPLOAD_DIR, f"{stem}-{datetime.now():%Y%m%d-%H%M%S%f}{extension}"
-                    )
-                with open(target, "wb") as handle:
-                    handle.write(body)
-                written.append(target)
-                resolved.append(target)
-
-            multi_account = [path for path in resolved if looks_like_multi_account_export(path)]
-            if multi_account:
-                names = ", ".join(os.path.basename(path) for path in multi_account)
-                raise DatasetError(
-                    f"{names}: this looks like Fidelity's multi-account transaction history export "
-                    "(separate 'Account'/'Account Number' columns) -- not supported yet. "
-                    "Download a per-account History_for_Account_*.csv export instead."
-                )
-
-            unrecognized = [
-                path for path in resolved if not looks_like_export(path) and not looks_like_position_snapshot(path)
-            ]
-            if unrecognized:
-                names = ", ".join(os.path.basename(path) for path in unrecognized)
-                raise DatasetError(f"not a recognized Fidelity export: {names}")
+            resolved = _write_uploads(UPLOAD_DIR, files, written)
 
             new_history = [path for path in resolved if looks_like_export(path)]
             if keep_current:
@@ -335,11 +379,7 @@ class DashboardState:
             targets = list(dict.fromkeys(targets))
             dashboard = self._validate(targets)
         except DatasetError:
-            for path in written:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+            _rollback_uploads(written)
             raise
 
         self._activate(targets, dashboard)
@@ -433,7 +473,16 @@ class Handler(BaseHTTPRequestHandler):
                     self._send_json({"error": f"unknown account {account_id!r}"}, 404)
             elif route == "/api/health":
                 self._sync_registry()
-                payload = self.registry.build(_preferred_account(self.registry))
+                try:
+                    payload = self.registry.build(_preferred_account(self.registry))
+                except KeyError:
+                    # A concurrent refresh() (another thread, between
+                    # _preferred_account()'s own read of list_accounts() and
+                    # this build()) can remove or rename the account it just
+                    # picked -- Combined always exists once any account does,
+                    # so this is a liveness check, not a specific account's
+                    # data, and always has an answer to fall back to.
+                    payload = self.registry.build(COMBINED_ACCOUNT_ID)
                 self._send_json(
                     {
                         "status": "ok",
@@ -567,7 +616,7 @@ class Handler(BaseHTTPRequestHandler):
         # DashboardState at all, since a named account has no "active
         # selection" concept -- every file found in its folder is always
         # included (see AccountRegistry).
-        if not account_id or account_id.lower() in {DEFAULT_ACCOUNT_ID, "combined"}:
+        if not account_id or account_id.lower() in {DEFAULT_ACCOUNT_ID, COMBINED_ACCOUNT_ID}:
             keep = (self.headers.get("X-Keep-Current") or "").lower() in {"1", "true", "yes"}
             self.state.accept_uploads(self._read_uploads(), keep_current=keep)
             self._send_json(self._dataset_listing(self._loaded_message("Loaded")))
@@ -586,55 +635,12 @@ class Handler(BaseHTTPRequestHandler):
         default bucket. The folder is created if this is the first file for a
         brand-new account name.
         """
-        if not files:
-            raise DatasetError("no file content was sent")
-
         target_dir = os.path.join(UPLOAD_DIR, account_id)
-        os.makedirs(target_dir, exist_ok=True)
-
         written: list[str] = []  # freshly created files -- rolled back on failure
-        resolved: list[str] = []  # this upload's files, written or reused from an existing duplicate
         try:
-            for filename, body in files:
-                if not body:
-                    raise DatasetError(f"{filename or 'upload'} was empty")
-                duplicate = _find_existing_duplicate(body)
-                if duplicate:
-                    resolved.append(duplicate)
-                    continue
-                name = safe_filename(filename)
-                target = os.path.join(target_dir, name)
-                if os.path.exists(target):
-                    stem, extension = os.path.splitext(name)
-                    target = os.path.join(
-                        target_dir, f"{stem}-{datetime.now():%Y%m%d-%H%M%S%f}{extension}"
-                    )
-                with open(target, "wb") as handle:
-                    handle.write(body)
-                written.append(target)
-                resolved.append(target)
-
-            multi_account = [path for path in resolved if looks_like_multi_account_export(path)]
-            if multi_account:
-                names = ", ".join(os.path.basename(path) for path in multi_account)
-                raise DatasetError(
-                    f"{names}: this looks like Fidelity's multi-account transaction history export "
-                    "(separate 'Account'/'Account Number' columns) -- not supported yet. "
-                    "Download a per-account History_for_Account_*.csv export instead."
-                )
-
-            unrecognized = [
-                path for path in resolved if not looks_like_export(path) and not looks_like_position_snapshot(path)
-            ]
-            if unrecognized:
-                names = ", ".join(os.path.basename(path) for path in unrecognized)
-                raise DatasetError(f"not a recognized Fidelity export: {names}")
+            resolved = _write_uploads(target_dir, files, written)
         except DatasetError:
-            for path in written:
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
+            _rollback_uploads(written)
             raise
 
         self.registry.refresh(force=True)
@@ -670,7 +676,7 @@ def _preferred_account(registry: AccountRegistry) -> str:
     subfolder and the project root/``data`` has nothing loose in it.
     """
     ids = {row["id"] for row in registry.list_accounts()}
-    return DEFAULT_ACCOUNT_ID if DEFAULT_ACCOUNT_ID in ids else "combined"
+    return DEFAULT_ACCOUNT_ID if DEFAULT_ACCOUNT_ID in ids else COMBINED_ACCOUNT_ID
 
 
 # How long a "the browser tab is probably still open" marker stays valid.

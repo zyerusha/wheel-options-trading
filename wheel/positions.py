@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Sequence
 
+from wheel.fileio import find_line, peek_text
 from wheel.parser import _num, parse_occ_symbol
 
 POSITION_HEADER_KEY = "account number"
@@ -209,10 +210,8 @@ class AccountSnapshot:
 
 def looks_like_position_snapshot(path: str) -> bool:
     """Cheap header peek: does this CSV look like a Positions export?"""
-    try:
-        with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
-            head = handle.read(4096)
-    except OSError:
+    head = peek_text(path)
+    if head is None:
         return False
     return any(line.lower().startswith(POSITION_HEADER_KEY) for line in head.splitlines())
 
@@ -275,10 +274,7 @@ def parse_position_snapshot(path: str) -> tuple[list[AccountSnapshot], list[str]
     which is robust to their exact position or wording.
     """
     lines = _read_lines(path)
-    header_index = next(
-        (i for i, line in enumerate(lines) if line.lower().split(",")[0].strip() == POSITION_HEADER_KEY),
-        None,
-    )
+    header_index = find_line(lines, lambda line: line.lower().split(",")[0].strip() == POSITION_HEADER_KEY)
     if header_index is None:
         raise PositionsFormatError(f"no 'Account number' header row found in {path!r}")
 
@@ -351,19 +347,56 @@ def parse_position_snapshot(path: str) -> tuple[list[AccountSnapshot], list[str]
     return snapshots, warnings
 
 
+# path -> (mtime, snapshots, warnings) at that mtime. A file is one account's
+# (or a handful of linked accounts') Positions export, unlikely to change
+# mid-session -- and the same "all accounts" file is routinely handed to
+# load_snapshots() several times in one AccountRegistry.refresh() (once per
+# configured folder that widens its search to it, plus once more to scan for
+# unclaimed accounts -- see wheel/accounts.py), so caching by (path, mtime)
+# avoids re-reading and re-parsing an unchanged multi-KB CSV several times
+# over for work whose answer cannot have changed. Keyed by mtime, not
+# invalidated any other way, so an edited file is transparently re-parsed the
+# next time its own mtime moves -- the same fingerprint idiom the rest of this
+# codebase (DashboardState._fingerprint, AccountRegistry._subfolder_fingerprint)
+# already uses to decide when a rebuild is actually needed.
+_parse_cache: dict[str, tuple[float, list[AccountSnapshot], list[str]]] = {}
+
+
+def _cached_parse_position_snapshot(path: str) -> tuple[list[AccountSnapshot], list[str]]:
+    mtime = os.path.getmtime(path)
+    cached = _parse_cache.get(path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1], cached[2]
+    parsed, warnings = parse_position_snapshot(path)
+    _parse_cache[path] = (mtime, parsed, warnings)
+    return parsed, warnings
+
+
 def load_snapshots(paths: Sequence[str]) -> tuple[list[AccountSnapshot], list[str]]:
     """Parse every file, then sort the combined list by (account, as_of).
 
     A duplicate ``(account_number, as_of)`` pair across two files -- the same
     snapshot re-downloaded or re-uploaded -- keeps the first occurrence and
     warns, rather than double counting a re-imported file.
+
+    Each file is parsed in isolation: one malformed or unreadable Positions
+    CSV produces a warning and is skipped, rather than aborting every other
+    (unrelated) file in ``paths``. This matters because a caller can widen
+    ``paths`` to every Positions file discovered across every account folder
+    (see ``wheel.accounts.AccountRegistry.refresh``'s ``all_position_paths``)
+    -- without per-file isolation, a single corrupted export for one account
+    would silently take down every other account's Dashboard construction too.
     """
     snapshots: list[AccountSnapshot] = []
     warnings: list[str] = []
     seen: dict[tuple[str, datetime], str] = {}
 
     for path in paths:
-        parsed, file_warnings = parse_position_snapshot(path)
+        try:
+            parsed, file_warnings = _cached_parse_position_snapshot(path)
+        except (OSError, PositionsFormatError) as error:
+            warnings.append(f"{os.path.basename(path)}: could not read this Positions file ({error}); skipped")
+            continue
         warnings.extend(file_warnings)
         for snapshot in parsed:
             key = (snapshot.account_number, snapshot.as_of)
@@ -388,3 +421,16 @@ def latest_snapshot_per_account(snapshots: Sequence[AccountSnapshot]) -> dict[st
         if current is None or snapshot.as_of > current.as_of:
             latest[snapshot.account_number] = snapshot
     return latest
+
+
+def latest_snapshot(snapshots: Sequence[AccountSnapshot]) -> AccountSnapshot | None:
+    """The single most-recently-seen snapshot across every account in
+    ``snapshots``, or ``None`` if ``snapshots`` is empty.
+
+    The ``max(latest_snapshot_per_account(x).values(), key=lambda s:
+    s.as_of)`` idiom this wraps was independently re-derived at several call
+    sites in :mod:`wheel.accounts` and :mod:`wheel.api` -- centralized here so
+    the "most recent" tie-break rule only needs to change in one place.
+    """
+    per_account = latest_snapshot_per_account(snapshots)
+    return max(per_account.values(), key=lambda snapshot: snapshot.as_of) if per_account else None

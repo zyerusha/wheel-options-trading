@@ -7,6 +7,7 @@ import os
 import string
 import sys
 import unittest
+from dataclasses import replace
 from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -15,7 +16,6 @@ from tests.test_engine import tx  # noqa: E402
 from wheel.cashflow import dividend_transactions  # noqa: E402
 from wheel.engine import COVERED_CALL, CSP, LONG_PUT, build_cycles  # noqa: E402
 from wheel.metrics import (  # noqa: E402
-    _time_weighted_average,
     capital_timeline,
     cycle_metrics,
     dividends_by_cycle,
@@ -24,6 +24,10 @@ from wheel.metrics import (  # noqa: E402
     portfolio_metrics,
     realized_pl_series,
     ticker_summary,
+    time_weighted_average,
+    wheel_cash_flow_events,
+    wheel_state_breakdown,
+    wheel_terminal_value,
 )
 from wheel.parser import ASSIGNED, BTC, BTO, EXPIRED, OTHER, STC, STO  # noqa: E402
 
@@ -81,6 +85,88 @@ class TestCapitalTimeline(unittest.TestCase):
         points = capital_timeline(cycles[0], date(2025, 9, 16))
         self.assertAlmostEqual(points[0].call_collateral, 58800.0)
         self.assertTrue(cycles[0].capital_estimated)
+
+    def test_assigned_shares_with_open_covered_call_are_not_idle(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-11-17", STO, "-MU251121P230", -1, 4.00, 399.33, row_id=1),
+                tx("2025-11-21", ASSIGNED, "-MU251121P230", 1, None, 0.0, row_id=2, as_of="2025-11-20"),
+                tx("2025-11-24", STO, "-MU251128C235", -1, 2.00, 199.33, row_id=3),
+            ]
+        )
+        points = {point.day: point for point in capital_timeline(cycles[0], date(2025, 11, 25))}
+        after_call = points[date(2025, 11, 25)]
+        self.assertAlmostEqual(after_call.idle_stock_basis, 0.0)
+        self.assertAlmostEqual(after_call.working_capital, after_call.total)
+
+    def test_assigned_shares_with_no_covered_call_are_fully_idle(self):
+        """The regression this field exists for: a hold with no call written
+        against it is real, committed capital (still counted in `total`,
+        still shown on "Capital deployed") but contributes nothing to the
+        capital that's actually backing an open option -- `working_capital`
+        must exclude every dollar of it, not just discount it.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-11-17", STO, "-MU251121P230", -1, 4.00, 399.33, row_id=1),
+                tx("2025-11-21", ASSIGNED, "-MU251121P230", 1, None, 0.0, row_id=2, as_of="2025-11-20"),
+            ]
+        )
+        points = {point.day: point for point in capital_timeline(cycles[0], date(2025, 11, 25))}
+        held = points[date(2025, 11, 25)]
+        self.assertAlmostEqual(held.stock_basis, 23000.0)
+        self.assertAlmostEqual(held.idle_stock_basis, 23000.0)
+        self.assertAlmostEqual(held.working_capital, 0.0)
+        self.assertAlmostEqual(held.total, 23000.0)  # still fully counted here
+
+    def test_a_fresh_csp_stays_working_alongside_an_idle_hold(self):
+        """Same cycle, both at once: idle shares from an earlier assignment
+        plus a brand-new CSP on a second lot. working_capital must reflect
+        only the CSP side.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-09-19", STO, "-MU250926P230", -1, 4.00, 399.33, row_id=1),
+                tx("2025-09-26", ASSIGNED, "-MU250926P230", 1, None, 0.0, row_id=2, as_of="2025-09-26"),
+                tx("2025-10-01", STO, "-MU251101P220", -1, 3.00, 299.33, row_id=3),
+            ]
+        )
+        points = {point.day: point for point in capital_timeline(cycles[0], date(2025, 10, 2))}
+        point = points[date(2025, 10, 2)]
+        self.assertAlmostEqual(point.idle_stock_basis, 23000.0)
+        self.assertAlmostEqual(point.working_capital, 22000.0)  # the fresh CSP's collateral only
+        self.assertAlmostEqual(point.total, 45000.0)
+
+    def test_cycle_opened_after_through_contributes_no_points(self):
+        """A cycle that opens two days after the requested `through` must not
+        leak a single point at its own start date -- that previously happened
+        via the ``end < cycle.start_date: end = cycle.start_date`` guard,
+        which silently reported capital from beyond the caller's own horizon.
+        This exact shape hit ``_build_net_worth()`` in production: the History
+        export can be a few days fresher than the Positions snapshot, so a
+        newly opened cycle would outrun the snapshot's own ``as_of`` date and
+        get counted as "capital deployed as of the snapshot" when it hadn't
+        even existed yet on that day.
+        """
+        cycles, _ = build_cycles([tx("2025-09-17", STO, "-JXN251016C50", -1, 4.20, 419.33)])
+        points = capital_timeline(cycles[0], date(2025, 9, 15))
+        self.assertEqual(points, [])
+
+    def test_cycle_closing_after_through_stops_the_walk_at_through(self):
+        """A cycle that closes after `through` (e.g. a same-day-fresher
+        History export shows the close, but the caller only asked "as of"
+        an earlier snapshot date) must stop reporting capital at `through`,
+        not walk all the way to the real close date.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-09-15", STO, "-MU250926P150", -1, 3.35, 334.33, row_id=1),
+                tx("2025-09-26", EXPIRED, "-MU250926P150", 1, None, 0.0, row_id=2, as_of="2025-09-26"),
+            ]
+        )
+        points = capital_timeline(cycles[0], date(2025, 9, 20))
+        self.assertEqual(points[-1].day, date(2025, 9, 20))
+        self.assertAlmostEqual(points[-1].total, 15000.0)  # still fully committed at `through`
 
 
 class TestSpreadCollateral(unittest.TestCase):
@@ -480,7 +566,7 @@ class TestCapitalSeriesGaps(unittest.TestCase):
         self.assertLess(len(before), len(filled))  # there really was a gap to fill
 
         self.assertAlmostEqual(
-            _time_weighted_average(filled), _time_weighted_average(before), places=6
+            time_weighted_average(filled), time_weighted_average(before), places=6
         )
         self.assertAlmostEqual(
             max(p.total for p in filled), max(p.total for p in before), places=6
@@ -676,6 +762,69 @@ class TestPortfolioRollup(unittest.TestCase):
         self.assertEqual(result.cycles, 0)
         self.assertIsNone(result.annualized_wheel_roc_pct)
         self.assertIsNone(result.win_rate_pct)
+
+
+class TestActiveCapital(unittest.TestCase):
+    """`avg_active_capital`/`annualized_active_wheel_roc_pct`: the same Wheel
+    ROC denominator, narrowed to capital actually backing an open put or
+    covered call -- shares held with no covered call written against them
+    (an idle hold after assignment) are real, counted capital in
+    `avg_capital`, but must not count here.
+    """
+
+    def test_idle_holding_shares_dilute_avg_capital_but_not_avg_active_capital(self):
+        """MU: CSP assigned (as of Nov 20 -- capital_timeline transitions on
+        the assignment's ``as_of`` day, not the transaction row's own date),
+        never gets a covered call -- idle from then on. QQQ: a separate CSP,
+        open the whole window, providing a steady $5,000 of genuinely
+        "working" capital every day so idle days register as diluted (some
+        working capital > 0), not excluded entirely (which is what happens
+        when NO capital is working that day -- see time_weighted_average's
+        engaged-days filter).
+
+        Total capital is a flat $28,000 for all 9 days (Nov 17-25 inclusive)
+        -- assignment doesn't change the total, only what's backing it.
+        Working capital is $28,000 for the 3 pre-assignment days (17-19) and
+        just QQQ's $5,000 for the 6 days after (20-25):
+        avg_active_capital = (3*28000 + 6*5000) / 9 = 12666.67, well below
+        the flat $28,000 avg_capital.
+        """
+        transactions = [
+            tx("2025-11-17", STO, "-MU251121P230", -1, 4.00, 399.33, row_id=1),
+            tx("2025-11-21", ASSIGNED, "-MU251121P230", 1, None, 0.0, row_id=2, as_of="2025-11-20"),
+            tx("2025-11-17", STO, "-QQQ251128P50", -1, 1.00, 99.33, row_id=3),
+        ]
+        cycles, _ = build_cycles(transactions)
+        through = date(2025, 11, 25)
+        result = portfolio_metrics(cycles, through)
+
+        self.assertAlmostEqual(result.avg_capital, 28000.0, places=2)
+        self.assertAlmostEqual(result.avg_active_capital, 114000.0 / 9, places=2)
+        self.assertLess(result.avg_active_capital, result.avg_capital)
+
+        self.assertAlmostEqual(
+            result.active_capital_deployed_now, 5000.0, places=2
+        )  # today: only QQQ's put is "working"
+        self.assertAlmostEqual(result.peak_active_capital, 28000.0, places=2)  # the pre-assignment stretch
+
+        expected_active_roc = (
+            100.0 * result.option_realized_pl / result.avg_active_capital * (365.0 / result.days_span)
+        )
+        self.assertAlmostEqual(result.annualized_active_wheel_roc_pct, expected_active_roc, places=6)
+        # Same numerator, smaller denominator -- the active figure must read
+        # higher than the all-in one whenever idle holding-shares capital
+        # exists to exclude.
+        self.assertGreater(result.annualized_active_wheel_roc_pct, result.annualized_wheel_roc_pct)
+
+    def test_no_idle_holding_shares_means_the_two_figures_match(self):
+        """A portfolio with no idle holds (every held lot backs an open call,
+        or nothing is held at all) has nothing to exclude -- active and
+        all-in must be identical, not just close.
+        """
+        cycles, _ = build_cycles([tx("2025-09-19", STO, "-MU250926P150", -1, 3.35, 334.33)])
+        result = portfolio_metrics(cycles, date(2025, 9, 26))
+        self.assertAlmostEqual(result.avg_active_capital, result.avg_capital, places=6)
+        self.assertAlmostEqual(result.annualized_active_wheel_roc_pct, result.annualized_wheel_roc_pct, places=6)
 
 
 class TestCapitalWindowContinuity(unittest.TestCase):
@@ -1382,6 +1531,289 @@ class TestHedgePL(unittest.TestCase):
         self.assertAlmostEqual(points[date(2025, 1, 15)].long_premium, 0.0, places=2)  # closed
         metrics = cycle_metrics(cycles[0], date(2025, 1, 20))
         self.assertAlmostEqual(metrics.hedge_realized_pl, -220.0, places=2)  # -320 + 100
+
+
+class TestWheelStateBreakdown(unittest.TestCase):
+    """``wheel_state_breakdown`` must be called on the *capital*-scoped cycle
+    set (``capital_cycles`` in wheel/api.py), never the P&L/date-filtered
+    ``cycles`` -- these tests exercise the classification and aggregation in
+    isolation, independent of that scoping choice (which lives in api.py's
+    wiring, not here).
+    """
+
+    def test_naked_csp_lands_entirely_in_puts(self):
+        cycles, _ = build_cycles([tx("2025-09-19", STO, "-MU250926P150", -1, 3.35, 334.33)])
+        result = wheel_state_breakdown(cycles, date(2025, 9, 20))
+        self.assertAlmostEqual(result["buckets"]["puts"]["amount"], 15000.0, places=2)
+        self.assertEqual(result["buckets"]["puts"]["cycles"], 1)
+        self.assertEqual(result["buckets"]["puts"]["tickers"], ["MU"])
+        self.assertAlmostEqual(result["buckets"]["calls"]["amount"], 0.0)
+        self.assertAlmostEqual(result["buckets"]["holding"]["amount"], 0.0)
+        self.assertAlmostEqual(result["buckets"]["other"]["amount"], 0.0)
+        self.assertEqual(result["active_cycles"], 1)
+
+    def test_assignment_with_open_covered_call_routes_stock_basis_to_calls(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-11-17", STO, "-MU251121P230", -1, 4.00, 399.33, row_id=1),
+                tx("2025-11-21", ASSIGNED, "-MU251121P230", 1, None, 0.0, row_id=2, as_of="2025-11-20"),
+                tx("2025-11-24", STO, "-MU251128C235", -1, 2.00, 199.33, row_id=3),
+            ]
+        )
+        result = wheel_state_breakdown(cycles, date(2025, 11, 25))
+        self.assertAlmostEqual(result["buckets"]["calls"]["amount"], 23000.0, places=2)
+        self.assertAlmostEqual(result["buckets"]["holding"]["amount"], 0.0)
+        self.assertAlmostEqual(result["buckets"]["puts"]["amount"], 0.0)
+        self.assertEqual(result["active_cycles"], 1)
+
+    def test_assignment_without_open_covered_call_lands_in_holding(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-11-17", STO, "-MU251121P230", -1, 4.00, 399.33, row_id=1),
+                tx("2025-11-21", ASSIGNED, "-MU251121P230", 1, None, 0.0, row_id=2, as_of="2025-11-20"),
+            ]
+        )
+        result = wheel_state_breakdown(cycles, date(2025, 11, 25))
+        self.assertAlmostEqual(result["buckets"]["holding"]["amount"], 23000.0, places=2)
+        self.assertAlmostEqual(result["buckets"]["calls"]["amount"], 0.0)
+
+    def test_covered_call_on_untracked_shares_uses_strike_proxy(self):
+        cycles, _ = build_cycles([tx("2025-09-15", STO, "-QQQ251017C588", -1, 3.32, 331.33)])
+        result = wheel_state_breakdown(cycles, date(2025, 9, 16))
+        self.assertAlmostEqual(result["buckets"]["calls"]["amount"], 58800.0, places=2)
+        self.assertEqual(result["buckets"]["calls"]["tickers"], ["QQQ"])
+
+    def test_protective_put_lands_in_other(self):
+        cycles, _ = build_cycles([tx("2025-01-01", BTO, "-XYZ250601P100", 1, 10.00, -1000.0)])
+        result = wheel_state_breakdown(cycles, date(2025, 1, 2))
+        self.assertAlmostEqual(result["buckets"]["other"]["amount"], 1000.0, places=2)
+        self.assertAlmostEqual(result["buckets"]["puts"]["amount"], 0.0)
+        self.assertAlmostEqual(result["buckets"]["calls"]["amount"], 0.0)
+        self.assertAlmostEqual(result["buckets"]["holding"]["amount"], 0.0)
+
+    def test_closed_cycle_contributes_nothing(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-09-19", STO, "-MU250926P150", -1, 3.35, 334.33, row_id=1),
+                tx("2025-09-26", EXPIRED, "-MU250926P150", 1, None, 0.0, row_id=2, as_of="2025-09-26"),
+            ]
+        )
+        result = wheel_state_breakdown(cycles, date(2025, 9, 27))
+        self.assertEqual(result["active_cycles"], 0)
+        for bucket in result["buckets"].values():
+            self.assertAlmostEqual(bucket["amount"], 0.0)
+
+    def test_held_shares_and_a_fresh_csp_split_across_two_buckets_in_one_cycle(self):
+        """The regression this function exists to prevent: a cycle that is
+        classified whole (rather than per capital-component) would hide one
+        side entirely. Here the same MU cycle holds shares from an earlier
+        assignment (no covered call written against them -- Holding Shares)
+        *and* has a brand-new CSP open on a second lot at a different strike
+        (Cash-Secured Puts) at the same time. Both must show up, from the one
+        cycle, simultaneously.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-09-19", STO, "-MU250926P230", -1, 4.00, 399.33, row_id=1),
+                tx("2025-09-26", ASSIGNED, "-MU250926P230", 1, None, 0.0, row_id=2, as_of="2025-09-26"),
+                tx("2025-10-01", STO, "-MU251101P220", -1, 3.00, 299.33, row_id=3),
+            ]
+        )
+        result = wheel_state_breakdown(cycles, date(2025, 10, 2))
+        self.assertAlmostEqual(result["buckets"]["holding"]["amount"], 23000.0, places=2)
+        self.assertAlmostEqual(result["buckets"]["puts"]["amount"], 22000.0, places=2)
+        self.assertEqual(result["buckets"]["holding"]["cycles"], 1)
+        self.assertEqual(result["buckets"]["puts"]["cycles"], 1)
+        # One cycle, contributing to two buckets -- not double-counted here.
+        self.assertEqual(result["active_cycles"], 1)
+
+
+class TestWheelCashFlowEvents(unittest.TestCase):
+    """wheel_cash_flow_events/wheel_terminal_value: the wheel's own dated
+    contribution/withdrawal timeline, feeding a money-weighted (XIRR) return
+    isolated from every other holding in the account. Sign convention: a
+    contribution (capital committed) is positive, a withdrawal (capital plus
+    whatever it earned or lost, returned) is negative -- matching
+    wheel.benchmark.CashFlowEvent.
+    """
+
+    def test_expired_csp_is_one_contribution_and_one_withdrawal(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250131P100", -1, 3.00, 300.0, row_id=1),
+                tx("2025-01-31", EXPIRED, "-XYZ250131P100", 1, None, 0.0, row_id=2, as_of="2025-01-31"),
+            ]
+        )
+        events = wheel_cash_flow_events(cycles)
+        self.assertEqual(len(events), 2)
+        self.assertEqual(events[0], (date(2025, 1, 1), 10000.0, "XYZ CSP open"))
+        # Collateral released ($10,000) + premium kept ($300) = $10,300.
+        self.assertEqual(events[1], (date(2025, 1, 31), -10300.0, "XYZ CSP close"))
+        self.assertAlmostEqual(wheel_terminal_value(cycles, date(2025, 1, 31), {}), 0.0)
+
+    def test_open_csp_is_only_a_contribution_with_no_close(self):
+        cycles, _ = build_cycles([tx("2025-01-01", STO, "-XYZ250201P100", -1, 3.00, 300.0)])
+        events = wheel_cash_flow_events(cycles)
+        self.assertEqual(events, [(date(2025, 1, 1), 10000.0, "XYZ CSP open")])
+        # Still committed -- shows up in terminal value, not as a withdrawal.
+        self.assertAlmostEqual(wheel_terminal_value(cycles, date(2025, 1, 15), {}), 10000.0)
+
+    def test_full_round_trip_loses_no_premium_across_the_assignment(self):
+        """The regression this test exists for: an earlier version of
+        wheel_cash_flow_events skipped BOTH the put's and the covered call's
+        assignment-closes entirely (to avoid double-counting the stock's
+        capital), which silently discarded their premium along with it. The
+        capital must be skipped (it converts to a ShareLot, not withdrawn),
+        but the premium is real, realized income and must still appear.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250201P100", -1, 4.00, 400.0, row_id=1),
+                tx("2025-02-01", ASSIGNED, "-XYZ250201P100", 1, None, 0.0, row_id=2, as_of="2025-02-01"),
+                tx("2025-02-05", STO, "-XYZ250305C105", -1, 2.00, 200.0, row_id=3),
+                tx("2025-03-05", ASSIGNED, "-XYZ250305C105", 1, None, 0.0, row_id=4, as_of="2025-03-05"),
+            ]
+        )
+        events = wheel_cash_flow_events(cycles)
+        self.assertEqual(
+            events,
+            [
+                (date(2025, 1, 1), 10000.0, "XYZ CSP open"),
+                (date(2025, 2, 1), -400.0, "XYZ CSP close"),  # premium only -- capital converts
+                (date(2025, 3, 5), -200.0, "XYZ COVERED_CALL close"),  # premium only -- $0 collateral
+                (date(2025, 3, 5), -10500.0, "XYZ shares sold"),  # the converted capital, finally returned
+            ],
+        )
+        contributions = sum(amount for _, amount, _ in events if amount > 0)
+        withdrawals = sum(-amount for _, amount, _ in events if amount < 0)
+        # $400 put premium + $200 call premium + $500 stock gain (sold at
+        # $105, assigned at $100, 100 shares) = $1,100 net.
+        self.assertAlmostEqual(withdrawals - contributions, 1100.0, places=2)
+        self.assertAlmostEqual(wheel_terminal_value(cycles, date(2025, 3, 5), {}), 0.0)
+
+    def test_brokers_own_settlement_row_does_not_double_the_contribution(self):
+        """The regression this test exists for: a real Fidelity export almost
+        always carries an explicit "YOU BOUGHT ASSIGNED PUTS ..." stock
+        row alongside the option's own ASSIGNED notification -- so
+        WheelEngine routes the share lot through the ordinary stock-purchase
+        path (to avoid double-booking the *shares*), which tags it
+        ``FROM_PURCHASE`` even though the cash is the same dollars as the
+        put's own contribution. Trusting ``ShareLot.source`` alone here
+        would count that contribution twice -- once for the put's open,
+        once again for the "purchase" -- inflating total contributions well
+        past total withdrawals and producing a deeply, wrongly negative
+        XIRR. See ``_assignment_lot_dates``.
+        """
+
+        def settlement(day, action, symbol, shares, price, amount, row_id, as_of):
+            row = tx(day, action, symbol, shares, price, amount, row_id=row_id, as_of=as_of)
+            return replace(row, assignment_settlement=True)
+
+        cycles, _ = build_cycles(
+            [
+                tx("2026-01-30", STO, "-DCH260220P8", -10, 0.55, 543.30, row_id=1),
+                tx("2026-02-23", ASSIGNED, "-DCH260220P8", 10, None, 0.0, row_id=2, as_of="2026-02-20"),
+                settlement("2026-02-23", "BUY_STOCK", "DCH", 1000, 8.0, -8000.0, 3, "2026-02-20"),
+            ]
+        )
+        cycle = cycles[0]
+        # Confirms the fixture actually exercises the broker-settlement path
+        # this test is about, not the synthetic one another test already covers.
+        self.assertEqual(cycle.share_lots[0].source, "PURCHASE")
+
+        events = wheel_cash_flow_events(cycles)
+        self.assertEqual(
+            events,
+            [
+                (date(2026, 1, 30), 8000.0, "DCH CSP open"),
+                (date(2026, 2, 20), -543.30, "DCH CSP close"),  # premium only, not a second $8,000
+            ],
+        )
+        self.assertAlmostEqual(wheel_terminal_value(cycles, date(2026, 2, 25), {}), 8000.0)
+
+    def test_covered_call_on_untracked_shares_gets_a_normal_open_and_close(self):
+        """A covered call with no tracked shares behind it (shares_tracked
+        False, the pre-export-start proxy case) is real, standalone
+        collateral -- unlike the tracked case above, both its open and its
+        close are ordinary events, no assignment carve-out.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-09-15", STO, "-QQQ251017C588", -1, 3.32, 331.33, row_id=1),
+                tx("2025-10-17", EXPIRED, "-QQQ251017C588", 1, None, 0.0, row_id=2, as_of="2025-10-17"),
+            ]
+        )
+        events = wheel_cash_flow_events(cycles)
+        self.assertEqual(events[0], (date(2025, 9, 15), 58800.0, "QQQ COVERED_CALL open"))
+        self.assertEqual(events[1], (date(2025, 10, 17), -59131.33, "QQQ COVERED_CALL close"))
+
+    def test_protective_put_open_and_close_use_the_debit_paid(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", BTO, "-XYZ250201P100", 1, 10.00, -1000.0, row_id=1),
+                tx("2025-01-10", STC, "-XYZ250201P100", -1, 7.00, 700.0, row_id=2),
+            ]
+        )
+        events = wheel_cash_flow_events(cycles)
+        self.assertEqual(events[0], (date(2025, 1, 1), 1000.0, "XYZ LONG_PUT open"))
+        self.assertEqual(events[1], (date(2025, 1, 10), -700.0, "XYZ LONG_PUT close"))
+
+    def test_plain_stock_purchase_with_no_covered_call_is_excluded(self):
+        """Shares bought outright, with no covered call ever written against
+        them, are not wheel capital -- an ordinary buy-and-hold position no
+        different from a non-wheel ETF sitting in the same account.
+        """
+        cycles, _ = build_cycles([tx("2025-01-01", "BUY_STOCK", "XYZ", 100, 50.00, -5000.0, row_id=1)])
+        self.assertEqual(wheel_cash_flow_events(cycles), [])
+        self.assertAlmostEqual(wheel_terminal_value(cycles, date(2025, 2, 15), {}), 0.0)
+
+    def test_stock_bought_outright_then_covered_becomes_wheel_capital(self):
+        """The regression this covers: a real account often buys shares
+        directly and writes calls against them, never having sold a put to
+        acquire them -- assignment-only tracking would silently drop the
+        entire cost of that stock from both the cash-flow ledger and the
+        terminal value, while still counting the call's own premium, making
+        the wheel look like it generates income from zero capital. The
+        moment a cycle writes even one covered call, the stock backing it
+        counts too, regardless of how it was acquired.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", "BUY_STOCK", "XYZ", 100, 50.00, -5000.0, row_id=1),
+                tx("2025-02-01", STO, "-XYZ250301C55", -1, 2.00, 199.33, row_id=2),
+                tx("2025-03-01", EXPIRED, "-XYZ250301C55", 1, None, 0.0, row_id=3, as_of="2025-03-01"),
+                tx("2025-04-01", "SELL_STOCK", "XYZ", -100, 55.00, 5500.0, row_id=4),
+            ]
+        )
+        events = wheel_cash_flow_events(cycles)
+        self.assertIn((date(2025, 1, 1), 5000.0, "XYZ shares bought"), events)
+        # The call's own collateral is $0 (tracked shares) -- no open event --
+        # but its premium is real, realized income once it closes.
+        self.assertIn((date(2025, 3, 1), -199.33, "XYZ COVERED_CALL close"), events)
+        self.assertIn((date(2025, 4, 1), -5500.0, "XYZ shares sold"), events)
+        contributions = sum(amount for _, amount, _ in events if amount > 0)
+        withdrawals = sum(-amount for _, amount, _ in events if amount < 0)
+        # $199.33 call premium + $500 stock gain (bought at $50, sold at $55).
+        self.assertAlmostEqual(withdrawals - contributions, 199.33 + 500.0, places=2)
+        self.assertAlmostEqual(wheel_terminal_value(cycles, date(2025, 4, 15), {}), 0.0)  # fully closed out
+
+    def test_terminal_value_marks_held_shares_to_current_price_when_available(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250201P100", -1, 4.00, 400.0, row_id=1),
+                tx("2025-02-01", ASSIGNED, "-XYZ250201P100", 1, None, 0.0, row_id=2, as_of="2025-02-01"),
+            ]
+        )
+        # No price supplied for XYZ -- falls back to cost basis ($100/share).
+        self.assertAlmostEqual(wheel_terminal_value(cycles, date(2025, 2, 15), {}), 10000.0)
+        # A live price marks the same shares to market instead.
+        self.assertAlmostEqual(
+            wheel_terminal_value(cycles, date(2025, 2, 15), {"XYZ": 120.0}), 12000.0
+        )
+        # A failed fetch (key present, value None) must fall back too, not crash.
+        self.assertAlmostEqual(
+            wheel_terminal_value(cycles, date(2025, 2, 15), {"XYZ": None}), 10000.0
+        )
 
 
 if __name__ == "__main__":

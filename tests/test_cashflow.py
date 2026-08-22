@@ -1,4 +1,4 @@
-"""Monthly cash-flow tests: bucketing, fee accounting, trailing metrics,
+"""Monthly cash-flow tests: bucketing, fee accounting, range summary,
 Combined-view aggregation.
 """
 
@@ -19,7 +19,7 @@ from wheel.cashflow import (  # noqa: E402
     format_report,
     month_average_collateral,
     monthly_cashflow_series,
-    trailing_metrics,
+    range_summary,
 )
 from wheel.parser import BTC, BTO, OTHER, STC, STO, Transaction  # noqa: E402
 
@@ -237,48 +237,76 @@ class TestMonthlyYield(unittest.TestCase):
         self.assertIsNone(rows[0]["monthly_yield_pct"])
 
 
-class TestTrailingMetrics(unittest.TestCase):
-    def _months(self, count: int, net: float, avg_collateral: float) -> list[dict]:
+class TestRangeSummary(unittest.TestCase):
+    def _row(self, year: int, month: int, net: float) -> dict:
+        return {
+            "year": year,
+            "month": month,
+            "period": f"{year:04d}-{month:02d}",
+            "gross_credits": max(net, 0.0),
+            "gross_debits": max(-net, 0.0),
+            "fees": 0.0,
+            "net_cash_flow": net,
+            "avg_collateral": None,
+            "monthly_yield_pct": None,
+        }
+
+    def test_covers_every_row_passed_in_not_a_fixed_window(self):
+        """No built-in lookback: give it 30 months and every one counts --
+        range_summary has no window of its own, the caller's own date filter
+        (already baked into `rows`) decides how many months are in scope.
+        """
         rows = []
-        year, month = 2024, 1
-        for i in range(count):
-            rows.append(
-                {
-                    "year": year,
-                    "month": month,
-                    "period": f"{year:04d}-{month:02d}",
-                    "gross_credits": net,
-                    "gross_debits": 0.0,
-                    "fees": 0.0,
-                    "net_cash_flow": net,
-                    "avg_collateral": avg_collateral,
-                    "monthly_yield_pct": None,
-                }
-            )
+        year, month = 2023, 1
+        for _ in range(30):
+            rows.append(self._row(year, month, 100.0))
             month += 1
             if month > 12:
                 month = 1
                 year += 1
-        return rows
+        result = range_summary(rows, [(date(2023, 1, 15), 10000.0)], date(2025, 6, 30))
+        self.assertEqual(result["months_counted"], 30)
+        self.assertAlmostEqual(result["cash_flow"], 3000.0, places=2)
+        self.assertAlmostEqual(result["avg_monthly_income"], 100.0, places=2)
 
-    def test_ttm_over_exactly_twelve_months(self):
-        rows = self._months(14, 100.0, 10000.0)
-        result = trailing_metrics(rows, date(2025, 2, 15))
-        self.assertEqual(result["months_counted"], 12)
-        self.assertAlmostEqual(result["ttm_cash_flow"], 1200.0, places=2)
+    def test_avg_collateral_is_one_time_weighted_average_not_average_of_monthly_averages(self):
+        """The bug this replaced: averaging each month's own average gives a
+        month engaged for 1 day the same weight as one engaged for 29 -- a
+        true time-weighted average must not, and must instead match
+        wheel.metrics' own denominator for Annualized Wheel ROC.
+        """
+        rows = [self._row(2024, 1, 0.0), self._row(2024, 2, 0.0)]
+        capital_points = [(date(2024, 1, 1), 10000.0)] + [  # January: 1 engaged day at $10,000
+            (date(2024, 2, d), 1000.0) for d in range(1, 30)  # February: 29 engaged days at $1,000
+        ]
+        result = range_summary(rows, capital_points, date(2024, 2, 29))
+        # True time-weighted average = (10000*1 + 1000*29) / 30 = 1300.
+        self.assertAlmostEqual(result["avg_collateral"], 1300.0, places=2)
+        # NOT the average-of-monthly-averages the old trailing_metrics gave:
+        # (10000 + 1000) / 2 = 5500.
+        self.assertNotAlmostEqual(result["avg_collateral"], 5500.0, places=2)
+
+    def test_zero_capital_days_are_excluded(self):
+        capital_points = [(date(2024, 1, d), 10000.0) for d in range(1, 11)] + [
+            (date(2024, 1, d), 0.0) for d in range(11, 32)
+        ]
+        result = range_summary([self._row(2024, 1, 0.0)], capital_points, date(2024, 1, 31))
+        self.assertAlmostEqual(result["avg_collateral"], 10000.0, places=2)
+
+    def test_annualized_return_formula(self):
+        rows = [self._row(2024, m, 100.0) for m in range(1, 13)]
+        result = range_summary(rows, [(date(2024, 1, 1), 10000.0)], date(2024, 12, 31))
         self.assertAlmostEqual(result["avg_monthly_income"], 100.0, places=2)
         # (100 * 12) / 10000 * 100 = 12%
         self.assertAlmostEqual(result["annualized_cash_on_cash_return_pct"], 12.0, places=2)
 
-    def test_short_history_does_not_pad_with_zeros(self):
-        rows = self._months(3, 100.0, 10000.0)
-        result = trailing_metrics(rows, date(2024, 3, 1))
-        self.assertEqual(result["months_counted"], 3)
-        self.assertAlmostEqual(result["ttm_cash_flow"], 300.0, places=2)
-        self.assertAlmostEqual(result["avg_monthly_income"], 100.0, places=2)
+    def test_no_collateral_means_no_return_pct(self):
+        result = range_summary([self._row(2024, 1, 500.0)], [], date(2024, 1, 31))
+        self.assertIsNone(result["annualized_cash_on_cash_return_pct"])
+        self.assertAlmostEqual(result["avg_monthly_income"], 500.0, places=2)
 
-    def test_empty_series(self):
-        result = trailing_metrics([], date(2025, 1, 1))
+    def test_empty_rows(self):
+        result = range_summary([], [], date(2025, 1, 1))
         self.assertEqual(result["months_counted"], 0)
         self.assertIsNone(result["avg_monthly_income"])
         self.assertIsNone(result["annualized_cash_on_cash_return_pct"])
@@ -289,8 +317,8 @@ class TestReportFormatting(unittest.TestCase):
         rows = monthly_cashflow_series(
             [tx("2025-06-05", STO, "-MU250926P150", -1, 3.35, 500.0)], [], date(2025, 6, 30)
         )
-        trailing = trailing_metrics(rows, date(2025, 6, 30))
-        report = format_report(rows, trailing)
+        summary = range_summary(rows, [], date(2025, 6, 30))
+        report = format_report(rows, summary)
         self.assertIn("2025-06", report)
         self.assertIn("500.00", format_monthly_table(rows))
         self.assertIn("2025-06", format_ascii_chart(rows))
