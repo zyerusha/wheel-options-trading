@@ -123,8 +123,8 @@ function setFormula(node, text) {
 function wheelOptionPlFormula(row, title) {
   return formula([
     `${title} =`,
-    '  CSP + covered-call P/L',
-    '  + Hedge P/L (protective puts, credit-spread legs)',
+    '  Cash-secured-put + covered-call profit/loss',
+    '  + Hedge profit/loss (protective puts, credit-spread legs)',
     '',
     `= ${money(row.wheel_core_realized_pl, { cents: true })} + ${money(row.hedge_realized_pl, { cents: true })}`,
     `= ${money(row.option_realized_pl, { cents: true })}`,
@@ -1074,12 +1074,11 @@ function drawWheelState(wheelState) {
         { label: 'Tickers', value: [...tickersByBucket[bucket.key]].sort().join(', ') || '—' },
       ],
       formula([
-        `${bucket.label} = Σ this capital component across ACTIVE cycles`,
-        '  A cycle holding shares while also running a fresh CSP contributes',
-        '  to both Holding Shares and Cash-Secured Puts -- see the hint above.',
+        `${bucket.label} = this capital component, summed across active cycles`,
+        '  (one cycle can count in more than one phase -- e.g. holding shares',
+        '  while also running a fresh cash-secured put)',
         '',
-        `= ${money(amount)} of ${money(grandTotal)} total`,
-        `= ${pct(share * 100, 1)}`,
+        `= ${money(amount)} of ${money(grandTotal)} total = ${pct(share * 100, 1)}`,
       ])
     );
 
@@ -1133,7 +1132,7 @@ function drawWheelState(wheelState) {
     legend.appendChild(item);
   });
   legend.appendChild(
-    el('span', { class: 'legend-note' }, `Across ${activeCycles} active cycle(s) -- see the center of the ring for the total.`)
+    el('span', { class: 'legend-note' }, `Across ${activeCycles} active cycle(s); the ring's center shows the total.`)
   );
 
   buildTable('wheel-state-table', tableHead, tableRows);
@@ -1297,18 +1296,17 @@ const CASHFLOW_TABLE_HEAD = [
     text: 'Net cash flow',
     title: formula([
       'Net cash flow = Gross credits − Gross debits − Fees',
-      'Dated to when cash actually settled (premium sold, dividends, a roll\'s',
-      'debit) -- not to when the underlying position closes. See "Wheel',
-      'realized P/L" beside it, and the gap chart below, for that distinction.',
+      'Dated to when cash actually settles -- premium sold, dividends',
+      '  received, a roll\'s debit -- not to when the underlying position',
+      '  finally closes.',
     ]),
   },
   {
     text: 'Wheel realized P/L',
     title: formula([
-      'This month\'s share of realized wheel P/L (option P/L + stock P/L),',
-      'dated to when a leg actually closes or a share lot is sold -- never to',
-      'when premium was sold. See the "Cash flow vs. wheel P/L gap" chart',
-      'below for why this can differ a lot from Net cash flow in any one month.',
+      'This month\'s share of realized wheel P/L (profit/loss): option P/L',
+      '  plus stock P/L, dated to when a leg actually closes or a share lot',
+      '  is sold -- never to when the premium was originally collected.',
     ]),
   },
   'Avg collateral',
@@ -1889,15 +1887,13 @@ function renderCashFlowTiles(trailing, rows, pnlSeries) {
           : formula([
               'Annualized cash-on-cash return =',
               '  (Avg monthly income × 12) ÷ Avg collateral × 100',
-              '  Avg collateral is one time-weighted average over every day in this',
-              '  range -- the same figure and method Annualized Wheel ROC uses.',
+              '  Avg collateral is a time-weighted average over every day in this range.',
               '',
               `= (${money(trailing.avg_monthly_income, { cents: true })} × 12) ÷ ${money(trailing.avg_collateral)} × 100`,
               `= ${pct(trailing.annualized_cash_on_cash_return_pct, 2)}`,
               '',
-              'Differs from Annualized Wheel ROC on purpose: this counts ALL cash',
-              'collected (incl. premium on still-open legs, and dividends); ROC',
-              'counts realized option P/L only, on legs that have actually closed.',
+              'Counts all cash actually collected -- including premium on still-open',
+              '  legs, and dividends -- not just profit/loss on legs already closed.',
             ]),
     },
     {
@@ -1916,7 +1912,6 @@ function renderCashFlowTiles(trailing, rows, pnlSeries) {
         'Positive: premium collected is running ahead of what has been realized --',
         '  usually open positions not yet closed, or dividends (never in wheel P/L).',
         'Negative: realized wheel P/L is running ahead of newly collected premium.',
-        'See the chart below for the trend, not just this one snapshot.',
       ]),
     },
   ];
@@ -2221,12 +2216,18 @@ function drawTickerScatter(rows) {
 
     const rocFormula =
       row.annualized_wheel_roc_pct === null
-        ? formula(['Annualized Wheel ROC = (Option P/L ÷ Avg capital) × (365 ÷ Days)', '', 'N/A -- no capital committed.'])
-        : formula([
-            'Bubble position: x = Annualized Wheel ROC, y = Net realized P/L',
-            'Bubble size: area ∝ avg capital deployed (radius uses a square-root scale)',
+        ? formula([
+            'Annualized Wheel ROC (return on capital) =',
+            '  (Option premium P/L ÷ Avg capital) × (365 ÷ Days)',
             '',
-            `Annualized Wheel ROC = (Option P/L ÷ Avg capital) × (365 ÷ Days) = ${pct(row.annualized_wheel_roc_pct)}`,
+            'N/A -- no capital committed.',
+          ])
+        : formula([
+            'Bubble position: x = Annualized Wheel ROC (return on capital),',
+            '  y = Net realized profit/loss (P/L)',
+            'Bubble size: area proportional to avg capital deployed',
+            '',
+            `Annualized Wheel ROC = (Option premium P/L ÷ Avg capital) × (365 ÷ Days) = ${pct(row.annualized_wheel_roc_pct)}`,
             `Net realized P/L = Premium collected (net) + Stock P/L = ${money(row.net_realized_pl, { cents: true })}`,
             `Avg capital deployed (bubble size) = ${money(row.avg_capital)}`,
           ]);
@@ -2593,8 +2594,8 @@ function cycleFormulas(cycle) {
   ]);
 
   const roi = formula([
-    'ROI = Net realized P/L ÷ Initial collateral',
-    '  (net P/L includes stock P/L -- a different question from Wheel ROC)',
+    'ROI (return on investment) = Net realized P/L ÷ Initial collateral',
+    '  Net P/L here includes stock profit/loss, not just option premium.',
     '',
     `= ${money(cycle.net_realized_pl, { cents: true })} ÷ ${money(cycle.initial_collateral)}`,
     `= ${cycle.roi_pct === null ? 'N/A' : pct(cycle.roi_pct, 2)}`,
@@ -2603,7 +2604,7 @@ function cycleFormulas(cycle) {
   const wheelRoc =
     cycle.annualized_wheel_roc_pct === null
       ? formula([
-          'Annualized Wheel ROC =',
+          'Annualized Wheel ROC (return on capital) =',
           '  (Wheel option P/L ÷ Avg collateral) × (365 ÷ Days active)',
           '',
           'N/A -- no capital committed in this cycle.',
@@ -2611,9 +2612,9 @@ function cycleFormulas(cycle) {
       : formula([
           ...wheelOptionPlFormula(cycle, 'Wheel option P/L').split('\n'),
           '',
-          'Annualized Wheel ROC =',
+          'Annualized Wheel ROC (return on capital) =',
           '  (Wheel option P/L ÷ Avg collateral) × (365 ÷ Days active)',
-          '  Includes CSP, covered-call, and hedge legs -- excludes stock P/L.',
+          '  Includes cash-secured-put, covered-call, and hedge legs; excludes stock P/L.',
           '',
           `= (${money(cycle.option_realized_pl, { cents: true })} ÷ ${money(cycle.avg_collateral)}) × (365 ÷ ${cycle.days_active})`,
           `= ${pct(cycle.roi_on_avg_wheel_pct, 2)} × ${(365 / cycle.days_active).toFixed(2)}`,
@@ -2629,9 +2630,9 @@ function cycleFormulas(cycle) {
           'N/A -- no initial collateral committed in this cycle.',
         ])
       : formula([
-          'Net Option Yield %: premium income only, against day-one capital --',
-          '  a different denominator from Wheel ROC (initial, not time-weighted average).',
-          '  Fees are already netted into every cash figure here, never subtracted twice.',
+          'Net Option Yield %: premium income only, measured against the capital',
+          '  committed on day one (not a time-weighted average over the cycle).',
+          '  Fees are already netted into every cash figure here.',
           '',
           'Net Option Yield = Option P/L ÷ Initial collateral',
           `= ${money(cycle.option_realized_pl, { cents: true })} ÷ ${money(cycle.initial_collateral)}`,
@@ -2645,7 +2646,7 @@ function cycleFormulas(cycle) {
   const totalPositionRoi =
     cycle.annualized_total_position_roi_pct === null
       ? formula([
-          'Annualized Total Position ROI =',
+          'Annualized Total Position ROI (return on investment) =',
           '  (Option P/L + Stock realized/unrealized P&L + Dividends) ÷ Initial collateral × (365 ÷ Days active)',
           '',
           'N/A -- no initial collateral committed in this cycle.',
@@ -2653,10 +2654,11 @@ function cycleFormulas(cycle) {
       : formula([
           'Total Position ROI %: everything this position has produced --',
           '  option P/L, realized AND unrealized stock P/L, and dividends --',
-          '  against day-one capital. Long-option (open hedge) unrealized P/L is',
-          '  not included: no options-quote feed exists to mark it.',
+          '  against day-one capital. Unrealized P/L on an open long-option',
+          '  hedge is not included: no options-quote feed exists to mark it.',
           '',
-          'Total Position ROI = (Option P/L + Stock realized P/L + Stock unrealized P/L + Dividends) ÷ Initial collateral',
+          'Total Position ROI (return on investment) = (Option P/L + Stock realized P/L +',
+          '  Stock unrealized P/L + Dividends) ÷ Initial collateral',
           `= (${money(cycle.option_realized_pl, { cents: true })} + ${money(cycle.stock_realized_pl, { cents: true })} + ${
             cycle.stock_unrealized_pl === null ? 'N/A' : money(cycle.stock_unrealized_pl, { cents: true })
           } + ${money(cycle.dividends_received, { cents: true })}) ÷ ${money(cycle.initial_collateral)}`,
@@ -2685,7 +2687,7 @@ function cycleFormulas(cycle) {
   const ppd = formula([
     'Profit Per Day (PPD) =',
     '  (Realized premium collected − Closeout cost) ÷ Days active',
-    '  Never stock P/L -- see Premium (net) above.',
+    '  Option premium only -- never includes stock profit/loss.',
     '',
     `= ${money(cycle.option_realized_pl, { cents: true })} ÷ ${cycle.days_active}`,
     `= ${money(cycle.profit_per_day, { cents: true })}/day`,
@@ -2876,7 +2878,8 @@ function legCollateralFormula(leg) {
     leg.paired_contracts > 0
       ? [
           `${leg.paired_contracts} of ${leg.contracts} contract(s) are paired into a spread`,
-          '  (see the Spreads table) -- their collateral is netted there, not here.',
+          '  -- a matched same-day short + long position whose collateral is',
+          '  netted as one |short strike − long strike| figure, not priced here.',
           `  Only the remaining ${contracts} naked contract(s) are priced below.`,
           '',
         ]
@@ -2894,7 +2897,8 @@ function legCollateralFormula(leg) {
       return formula([
         'Collateral = $0',
         '  The shares backing this call are already counted as capital',
-        '  (see Capital deployed) -- a covered call adds nothing on top.',
+        '  on their own -- a covered call adds nothing on top of shares',
+        '  already held.',
       ]);
     }
     return formula([
@@ -2963,9 +2967,9 @@ function cycleDetail(cycle) {
       el(
         'p',
         { class: 'hint' },
-        'A short and a long leg of the same underlying, right and expiry, opened the same day pair ' +
+        'A short and a long leg of the same underlying, right and expiry, opened the same day, pair ' +
           'automatically -- collateral nets to the strike distance instead of the short leg\'s full ' +
-          'CSP/covered-call figure. Legs that don\'t pair this way stay in the Legs table above, priced normally.'
+          'cash-secured-put/covered-call figure. Legs that don\'t pair this way appear in the Legs table, priced normally.'
       )
     );
     const spreadHost = el('div');
@@ -3002,8 +3006,8 @@ function cycleDetail(cycle) {
           title: formula([
             'The raw assignment/purchase price -- what a 1099-B would show.',
             '"Unknown" means these shares were acquired before this export',
-            'begins (a PRE_HISTORY lot): the real cost basis was never seen,',
-            'so it is reported as unknown rather than invented.',
+            'begins: the real cost basis was never seen, so it is reported',
+            'as unknown rather than invented.',
           ]),
         },
         'Net adjusted cost basis',
@@ -3109,7 +3113,7 @@ function cycleDetail(cycle) {
             '  ACQUIRE = −Strike × Shares (buying the stock)',
             '  DISPOSE = +Strike × Shares (selling the stock, i.e. called away)',
             'From the broker\'s own equity fill when the export supplies one;',
-            'synthesized at the strike otherwise -- see the Note column.',
+            'synthesized at the strike price otherwise.',
           ]),
         },
         'Note',
@@ -3209,7 +3213,7 @@ function renderTiles(portfolio, reconciliation) {
       formula:
         portfolio.annualized_wheel_roc_pct === null
           ? formula([
-              'Annualized Wheel ROC =',
+              'Annualized Wheel ROC (return on capital) =',
               '  (Wheel option P/L ÷ Time-weighted avg capital) × (365 ÷ Days)',
               '',
               'N/A -- no capital has been committed in this window yet.',
@@ -3217,7 +3221,7 @@ function renderTiles(portfolio, reconciliation) {
           : formula([
               ...wheelOptionPlFormula(portfolio, 'Wheel option P/L').split('\n'),
               '',
-              'Annualized Wheel ROC =',
+              'Annualized Wheel ROC (return on capital) =',
               '  (Wheel option P/L ÷ Time-weighted avg capital) × (365 ÷ Days)',
               '  Avg capital excludes days at $0 committed; never includes stock P/L.',
               '',
@@ -3234,17 +3238,17 @@ function renderTiles(portfolio, reconciliation) {
       formula:
         portfolio.annualized_active_wheel_roc_pct === null
           ? formula([
-              'Annualized Active Wheel ROC =',
-              '  (Wheel option P/L ÷ Time-weighted avg ACTIVE capital) × (365 ÷ Days)',
+              'Annualized Active Wheel ROC (return on capital) =',
+              '  (Wheel option P/L ÷ Time-weighted avg active capital) × (365 ÷ Days)',
               '',
               'N/A -- no capital was actively backing an open put or covered call',
               '  in this window yet.',
             ])
           : formula([
-              'Same as Annualized Wheel ROC, but excludes idle holding-shares',
-              '  capital (no call currently written against it) from the average.',
+              'Active capital excludes idle holding-shares capital: shares held',
+              '  with no covered call currently written against them.',
               '',
-              'Annualized Active Wheel ROC =',
+              'Annualized Active Wheel ROC (return on capital) =',
               '  (Wheel option P/L ÷ Avg active capital) × (365 ÷ Days)',
               `= (${money(portfolio.option_realized_pl, { cents: true })} ÷ ${money(portfolio.avg_active_capital)}) × (365 ÷ ${days})`,
               `= ${pct(portfolio.annualized_active_wheel_roc_pct)}`,
@@ -3264,8 +3268,8 @@ function renderTiles(portfolio, reconciliation) {
               'N/A -- no initial collateral committed in this window.',
             ])
           : formula([
-              'A different denominator from Annualized Wheel ROC above: the sum of',
-              '  every cycle\'s own day-one capital, not the time-weighted average.',
+              'Denominator is the sum of every cycle\'s own day-one capital,',
+              '  added across every cycle -- not a time-weighted average.',
               '',
               'Annualized Net Option Yield =',
               '  (Option P/L ÷ Total initial collateral) × (365 ÷ Days)',
@@ -3282,7 +3286,7 @@ function renderTiles(portfolio, reconciliation) {
       formula:
         portfolio.annualized_total_position_roi_pct === null
           ? formula([
-              'Annualized Total Position ROI =',
+              'Annualized Total Position ROI (return on investment) =',
               '  (Option P/L + Stock realized/unrealized P&L + Dividends) ÷ Total initial collateral × (365 ÷ Days)',
               '',
               'N/A -- no initial collateral committed in this window.',
@@ -3293,7 +3297,7 @@ function renderTiles(portfolio, reconciliation) {
               '  Open long-option (hedge) unrealized P/L is not included: no',
               '  options-quote feed exists to mark it.',
               '',
-              'Annualized Total Position ROI =',
+              'Annualized Total Position ROI (return on investment) =',
               '  (Option P/L + Stock realized P/L + Stock unrealized P/L + Dividends) ÷ Total initial collateral × (365 ÷ Days)',
               `= (${money(portfolio.option_realized_pl, { cents: true })} + ${money(portfolio.stock_realized_pl, { cents: true })} + ${money(portfolio.stock_unrealized_pl, { cents: true })} + ${money(portfolio.dividends_received, { cents: true })}) ÷ ${money(portfolio.total_initial_collateral)} × (365 ÷ ${days})`,
               `= ${pct(portfolio.total_position_roi_pct, 2)} × ${scale.toFixed(2)}`,
@@ -3315,7 +3319,7 @@ function renderTiles(portfolio, reconciliation) {
         `Peak = highest single day's total = ${money(portfolio.peak_capital)}`,
         '',
         `Includes idle holding-shares capital (${money(portfolio.avg_capital - portfolio.avg_active_capital)} of`,
-        '  the avg) -- see Annualized Active Wheel ROC to exclude it.',
+        '  the avg): shares held with no covered call currently written against them.',
       ]),
     },
     {
@@ -3482,84 +3486,97 @@ function renderNetWorthTiles(netWorth, benchmark, wheelReturn) {
       value: money(totals.wheel_capital_deployed),
       foot: `of ${money(totals.total_value)} total value -- the rest is cash or buy-and-hold`,
       formula: formula([
-        "Today's committed Wheel capital =",
+        "Today's committed wheel capital =",
         '  Put collateral + Stock cost basis + Call proxy + Long-option debit + Spread collateral',
-        '  (see Capital deployed below for the daily breakdown by band)',
         `= ${money(totals.wheel_capital_deployed)}`,
         '',
-        'Same figure as the "Capital deployed" tile above, carried forward to',
-        "  this snapshot's own moment in time (the Positions export's as-of date).",
+        "Dated to the broker's Positions export (the as-of date), which can",
+        '  trail a few days behind the latest transaction on file.',
       ]),
     },
   ];
 
-  // Independent of the SPY replay below -- no Positions/Stooq price data
+  // Independent of the SPY replay below -- no Positions/Yahoo price data
   // needed, just the wheel's own transaction history -- so it renders
   // whenever it has enough of its own activity, whether or not the
   // whole-account benchmark comparison below is available.
   if (wheelReturn && wheelReturn.available) {
     const events = wheelReturn.cash_flow_events || [];
     const span = events.length ? `${events[0].date} → ${events[events.length - 1].date}` : '—';
+    const wb = wheelReturn.benchmark;
     tiles.push({
       label: 'Wheel-only return (XIRR)',
       value: pct(wheelReturn.xirr_pct, 1),
       foot: `${span} · ${money(wheelReturn.terminal_value)} still committed`,
       tone: (wheelReturn.xirr_pct ?? 0) >= 0 ? 'pos' : 'neg',
       formula: formula([
-        'Same XIRR method as Actual return, scoped to just the wheel.',
+        'XIRR (money-weighted annualized return): the single rate that makes',
+        '  every dated cash flow -- each option-leg open/close, each wheel-',
+        '  active share purchase/sale -- discount to zero against the',
+        '  capital still committed today.',
         `${events.length} events, ${span} = ${pct(wheelReturn.xirr_pct, 1)}`,
         '',
-        'Already annualized -- compare directly to SPY\'s own annualized',
-        '  return (CAGR) over this same date span, not a raw % gain.',
         'Not risk-adjusted; fast turnover inflates this vs. buy-and-hold.',
         'Spreads not netted; dividends excluded.',
       ]),
     });
+
+    if (wb && wb.xirr_pct !== null && wb.xirr_pct !== undefined) {
+      tiles.push(
+        {
+          label: 'Wheel vs. S&P 500 (XIRR)',
+          value: pct(wb.xirr_pct, 1),
+          tone: (wb.xirr_pct ?? 0) >= 0 ? 'pos' : 'neg',
+          formula: formula([
+            'The wheel\'s own option-leg opens/closes and share buys/sells,',
+            '  replayed into SPY (an S&P 500 index fund) shares priced on',
+            `  each date instead, then valued at SPY's price on ${wheelReturn.as_of}`,
+            `  -- terminal value ${money(wb.terminal_value)}.`,
+            '',
+            'Answers "did the wheel itself beat buy-and-hold SPY," isolated',
+            '  from whatever else -- other ETFs, other stock -- sits in this account.',
+          ]),
+        },
+        {
+          label: 'Wheel value added vs. S&P 500',
+          value: money(wheelReturn.value_added, { cents: true, sign: true }),
+          foot: `${money(wheelReturn.terminal_value)} wheel vs ${money(wb.terminal_value)} in SPY`,
+          tone: (wheelReturn.value_added ?? 0) >= 0 ? 'pos' : 'neg',
+          formula: formula([
+            'Value added = Wheel terminal value − SPY terminal value',
+            '  (same cash-flow timing replayed into both, so this isolates',
+            '  strategy performance from when money happened to move)',
+            '',
+            `= ${money(wheelReturn.terminal_value)} − ${money(wb.terminal_value)}`,
+            `= ${money(wheelReturn.value_added, { sign: true })}`,
+          ]),
+        }
+      );
+    }
   }
 
   if (benchmark.available) {
     const events = benchmark.cash_flow_events || [];
     const span = events.length ? `${events[0].date} → ${events[events.length - 1].date}` : '—';
-    tiles.push(
-      {
-        label: 'Actual return (XIRR)',
-        value: pct(benchmark.actual.xirr_pct, 1),
-        tone: (benchmark.actual.xirr_pct ?? 0) >= 0 ? 'pos' : 'neg',
-        formula: formula([
-          'Money-weighted return (XIRR): the annualized rate r solving',
-          '  Σ amount_i ÷ (1 + r)^((date_i − date_0) / 365) = 0',
-          `  over ${events.length} cash-flow event(s) -- the opening balance`,
-          '  plus every external deposit/withdrawal found in the transaction',
-          `  history, ${span} -- valued against the account's`,
-          `  terminal value of ${money(benchmark.actual.terminal_value)} on ${benchmark.as_of}.`,
-        ]),
-      },
-      {
-        label: 'S&P 500 benchmark (XIRR)',
-        value: pct(benchmark.benchmark.xirr_pct, 1),
-        tone: (benchmark.benchmark.xirr_pct ?? 0) >= 0 ? 'pos' : 'neg',
-        formula: formula([
-          'The same XIRR solve as Actual return, but every one of those',
-          '  cash-flow dates/amounts is replayed into SPY shares priced on',
-          '  that date instead, then valued at SPY\'s price on the latest',
-          `  snapshot date -- terminal value ${money(benchmark.benchmark.terminal_value)} on ${benchmark.as_of}.`,
-        ]),
-      },
-      {
-        label: 'Value added vs. S&P 500',
-        value: money(benchmark.value_added, { cents: true, sign: true }),
-        foot: `${money(benchmark.actual.terminal_value)} actual vs ${money(benchmark.benchmark.terminal_value)} in SPY`,
-        tone: (benchmark.value_added ?? 0) >= 0 ? 'pos' : 'neg',
-        formula: formula([
-          'Value added = Actual terminal value − SPY terminal value',
-          '  (same cash-flow timing replayed into both, so this isolates',
-          '  strategy performance from when money happened to arrive)',
-          '',
-          `= ${money(benchmark.actual.terminal_value)} − ${money(benchmark.benchmark.terminal_value)}`,
-          `= ${money(benchmark.value_added, { sign: true })}`,
-        ]),
-      }
-    );
+    // The S&P 500 benchmark and Value-added tiles that used to sit here were
+    // removed: both were computed almost entirely from data/accounts.json's
+    // manually-typed "opening_balances" guess (no real Positions snapshot
+    // exists that far back), so their precision was fake -- see the
+    // Wheel-only tiles above for a same-question comparison built from real
+    // transaction history instead of a guessed starting balance.
+    tiles.push({
+      label: 'Actual return (XIRR)',
+      value: pct(benchmark.actual.xirr_pct, 1),
+      tone: (benchmark.actual.xirr_pct ?? 0) >= 0 ? 'pos' : 'neg',
+      formula: formula([
+        'Money-weighted return (XIRR): the annualized rate r solving',
+        '  Σ amount_i ÷ (1 + r)^((date_i − date_0) / 365) = 0',
+        `  over ${events.length} cash-flow event(s) -- the opening balance`,
+        '  plus every external deposit/withdrawal found in the transaction',
+        `  history, ${span} -- valued against the account's`,
+        `  terminal value of ${money(benchmark.actual.terminal_value)} on ${benchmark.as_of}.`,
+      ]),
+    });
   }
 
   for (const tile of tiles) {
@@ -3675,9 +3692,10 @@ function drawNetWorthChart(benchmark) {
         formula([
           'Actual account value is read verbatim off the Positions snapshot.',
           '',
-          '"If held in SPY instead" replays the same external cash-flow',
-          '  dates/amounts (see Actual return (XIRR) above) into SPY shares',
-          "  priced on each flow's date, then values them at SPY's price here.",
+          '"If held in SPY instead" replays the account\'s opening balance plus',
+          '  every external deposit/withdrawal, on those same dates, into SPY',
+          "  (an S&P 500 index fund) shares priced then, valued at SPY's",
+          '  price here.',
         ])
       );
     },
@@ -4261,7 +4279,7 @@ function render() {
       {
         text: money(row.profit_per_day, { cents: true }) + '/day',
         title: formula([
-          'PPD = (Premium collected − Closeout cost) ÷ Days',
+          'Profit Per Day (PPD) = (Premium collected − Closeout cost) ÷ Days',
           '',
           `= ${money(row.option_realized_pl, { cents: true })} ÷ ${row.days_span}`,
           `= ${money(row.profit_per_day, { cents: true })}/day`,
@@ -4276,13 +4294,18 @@ function render() {
 
   const tickerRocFormula = (row) =>
     row.annualized_wheel_roc_pct === null
-      ? formula(['Annualized Wheel ROC = (Wheel option P/L ÷ Avg capital) × (365 ÷ Days)', '', 'N/A -- no capital committed.'])
+      ? formula([
+          'Annualized Wheel ROC (return on capital) =',
+          '  (Wheel option P/L ÷ Avg capital) × (365 ÷ Days)',
+          '',
+          'N/A -- no capital committed.',
+        ])
       : formula([
           ...wheelOptionPlFormula(row, 'Wheel option P/L').split('\n'),
           '',
-          'Annualized Wheel ROC =',
+          'Annualized Wheel ROC (return on capital) =',
           '  (Wheel option P/L ÷ Avg capital) × (365 ÷ Days)',
-          '  Includes CSP, covered-call, and hedge legs -- excludes stock P/L.',
+          '  Includes cash-secured-put, covered-call, and hedge legs; excludes stock P/L.',
           '',
           `= (${money(row.option_realized_pl, { cents: true })} ÷ ${money(row.avg_capital)}) × (365 ÷ ${row.days_span})`,
           `= ${pct(row.roi_on_avg_wheel_pct, 2)} × ${(365 / row.days_span).toFixed(2)}`,
@@ -4297,8 +4320,8 @@ function render() {
           'N/A -- no initial collateral committed.',
         ])
       : formula([
-          'Against total initial (day-one) collateral, not the time-weighted',
-          '  average Wheel ROC above uses.',
+          'Denominator is total initial (day-one) collateral, summed across',
+          '  every cycle -- not a time-weighted average.',
           '',
           'Annualized Net Option Yield =',
           '  (Option P/L ÷ Total initial collateral) × (365 ÷ Days)',
@@ -4310,7 +4333,7 @@ function render() {
   const tickerTotalPositionRoiFormula = (row) =>
     row.annualized_total_position_roi_pct === null
       ? formula([
-          'Annualized Total Position ROI =',
+          'Annualized Total Position ROI (return on investment) =',
           '  (Option P/L + Stock realized/unrealized P&L + Dividends) ÷ Total initial collateral × (365 ÷ Days)',
           '',
           'N/A -- no initial collateral committed.',
@@ -4320,7 +4343,7 @@ function render() {
           '  unrealized stock P/L, dividends -- against total day-one capital.',
           '  Open long-option (hedge) unrealized P/L is not included.',
           '',
-          'Annualized Total Position ROI =',
+          'Annualized Total Position ROI (return on investment) =',
           '  (Option P/L + Stock realized P/L + Stock unrealized P/L + Dividends) ÷ Total initial collateral × (365 ÷ Days)',
           `= (${money(row.option_realized_pl, { cents: true })} + ${money(row.stock_realized_pl, { cents: true })} + ${money(row.stock_unrealized_pl, { cents: true })} + ${money(row.dividends_received, { cents: true })}) ÷ ${money(row.total_initial_collateral)} × (365 ÷ ${row.days_span})`,
           `= ${pct(row.total_position_roi_pct, 2)} × ${(365 / row.days_span).toFixed(2)}`,

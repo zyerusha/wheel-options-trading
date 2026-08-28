@@ -1,15 +1,17 @@
-"""Market data tests: Stooq parsing, cache round-trip, offline degrade behavior.
+"""Market data tests: Yahoo chart JSON parsing, cache round-trip, offline
+degrade behavior.
 
 No test in this file makes a real network call -- ``fetch`` is always injected.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -19,40 +21,72 @@ from wheel.marketdata import (  # noqa: E402
     _default_cache_path,
     get_price_series,
     load_cache,
-    parse_stooq_csv,
+    parse_yahoo_chart,
     price_on_or_before,
     save_cache,
-    stooq_url,
-)
-
-STOOQ_SAMPLE = (
-    "Date,Open,High,Low,Close,Volume\n"
-    "2026-01-02,470.00,472.00,469.00,471.50,1000000\n"
-    "2026-01-05,471.50,475.00,470.00,474.25,900000\n"
-    "2026-01-06,474.25,476.00,473.00,475.00,850000\n"
+    yahoo_chart_url,
 )
 
 
-class TestParseStooqCsv(unittest.TestCase):
+def _yahoo_payload(rows: list[tuple[str, float | None]]) -> str:
+    """Build a minimal Yahoo chart JSON body from (date, close) rows."""
+    timestamps = [int(datetime(*map(int, d.split("-")), tzinfo=timezone.utc).timestamp()) for d, _ in rows]
+    closes = [c for _, c in rows]
+    return json.dumps(
+        {
+            "chart": {
+                "result": [
+                    {
+                        "timestamp": timestamps,
+                        "indicators": {"quote": [{"close": closes}]},
+                    }
+                ],
+                "error": None,
+            }
+        }
+    )
+
+
+YAHOO_SAMPLE = _yahoo_payload(
+    [
+        ("2026-01-02", 471.50),
+        ("2026-01-05", 474.25),
+        ("2026-01-06", 475.00),
+    ]
+)
+
+
+class TestParseYahooChart(unittest.TestCase):
     def test_parses_ascending(self):
-        points = parse_stooq_csv(STOOQ_SAMPLE)
+        points = parse_yahoo_chart(YAHOO_SAMPLE)
         self.assertEqual([p.day for p in points], [date(2026, 1, 2), date(2026, 1, 5), date(2026, 1, 6)])
         self.assertEqual(points[0].close, 471.50)
 
     def test_out_of_order_input_is_sorted(self):
-        shuffled = "Date,Open,High,Low,Close,Volume\n2026-01-06,1,1,1,475.00,1\n2026-01-02,1,1,1,471.50,1\n"
-        points = parse_stooq_csv(shuffled)
+        shuffled = _yahoo_payload([("2026-01-06", 475.00), ("2026-01-02", 471.50)])
+        points = parse_yahoo_chart(shuffled)
         self.assertEqual([p.day for p in points], [date(2026, 1, 2), date(2026, 1, 6)])
 
-    def test_malformed_rows_are_skipped_not_fatal(self):
-        text = STOOQ_SAMPLE + "not,a,real,row\n2026-01-07,x,x,x,not-a-number,1\n"
-        points = parse_stooq_csv(text)
-        self.assertEqual(len(points), 3)
+    def test_null_closes_are_skipped_not_fatal(self):
+        text = _yahoo_payload(
+            [("2026-01-02", 471.50), ("2026-01-03", None), ("2026-01-06", 475.00)]
+        )
+        points = parse_yahoo_chart(text)
+        self.assertEqual(len(points), 2)
+
+    def test_malformed_json_raises_market_data_error(self):
+        with self.assertRaises(MarketDataError):
+            parse_yahoo_chart("not json")
+
+    def test_error_payload_raises_market_data_error(self):
+        text = json.dumps({"chart": {"result": None, "error": {"code": "Not Found"}}})
+        with self.assertRaises(MarketDataError):
+            parse_yahoo_chart(text)
 
 
 class TestPriceOnOrBefore(unittest.TestCase):
     def setUp(self):
-        self.points = parse_stooq_csv(STOOQ_SAMPLE)
+        self.points = parse_yahoo_chart(YAHOO_SAMPLE)
 
     def test_exact_match(self):
         self.assertEqual(price_on_or_before(self.points, date(2026, 1, 5)).close, 474.25)
@@ -71,7 +105,7 @@ class TestPriceOnOrBefore(unittest.TestCase):
 
 class TestCacheRoundTrip(unittest.TestCase):
     def test_save_then_load(self):
-        points = parse_stooq_csv(STOOQ_SAMPLE)
+        points = parse_yahoo_chart(YAHOO_SAMPLE)
         with tempfile.TemporaryDirectory() as tmp:
             cache_path = os.path.join(tmp, "cache.csv")
             save_cache(points, cache_path)
@@ -90,7 +124,7 @@ class TestGetPriceSeries(unittest.TestCase):
     def test_cold_start_successful_fetch_populates_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache_path = self._cache_path(tmp)
-            points, warnings = get_price_series(fetch=lambda: STOOQ_SAMPLE, cache_path=cache_path)
+            points, warnings = get_price_series(fetch=lambda: YAHOO_SAMPLE, cache_path=cache_path)
             self.assertEqual(warnings, [])
             self.assertEqual(len(points), 3)
             self.assertTrue(os.path.isfile(cache_path))
@@ -104,7 +138,7 @@ class TestGetPriceSeries(unittest.TestCase):
 
             def fetch():
                 calls.append(1)
-                return STOOQ_SAMPLE
+                return YAHOO_SAMPLE
 
             points, warnings = get_price_series(fetch=fetch, cache_path=cache_path, max_age_days=1)
             self.assertEqual(calls, [])
@@ -145,7 +179,7 @@ class TestGetPriceSeries(unittest.TestCase):
 
             def fetch():
                 calls.append(1)
-                return STOOQ_SAMPLE
+                return YAHOO_SAMPLE
 
             points, warnings = get_price_series(fetch=fetch, cache_path=cache_path, force_refresh=True)
             self.assertEqual(len(calls), 1)
@@ -154,9 +188,15 @@ class TestGetPriceSeries(unittest.TestCase):
 
 
 class TestPerTicker(unittest.TestCase):
-    def test_stooq_url_is_ticker_specific(self):
-        self.assertEqual(stooq_url("SPY"), "https://stooq.com/q/d/l/?s=spy.us&i=d")
-        self.assertEqual(stooq_url("mu"), "https://stooq.com/q/d/l/?s=mu.us&i=d")
+    def test_yahoo_chart_url_is_ticker_specific(self):
+        self.assertEqual(
+            yahoo_chart_url("SPY", period2=1700000000),
+            "https://query1.finance.yahoo.com/v8/finance/chart/SPY?period1=0&period2=1700000000&interval=1d",
+        )
+        self.assertEqual(
+            yahoo_chart_url("mu", period2=1700000000),
+            "https://query1.finance.yahoo.com/v8/finance/chart/MU?period1=0&period2=1700000000&interval=1d",
+        )
 
     def test_spy_keeps_its_original_cache_path(self):
         """SPY's cache stays at the pre-existing path, not under data/prices/,
@@ -173,7 +213,7 @@ class TestPerTicker(unittest.TestCase):
     def test_default_ticker_is_spy(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache_path = os.path.join(tmp, "cache.csv")
-            points, warnings = get_price_series(fetch=lambda: STOOQ_SAMPLE, cache_path=cache_path)
+            points, warnings = get_price_series(fetch=lambda: YAHOO_SAMPLE, cache_path=cache_path)
             self.assertEqual(warnings, [])
             self.assertEqual(len(points), 3)
 
@@ -181,9 +221,9 @@ class TestPerTicker(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             spy_cache = os.path.join(tmp, "SPY.csv")
             mu_cache = os.path.join(tmp, "MU.csv")
-            save_cache(parse_stooq_csv(STOOQ_SAMPLE), spy_cache)
+            save_cache(parse_yahoo_chart(YAHOO_SAMPLE), spy_cache)
 
-            mu_sample = "Date,Open,High,Low,Close,Volume\n2026-01-06,1,1,1,210.50,1\n"
+            mu_sample = _yahoo_payload([("2026-01-06", 210.50)])
             points, warnings = get_price_series("MU", fetch=lambda: mu_sample, cache_path=mu_cache)
             self.assertEqual(warnings, [])
             self.assertEqual(points[-1].close, 210.50)
@@ -194,7 +234,7 @@ class TestPerTicker(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             spy_cache = os.path.join(tmp, "SPY.csv")
             mu_cache = os.path.join(tmp, "MU.csv")
-            save_cache(parse_stooq_csv(STOOQ_SAMPLE), spy_cache)
+            save_cache(parse_yahoo_chart(YAHOO_SAMPLE), spy_cache)
 
             def failing_fetch():
                 raise MarketDataError("MU offline")
@@ -204,7 +244,7 @@ class TestPerTicker(unittest.TestCase):
             self.assertEqual(len(mu_warnings), 1)
 
             spy_points, spy_warnings = get_price_series(
-                "SPY", fetch=lambda: STOOQ_SAMPLE, cache_path=spy_cache, max_age_days=999999
+                "SPY", fetch=lambda: YAHOO_SAMPLE, cache_path=spy_cache, max_age_days=999999
             )
             self.assertEqual(spy_warnings, [])
             self.assertEqual(len(spy_points), 3)

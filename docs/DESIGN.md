@@ -593,16 +593,18 @@ ROI above.
 
 ## Market data cache
 
-Daily closes for any ticker come from Stooq's free, no-key CSV endpoint
-(`https://stooq.com/q/d/l/?s=<ticker>.us&i=d`) over stdlib `urllib.request` — the
-only network access anywhere in this project, and the only reason "standard
-library only" carries a footnote. `get_price_series(ticker)` defaults to `"SPY"`,
-the original use (the benchmark comparison); Stock Unrealized P&L calls it for
-every ticker the dashboard currently holds shares in. Each ticker's response is
-cached to its own file, decoupled from Stooq's column layout so a change there
-can't silently corrupt the cache: SPY keeps the original `data/spy_daily_closes.csv`
-path so an existing cache on disk keeps working unchanged, every other ticker gets
-`data/prices/<TICKER>.csv`.
+Daily closes for any ticker come from Yahoo Finance's free, no-key chart JSON
+endpoint (`https://query1.finance.yahoo.com/v8/finance/chart/<TICKER>?period1=0&period2=<now>&interval=1d`)
+over stdlib `urllib.request` — the only network access anywhere in this
+project, and the only reason "standard library only" carries a footnote. (An
+earlier version used Stooq's CSV endpoint; Stooq now fronts it with a
+JavaScript bot challenge a stdlib-only fetch can't solve.) `get_price_series(ticker)`
+defaults to `"SPY"`, the original use (the benchmark comparison); Stock
+Unrealized P&L calls it for every ticker the dashboard currently holds shares
+in. Each ticker's response is cached to its own file, decoupled from Yahoo's
+response shape so a change there can't silently corrupt the cache: SPY keeps
+the original `data/spy_daily_closes.csv` path so an existing cache on disk
+keeps working unchanged, every other ticker gets `data/prices/<TICKER>.csv`.
 
 `get_price_series` never raises: a missing or stale (>1 day old) cache triggers
 a refresh attempt, but a failed fetch falls back to whatever cache already

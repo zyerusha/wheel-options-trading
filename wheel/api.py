@@ -737,6 +737,14 @@ class Dashboard:
         whole-account figure, which only sees a single terminal total_value
         with no notion of "which dollars are wheel dollars").
 
+        Also replays the wheel's own cash-flow timing into SPY -- the same
+        technique ``_build_benchmark`` uses for the whole account -- so "did
+        the wheel beat buy-and-hold SPY" has a direct answer isolated from
+        whatever else (buy-and-hold ETFs, other stock) sits in the same
+        account. A whole-account XIRR ahead of or behind SPY doesn't answer
+        that question by itself: it's diluted by every non-wheel dollar in
+        the account too.
+
         Uses ``self.all_cycles`` -- every cycle ever built from this
         account's full history -- independent of whatever ticker/date
         filters are active on this particular ``build()`` call, the same
@@ -759,7 +767,14 @@ class Dashboard:
             bm.CashFlowEvent(date=event_date, amount=amount, label=label, source="wheel", kind="WHEEL")
             for event_date, amount, label in events
         ]
-        result = bm.compare_to_benchmark(cash_flow_events, terminal_value, None, through)
+
+        price_points, warnings = marketdata.get_price_series("SPY")
+
+        def price_lookup(day: date):
+            return marketdata.price_on_or_before(price_points, day)
+
+        benchmark_terminal_value = bm.simulate_benchmark(cash_flow_events, through, price_lookup)
+        result = bm.compare_to_benchmark(cash_flow_events, terminal_value, benchmark_terminal_value, through)
 
         if result.actual_xirr_pct is None:
             return {
@@ -771,9 +786,9 @@ class Dashboard:
                 ],
             }
 
-        return {
+        payload: dict[str, Any] = {
             "available": True,
-            "warnings": [],
+            "warnings": warnings,
             "as_of": through.isoformat(),
             "terminal_value": _money(result.actual_terminal_value),
             "xirr_pct": _money(result.actual_xirr_pct),
@@ -781,7 +796,14 @@ class Dashboard:
                 {"date": event.date.isoformat(), "amount": _money(event.amount), "label": event.label}
                 for event in sorted(cash_flow_events, key=lambda event: event.date)
             ],
+            "benchmark": {
+                "name": "SPY",
+                "terminal_value": _money(result.benchmark_terminal_value),
+                "xirr_pct": _money(result.benchmark_xirr_pct),
+            },
+            "value_added": _money(result.value_added),
         }
+        return payload
 
     # ---- query ----
 
