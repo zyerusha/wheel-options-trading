@@ -53,7 +53,6 @@ from wheel.parser import (
     parse_exports,
 )
 from wheel.positions import discover_position_snapshots, latest_snapshot, latest_snapshot_per_account, load_snapshots
-from wheel.statmath import DAYS_PER_YEAR
 
 EXPORT_DIRS = (".", "data")
 
@@ -373,7 +372,11 @@ def _trade_log_txn_type(transaction: Transaction, dividend_row_ids: set[int]) ->
 
 
 def _trade_log_raw_row(
-    transaction: Transaction, type_: str, close_return_pct: float | None = None
+    transaction: Transaction,
+    type_: str,
+    close_return_pct: float | None = None,
+    *,
+    is_settled: bool = False,
 ) -> dict[str, Any]:
     quantity = abs(transaction.contracts)
     is_csp_open = (
@@ -400,6 +403,11 @@ def _trade_log_raw_row(
         # Only a closing fill has one; filled in by the caller, which knows the
         # opening price of the contract this row shut.
         "close_return_pct": close_return_pct,
+        # This row belongs to a position that is no longer active -- a fully
+        # closed leg (its open *and* its closes), a sale, an expiry. The
+        # frontend greys the whole row. The caller resolves it against the
+        # engine's leg state; see `_trade_log_entry`.
+        "is_settled": is_settled,
         "synthetic": False,
         "_sort": (transaction.event_date, 1, transaction.row_id),
     }
@@ -428,6 +436,7 @@ def _trade_log_engine_rows(cycle: Cycle) -> list[dict[str, Any]]:
                 "commission": None,
                 "net_cash_flow": _money(leg.open_cash),
                 "close_return_pct": None,
+                "is_settled": not leg.is_open,
                 "synthetic": False,
                 "_sort": (leg.open_date, 0, 0),
             }
@@ -448,6 +457,7 @@ def _trade_log_engine_rows(cycle: Cycle) -> list[dict[str, Any]]:
                     "commission": None,
                     "net_cash_flow": _money(close.cash),
                     "close_return_pct": _close_return_pct(leg.open_price, close.price, leg.side),
+                    "is_settled": not leg.is_open,
                     "synthetic": False,
                     "_sort": (close.date, 1, 0),
                 }
@@ -455,7 +465,7 @@ def _trade_log_engine_rows(cycle: Cycle) -> list[dict[str, Any]]:
     return rows
 
 
-def _trade_log_assignment_row(assignment) -> dict[str, Any]:
+def _trade_log_assignment_row(assignment, *, is_settled: bool) -> dict[str, Any]:
     acquire = assignment.direction == "ACQUIRE"
     return {
         "type": "Shares Assigned" if acquire else "Shares Called Away",
@@ -470,6 +480,7 @@ def _trade_log_assignment_row(assignment) -> dict[str, Any]:
         "commission": 0.0,
         "net_cash_flow": _money(assignment.cash),
         "close_return_pct": None,
+        "is_settled": is_settled,
         "synthetic": assignment.synthetic,
         "_sort": (assignment.date, 2, 0),
     }
@@ -484,12 +495,22 @@ def _trade_log_entry(
     dividend_row_ids: set[int],
     dividends: float,
     engine_exact: bool,
+    current_price: float | None = None,
 ) -> dict[str, Any]:
-    metrics = cycle_metrics(cycle, through, dividends=dividends)
+    metrics = cycle_metrics(cycle, through, current_price=current_price, dividends=dividends)
+
+    # A cycle holding no shares right now: any acquire-then-flat share row and
+    # any bare stock purchase are settled positions.
+    share_flat = sum(lot.remaining for lot in cycle.share_lots) <= 1e-9
+
+    def _assignment_settled(assignment) -> bool:
+        return assignment.direction == "DISPOSE" or share_flat
 
     if engine_exact:
         rows = _trade_log_engine_rows(cycle)
-        rows += [_trade_log_assignment_row(a) for a in cycle.assignments]
+        rows += [
+            _trade_log_assignment_row(a, is_settled=_assignment_settled(a)) for a in cycle.assignments
+        ]
         attribution_note = (
             "Same-day close/reopen on this ticker: rows are attributed via the "
             "engine, and Fees combines commission + fees."
@@ -501,11 +522,17 @@ def _trade_log_entry(
         # its return against the premium it actually opened at -- even after a
         # roll or a scaled entry at several prices.
         close_ref: dict[tuple[str, date], list[tuple[float, float, str]]] = {}
+        # Whether the leg a raw fill belongs to is fully closed -- so its open
+        # row is greyed together with its closes once the position is done.
+        open_settled: dict[tuple[str, date], bool] = {}
+        close_settled: dict[tuple[str, date], bool] = {}
         for leg in cycle.legs:
+            open_settled[(leg.occ_symbol, leg.open_date)] = not leg.is_open
             for close in leg.closes:
                 close_ref.setdefault((leg.occ_symbol, close.date), []).append(
                     (close.contracts, leg.open_price, leg.side)
                 )
+                close_settled[(leg.occ_symbol, close.date)] = not leg.is_open
 
         def _raw_close_pct(t: Transaction) -> float | None:
             if t.action not in _CLOSING_ACTIONS:
@@ -517,8 +544,24 @@ def _trade_log_entry(
             wavg_open = sum(qty * op for qty, op, _sd in items) / total
             return _close_return_pct(wavg_open, t.price, items[0][2])
 
+        def _raw_settled(t: Transaction) -> bool:
+            if t.action in (STO, BTO):
+                return open_settled.get((t.occ_symbol, t.event_date), False)
+            if t.action in _CLOSING_ACTIONS:
+                return close_settled.get((t.occ_symbol, t.event_date), True)
+            if t.action == SELL_STOCK:
+                return True
+            if t.action == BUY_STOCK:
+                return share_flat
+            return False
+
         rows = [
-            _trade_log_raw_row(t, _trade_log_txn_type(t, dividend_row_ids), _raw_close_pct(t))
+            _trade_log_raw_row(
+                t,
+                _trade_log_txn_type(t, dividend_row_ids),
+                _raw_close_pct(t),
+                is_settled=_raw_settled(t),
+            )
             for t in transactions
             if t.underlying == cycle.underlying
             and cycle.start_date <= t.event_date <= end
@@ -526,7 +569,11 @@ def _trade_log_entry(
         ]
         # A broker export that carries the equity leg already yields a real
         # Buy/Sell Shares row above; only the synthesized legs need adding.
-        rows += [_trade_log_assignment_row(a) for a in cycle.assignments if a.synthetic]
+        rows += [
+            _trade_log_assignment_row(a, is_settled=_assignment_settled(a))
+            for a in cycle.assignments
+            if a.synthetic
+        ]
         attribution_note = None
 
     rows.sort(key=lambda row: row.pop("_sort"))
@@ -557,11 +604,39 @@ def _trade_log_entry(
         (row.get("fees") or 0.0) + (row.get("commission") or 0.0) for row in rows
     )
 
-    # Wheel ROC annualized by trade turnover (365 / avg days a leg is held)
-    # rather than by the wheel's calendar span (365 / days_active).
-    roc_on_avg_days = (
-        metrics.roi_on_avg_wheel_pct * (DAYS_PER_YEAR / metrics.avg_days_in_trade)
-        if metrics.roi_on_avg_wheel_pct is not None and metrics.avg_days_in_trade
+    # P&L per day a position was actually held: total realized P&L of every
+    # completed open->close leg (roll segments included) over the sum of their
+    # holding days. Open legs have no finished pair yet.
+    closed_legs = [leg for leg in cycle.legs if not leg.is_open]
+    leg_days = [max(1, leg.days_held or 0) for leg in closed_legs]
+    closed_leg_pl = sum(leg.realized_pl for leg in closed_legs)
+    total_days_held = sum(leg_days)
+    pl_per_day_held = closed_leg_pl / total_days_held if total_days_held else None
+
+    # Where the campaign really stands right now, vs the misleading realized-only
+    # figure. Open option legs are valued at expiry (`option_open_premium`: a
+    # long put's whole debit is a loss, a short call's whole credit a gain) --
+    # their remaining time value is not marked, so a held protective put makes
+    # this conservative. `stock_unrealized_pl` marks held shares to the latest
+    # close (None when there is no price / no shares).
+    open_option_pl = metrics.option_open_premium
+    non_stock_pl = metrics.option_realized_pl + metrics.stock_realized_pl + dividends + open_option_pl
+    stock_unrealized = metrics.stock_unrealized_pl
+    mark_to_market_pl = (
+        None
+        if shares_held > 1e-9 and stock_unrealized is None
+        else non_stock_pl + (stock_unrealized or 0.0)
+    )
+    # The stock price at which the whole campaign nets to $0: raw cost of the
+    # shares still held, less every other dollar the campaign has banked or paid.
+    break_even_price = (
+        cost_basis - non_stock_pl / shares_held
+        if shares_held > 1e-9 and cost_basis is not None
+        else None
+    )
+    dollars_to_break_even = (
+        shares_held * (break_even_price - current_price)
+        if break_even_price is not None and current_price is not None
         else None
     )
 
@@ -581,12 +656,22 @@ def _trade_log_entry(
         "option_realized_pl": _money(metrics.option_realized_pl),
         "stock_realized_pl": _money(metrics.stock_realized_pl),
         "net_realized_pl": _money(metrics.net_realized_pl),
+        "stock_unrealized_pl": _money(stock_unrealized),
+        "open_option_pl": _money(open_option_pl),
+        "mark_to_market_pl": _money(mark_to_market_pl),
+        "current_price": _money(current_price),
+        "break_even_price": _money(break_even_price),
+        "dollars_to_break_even": _money(dollars_to_break_even),
         "dividends": _money(dividends),
         "total_fees_commissions": _money(total_fees_commissions),
         "capital_committed_now": _money(metrics.current_collateral),
         "capital_estimated": cycle.capital_estimated,
         "days_active": metrics.days_active,
         "profit_per_day": _money(metrics.profit_per_day),
+        "pl_per_day_held": _money(pl_per_day_held),
+        "closed_leg_pl": _money(closed_leg_pl),
+        "closed_leg_count": len(closed_legs),
+        "total_days_held": total_days_held,
         "win_rate_pct": metrics.win_rate_pct,
         "wins": metrics.wins,
         "losses": metrics.losses,
@@ -594,7 +679,6 @@ def _trade_log_entry(
         "avg_collateral": _money(metrics.avg_collateral),
         "roi_on_avg_wheel_pct": metrics.roi_on_avg_wheel_pct,
         "annualized_wheel_roc_pct": metrics.annualized_wheel_roc_pct,
-        "annualized_wheel_roc_on_avg_days_pct": roc_on_avg_days,
         "attribution_note": attribution_note,
         "transactions": rows,
     }
@@ -1125,7 +1209,7 @@ class Dashboard:
         }
         return payload
 
-    def _build_trade_log(self) -> dict[str, Any]:
+    def _build_trade_log(self, current_prices: dict[str, float | None]) -> dict[str, Any]:
         """One entry per wheel (``all_cycles``), each with its whole-history
         transaction ledger -- deliberately independent of any ticker/date/status
         filter, the same "a wheel is a historical unit" reasoning
@@ -1168,6 +1252,7 @@ class Dashboard:
                 dividend_row_ids=dividend_row_ids,
                 dividends=dividends.get(cycle.cycle_id, 0.0),
                 engine_exact=cycle.cycle_id in engine_exact,
+                current_price=current_prices.get(cycle.underlying),
             )
             for cycle in sorted(self.all_cycles, key=lambda cycle: (cycle.start_date, cycle.underlying))
         ]
@@ -1251,7 +1336,7 @@ class Dashboard:
         if self._wheel_return is None:
             self._wheel_return = self._build_wheel_return(current_prices)
         if self._trade_log is None:
-            self._trade_log = self._build_trade_log()
+            self._trade_log = self._build_trade_log(current_prices)
 
         portfolio = portfolio_metrics(
             cycles,

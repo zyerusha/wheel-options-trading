@@ -960,3 +960,17 @@ tr.detail > td {
   color: var(--text-muted);
   font-style: italic;
 }
+
+/* Rows for a position that is no longer active -- both the open (STO/BTO) and
+   its closes (BTC/STC/expiry/assignment), plus sales -- get a light-grey row
+   background so the still-active trades stand out. Font colours are untouched. */
+#tradelog-table tr.settled td {
+  background-color: var(--mid);
+}
+
+/* Stock fills (Buy / Sell Shares) read blue so they stand apart from the
+   option rows in the Type column. */
+#tradelog-table td.shares-type {
+  color: var(--series-1);
+  font-weight: 600;
+}

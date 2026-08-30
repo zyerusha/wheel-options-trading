@@ -15,7 +15,7 @@ from wheel.engine import build_cycles  # noqa: E402
 from wheel.parser import ASSIGNED, BTC, BTO, EXPIRED, STC, STO  # noqa: E402
 
 
-def _trade_log(transactions, names=None) -> dict:
+def _trade_log(transactions, names=None, prices=None) -> dict:
     """Run ``Dashboard._build_trade_log`` against a hand-built transaction list,
     without touching disk or the network (the ``__init__`` pipeline).
     """
@@ -23,7 +23,7 @@ def _trade_log(transactions, names=None) -> dict:
     dashboard.transactions = transactions
     dashboard.all_cycles, dashboard.engine = build_cycles(transactions)
     dashboard._company_names = names or {}
-    return Dashboard._build_trade_log(dashboard)
+    return Dashboard._build_trade_log(dashboard, prices or {})
 
 
 class TestTransactionRows(unittest.TestCase):
@@ -89,6 +89,75 @@ class TestTransactionRows(unittest.TestCase):
         self.assertIsNone(wheel["cost_basis_per_share"])
         self.assertIsNone(wheel["break_even_per_share"])
         self.assertAlmostEqual(wheel["total_fees_commissions"], 0.67)
+
+    def test_pl_per_day_held(self):
+        rows = _trade_log(
+            [
+                # 5-day short put: +99.34 open, -10.66 close -> +88.68
+                tx("2025-01-01", STO, "-MU250110P100", -1, 1.0, 99.34, row_id=1),
+                tx("2025-01-06", BTC, "-MU250110P100", 1, 0.10, -10.66, row_id=2),
+                # 10-day short put: +199.34 open, -50.66 close -> +148.68
+                tx("2025-02-01", STO, "-MU250228P100", -1, 2.0, 199.34, row_id=3),
+                tx("2025-02-11", BTC, "-MU250228P100", 1, 0.50, -50.66, row_id=4),
+            ]
+        )
+        (wheel,) = rows["wheels"]
+        self.assertEqual(wheel["closed_leg_count"], 2)
+        self.assertEqual(wheel["total_days_held"], 15)
+        self.assertAlmostEqual(wheel["closed_leg_pl"], 237.36, places=2)
+        # total P&L / total days held: 237.36 / 15
+        self.assertAlmostEqual(wheel["pl_per_day_held"], 15.82, places=2)
+
+    def test_pl_per_day_held_is_negative_for_a_losing_long(self):
+        rows = _trade_log(
+            [
+                tx("2025-03-01", BTO, "-MU250321P90", 1, 1.0, -100.66, row_id=1),
+                tx("2025-03-21", EXPIRED, "-MU250321P90", -1, None, 0.0, row_id=2, as_of="2025-03-21"),
+            ]
+        )
+        (wheel,) = rows["wheels"]
+        self.assertAlmostEqual(wheel["closed_leg_pl"], -100.66, places=2)
+        self.assertLess(wheel["pl_per_day_held"], 0)
+
+    def test_pl_per_day_held_is_none_when_no_leg_has_closed(self):
+        rows = _trade_log([tx("2025-01-01", STO, "-MU250131P100", -1, 1.0, 99.34, row_id=1)])
+        (wheel,) = rows["wheels"]
+        self.assertIsNone(wheel["pl_per_day_held"])
+        self.assertEqual(wheel["closed_leg_count"], 0)
+
+    def test_mark_to_market_pl_and_break_even_price(self):
+        # STO put -> assigned 100 sh @ $100 (kept $300 premium), then STO a
+        # covered call still open for +$150, stock now at $92.
+        rows = _trade_log(
+            [
+                tx("2025-01-02", STO, "-MU250117P100", -1, 3.0, 300.0, row_id=1),
+                tx("2025-01-17", ASSIGNED, "-MU250117P100", 1, None, 0.0, row_id=2, as_of="2025-01-17"),
+                tx("2025-01-20", STO, "-MU250221C105", -1, 1.5, 150.0, row_id=3),
+            ],
+            prices={"MU": 92.0},
+        )
+        (wheel,) = rows["wheels"]
+        self.assertEqual(wheel["shares_held"], 100.0)
+        # break-even: $100 cost - ($300 kept put premium + $150 open call) / 100
+        self.assertAlmostEqual(wheel["break_even_price"], 100.0 - 4.5, places=2)
+        # mark-to-market: +300 realized option, +150 open call, shares -$800 (92 vs 100)
+        self.assertAlmostEqual(wheel["stock_unrealized_pl"], -800.0, places=2)
+        self.assertAlmostEqual(wheel["mark_to_market_pl"], 300.0 + 150.0 - 800.0, places=2)
+        # ~ shares_held * (current - break_even)
+        self.assertAlmostEqual(
+            wheel["mark_to_market_pl"], 100.0 * (92.0 - wheel["break_even_price"]), places=2
+        )
+
+    def test_mark_to_market_pl_is_none_without_a_price(self):
+        rows = _trade_log(
+            [
+                tx("2025-01-02", STO, "-MU250117P100", -1, 3.0, 300.0, row_id=1),
+                tx("2025-01-17", ASSIGNED, "-MU250117P100", 1, None, 0.0, row_id=2, as_of="2025-01-17"),
+            ]
+        )  # no price supplied
+        (wheel,) = rows["wheels"]
+        self.assertEqual(wheel["shares_held"], 100.0)
+        self.assertIsNone(wheel["mark_to_market_pl"])
 
     def test_close_return_pct(self):
         rows = _trade_log(

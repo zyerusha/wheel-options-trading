@@ -4300,12 +4300,15 @@ function stepTradeLog(delta) {
   renderTradeLog();
 }
 
-function tradeLogCell(label, value, { help, foot } = {}) {
+function tradeLogCell(label, value, { help, foot, tone } = {}) {
   const cell = el('div', { class: 'tl-cell' });
   cell.appendChild(el('div', { class: 'tl-label' }, label));
   // An array value stacks each part on its own line (e.g. a date range), so a
-  // long value never wraps mid-token across two lines.
-  const valueNode = el('div', { class: 'tl-value' + (help ? ' help' : '') });
+  // long value never wraps mid-token across two lines. `tone` ('pos'|'neg')
+  // colours the value.
+  const valueNode = el('div', {
+    class: 'tl-value' + (help ? ' help' : '') + (tone ? ' ' + tone : ''),
+  });
   for (const part of Array.isArray(value) ? value : [value]) {
     valueNode.appendChild(el('div', {}, part));
   }
@@ -4324,55 +4327,167 @@ function renderTradeLogSummary(entry) {
   const cents = (value) => money(value, { cents: true });
   const perShare = (value) => (value === null || value === undefined ? '—' : '$' + value.toFixed(2));
 
-  host.appendChild(tradeLogCell('Ticker', entry.underlying + (entry.capital_estimated ? ' ~' : '')));
-  host.appendChild(tradeLogCell('Name', entry.name || '—'));
-  host.appendChild(tradeLogCell('Status', entry.status));
-  host.appendChild(tradeLogCell('Entries', String(entry.transactions.length)));
   host.appendChild(
-    tradeLogCell('Date range', [entry.start_date, `→ ${entry.end_date || 'current'}`])
+    tradeLogCell('Ticker', entry.underlying + (entry.capital_estimated ? ' ~' : ''), {
+      help: formula([
+        'Underlying stock symbol for this wheel.',
+        '~ = some capital is a strike-based estimate (pre-export shares).',
+      ]),
+    })
+  );
+  host.appendChild(
+    tradeLogCell('Name', entry.name || '—', {
+      help: formula(['Issuer name, best-effort from the broker description. Cosmetic only.']),
+    })
+  );
+  host.appendChild(
+    tradeLogCell('Status', entry.status, {
+      help: formula([
+        'ACTIVE: something is still open (a contract or shares).',
+        'CLOSED: flat, and never went through an assignment.',
+        'ASSIGNED: flat now, but an assignment happened along the way.',
+      ]),
+    })
+  );
+  host.appendChild(
+    tradeLogCell('Entries', String(entry.transactions.length), {
+      help: formula(['Number of transaction rows in the table below.']),
+    })
+  );
+  host.appendChild(
+    tradeLogCell('Date range', [entry.start_date, `→ ${entry.end_date || 'current'}`], {
+      foot: `${entry.days_active.toLocaleString('en-US')} day${entry.days_active === 1 ? '' : 's'}`,
+      help: formula([
+        "First trade → last trade, or 'current' while the wheel is open.",
+        'The day count is calendar days from the first trade to that end.',
+      ]),
+    })
   );
   host.appendChild(
     tradeLogCell('Cost basis / share', perShare(entry.cost_basis_per_share), {
       help: formula([
-        'Average purchase price of shares still held.',
-        'Raw tax-lot basis — what a 1099-B shows.',
-        '— when the wheel holds no shares.',
+        'Average purchase price of the shares still held.',
+        'The raw tax-lot basis (what a 1099-B would show).',
+        'A dash means the wheel holds no shares.',
       ]),
     })
   );
   host.appendChild(
-    tradeLogCell('Break-even / share', perShare(entry.break_even_per_share), {
+    tradeLogCell('Break-even price', perShare(entry.break_even_price), {
+      foot:
+        entry.current_price === null || entry.break_even_price === null
+          ? null
+          : `now ${perShare(entry.current_price)} · ${perShare(
+              Math.abs(entry.break_even_price - entry.current_price)
+            )} ${entry.current_price >= entry.break_even_price ? 'above' : 'to go'}`,
       help: formula([
-        'Net adjusted cost basis of the shares currently held.',
-        "Includes the wheel's applicable option cash flows and adjustments.",
-        'The price at which the remaining position exits flat.',
-        '— when the wheel holds no shares.',
+        'Stock price at which the whole campaign nets to $0:',
+        'raw cost of the shares still held, less every other',
+        'dollar the campaign has banked or paid (premium, fees,',
+        'dividends, open options valued at expiry).',
+        'A dash means the wheel holds no shares.',
       ]),
     })
   );
   host.appendChild(
-    tradeLogCell('Shares held', (entry.shares_held || 0).toLocaleString('en-US'))
+    tradeLogCell('Shares held', (entry.shares_held || 0).toLocaleString('en-US'), {
+      help: formula([
+        'Shares still held from assignment(s),',
+        'net of any sold or called away.',
+        '0 once the wheel is flat.',
+      ]),
+    })
   );
-  host.appendChild(tradeLogCell('Open contracts', String(entry.open_contracts || 0)));
-  host.appendChild(tradeLogCell('Gross premium received', cents(entry.gross_premium_received)));
-  host.appendChild(tradeLogCell('Dividends', cents(entry.dividends)));
-  host.appendChild(tradeLogCell('Total fees & commissions', cents(entry.total_fees_commissions)));
-  host.appendChild(tradeLogCell('Capital committed now', money(entry.capital_committed_now)));
+  host.appendChild(
+    tradeLogCell('Open contracts', String(entry.open_contracts || 0), {
+      help: formula(['Short option contracts still open, summed across all legs.']),
+    })
+  );
+  host.appendChild(
+    tradeLogCell('Gross premium received', cents(entry.gross_premium_received), {
+      help: formula([
+        'Sum of credits taken in on every short open (STO).',
+        'Not net of buy-backs (see Realized P&L for that).',
+      ]),
+    })
+  );
+  host.appendChild(
+    tradeLogCell('Dividends', cents(entry.dividends), {
+      help: formula(['Dividends received while this wheel held the stock.']),
+    })
+  );
+  host.appendChild(
+    tradeLogCell('Total fees & commissions', cents(entry.total_fees_commissions), {
+      help: formula(['Σ (fees + commissions) over every row in the table below.']),
+    })
+  );
+  host.appendChild(
+    tradeLogCell('Capital committed now', money(entry.capital_committed_now), {
+      help: formula([
+        'Collateral tied up right now, the sum of:',
+        'short-put collateral (strike × 100 × contracts),',
+        'cost basis of any shares held,',
+        'and strike × 100 for a short call whose backing',
+        'shares are not in the data (marked ~).',
+        '$0 once the wheel is flat.',
+      ]),
+    })
+  );
   host.appendChild(
     tradeLogCell('Realized P&L', cents(entry.net_realized_pl), {
+      tone: entry.net_realized_pl >= 0 ? 'pos' : 'neg',
       foot: `${cents(entry.option_realized_pl)} option · ${cents(entry.stock_realized_pl)} stock`,
+      help: formula([
+        'Closed positions only: option P/L plus realized stock P/L.',
+        `= ${cents(entry.option_realized_pl)} + ${cents(entry.stock_realized_pl)}`,
+        `= ${cents(entry.net_realized_pl)}`,
+        'For the full picture incl. open shares and options,',
+        'see P&L (mark-to-market) below.',
+      ]),
     })
+  );
+  host.appendChild(
+    tradeLogCell(
+      'P&L (mark-to-market)',
+      entry.mark_to_market_pl === null ? '—' : cents(entry.mark_to_market_pl),
+      {
+        tone:
+          entry.mark_to_market_pl === null ? null : entry.mark_to_market_pl >= 0 ? 'pos' : 'neg',
+        foot:
+          entry.mark_to_market_pl === null
+            ? 'no share price available'
+            : `${cents(entry.net_realized_pl)} realized · ${cents(
+                entry.stock_unrealized_pl
+              )} shares · ${cents(entry.open_option_pl)} open options`,
+        help: formula([
+          'Where the campaign stands right now.',
+          'Realized P&L + held shares marked to the latest close',
+          '+ open option legs valued at expiry (long puts as a',
+          'loss, short calls as a gain).',
+          "An open long option's remaining time value is not",
+          'marked, so a held protective put makes this conservative.',
+        ]),
+      }
+    )
   );
 
   const days1 = (value) => (value === null || value === undefined ? '—' : value.toFixed(1));
   host.appendChild(
-    tradeLogCell('PPD', entry.profit_per_day === null ? '—' : cents(entry.profit_per_day) + '/day', {
-      help: formula([
-        'Profit Per Day = Option P/L ÷ days the wheel has been active',
-        `= ${cents(entry.option_realized_pl)} ÷ ${entry.days_active}`,
-        `= ${entry.profit_per_day === null ? '—' : cents(entry.profit_per_day)}/day`,
-      ]),
-    })
+    tradeLogCell(
+      'P&L / day held',
+      entry.pl_per_day_held === null ? '—' : cents(entry.pl_per_day_held) + '/day',
+      {
+        foot: entry.closed_leg_count
+          ? `${entry.closed_leg_count} closed legs over ${entry.total_days_held} days held`
+          : null,
+        help: formula([
+          'Total option P&L divided by total days a position was held.',
+          `= ${cents(entry.closed_leg_pl)} ÷ ${entry.total_days_held} days`,
+          `= ${entry.pl_per_day_held === null ? '—' : cents(entry.pl_per_day_held)}/day`,
+          'Closed legs only. Each roll segment counts on its own.',
+        ]),
+      }
+    )
   );
   host.appendChild(
     tradeLogCell('Win rate', pct(entry.win_rate_pct), {
@@ -4389,17 +4504,20 @@ function renderTradeLogSummary(entry) {
     })
   );
   host.appendChild(
-    tradeLogCell('Annualized Wheel ROC', pct(entry.annualized_wheel_roc_on_avg_days_pct), {
-      foot:
+    tradeLogCell('Annualized Wheel ROC', pct(entry.annualized_wheel_roc_pct), {
+      tone:
         entry.annualized_wheel_roc_pct === null
           ? null
-          : `${pct(entry.annualized_wheel_roc_pct)} by calendar span`,
+          : entry.annualized_wheel_roc_pct >= 0
+          ? 'pos'
+          : 'neg',
       help: formula([
-        '(Option P/L ÷ Avg collateral) × (365 ÷ Avg days in trade)',
+        'Option P/L on the capital it tied up, scaled to a year.',
+        '(Option P/L ÷ Avg collateral) × (365 ÷ Days active)',
         `= (${cents(entry.option_realized_pl)} ÷ ${money(entry.avg_collateral)})` +
-          ` × (365 ÷ ${days1(entry.avg_days_in_trade)})`,
-        `= ${pct(entry.annualized_wheel_roc_on_avg_days_pct)}`,
-        'Annualized by trade turnover, not the wheel’s calendar span.',
+          ` × (365 ÷ ${entry.days_active})`,
+        `= ${pct(entry.annualized_wheel_roc_pct)}`,
+        'Option P/L only, never stock P/L. Same figure the Dashboard shows.',
       ]),
     })
   );
@@ -4431,22 +4549,61 @@ function renderTradeLogTable(entry) {
     'Net cash flow',
     'Cumulative cash flow',
   ];
+  const HEAD_HELP = {
+    Type: formula([
+      'What the trade did:',
+      'sell put, buy put, sell call, buy call,',
+      'expire, assign, shares in / out, dividend.',
+    ]),
+    Date: formula([
+      'Date the trade actually happened.',
+      'The as-of date, not the ledger post date.',
+    ]),
+    Expiration: formula(['Option expiry.', 'Blank for stock and dividend rows.']),
+    Strike: 'Option strike price.',
+    'Shares / Contracts': formula([
+      'Signed size of the fill:',
+      'positive means bought / long,',
+      'negative means sold / short.',
+      'A dash means a dividend row.',
+    ]),
+    'Price / Premium': formula([
+      'Per-share fill price for stock,',
+      'or option premium per share, as the broker quoted it.',
+      'Green +: cash received on this fill.',
+      'Red -: cash paid on this fill.',
+    ]),
+    'Return %': formula([
+      "The closing fill's return vs the premium at open.",
+      'Short: (open minus close) ÷ open.',
+      '  0.50 then a 0.25 buyback = 50%.',
+      'Long: (close minus open) ÷ open.',
+      '  1.00 then a 0.20 sale = -80%.',
+      'Expiry and assignment count as a close at 0.',
+      'Opening fills have no value here.',
+    ]),
+    'Initial CSP collateral': formula([
+      'Strike × 100 × contracts.',
+      'Shown on a cash-secured put open only.',
+    ]),
+    Fees: 'Regulatory and exchange fees on this fill.',
+    Commissions: 'Broker commission on this fill.',
+    'Net cash flow': formula([
+      "The broker's Amount for this row.",
+      'Already net of fees and commission.',
+    ]),
+    'Cumulative cash flow': formula([
+      'Running sum of Net cash flow down the rows.',
+      'A cash ledger, not a P&L figure.',
+    ]),
+  };
   const table = el('table');
   const thead = el('thead');
   const headRow = el('tr');
   head.forEach((label, index) => {
     const th = el('th', { class: index === 0 ? 'left' : '' }, label);
-    if (label === 'Return %') {
-      setFormula(
-        th,
-        formula([
-          "This closing fill's realized return, as a % of the premium at open:",
-          '  short  (open - close) ÷ open   — sold 0.50, bought back 0.25 → 50%',
-          '  long   (close - open) ÷ open   — bought 1.00, sold 0.20 → -80%',
-          'Expiry / assignment closes at 0. Opening fills have none.',
-        ])
-      );
-    }
+    setFormula(th, HEAD_HELP[label]);
+    th.style.cursor = 'help';
     headRow.appendChild(th);
   });
   thead.appendChild(headRow);
@@ -4460,13 +4617,24 @@ function renderTradeLogTable(entry) {
     value === null || value === undefined || value === 0
       ? '—'
       : (value > 0 ? '+' : '-') + Math.abs(value).toLocaleString('en-US');
+  // Price / premium signed by whether the cash for this fill was received
+  // (+, credit) or paid (-, debit) -- taken from the row's net cash flow.
+  const signedPrice = (row) => {
+    if (row.price === null || row.price === undefined) return '—';
+    const flow = row.net_cash_flow;
+    const prefix = typeof flow !== 'number' || flow === 0 ? '$' : flow > 0 ? '+$' : '-$';
+    return prefix + row.price;
+  };
 
   const tbody = el('tbody');
   for (const row of entry.transactions) {
     const tr = el('tr');
+    // Row belongs to a position that is no longer active (a fully closed leg --
+    // its open and its closes -- a sale, an expiry): grey the whole row.
+    if (row.is_settled) tr.classList.add('settled');
     if (row.synthetic) {
-      tr.className = 'synthetic';
-      tr.title = 'synthesized at strike — the broker export has no share leg for this assignment';
+      tr.classList.add('synthetic');
+      tr.title = 'Synthesized at the strike: the broker export has no share leg for this assignment.';
     }
     const cells = [
       row.type,
@@ -4474,7 +4642,7 @@ function renderTradeLogTable(entry) {
       row.expiration || '—',
       bare(row.strike),
       signedQty(row.signed_quantity),
-      bare(row.price),
+      signedPrice(row),
       typeof row.close_return_pct === 'number' ? pct(row.close_return_pct, 0) : '—',
       cents(row.initial_csp_collateral),
       cents(row.fees),
@@ -4484,8 +4652,20 @@ function renderTradeLogTable(entry) {
     ];
     cells.forEach((value, index) => {
       const td = el('td', { class: index === 0 ? 'left' : 'num' }, value);
+      if (index === 0 && (row.type === 'Buy Shares' || row.type === 'Sell Shares')) {
+        td.classList.add('shares-type'); // stock fills read blue, apart from the option rows
+      }
       if (index === 4 && typeof row.signed_quantity === 'number' && row.signed_quantity !== 0) {
         td.classList.add(row.signed_quantity > 0 ? 'pos' : 'neg');
+      }
+      if (
+        index === 5 &&
+        row.price !== null &&
+        row.price !== undefined &&
+        typeof row.net_cash_flow === 'number' &&
+        row.net_cash_flow !== 0
+      ) {
+        td.classList.add(row.net_cash_flow > 0 ? 'pos' : 'neg');
       }
       if (index === 6 && typeof row.close_return_pct === 'number') {
         td.classList.add(row.close_return_pct >= 0 ? 'pos' : 'neg');
