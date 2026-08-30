@@ -297,6 +297,68 @@ class TestEveryExport(unittest.TestCase):
                         self.assertGreaterEqual(lot["remaining"], -1e-6)
                         self.assertLessEqual(lot["remaining"], lot["shares"] + 1e-6)
 
+    def test_same_ticker_cycles_never_overlap_in_time(self):
+        """The Trade Log attributes raw transactions to a wheel by
+        underlying + inclusive date span (``wheel/api.py`` ``_trade_log_entry``).
+        That is only unambiguous while one ticker's cycles are strictly
+        separated -- so lock that in: at most one open cycle per ticker, and
+        every consecutive pair strictly ordered ``next.start > prev.end``.
+        """
+        for path in available_exports():
+            with self.subTest(export=os.path.basename(path)):
+                dashboard = Dashboard(path)
+                by_underlying: dict[str, list] = {}
+                for cycle in dashboard.all_cycles:
+                    by_underlying.setdefault(cycle.underlying, []).append(cycle)
+                for underlying, group in by_underlying.items():
+                    ordered = sorted(group, key=lambda cycle: cycle.start_date)
+                    self.assertLessEqual(
+                        sum(1 for cycle in ordered if cycle.end_date is None),
+                        1,
+                        f"{underlying}: more than one open cycle",
+                    )
+                    for prev, nxt in zip(ordered, ordered[1:]):
+                        self.assertIsNotNone(
+                            prev.end_date, f"{underlying}: {prev.cycle_id} open but a later cycle exists"
+                        )
+                        self.assertGreater(
+                            nxt.start_date,
+                            prev.end_date,
+                            f"{underlying}: {prev.cycle_id} and {nxt.cycle_id} overlap",
+                        )
+
+    def test_trade_log_covers_every_wheel_and_reconciles_row_cash(self):
+        for path in available_exports():
+            with self.subTest(export=os.path.basename(path)):
+                dashboard = Dashboard(path)
+                payload = dashboard.build()  # no filters -> wheels == all cycles
+                trade_log = payload["trade_log"]
+                self.assertEqual(trade_log["warnings"], [])
+                self.assertEqual(
+                    {w["cycle_id"] for w in trade_log["wheels"]},
+                    {c.cycle_id for c in dashboard.all_cycles},
+                )
+                for wheel in trade_log["wheels"]:
+                    running = 0.0
+                    for row in wheel["transactions"]:
+                        running += row["net_cash_flow"] or 0.0
+                        self.assertAlmostEqual(row["running_cash_flow"], round(running, 2), places=2)
+
+    def test_trade_log_is_filter_independent(self):
+        """A date filter narrows the Dashboard's cycles but must never shrink a
+        Trade Log wheel -- it is always the whole wheel.
+        """
+        for path in available_exports():
+            with self.subTest(export=os.path.basename(path)):
+                dashboard = Dashboard(path)
+                full = dashboard.build()["trade_log"]["wheels"]
+                narrowed = dashboard.build(Filters(start=date(2025, 11, 1), end=date(2025, 11, 30)))
+                narrowed_wheels = narrowed["trade_log"]["wheels"]
+                self.assertEqual(
+                    {w["cycle_id"]: len(w["transactions"]) for w in full},
+                    {w["cycle_id"]: len(w["transactions"]) for w in narrowed_wheels},
+                )
+
     def test_building_twice_is_deterministic(self):
         """Guards against state leaking onto the shared transaction records."""
         for path in available_exports():
@@ -341,7 +403,9 @@ class TestCapitalPayload(unittest.TestCase):
             for point in series:
                 self.assertEqual(
                     point["total"],
-                    round(point["put"] + point["stock"] + point["call"] + point["long"], 2),
+                    round(
+                        point["put"] + point["stock"] + point["call"] + point["long"] + point["spread"], 2
+                    ),
                     point["date"],
                 )
                 checked += 1
@@ -378,7 +442,7 @@ class TestCapitalPayload(unittest.TestCase):
 
     def test_capital_is_never_negative(self):
         for point in self.payload["capital_series"]:
-            for key in ("put", "stock", "call", "long", "total"):
+            for key in ("put", "stock", "call", "long", "spread", "total"):
                 self.assertGreaterEqual(point[key], 0.0, f"{point['date']} {key}")
 
 

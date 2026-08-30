@@ -56,10 +56,28 @@ prefers the as-of date, which is what puts them in the right cycle.
 ### Cycles
 
 A **cycle** is one campaign in one underlying: it opens on the first position taken
-and closes only when that ticker is completely flat — no open contracts, no shares.
+and closes when that ticker is completely flat — no open contracts, no shares.
 Rolls, scaled entries, assignment and the covered calls that follow all land inside
 one cycle without contract-to-contract chaining, which matters because real rolls do
 not preserve size (this book closes 4 contracts and opens 2 on 2025-10-20).
+
+**A flat gap does not end the wheel; a completed rotation or the year turning does.**
+Selling puts, closing them, and selling more later — with a flat stretch in between —
+is one ongoing wheel, not a string of tiny ones. So when a ticker goes flat and is
+then re-entered *with an option (STO/BTO)*, the engine reopens the most recent cycle
+(`WheelEngine._resumable_cycle`) rather than starting a new one, **unless** either:
+
+- that cycle already **completed a full rotation** — a covered call was assigned and
+  its stock called away (a `DISPOSE` assignment). That is a finished wheel; the next
+  entry is a new one. A cycle that only ever sold puts (assigned or not) has not
+  completed and stays resumable.
+- the re-entry falls in a **later calendar year**. The year is a deliberate cut point
+  (it also resets the `-<n>` sequence), so a position carried across New Year's still
+  starts a fresh `<ticker>-<year>-1`.
+
+A bare stock purchase after a flat gap also starts its own cycle. A resumed cycle
+keeps its original id and simply spans the flat days; committed capital reads $0
+across them.
 
 Status is `ACTIVE` while anything is open, otherwise `ASSIGNED` if the campaign went
 through an assignment, otherwise `CLOSED`.
@@ -128,10 +146,45 @@ changes every time a put rolls to a different strike:
 - assigned shares → cost basis
 - covered call → **nothing**; the capital is already in the shares
 - short call with no tracked shares → `strike × 100`, as a labelled proxy
+- a short and a long leg paired into a `Spread` (see "Credit spreads" below) →
+  `|short strike − long strike| × 100 × paired contracts`, in place of the short
+  leg's own full CSP/covered-call figure for the paired portion
 
-That last case covers eight tickers here: calls written against stock bought before
-this export starts. Without the proxy those tickers report an undefined return on
-zero capital. They are marked `~` in the UI and `capital_estimated` in the payload.
+That last un-paired case covers eight tickers here: calls written against stock
+bought before this export starts. Without the proxy those tickers report an
+undefined return on zero capital. They are marked `~` in the UI and
+`capital_estimated` in the payload.
+
+### Credit spreads
+
+A short and a long leg of the same underlying, right and expiry, opened on the
+*same day*, pair into a `Spread` (`wheel/engine.py`, `WheelEngine._detect_spreads`)
+-- the only pairing rule the engine applies, deliberately narrow: it mirrors the
+existing same-day `_detect_rolls` grouping rather than trying to match legs across
+different days, where the correct pairing is genuinely ambiguous (a later long
+could be a new hedge, an adjustment, or unrelated). Quantities pair down to
+whichever side is smaller; the excess on the larger side stays a naked leg, priced
+by its own ordinary formula above.
+
+**More than one short or long candidate in the same (underlying, right, expiry,
+day) group pairs nothing.** One short put alongside two same-day long puts at
+different strikes is real data, not a hypothetical (MU, 2025-11-17): pairing
+against either one would be a guess, so none of that group pairs, all three legs
+stay naked, and a cycle warning names the ambiguous group -- the same
+"ambiguous → leave unmatched, warn" rule already used for ticker-rename matching
+(`_lots_under_former_ticker`).
+
+**A spread's netting only holds while both legs remain open.** If one side closes
+early, the other reverts to its own naked collateral formula for whatever it has
+left -- `paired_contracts` is fixed at pairing time, but each day's actual netted
+amount is `min(paired_contracts, short leg's remaining, long leg's remaining)`,
+computed fresh in `capital_timeline`.
+
+Pairing never touches P/L: `Spread` is a costing overlay only, layered on top of
+the untouched `OptionLeg.realized_pl`/`gross_premium`/`closes` machinery. A credit
+spread's net P/L was already correct before this feature existed (both legs'
+`realized_pl` simply summed into `option_realized_pl`); what changed is only how
+much *collateral* the paired portion reports while open.
 
 A day on which nothing was live is emitted explicitly at zero rather than left out
 of the series. Anything plotting it draws a straight line between consecutive
@@ -155,6 +208,12 @@ findable. It stays in the tooltip, the table and a legend note. Dropping it also
 leaves the stack on palette slots 1–3, the only subset validated all-pairs in both
 modes; the slot-4 yellow it gave up sat next to slot-2 orange, the documented weak
 pair.
+
+**Spread collateral gets the same treatment, for a different reason.** Unlike
+long-option debit it is not always negligible, but giving it a fourth band would
+reopen exactly the weak-color-pair problem the three existing bands were
+deliberately validated against. It is counted in the total and shown in the
+tooltip, the table and its own legend note, never banded.
 
 **That makes the total line load-bearing, not decoration.** The gap between the top
 band and the line is exactly the excluded debit, and on 26 days across two tickers
@@ -180,23 +239,121 @@ tooltip's dollars disagree with the chart's percentages.
 
 ### Returns
 
-ROI is quoted against three denominators — initial, peak, and time-weighted average
-capital — because no single one is honest for a position that resizes. Annualized ROC
-always uses the time-weighted average, the only denominator that credits a position
-for releasing capital early. Idle days at zero committed capital are excluded so a
-gap between legs does not dilute the result.
+`roi_pct` and `roi_on_peak_pct` are quoted against the initial and peak collateral
+using `net_realized_pl` (premium plus realized stock P/L) -- they exist to show how
+sensitive ROI is to denominator choice on a position that resizes, not to gauge the
+wheel's own option income.
 
-The portfolio-level annualized figure is computed against the portfolio's own
-time-weighted average capital rather than by averaging per-cycle percentages, which
-would weight a one-day $1,400 trade the same as a two-month $60,000 one.
+The headline metric, **Wheel ROC** (`roi_on_avg_wheel_pct`, annualized as
+`annualized_wheel_roc_pct`), answers a narrower question: how much did the wheel's
+*option activity* return on the capital it tied up, over time. Its numerator is
+`option_realized_pl` only -- credits received minus debits paid to close -- and never
+`net_realized_pl`: stock P/L, realized or not, gain or loss, does not enter it. A put
+assigned at $100 that later trades at $80 does not make the wheel's ROC negative --
+the stock is capital the wheel has tied up, not a loss the wheel's option leg took.
+Conflating the two would credit (or blame) the option side for a move that was really
+the stock's. `stock_realized_pl` and `net_realized_pl` remain available as their own
+figures for anyone who wants the stock's own P/L or the full investment picture --
+this tracker's ROC just doesn't fold them in.
 
-Every ROI and annualized ROC number is quoted twice, at the cycle, ticker, and
-portfolio level: once against `option_realized_pl` (premium only -- credits
-received minus debits paid to close, never touched by the underlying's price)
-and once against `net_realized_pl` (premium plus realized stock P/L -- the full
-wheel result). A stock assignment or call-away can swing the full-wheel figure
-well away from the premium-only one; conflating the two would credit premium
-income for a move that was really the stock's, or vice versa.
+`option_realized_pl` sums every leg in the cycle -- it always has, since nothing
+here filters by `WHEEL_STRATEGIES` -- so protective puts and both legs of a
+credit-spread hedge are already in it, each leg's own `realized_pl` already
+netting its opening cash against every closing cash flow (a put bought for
+$1,000 and sold for $700 contributes -$300, not -$1,000 and not +$700 booked
+separately). `wheel_core_realized_pl` (CSP + covered-call legs) and
+`hedge_realized_pl` (everything else -- `LONG_PUT`/`LONG_CALL`) are exposed as
+the two addends purely so a caller can show that split; the model has no
+concept of "this leg hedges that one", so every non-core leg counts as a hedge.
+Capital for a long leg is the actual debit paid, decaying to $0 on close, never
+notional -- and a short leg paired into a same-day `Spread` (see "Credit spreads"
+above) reports the netted `|short strike − long strike| × 100` collateral for its
+paired portion instead of the full CSP/covered-call figure. An unpaired short leg
+-- no same-day long partner, or an ambiguous multi-candidate group -- is completely
+unaffected and still gets full collateral, exactly as before this feature existed.
+
+Both `roi_on_avg_wheel_pct` and the net-based ROI variants use the time-weighted
+average collateral as their denominator when annualizing, the only one that credits
+a position for releasing capital early; idle days at zero committed capital are
+excluded so a gap between legs does not dilute the result. The portfolio-level
+annualized figure is computed against the portfolio's own time-weighted average
+capital rather than by averaging per-cycle percentages, which would weight a one-day
+$1,400 trade the same as a two-month $60,000 one.
+
+### Cost basis: tax basis vs. net adjusted cost basis
+
+`ShareLot.basis_per_share` is the raw tax-lot basis -- the bare assignment or
+purchase price, exactly what a 1099-B would show -- and nothing in this feature
+touches it. `net_adjusted_cost_basis()` (`wheel/metrics.py`) is a second, separate
+number: the wheel's own economic break-even, `strike − net option cash flow/share`,
+accumulated over the *whole cycle's* option activity (every roll, every covered
+call sold after assignment), not just the leg that produced the lot. When a cycle
+holds more than one concurrent lot at different strikes, the cycle's net cash flow
+is allocated pro-rata by share count, against every share the cycle's lots ever
+held -- so the allocation stays stable as shares are later sold off, rather than
+each lot claiming the whole cycle's premium independently.
+
+The formula's `+ fees/share` term looks like it duplicates the fee that's already
+netted into every cash figure here (`Transaction.amount` is fee-net -- see
+"Verification" below) -- and it would, if "net premiums received" meant that same
+fee-net figure. It doesn't: reconstructing gross premium (adding each leg's fees
+back, the same trick `wheel/cashflow.py`'s `_split_option_row` already uses) and
+then subtracting fees back out via the formula's own term is algebraically
+identical to just using the already fee-net total directly. That identity is
+exactly what the implementation does -- no separate fee term, because there's
+nothing left for it to do once the gross reconstruction is skipped.
+
+### Dual-track returns: Net Option Yield and Total Position ROI
+
+Two more figures sit alongside the existing `roi_pct` / `roi_on_avg_wheel_pct` /
+`annualized_wheel_roc_pct` trio, side by side rather than replacing them, quoted
+against a different denominator: **initial** collateral (the position's day-one
+capital), not the time-weighted average the headline Wheel ROC uses.
+
+**Net Option Yield %** (`net_option_yield_pct`, annualized as
+`annualized_net_option_yield_pct`) is `option_realized_pl ÷ initial_collateral` --
+the same numerator as Wheel ROC, a different denominator. It answers "how much did
+the option side return on the capital committed at entry," which a resizing
+position (more contracts added mid-cycle, or capital freed early) can report
+differently from the time-weighted-average-based Wheel ROC.
+
+**Total Position ROI %** (`total_position_roi_pct`, annualized as
+`annualized_total_position_roi_pct`) is the full investment picture:
+`(option_realized_pl + stock_realized_pl + stock_unrealized_pl + dividends_received)
+÷ initial_collateral`. Two things it deliberately does *not* include:
+
+- **Long-option (open protective put / long call) unrealized P/L.** There is no
+  options-quote feed anywhere in this stdlib-only project to mark an open hedge to
+  market, so `long_leg_unrealized_pl` is always `None` -- a labelled placeholder,
+  not a fake zero. Only a hedge leg's *realized* P/L (already inside
+  `option_realized_pl` via `hedge_realized_pl`) counts until it actually closes.
+- **Fees on top of the option/stock figures.** Every cash figure feeding this
+  formula is already fee-net (the broker's own `Amount`), so nothing here
+  re-subtracts fees a second time -- the same principle the module docstring
+  states for `option_realized_pl` itself.
+
+`stock_unrealized_pl` marks every share lot still held to the underlying's latest
+close, fetched and cached the same way the SPY benchmark price always has been --
+see "Market data cache" below, now generalized to any ticker. It is `None`, not
+`0.0`, when no shares are held or no price is available, so it reads as "unknown"
+rather than "no gain," matching this codebase's existing `None`-means-unknown
+convention (`_safe_pct`, `win_rate_pct`).
+
+`dividends_received` comes from `wheel/cashflow.py`'s existing dividend classifier
+(`dividend_transactions`), attributed to whichever cycle was open on the
+underlying's own ticker when the dividend posted -- `wheel.metrics.dividends_by_cycle`
+matches each dividend's `event_date` against `[cycle.start_date, cycle.end_date or
+still-open]`. On the rare day one cycle closes and a new one for the same ticker
+opens, the earlier (closing) cycle claims it, since cycles are walked in
+chronological order and the engine never actually produces two cycles that open
+and close on the exact same day for the same ticker (a new cycle can't open until
+the prior one goes flat, which this replay processes within the same day).
+
+Portfolio- and ticker-level rollups follow the same "recompute from summed
+absolutes, never average per-cycle percentages" principle as every other combined
+figure in this codebase: `total_initial_collateral` is the sum of every cycle's own
+`initial_collateral`, and both dual-track percentages are recomputed against that
+sum, not averaged from each cycle's or account's own percentage.
 
 ## Verification
 
@@ -256,13 +413,19 @@ copies of a trade are taken from a single chosen file so their relative order �
 the intra-day sequencing depends on — stays intact.
 
 **The identity test has to tolerate the broker's own inconsistency.** Comparing rows
-verbatim fails on two axes that vary between exports of the same account:
+verbatim fails on three axes that vary between exports of the same account:
 
 - spacing: `BRIGHTHOUSE FINL INC NOV 21 25` vs `BRIGHTHOUSE FINL INCNOV 21 25`;
-- the as-of date format: `as of Sep-17-2025` vs `as of 2025-09-17`.
+- the as-of date format: `as of Sep-17-2025` vs `as of 2025-09-17`;
+- the cash columns: one PLTR buy-back downloaded twice shows `Fees 0.02 / Amount
+  −261.32` in the newer file and `0.03 / −261.33` in the older — Fidelity re-rounds
+  commission, fees and the net amount between downloads.
 
-So the key strips all whitespace and replaces the whole as-of phrase — the parsed
-`as_of_date` already carries that information as a real field.
+So the key strips all whitespace, replaces the whole as-of phrase (the parsed
+`as_of_date` already carries that), and is built from the fields that actually define
+a fill — date, symbol, action, direction, size, quoted price — **not** `commission`,
+`fees` or `amount`. A genuinely repeated fill within one file still survives, because
+the merged count is the max seen in any one file, not a set membership test.
 
 **Row order has to be normalized first.** Some exports are oldest-first, others
 newest-first. Since `row_id` breaks ties between events on the same day, a
@@ -274,6 +437,219 @@ One assumption worth stating: identity is content-based, so two *different accou
 making an identical trade on the same day would merge into one. The exports carry no
 account column, so this cannot be detected — combine exports from one account unless
 a portfolio-wide view is what you want.
+
+## Position snapshots
+
+A Positions export (`wheel/positions.py`) is a different shape from everything
+above: one row per current holding at a single moment, not one row per historical
+fill. It is what makes true net worth possible — the transaction-history engine
+only ever sees option-wheel-related legs, so a buy-and-hold ETF an option has
+never touched (IVV, QQQ, GLD) is invisible to it, and so is whole-account cash.
+
+**The header alone tells the two formats apart.** Transaction history starts
+`Run Date`; Positions starts `Account number`. Discovery sniffs on that first
+column, the same way `looks_like_export` already does, so both kinds of file can
+sit in the same folder without either misparsing the other.
+
+**A short option's symbol carries a leading space before the dash** —
+`" -CROX260821C150"` as one CSV field. `parse_occ_symbol` already strips the
+dash; the parser strips the whitespace first, and reuses that function rather
+than duplicating OCC-symbol parsing a second time.
+
+**A row with no quantity and no price is cash**, regardless of what its Symbol
+column says — the money-market sweep (`SPAXX**`) and the unlabeled
+`Pending activity` line both take this path. Every other row is classified from
+its symbol: a resolvable OCC symbol is an option, a bare symbol is equity, and
+what remains is `UNKNOWN` — kept, not dropped, with one warning per occurrence,
+matching the norm the parser already sets for anything ambiguous.
+
+**`Type` is Fidelity's Cash/Margin/Financing activity tag, not a separate
+brokerage account.** The same symbol legitimately appears on two rows with two
+different `Type` values (a real Fidelity account splits a position across
+sub-types), and both are kept as distinct rows rather than merged — merging
+them would silently drop one lot's cost basis.
+
+**The authoritative as-of moment is the footer, not the filename.** Every export
+ends with a line like `"Date downloaded Aug-03-2026 5:45 p.m ET"`; that instant
+is what every net-worth and benchmark figure is dated to. The filename is only a
+fallback for a file whose footer is missing or unparseable, since it carries a
+coarser, date-only granularity and is trivially user-editable.
+
+## Account folders and combined aggregation
+
+Transaction-history exports carry no account column — already a known limitation
+for merging (see "Combining exports" above), and it means a true *per-account*
+view was previously impossible even in principle. Since one Positions row genuinely
+does carry `Account number`, the fix is structural rather than another parsing
+heuristic: put each account's own files in their own folder under `data/`, and let
+the folder be the account boundary. Loose files directly in `data/` (the layout
+every export before this feature used) become one more, implicit account, so
+nothing already on disk has to be reorganized.
+
+`wheel/accounts.py`'s `AccountRegistry` builds one `Dashboard` per discovered
+folder — each is exactly the existing single-account pipeline, unmodified — and
+answers a `"combined"` query by aggregating the already-built payloads one level
+up, never by pooling the accounts' transactions into one parse. That distinction
+matters concretely: two accounts independently running a wheel on the same ticker
+would merge into one cycle if their transactions were combined the way two
+exports of the *same* account are (`merge_transactions` has no account field to
+key on) — so combined `cycles` and `tickers` are the **concatenation** of every
+account's own rows, each tagged with the account it came from, never re-merged.
+
+**`cycle_id` is `"<ticker>-<start year>-<n>"`, and `n` restarts at 1 each calendar
+year** (`WheelEngine._cycle_counter` is keyed on `(underlying, year)`) — the first MU
+campaign of 2026 is `MU-2026-1` no matter how many MU campaigns ran in 2025, since the
+year already separates them. It is also regenerated per account, so both accounts'
+first 2026 MU cycle would be `MU-2026-1`; the dashboard uses `cycle_id` as a set key
+for expand/collapse state, so the combined view prefixes it with the account id.
+Without that, two unrelated cycles sharing a generated id would expand and collapse
+together.
+
+**Combined return figures are recomputed from the combined absolutes, never
+averaged from each account's own percentage** — the same principle
+`portfolio_metrics` already applies going from cycles to the portfolio (see
+"Returns" below), one level further up. Concretely: a $15,000 six-day trade and a
+$20,000 nine-day trade combine to an $18,000 time-weighted average capital
+(`(15000×6 + 20000×9) / (6+9)`), not the $17,500 a naive average of the two
+positions' own sizes would give — and the two accounts' own ROI percentages
+average to a number further still from the combined figure, since averaging
+percentages discards how large or how long each position actually was. Capital
+series and P/L series are summed **day by day** across accounts' already-built
+series for the same reason a lump average would misrepresent them.
+
+**The reverse case — one Positions file naming more than one real account —
+can't be resolved the same way, since there's nothing to group by two folders
+reporting the same number.** Fidelity's "all accounts" download lists every
+linked account's positions in a single CSV — often more accounts than there
+are folders under `data/`, since not every account needs (or has) its own
+transaction-history folder. So `AccountRegistry.refresh()` doesn't stop at one
+Dashboard per folder: after resolving each folder's own account number
+(config or the "whichever snapshot was seen most recently" heuristic
+`Dashboard._build_net_worth` falls back to), it scans every Positions file
+found anywhere under `data/` for account numbers no folder claimed and gives
+each of *those* its own positions-only Dashboard too — Net Worth and holdings
+only, since there's no transaction-history column to attribute it by.
+
+An optional `data/accounts.json` covers what auto-discovery can't decide on
+its own; see `wheel.accounts.load_account_config` and `AccountConfig`.
+`"folders"` — `{"<folder>": "<account number>", ...}` — names a folder's
+account explicitly instead of leaving it to the heuristic, which can pick the
+wrong one when a folder's own Positions file (or the shared "all accounts"
+download) lists several; a configured folder's Dashboard also widens its
+search to every discovered Positions file, not just its own folder's, since
+its data may only ever appear in someone else's shared download.
+`Dashboard.__init__`'s `account_number` argument does the actual filtering —
+for a configured folder and an auto-discovered account alike — dropping (with
+a warning) any other account numbers the same file(s) also contain, never
+silently shown or blended in. `"ignore"` — `["<account number or name>", ...]`
+— drops an account entirely, everywhere, by number or by `Account name`.
+`"default_account"` — an account id — is which account tab the frontend opens
+to instead of Combined, surfaced through `AccountRegistry.default_account_id`
+and `/api/accounts`. Transaction history still can't be split by account this
+way — no column to split it on — so it stays wholly attributed to whichever
+folder it's found in, same as the "Account folders" rule above.
+
+## External cash-flow classification
+
+The benchmark comparison (below) needs to know which non-trade ledger rows are
+money actually entering or leaving the account — a wire, a check, a rollover —
+versus money that only moved *within* it: a dividend, a fee, interest, or a
+corporate-action rename. Counting the latter as a contribution would make an
+account look like it needed less of its own performance to reach its ending
+value than it actually did.
+
+`wheel/benchmark.py` classifies every non-trade (`OTHER`-action) row with an
+ordered, most-specific-first pattern list — the same idiom as
+`wheel.parser._ACTION_PATTERNS` — for the same reason: `"DISTRIBUTION
+NAME/SYMBOL CHANGE"` (a corporate-action rename, see "Corporate actions" above)
+must be matched *before* any looser `"distribution"` rule, or it would be
+mistaken for a cash distribution and inflate the account's apparent contributions.
+
+Anything that matches no pattern is `UNCLASSIFIED`: excluded from the
+money-weighted calculation and surfaced as one deduped warning per distinct
+unmatched action text, rather than guessed at either way. This mirrors the
+`UNKNOWN` treatment for an unrecognized Positions row, and the same "detect from
+data, never hard-code, surface uncertainty" norm the whole parser is built on.
+
+## Money-weighted benchmark comparison
+
+The question "did the wheel beat just holding stock" is not a point-to-point
+value comparison: if the user deposited or withdrew money over time, comparing
+the ending values of two accounts that received cash on different dates isn't
+comparing the same amount of investing.
+
+**XIRR is the standard fix** — `wheel/benchmark.py`'s `xirr` solves for the
+single annualized rate that makes the present value of every dated cash flow net
+to zero, using Newton's method with a bisection fallback (stdlib `math` only, no
+`numpy`/`scipy`). But XIRR alone only tells you the account's own return; it
+says nothing about whether an index fund would have done as well or better with
+the *same* money.
+
+**The benchmark has to see the same cash-flow timing as the account did.**
+`simulate_benchmark_series` replays every external contribution and withdrawal —
+identical dates, identical dollar amounts — into a synthetic SPY position: a
+contribution buys shares at that day's close, a withdrawal sells them, and the
+result is marked to market at each requested date. Feeding the real account's
+own timing into the benchmark, rather than comparing a lump-sum SPY return to
+the account's XIRR, is what isolates "did the strategy beat buy-and-hold SPY"
+from "the user happened to add money before a rally" — the latter would bias a
+naive comparison in either direction, and it is exactly the same reasoning that
+makes a fund's own money-weighted return differ from its time-weighted one.
+
+**The tracked transaction history rarely reaches back to when the account was
+first funded.** Without accounting for that, XIRR would see only cash moved
+*after* the earliest recorded date and ignore whatever balance was already in
+place — understating invested capital, or with zero external transfers on
+record at all, making the return uncomputable outright (a single flow has no
+rate to solve for). So `wheel/api.py`'s `Dashboard._build_benchmark` treats the
+account's total value at its *earliest available* Positions snapshot as a
+synthetic opening contribution dated that day, and only external transfers
+*after* that date are added on top — avoiding a double count on the day the
+snapshot and a same-day transfer coincide.
+
+**At least two snapshots, on different dates, are required.** With only one,
+the opening-balance flow and the terminal valuation flow fall on the same date
+and exactly cancel for *any* rate — Newton's method would converge to its own
+initial guess and report it as if it meant something. The dashboard checks for
+this explicitly and reports the benchmark section as unavailable with a plain
+explanation, rather than a spurious number.
+
+**The combined view pools every account's cash-flow events into one stream**
+before computing a single portfolio-wide XIRR, rather than averaging each
+account's own rate — the same "recompute from absolutes" principle as combined
+ROI above.
+
+## Market data cache
+
+Daily closes for any ticker come from Yahoo Finance's free, no-key chart JSON
+endpoint (`https://query1.finance.yahoo.com/v8/finance/chart/<TICKER>?period1=0&period2=<now>&interval=1d`)
+over stdlib `urllib.request` — the only network access anywhere in this
+project, and the only reason "standard library only" carries a footnote. (An
+earlier version used Stooq's CSV endpoint; Stooq now fronts it with a
+JavaScript bot challenge a stdlib-only fetch can't solve.) `get_price_series(ticker)`
+defaults to `"SPY"`, the original use (the benchmark comparison); Stock
+Unrealized P&L calls it for every ticker the dashboard currently holds shares
+in. Each ticker's response is cached to its own file, decoupled from Yahoo's
+response shape so a change there can't silently corrupt the cache: SPY keeps
+the original `data/spy_daily_closes.csv` path so an existing cache on disk
+keeps working unchanged, every other ticker gets `data/prices/<TICKER>.csv`.
+
+`get_price_series` never raises: a missing or stale (>1 day old) cache triggers
+a refresh attempt, but a failed fetch falls back to whatever cache already
+exists — stale is better than unavailable — and only when there is genuinely
+neither a working fetch nor any cache does it return an empty series, with a
+warning the benchmark section (or, for a non-SPY ticker, `meta.market_data_warnings`)
+surfaces rather than a crash. One ticker's fetch failing never touches another's
+already-cached series. `price_on_or_before` resolves an arbitrary calendar date (a
+weekend, a holiday, the day a Positions snapshot happened to be taken) to the
+nearest prior trading-day close, the same way a broker values a non-trading day.
+
+`Dashboard._current_prices()` fetches every held ticker's price once per
+`Dashboard` instance, not once per `build()` call: the frontend calls `build()` on
+every filter change, and `get_price_series` still does disk I/O and a
+cache-freshness check even when it skips the network fetch, so re-running it on
+every filter change would multiply that cost by however many times a user narrows
+the date range or ticker list.
 
 ## Filtering
 

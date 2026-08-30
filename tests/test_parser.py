@@ -21,6 +21,7 @@ from wheel.parser import (  # noqa: E402
     STO,
     FidelityFormatError,
     classify_action,
+    company_name_from_description,
     parse_fidelity_csv,
     parse_occ_symbol,
 )
@@ -30,12 +31,21 @@ HEADER = (
     "Fees ($),Accrued Interest ($),Amount ($),Cash Balance ($),Settlement Date"
 )
 
+# The newer dialect seen (so far) on non-retirement accounts: no " ($)" suffix
+# on the dollar columns, a few extra FX columns this parser never reads, and
+# Price ahead of Quantity rather than behind it.
+MODERN_HEADER = (
+    "Run Date,Action,Symbol,Description,Type,Exchange Quantity,Exchange Currency,"
+    "Currency,Price,Quantity,Exchange Rate,Commission,Fees,Accrued Interest,"
+    "Amount,Cash Balance,Settlement Date"
+)
 
-def write_csv(rows: list[str], bom: bool = True, blanks: int = 2) -> str:
+
+def write_csv(rows: list[str], bom: bool = True, blanks: int = 2, header: str = HEADER) -> str:
     """Materialize a Fidelity-shaped CSV and return its path."""
     handle = tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, encoding="utf-8-sig" if bom else "utf-8")
     handle.write("\n" * blanks)
-    handle.write(HEADER + "\n")
+    handle.write(header + "\n")
     handle.write("\n".join(rows) + "\n")
     handle.close()
     return handle.name
@@ -109,6 +119,40 @@ class TestActionClassification(unittest.TestCase):
         )
 
 
+class TestCompanyName(unittest.TestCase):
+    """Best-effort, cosmetic-only issuer name for the Trade Log summary."""
+
+    def test_option_description(self):
+        self.assertEqual(
+            company_name_from_description("PUT (MU) MICRON TECHNOLOGY JAN 17 25 $100 (100 SHS)", "MU"),
+            "Micron Technology",
+        )
+
+    def test_name_ending_in_digits_survives(self):
+        self.assertEqual(
+            company_name_from_description("CALL (IWM) ISHARES RUSSELL 2000JAN 09 26 $253 (100 SHS)", "IWM"),
+            "Ishares Russell 2000",
+        )
+
+    def test_assignment_settlement_description(self):
+        self.assertEqual(
+            company_name_from_description("YOU BOUGHT ASSIGNED PUTS AS OF 02-20-26 MICRON TECHNOLOGY", "MU"),
+            "Micron Technology",
+        )
+
+    def test_ticker_only_trailer_is_rejected(self):
+        self.assertIsNone(company_name_from_description("(MU)", "MU"))
+
+    def test_bare_ticker_is_rejected(self):
+        self.assertIsNone(company_name_from_description("MU", "MU"))
+
+    def test_empty_description_is_rejected(self):
+        self.assertIsNone(company_name_from_description("", "MU"))
+
+    def test_fragment_with_stray_dollar_is_rejected(self):
+        self.assertIsNone(company_name_from_description("PUT (MU) $100", "MU"))
+
+
 class TestColumnOrientation(unittest.TestCase):
     def test_detects_transposed_columns(self):
         """Fidelity's export puts price under 'Quantity' and vice versa."""
@@ -145,6 +189,55 @@ class TestColumnOrientation(unittest.TestCase):
         self.assertFalse(report.columns_swapped)
         self.assertEqual(transactions[0].contracts, -1)
         self.assertEqual(transactions[0].price, 3.32)
+
+
+class TestModernDialect(unittest.TestCase):
+    """Fidelity's newer, non-'($)'-suffixed export dialect (seen so far on
+    non-retirement accounts) must reach the exact same parsing logic as the
+    classic one -- see wheel.parser._resolve_columns. A file using it must
+    never fall back to reading 'Price ($)'/'Amount ($)' (which don't exist in
+    this dialect) and silently zeroing out every dollar amount.
+    """
+
+    def test_correctly_labelled_modern_export_parses(self):
+        path = write_csv(
+            [
+                '08/05/2026,"YOU SOLD OPENING TRANSACTION CALL (QQQ) ...", -QQQ260904C745,'
+                '"CALL (QQQ) ...",Cash,0,"",USD,9,-1,0,0.65,0.03,,899.32,Processing,08/06/2026',
+            ],
+            header=MODERN_HEADER,
+        )
+        transactions, report = parse_fidelity_csv(path)
+        os.unlink(path)
+
+        self.assertFalse(report.columns_swapped)
+        self.assertEqual(len(transactions), 1)
+        transaction = transactions[0]
+        self.assertEqual(transaction.action, STO)
+        self.assertEqual(transaction.contracts, -1)
+        self.assertEqual(transaction.price, 9.0)
+        self.assertEqual(transaction.amount, 899.32)
+        self.assertEqual(report.reconciled, 1)
+
+    def test_modern_export_transposed_columns_are_still_detected(self):
+        """Same swap quirk, same detection mechanism, just the modern column names."""
+        path = write_csv(
+            [
+                '09/15/2025,"YOU SOLD OPENING TRANSACTION CALL (QQQ) ...", -QQQ250917C588,'
+                '"CALL (QQQ) ...",Cash,0,"",USD,-1,3.32,0,0.65,0.02,,331.33,60051.48,09/16/2025',
+                '09/15/2025,"YOU SOLD OPENING TRANSACTION CALL (KEY) ...", -KEY251031C20,'
+                '"CALL (KEY) ...",Cash,0,"",USD,-2,0.4,0,1.3,0.05,,78.65,60130.13,09/16/2025',
+            ],
+            header=MODERN_HEADER,
+        )
+        transactions, report = parse_fidelity_csv(path)
+        os.unlink(path)
+
+        self.assertTrue(report.columns_swapped)
+        self.assertEqual(transactions[0].contracts, -1)
+        self.assertEqual(transactions[0].price, 3.32)
+        self.assertEqual(transactions[1].contracts, -2)
+        self.assertEqual(transactions[1].price, 0.40)
 
 
 class TestRobustness(unittest.TestCase):

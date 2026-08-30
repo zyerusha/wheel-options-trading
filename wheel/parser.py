@@ -1,20 +1,32 @@
 """Fidelity transaction-history parser.
 
-The Fidelity "History_for_Account_*.csv" export has three quirks this module
+The Fidelity "History_for_Account_*.csv" export has four quirks this module
 absorbs so that nothing downstream has to think about them:
 
 1. A UTF-8 BOM and one or more blank lines before the real header row.
-2. The ``Quantity`` and ``Price ($)`` columns are **swapped** relative to their
-   labels: ``Quantity`` holds the per-share price and ``Price ($)`` holds the
-   signed contract count.  Rather than hard-coding that, :func:`parse_fidelity_csv`
-   tests both interpretations against the authoritative ``Amount ($)`` column
-   and picks whichever one reconciles -- so a future corrected export still works.
-3. ``ASSIGNED`` / ``EXPIRED`` rows are booked on the *following* business day but
+2. **Two column-naming dialects**, seen across different accounts (so far,
+   retirement accounts export the first and non-retirement accounts the
+   second -- but this is detected per file, not assumed from account type).
+   The classic dialect suffixes every dollar column with " ($)"
+   (``Price ($)``, ``Commission ($)``, ``Fees ($)``, ``Amount ($)``). A newer
+   dialect drops the suffix (``Price``, ``Commission``, ``Fees``, ``Amount``)
+   and adds a few FX columns this parser has no use for (``Exchange
+   Quantity``, ``Exchange Currency``, ``Exchange Rate``). :func:`_resolve_columns`
+   picks the right column names from whichever header the file actually has,
+   once per file -- every lookup downstream goes through that map rather than
+   a literal column name, so both dialects reach the same parsing logic.
+3. The ``Quantity`` and price columns are **swapped** relative to their labels
+   in some exports: ``Quantity`` holds the per-share price and the price
+   column holds the signed contract count. Rather than hard-coding that,
+   :func:`parse_fidelity_csv` tests both interpretations against the
+   authoritative ``Amount`` column and picks whichever one reconciles -- so a
+   correctly-labelled export still works too.
+4. ``ASSIGNED`` / ``EXPIRED`` rows are booked on the *following* business day but
    carry the real event date inline as ``as of Nov-20-2025``.  The parser exposes
    that as :attr:`Transaction.event_date`.
 
 Every monetary figure that reaches the engine comes from the file's own
-``Amount ($)`` column, which is already net of commission and fees.  Derived
+``Amount`` column, which is already net of commission and fees.  Derived
 prices are never used to re-compute cash.
 """
 
@@ -27,6 +39,8 @@ from collections import Counter
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from typing import Iterable, Iterator, Sequence
+
+from wheel.fileio import find_line
 
 # --------------------------------------------------------------------------
 # Action vocabulary
@@ -87,7 +101,64 @@ _AS_OF_ANY_RE = re.compile(r"as of\s+[\w-]+", re.IGNORECASE)
 _DESC_EXPIRY_RE = re.compile(r"\b([A-Z]{3})\s+(\d{2})\s+(\d{2})\b")
 _DESC_STRIKE_RE = re.compile(r"\$(\d+(?:\.\d+)?)")
 
+_MONTH_TOKENS = frozenset(
+    ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+)
+# One leading chunk of Fidelity action verbiage, before the issuer name.
+# ``company_name_from_description`` strips this repeatedly, so each alternative
+# only needs to match one token/phrase:
+#   "CALL (IWM) ISHARES RUSSELL 2000JAN 09 26 $253 (100 SHS)"
+#   "YOU BOUGHT ASSIGNED PUTS AS OF ... MICRON TECHNOLOGY"
+_NAME_PREFIX_RE = re.compile(
+    r"^\s*(?:"
+    r"YOU\s+(?:BOUGHT|SOLD)"
+    r"|(?:ASSIGNED|EXERCISED)"
+    r"|(?:OPENING|CLOSING)(?:\s+TRANSACTION)?"
+    r"|TRANSACTION"
+    r"|(?:PUTS?|CALLS?)\s*\([A-Z.]{1,6}\)"
+    r"|(?:PUTS?|CALLS?)"
+    r")\s+",
+    re.IGNORECASE,
+)
+# The option expiry that trails the issuer name -- Fidelity glues the two
+# together ("...RUSSELL 2000JAN 09 26"), so no leading word boundary. This is
+# where the name ends; deliberately no ``\b`` so a name ending in a digit
+# (iShares Russell 2000) survives intact.
+_NAME_DATE_TAIL_RE = re.compile(
+    r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{1,2}\s+\d{2,4}",
+    re.IGNORECASE,
+)
+
 _HEADER_KEY = "run date"
+
+# Two dialects of the same four dollar/quantity columns -- see the module
+# docstring. "Quantity" itself is spelled identically in both and so isn't
+# part of either map. "Accrued Interest" and "Cash Balance" also differ the
+# same way between dialects but are never read by this parser, so they're
+# left out rather than tracked for no reason.
+_LEGACY_COLUMNS = {
+    "price": "Price ($)",
+    "commission": "Commission ($)",
+    "fees": "Fees ($)",
+    "amount": "Amount ($)",
+}
+_MODERN_COLUMNS = {
+    "price": "Price",
+    "commission": "Commission",
+    "fees": "Fees",
+    "amount": "Amount",
+}
+
+
+def _resolve_columns(fieldnames: Sequence[str] | None) -> dict[str, str]:
+    """Which of Fidelity's two dollar-column dialects this export uses.
+
+    Detected from the header actually present in *this* file, never guessed
+    from account type or content -- a legacy file whose ``Price ($)`` column
+    happens to be empty on every row must still be read as legacy, not
+    mistaken for the modern dialect just because nothing reconciled.
+    """
+    return _LEGACY_COLUMNS if "Price ($)" in (fieldnames or ()) else _MODERN_COLUMNS
 
 
 class FidelityFormatError(ValueError):
@@ -244,6 +315,45 @@ def _expiry_from_description(description: str) -> date | None:
         return None
 
 
+def company_name_from_description(description: str, underlying: str) -> str | None:
+    """Best-effort issuer name pulled from a Fidelity description string.
+
+    ``'MICRON TECHNOLOGY OCT 03 25 $157.5 CALL (MU)'`` -> ``'Micron Technology'``.
+
+    Cosmetic only -- the ticker stays the sole identifier everywhere this is
+    used.  Returns ``None`` whenever what survives the trim still looks like a
+    half-parsed fragment (a digit, a ``$``, a month token) rather than a clean
+    name, so a caller can fall back to showing just the ticker.
+    """
+    text = _AS_OF_ANY_RE.sub(" ", (description or "").upper()).strip()
+    for _ in range(6):  # peel one verbiage chunk at a time
+        peeled = _NAME_PREFIX_RE.sub("", text, count=1).strip()
+        if peeled == text:
+            break
+        text = peeled
+
+    date_tail = _NAME_DATE_TAIL_RE.search(text)
+    strike = _DESC_STRIKE_RE.search(text)
+    if date_tail:
+        text = text[: date_tail.start()]
+    elif strike:
+        text = text[: strike.start()]
+
+    text = re.sub(r"\(\s*\d+\s*SH(?:S|ARES)?\s*\)\s*$", "", text)  # trailing "(100 SHS)"
+    text = re.sub(r"\(\s*[A-Z.]{1,6}\s*\)\s*$", "", text)  # trailing "(TICKER)"
+    text = re.sub(r"\b(PUT|CALL)S?\s*$", "", text)
+    text = re.sub(r"[\s,&/\-]+$", "", text)  # trailing punctuation from a truncated name
+    text = re.sub(r"\s{2,}", " ", text).strip()
+
+    # A name legitimately can carry digits (iShares Russell 2000, 3M), so only
+    # reject the tells of a half-parsed fragment: a stray "$", or a lone month.
+    if not text or text == (underlying or "").upper():
+        return None
+    if "$" in text or text in _MONTH_TOKENS:
+        return None
+    return " ".join(word.capitalize() for word in text.split())
+
+
 def _as_of(text: str) -> date | None:
     """Pull the real event date out of an 'as of ...' phrase, either format."""
     match = _AS_OF_RE.search(text or "")
@@ -304,20 +414,22 @@ def _orientation_score(contracts: float, price: float, amount: float, is_sale: b
     return score
 
 
-def _detect_swapped_columns(rows: Sequence[dict]) -> tuple[bool, str]:
-    """Decide whether ``Quantity`` and ``Price ($)`` are transposed.
+def _detect_swapped_columns(rows: Sequence[dict], columns: dict[str, str]) -> tuple[bool, str]:
+    """Decide whether ``Quantity`` and the price column are transposed.
 
     Returns ``(swapped, explanation)``.  Only rows that carry both numbers and a
     resolvable option symbol are scored, since equity rows admit fractional
     share counts and would muddy the whole-number test.
     """
+    price_col = columns["price"]
+    amount_col = columns["amount"]
     straight = swapped = 0
     for row in rows:
         if not parse_occ_symbol(row.get("Symbol", "")):
             continue
         col_qty = _num(row.get("Quantity"))
-        col_price = _num(row.get("Price ($)"))
-        amount = _num(row.get("Amount ($)"))
+        col_price = _num(row.get(price_col))
+        amount = _num(row.get(amount_col))
         if col_qty is None or col_price is None or amount is None or amount == 0:
             continue
 
@@ -329,7 +441,7 @@ def _detect_swapped_columns(rows: Sequence[dict]) -> tuple[bool, str]:
 
     if swapped > straight:
         return True, (
-            f"'Quantity' and 'Price ($)' are transposed in this export "
+            f"'Quantity' and '{price_col}' are transposed in this export "
             f"(score {swapped} vs {straight}); reading them in swapped order"
         )
     if straight > swapped:
@@ -342,26 +454,29 @@ def _detect_swapped_columns(rows: Sequence[dict]) -> tuple[bool, str]:
 # --------------------------------------------------------------------------
 
 
-def _read_rows(path: str) -> list[dict]:
-    """Read the CSV, tolerating the BOM, leading blanks and trailing junk."""
+def _read_rows(path: str) -> tuple[list[dict], dict[str, str]]:
+    """Read the CSV, tolerating the BOM, leading blanks and trailing junk.
+
+    Also resolves which dollar-column dialect this file uses (see
+    :func:`_resolve_columns`) from the header actually present, once, so
+    every row downstream is read with the same column names.
+    """
     with open(path, "r", encoding="utf-8-sig", newline="") as handle:
         lines = handle.read().splitlines()
 
-    header_index = next(
-        (i for i, line in enumerate(lines) if _HEADER_KEY in line.lower().split(",")[0]),
-        None,
-    )
+    header_index = find_line(lines, lambda line: _HEADER_KEY in line.lower().split(",")[0])
     if header_index is None:
         raise FidelityFormatError(f"no 'Run Date' header row found in {path!r}")
 
     reader = csv.DictReader(lines[header_index:])
+    columns = _resolve_columns(reader.fieldnames)
     rows: list[dict] = []
     for row in reader:
         # Disclaimer text at the foot of the file parses as a row with no date.
         if _parse_date(row.get("Run Date")) is None:
             continue
         rows.append(row)
-    return rows
+    return rows, columns
 
 
 def parse_fidelity_csv(path: str, report: ParseReport | None = None) -> tuple[list[Transaction], ParseReport]:
@@ -369,17 +484,17 @@ def parse_fidelity_csv(path: str, report: ParseReport | None = None) -> tuple[li
 
     Returns the transactions in chronological order plus a :class:`ParseReport`
     describing what was skipped and how many rows reconciled against the
-    broker's own ``Amount ($)`` column.
+    broker's own ``Amount`` column.
     """
     report = report or ParseReport()
-    rows = _read_rows(path)
+    rows, columns = _read_rows(path)
     report.total_rows = len(rows)
 
-    swapped, reason = _detect_swapped_columns(rows)
+    swapped, reason = _detect_swapped_columns(rows, columns)
     report.columns_swapped = swapped
     report.warnings.append(reason)
 
-    qty_col, price_col = ("Price ($)", "Quantity") if swapped else ("Quantity", "Price ($)")
+    qty_col, price_col = (columns["price"], "Quantity") if swapped else ("Quantity", columns["price"])
 
     transactions: list[Transaction] = []
     for index, row in enumerate(rows):
@@ -406,9 +521,9 @@ def parse_fidelity_csv(path: str, report: ParseReport | None = None) -> tuple[li
 
         contracts = _num(row.get(qty_col))
         price = _num(row.get(price_col))
-        commission = _num(row.get("Commission ($)")) or 0.0
-        fees = _num(row.get("Fees ($)")) or 0.0
-        amount = _num(row.get("Amount ($)")) or 0.0
+        commission = _num(row.get(columns["commission"])) or 0.0
+        fees = _num(row.get(columns["fees"])) or 0.0
+        amount = _num(row.get(columns["amount"])) or 0.0
 
         if action in {ASSIGNED, EXPIRED}:
             # These rows carry a bare, unsigned contract count in whichever of the
@@ -554,12 +669,21 @@ class MergeReport:
 def dedup_key(transaction: Transaction) -> tuple:
     """Identity of a trade for the purpose of spotting it in two exports.
 
-    Every economic field the broker prints, plus the action text with **all
+    The fields that actually define a fill -- its date, symbol, action,
+    direction, size and quoted price -- plus the action text with **all
     whitespace stripped**.  The spacing is not stable between exports -- the same
     call shows as ``BRIGHTHOUSE FINL INC NOV 21 25`` in one file and
     ``BRIGHTHOUSE FINL INCNOV 21 25`` in another -- so comparing it verbatim would
-    treat identical trades as distinct.  ``row_id`` and ``source`` are excluded
-    because they differ by construction.
+    treat identical trades as distinct.
+
+    ``commission``, ``fees`` and ``amount`` are deliberately **excluded**: the
+    broker re-rounds them between downloads (a buy-back reported as ``fees 0.02 /
+    amount -261.32`` in one export and ``0.03 / -261.33`` in another is one
+    fill, not two), and they add nothing to identity that ``contracts x price``
+    doesn't already carry.  A genuine repeated fill within one file is still
+    kept, because :func:`merge_transactions` takes the *max count per file*, not
+    a set.  ``row_id`` and ``source`` are excluded because they differ by
+    construction.
     """
     return (
         transaction.run_date,
@@ -569,9 +693,6 @@ def dedup_key(transaction: Transaction) -> tuple:
         transaction.occ_symbol or transaction.underlying,
         transaction.contracts,
         transaction.price,
-        transaction.commission,
-        transaction.fees,
-        transaction.amount,
         transaction.as_of_date,
     )
 

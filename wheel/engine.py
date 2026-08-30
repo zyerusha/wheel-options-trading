@@ -49,6 +49,7 @@ __all__ = [
     "LegClose",
     "ShareLot",
     "Roll",
+    "Spread",
     "Assignment",
     "build_cycles",
 ]
@@ -122,6 +123,12 @@ class OptionLeg:
     # begins. The call is still covered; the shares are simply not visible here,
     # so their capital has to be estimated.
     shares_tracked: bool = True
+    # spread_id -> contracts of *this* leg claimed by that spread as of pairing.
+    # A costing overlay only: contracts/closes/realized_pl/gross_premium never
+    # change because of this -- see Spread below and capital_timeline in
+    # wheel/metrics.py, which is where the paired portion's collateral is
+    # actually netted.
+    paired_contracts: dict[str, float] = field(default_factory=dict)
 
     # ---- position ----
 
@@ -202,11 +209,25 @@ class OptionLeg:
         return 0.0
 
     def collateral_on(self, day: date) -> float:
-        """Collateral committed by this leg at end of ``day``."""
+        """Collateral committed by this leg at end of ``day``, ignoring any
+        spread pairing -- :func:`wheel.metrics.capital_timeline` subtracts the
+        portion protected by an open :class:`Spread` before folding this in,
+        so this always reflects the naked/unpaired formula.
+        """
+        return self.remaining_contracts_on(day) * self.collateral_per_contract
+
+    def remaining_contracts_on(self, day: date) -> float:
+        """Contracts of this leg still open at end of ``day``.
+
+        Exposed separately from :meth:`collateral_on` so a :class:`Spread` can
+        tell how much of its paired quantity is still protected -- a spread's
+        netting only holds while *both* legs remain open, so this is checked
+        against both legs independently rather than assumed from one.
+        """
         if day < self.open_date:
             return 0.0
         still_open = self.contracts - sum(c.contracts for c in self.closes if c.date <= day)
-        return max(still_open, 0.0) * self.collateral_per_contract
+        return max(still_open, 0.0)
 
 
 @dataclass
@@ -273,6 +294,53 @@ class Roll:
 
 
 @dataclass
+class Spread:
+    """A short and a long leg, same underlying/right/expiry, paired because
+    they were opened on the same day -- the only pairing rule this engine
+    applies (see :meth:`WheelEngine._detect_spreads`). Collateral for the
+    paired portion is the strike distance, not the short leg's full
+    CSP/covered-call collateral; P/L is untouched -- each leg's own
+    ``realized_pl`` already carries its own cash flows, so a spread never
+    double-counts anything, it only changes how collateral is reported.
+
+    ``paired_contracts`` is the quantity paired at open time. It does not
+    shrink as one side is later closed; instead capital_timeline checks both
+    legs' own ``remaining_contracts_on(day)`` against it, since the netting
+    only holds while both sides are still open.
+    """
+
+    spread_id: str
+    cycle_id: str
+    underlying: str
+    right: str
+    expiry: date
+    open_date: date
+    short_leg_id: str
+    long_leg_id: str
+    paired_contracts: float
+    short_strike: float
+    long_strike: float
+    short_open_cash: float  # this spread's share of the short leg's open credit
+    long_open_cash: float  # this spread's share of the long leg's open debit
+    # True when either paired leg's own collateral was itself an estimate
+    # (a covered call whose backing shares this export cannot see) -- carries
+    # the same "~" caveat the leg already gets, see OptionLeg.collateral_per_contract.
+    capital_estimated: bool = False
+
+    @property
+    def collateral_per_contract(self) -> float:
+        return abs(self.short_strike - self.long_strike) * OPTION_MULTIPLIER
+
+    @property
+    def net_credit(self) -> float:
+        """Short premium received minus long premium paid, for the paired
+        contracts only -- both already signed (short credit positive, long
+        debit negative), so this is a plain sum.
+        """
+        return self.short_open_cash + self.long_open_cash
+
+
+@dataclass
 class Assignment:
     """An assignment event and the share movement it implies."""
 
@@ -302,6 +370,7 @@ class Cycle:
     legs: list[OptionLeg] = field(default_factory=list)
     share_lots: list[ShareLot] = field(default_factory=list)
     rolls: list[Roll] = field(default_factory=list)
+    spreads: list[Spread] = field(default_factory=list)
     assignments: list[Assignment] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     # True when some committed capital is a proxy (short calls backed by stock
@@ -351,7 +420,10 @@ class WheelEngine:
         self._open_legs: dict[str, list[OptionLeg]] = {}  # occ_symbol -> FIFO lots
         self._share_lots: dict[str, list[ShareLot]] = {}  # underlying -> FIFO lots
         self._active_cycle: dict[str, Cycle] = {}
-        self._cycle_counter: dict[str, int] = {}
+        # (underlying, calendar year) -> count. The sequence restarts every year,
+        # so the first MU cycle of 2026 is "MU-2026-1" regardless of how many MU
+        # cycles ran in 2025 -- the year already separates them.
+        self._cycle_counter: dict[tuple[str, int], int] = {}
         self._ids = itertools.count(1)
         self._settlements = self._index_settlements()
         # Consumption is tracked here, not on the Transaction objects: those are
@@ -442,12 +514,22 @@ class WheelEngine:
 
     # ---------------- cycle bookkeeping ----------------
 
-    def _cycle_for(self, underlying: str, when: date) -> Cycle:
+    def _cycle_for(self, underlying: str, when: date, *, resume: bool = False) -> Cycle:
         cycle = self._active_cycle.get(underlying)
         if cycle is not None:
             return cycle
-        sequence = self._cycle_counter.get(underlying, 0) + 1
-        self._cycle_counter[underlying] = sequence
+        # A wheel that went flat but is re-entered with another option in the
+        # *same calendar year* is the same campaign -- selling puts, closing
+        # them, and selling more later is one ongoing wheel until it either
+        # completes a full rotation (stock called away) or the year turns.
+        if resume:
+            revived = self._resumable_cycle(underlying, when)
+            if revived is not None:
+                revived.end_date = None
+                self._active_cycle[underlying] = revived
+                return revived
+        sequence = self._cycle_counter.get((underlying, when.year), 0) + 1
+        self._cycle_counter[(underlying, when.year)] = sequence
         cycle = Cycle(
             cycle_id=f"{underlying}-{when.year}-{sequence}",
             underlying=underlying,
@@ -457,6 +539,24 @@ class WheelEngine:
         self._active_cycle[underlying] = cycle
         self.cycles.append(cycle)
         return cycle
+
+    def _resumable_cycle(self, underlying: str, when: date) -> Cycle | None:
+        """The most recent cycle for ``underlying`` that a re-entry on ``when``
+        should rejoin instead of opening a fresh cycle: it closed earlier in the
+        same calendar year, and it never completed a full wheel rotation -- no
+        call assignment took its stock away. A cycle whose shares were called
+        away is a finished wheel; the next entry, even the same year, is new.
+        """
+        for cycle in reversed(self.cycles):
+            if cycle.underlying != underlying:
+                continue
+            if cycle.end_date is None:
+                return None  # still open -- would have been the active cycle
+            if cycle.end_date.year != when.year or when < cycle.end_date:
+                return None
+            called_away = any(event.direction == "DISPOSE" for event in cycle.assignments)
+            return None if called_away else cycle
+        return None
 
     def _is_flat(self, underlying: str) -> bool:
         legs_open = any(leg.is_open for leg in self._open_legs_for(underlying))
@@ -516,12 +616,15 @@ class WheelEngine:
                     opened_records.append(record)
 
         self._detect_rolls(underlying, when, closed_records, opened_records)
+        self._detect_spreads(underlying, when, opened_records)
         self._close_cycle_if_flat(underlying, when)
 
     # ---------------- opens ----------------
 
     def _apply_open(self, underlying: str, row: Transaction) -> dict | None:
-        cycle = self._cycle_for(underlying, row.event_date)
+        # Only a fresh option open (STO/BTO) may revive a same-month flat wheel;
+        # a bare stock purchase starts its own cycle as before.
+        cycle = self._cycle_for(underlying, row.event_date, resume=row.action in (STO, BTO))
 
         if row.action == BUY_STOCK:
             shares = abs(row.contracts)
@@ -620,23 +723,34 @@ class WheelEngine:
         cycle = self._active_cycle.get(underlying) or self._cycle_for(underlying, row.event_date)
         total_available = sum(leg.remaining_contracts for leg in lots)
         matched = min(wanted, total_available)
+
+        # Per-contract cash is always the row's own total spread over the *full*
+        # requested size, never just the portion that matched a known lot.  A
+        # single BTC of 3 contracts at a uniform fill price still costs 1/3 of
+        # the row's Amount per contract even when this export only shows 1 of
+        # those 3 as open (the other 2 were opened before the window) --
+        # dividing by `matched` instead would load the whole 3-contract cost
+        # onto the 1 visible contract, tripling its apparent realized P/L.
+        cash_per_contract = row.amount / wanted if wanted else 0.0
+        fees_per_contract = row.total_fees / wanted if wanted else 0.0
+
         if wanted - total_available > 1e-9:
+            excess_contracts = wanted - total_available
+            excess_cash = cash_per_contract * excess_contracts
+            self.unmatched_cash += excess_cash
             self.unmatched_closes.append(
                 {
                     "date": row.event_date.isoformat(),
                     "symbol": row.occ_symbol,
                     "action": row.action,
-                    "contracts": wanted - total_available,
-                    "cash": 0.0,
+                    "contracts": excess_contracts,
+                    "cash": round(excess_cash, 2),
                     "reason": (
-                        "close exceeds open position; its full cash is allocated "
-                        "across the contracts that did match"
+                        "close exceeds open position; its pro-rata share of cash "
+                        "has no matching lot and is excluded from any leg's P/L"
                     ),
                 }
             )
-
-        cash_per_contract = row.amount / matched if matched else 0.0
-        fees_per_contract = row.total_fees / matched if matched else 0.0
 
         records: list[dict] = []
         remaining = matched
@@ -922,6 +1036,73 @@ class WheelEngine:
                 record["leg"].open_roll_id = roll.roll_id
                 roll.opened.append(_roll_item(record))
             cycle.rolls.append(roll)
+
+    # ---------------- spreads ----------------
+
+    def _detect_spreads(self, underlying: str, when: date, opened: list[dict]) -> None:
+        """Pair a short and a long leg opened the same day into a Spread.
+
+        The only rule this engine applies: same underlying (guaranteed by the
+        caller, one ticker-day at a time), same right, same expiry, opened on
+        the same day. Quantities are paired down to whichever side is smaller;
+        the excess on the larger side stays naked.
+
+        When more than one short or more than one long candidate shares a
+        (right, expiry) group, which pairs with which is genuinely ambiguous
+        -- real data has this (one short put alongside two same-day long puts
+        at different strikes). Pairing any of them would be a guess, so none
+        of that group is paired; a cycle warning names it instead, mirroring
+        the "ambiguous -> leave unmatched, warn" rule already used for
+        ticker-rename matching (_lots_under_former_ticker).
+        """
+        by_group: dict[tuple[str, date], dict[str, list[dict]]] = {}
+        for record in opened:
+            key = (record["right"], record["expiry"])
+            bucket = by_group.setdefault(key, {"short": [], "long": []})
+            bucket["short" if record["side"] == SHORT else "long"].append(record)
+
+        for (right, expiry), sides in by_group.items():
+            shorts, longs = sides["short"], sides["long"]
+            if not shorts or not longs:
+                continue
+
+            cycle = self._active_cycle.get(underlying) or self._cycle_for(underlying, when)
+            if len(shorts) > 1 or len(longs) > 1:
+                cycle.warnings.append(
+                    f"{when}: {len(shorts)} short and {len(longs)} long {right} legs on "
+                    f"{underlying} expiring {expiry} opened the same day -- which pairs "
+                    "with which is ambiguous, so none were paired into a spread"
+                )
+                continue
+
+            short_record, long_record = shorts[0], longs[0]
+            short_leg: OptionLeg = short_record["leg"]
+            long_leg: OptionLeg = long_record["leg"]
+            paired = min(short_leg.contracts, long_leg.contracts)
+            if paired <= 1e-9:
+                continue
+
+            short_fraction = paired / short_leg.contracts if short_leg.contracts else 0.0
+            long_fraction = paired / long_leg.contracts if long_leg.contracts else 0.0
+            spread = Spread(
+                spread_id=f"SP{next(self._ids)}",
+                cycle_id=cycle.cycle_id,
+                underlying=underlying,
+                right=right,
+                expiry=expiry,
+                open_date=when,
+                short_leg_id=short_leg.leg_id,
+                long_leg_id=long_leg.leg_id,
+                paired_contracts=paired,
+                short_strike=short_leg.strike,
+                long_strike=long_leg.strike,
+                short_open_cash=short_leg.open_cash * short_fraction,
+                long_open_cash=long_leg.open_cash * long_fraction,
+                capital_estimated=not short_leg.shares_tracked,
+            )
+            short_leg.paired_contracts[spread.spread_id] = paired
+            long_leg.paired_contracts[spread.spread_id] = paired
+            cycle.spreads.append(spread)
 
     # ---------------- finalize ----------------
 

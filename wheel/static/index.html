@@ -18,6 +18,22 @@
         </div>
       </header>
 
+      <!-- Top-level view switch. Dashboard = every analytics card; Trade Log =
+           one wheel's transactions end to end. The account switcher stays
+           outside, shared by both. -->
+      <nav class="tabs" id="tab-bar" aria-label="View">
+        <button class="tab" type="button" data-tab="dashboard" aria-selected="true">Dashboard</button>
+        <button class="tab" type="button" data-tab="tradelog" aria-selected="false">Trade Log</button>
+      </nav>
+
+      <!-- Account switcher: which data/<account>/ folder to view. "Combined"
+           aggregates every discovered account without merging their cycles. -->
+      <section class="accounts" id="accounts-bar" aria-label="Account" hidden>
+        <label id="account-label">Account</label>
+        <div class="chip-row" id="account-chips" role="group" aria-labelledby="account-label"></div>
+      </section>
+
+      <div id="tab-dashboard">
       <!-- Data source: choose an export, or upload a new one. Nothing is
            evaluated until Load is pressed. -->
       <section class="source" aria-label="Data source">
@@ -46,6 +62,9 @@
           <select id="preset">
             <option value="all">All history</option>
             <option value="10">Last 10 days</option>
+            <option value="30">Last 30 days</option>
+            <option value="60">Last 60 days</option>
+            <option value="90">Last 90 days</option>
             <option value="ytd">Year to date</option>
             <option value="1y">1 year</option>
             <option value="3y">3 years</option>
@@ -79,6 +98,24 @@
 
       <section class="tiles" id="tiles" aria-label="Headline metrics"></section>
 
+      <section class="card" id="net-worth-card" style="margin-bottom: var(--gap)" hidden>
+        <header>
+          <h2>Net worth &amp; benchmark</h2>
+          <button class="toggle" data-twin="networth-table" aria-pressed="false">Table</button>
+        </header>
+        <p class="hint">
+          From Fidelity Portfolio Positions snapshots — independent of the filters below. Money-weighted
+          (XIRR) return replays your own contribution/withdrawal timing into SPY, so the comparison
+          isolates whether the wheel beat a buy-and-hold benchmark from when you happened to add or
+          remove money. Add more snapshots over time for a smoother trend.
+        </p>
+        <div id="net-worth-empty" class="notice" hidden></div>
+        <div class="tiles" id="networth-tiles"></div>
+        <div class="chart-scroll"><svg id="chart-networth" role="img"></svg></div>
+        <div class="legend" id="legend-networth"></div>
+        <div class="table-twin" id="networth-table" hidden></div>
+      </section>
+
       <div class="grid two">
         <section class="card">
           <header>
@@ -89,11 +126,14 @@
             </div>
           </header>
           <p class="hint">
-            <strong>Stacked</strong> — each day's bands sit on top of each other, so the height of
-            the stack is your total committed capital (the grey line, in dollars). Put collateral is
-            strike × 100 × contracts; assigned shares carry their cost basis; a covered call adds
-            nothing, because the capital is already in the shares.
+            <strong>Stacked</strong> — each day's bands sit on top of each other; the stack's height is
+            your total committed capital (the grey line, in dollars):
           </p>
+          <ul class="hint-list">
+            <li>Put collateral = strike × 100 × contracts</li>
+            <li>Assigned shares carry their cost basis</li>
+            <li>A covered call adds nothing — the capital is already in the shares</li>
+          </ul>
           <div class="chart-scroll"><svg id="chart-capital" role="img"></svg></div>
           <div class="legend" id="legend-capital"></div>
           <div class="table-twin" id="capital-table" hidden></div>
@@ -114,6 +154,69 @@
         </section>
       </div>
 
+      <section class="card" style="margin-bottom: var(--gap)">
+        <header>
+          <h2>Puts or calls: where the wheel is right now</h2>
+          <button class="toggle" data-twin="wheel-state-table" aria-pressed="false">Table</button>
+        </header>
+        <p class="hint">
+          Every active cycle's <em>current</em> capital, split by component — a cycle holding shares
+          from one assignment while separately running a fresh cash-secured put contributes to both
+          buckets below, not just one:
+        </p>
+        <ul class="hint-list">
+          <li><strong>Cash-Secured Puts</strong> — cash securing a short put, waiting to be assigned or expire</li>
+          <li><strong>Covered Calls</strong> — shares backing a short call currently written against them, waiting to be called away</li>
+          <li><strong>Holding Shares</strong> — shares held with no call currently written; capital not generating premium right now</li>
+          <li><strong>Hedged / Other</strong> — protective puts, long calls, and netted credit-spread collateral — capital that isn't plain put or stock exposure</li>
+        </ul>
+        <p class="hint">
+          Weighted toward Covered Calls/Holding = most capital tied up in stock. Weighted toward Cash-Secured
+          Puts = mostly waiting on assignment decisions. Zero in a bucket is a real reading, not a gap — it
+          means nothing currently active is in that phase.
+        </p>
+        <div class="chart-scroll"><svg id="chart-wheel-state" role="img"></svg></div>
+        <div class="legend" id="legend-wheel-state"></div>
+        <div class="table-twin" id="wheel-state-table" hidden></div>
+      </section>
+
+      <section class="card" style="margin-bottom: var(--gap)">
+        <header>
+          <h2>Monthly cash flow</h2>
+          <button class="toggle" data-twin="cashflow-table" aria-pressed="false">Table</button>
+        </header>
+        <p class="hint">Net cash flow = Realized credits - Realized debits - Fees, booked the day cash actually settles:</p>
+        <ul class="hint-list">
+          <li>Credits: premium sold, dividends</li>
+          <li>Debits: premium paid to close a short or open a hedge</li>
+          <li>Independent of expiration date or whether the position is still open</li>
+          <li>Share assignment costs and call-away proceeds are capital shifts, not income — excluded (see Capital deployed above)</li>
+        </ul>
+        <div class="tiles" id="cashflow-tiles"></div>
+        <div class="chart-scroll"><svg id="chart-cashflow" role="img"></svg></div>
+        <div class="legend" id="legend-cashflow"></div>
+        <div class="table-twin" id="cashflow-table" hidden></div>
+      </section>
+
+      <section class="card" style="margin-bottom: var(--gap)">
+        <header>
+          <h2>Cash flow vs. wheel P/L gap</h2>
+          <button class="toggle" data-twin="gap-table" aria-pressed="false">Table</button>
+        </header>
+        <p class="hint">
+          Cash flow books a credit the moment premium is sold; wheel P/L only books it once a position
+          actually closes. The line is the running total of that difference:
+        </p>
+        <ul class="hint-list">
+          <li><strong>Rising</strong> — collecting more premium than you're realizing, usually because open positions are building up (normal for a growing wheel, worth knowing)</li>
+          <li><strong>Flattening or falling</strong> — closes are catching up to, or outpacing, new premium sold</li>
+          <li>Climbing for months with no pullback is the thing to watch — can mean premium sitting in open risk, not banked profit</li>
+        </ul>
+        <div class="chart-scroll"><svg id="chart-gap" role="img"></svg></div>
+        <div class="legend" id="legend-gap"></div>
+        <div class="table-twin" id="gap-table" hidden></div>
+      </section>
+
       <div class="grid two">
         <section class="card">
           <header>
@@ -122,22 +225,44 @@
           </header>
           <p class="hint">Net of option cash and realized stock P/L. Blue is a gain, red a loss.</p>
           <div class="chart-scroll"><svg id="chart-ticker-pl" role="img"></svg></div>
+          <div class="legend" id="legend-ticker-pl"></div>
           <div class="table-twin" id="ticker-table" hidden></div>
         </section>
 
         <section class="card">
           <header>
-            <h2>Annualized return on capital</h2>
+            <h2>Annualized Wheel ROC</h2>
             <button class="toggle" data-twin="roc-table" aria-pressed="false">Table</button>
           </header>
           <p class="hint">
-            Net P/L ÷ time-weighted average capital, scaled to a year. Tickers marked ~ include a
-            strike-based proxy for stock held before this export.
+            Option P/L only (never stock P/L) ÷ time-weighted average capital, scaled to a year.
+            Assigned shares count as capital by their cost basis, not by their price move. Tickers
+            marked ~ include a strike-based proxy for stock held before this export.
           </p>
           <div class="chart-scroll"><svg id="chart-roc" role="img"></svg></div>
+          <div class="legend" id="legend-roc"></div>
           <div class="table-twin" id="roc-table" hidden></div>
         </section>
       </div>
+
+      <section class="card" style="margin-bottom: var(--gap)">
+        <header>
+          <h2>Ticker efficiency: P/L vs. Annualized ROC</h2>
+          <button class="toggle" data-twin="ticker-scatter-table" aria-pressed="false">Table</button>
+        </header>
+        <p class="hint">
+          The two charts above, combined: each bubble is a ticker, positioned by Annualized Wheel ROC (x)
+          and Net realized P/L (y), sized by average capital deployed.
+        </p>
+        <ul class="hint-list">
+          <li><strong>Top-right</strong> — big money, high return</li>
+          <li><strong>Bottom-right</strong> — large position, weak return</li>
+          <li><strong>Top-left</strong> — small, highly efficient bet that may be worth sizing up</li>
+        </ul>
+        <div class="chart-scroll"><svg id="chart-ticker-scatter" role="img"></svg></div>
+        <div class="legend" id="legend-ticker-scatter"></div>
+        <div class="table-twin" id="ticker-scatter-table" hidden></div>
+      </section>
 
       <section class="card" style="margin-bottom: var(--gap)">
         <header>
@@ -158,8 +283,42 @@
           <h2>Wheel sequences</h2>
           <span class="hint" style="margin: 0">Click a row for legs, rolls and assignments</span>
         </header>
+        <p class="hint">Four percentage columns, each answering a different question — hover any cell for its formula:</p>
+        <ul class="hint-list">
+          <li><strong>ROI</strong> — net P/L (incl. stock) ÷ time-weighted avg collateral</li>
+          <li><strong>Wheel ROC</strong> — option P/L only ÷ time-weighted avg collateral</li>
+          <li><strong>Net Option Yield</strong> — option P/L only ÷ initial (day-one) collateral</li>
+          <li><strong>Total Position ROI</strong> — option + stock P/L (realized &amp; unrealized) + dividends ÷ initial collateral</li>
+        </ul>
+        <p class="hint">None is "the" right answer — different lenses on the same cycle.</p>
         <div style="overflow-x: auto"><table id="cycles-table"></table></div>
       </section>
+      </div><!-- /#tab-dashboard -->
+
+      <div id="tab-tradelog" hidden>
+        <section class="card">
+          <header><h2>Trade Log</h2></header>
+          <p class="hint">
+            A selected wheel always shows its transactions end to end — the full wheel.
+            The list below follows the Dashboard's date range (open wheels always shown);
+            narrow it further by ticker here.
+          </p>
+          <div class="tradelog-nav">
+            <select id="tradelog-ticker" aria-label="Ticker"></select>
+            <button id="tradelog-prev" type="button" aria-label="Previous wheel">◀</button>
+            <select id="tradelog-pick" aria-label="Wheel"></select>
+            <button id="tradelog-next" type="button" aria-label="Next wheel">▶</button>
+          </div>
+          <div id="tradelog-empty" class="hint">
+            Pick a wheel above, or click one in the Dashboard's “Wheel timelines” chart.
+          </div>
+          <div id="tradelog-note" class="notice" hidden></div>
+          <div id="tradelog-insights" class="tradelog-insights" hidden></div>
+          <div id="tradelog-bridge" class="tradelog-bridge" hidden></div>
+          <div id="tradelog-summary" class="tradelog-summary" hidden></div>
+          <div style="overflow-x: auto"><div id="tradelog-table"></div></div>
+        </section>
+      </div>
     </div>
 
     <div id="tooltip" role="tooltip" aria-live="polite"></div>

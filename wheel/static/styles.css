@@ -29,6 +29,8 @@
   --critical: #d03b3b;
   --success-text: #006300;
 
+  --closed-bg: #ffe6df; /* salmon - a closed wheel in the Trade Log */
+
   --radius: 10px;
   --gap: 18px;
 }
@@ -53,6 +55,7 @@
     --neg: #e66767;
     --mid: #383835;
     --success-text: #0ca30c;
+    --closed-bg: #4a2b25;
   }
 }
 
@@ -75,6 +78,7 @@
   --neg: #e66767;
   --mid: #383835;
   --success-text: #0ca30c;
+  --closed-bg: #4a2b25;
 }
 
 * {
@@ -219,6 +223,14 @@ input[type='file']::file-selector-button {
   font-size: 11.5px;
 }
 
+.dataset-unsupported {
+  width: 100%;
+  font-size: 12px;
+  font-style: italic;
+  color: var(--text-muted);
+  padding: 3px 0;
+}
+
 .source-status {
   flex: 1 1 240px;
   font-size: 12.5px;
@@ -251,6 +263,26 @@ input[type='file']::file-selector-button {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   margin-bottom: var(--gap);
+}
+
+.accounts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: var(--gap);
+}
+
+.accounts #account-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
 }
 
 .field {
@@ -350,6 +382,15 @@ button.primary {
   padding: 14px 16px;
 }
 
+.tile.primary {
+  border-color: var(--series-1);
+  border-width: 2px;
+}
+
+.tile.primary .value {
+  font-size: 30px;
+}
+
 .tile .label {
   font-size: 11px;
   font-weight: 600;
@@ -424,6 +465,17 @@ button.primary {
   font-size: 12px;
   color: var(--text-secondary);
   margin: 0 0 12px;
+}
+
+.card .hint-list {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin: 0 0 12px;
+  padding-left: 18px;
+}
+
+.card .hint-list li + li {
+  margin-top: 3px;
 }
 
 .legend {
@@ -501,6 +553,13 @@ svg .tick-label {
 }
 
 svg .hit {
+  fill: transparent;
+  cursor: pointer;
+}
+
+/* Full-row click target behind the per-leg hits in the wheel timeline -- opens
+   that wheel in the Trade Log tab. Painted first, so leg tooltips still win. */
+svg .row-hit {
   fill: transparent;
   cursor: pointer;
 }
@@ -725,6 +784,19 @@ tr.detail > td {
   font-variant-numeric: tabular-nums;
 }
 
+/* The calculation behind the value(s) above -- how, not just what. */
+#tooltip .tt-formula {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  white-space: pre-line;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
+  max-width: 260px;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ---------------- notices ---------------- */
 
 .notice {
@@ -769,4 +841,196 @@ tr.detail > td {
   .chip-row {
     max-width: 100%;
   }
+}
+
+/* ---------------- tabs ---------------- */
+
+.tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: var(--gap);
+}
+
+.tab {
+  border: 1px solid var(--axis);
+  border-radius: 999px;
+  padding: 5px 14px;
+  font-size: 12.5px;
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  min-height: 30px;
+}
+
+.tab[aria-selected='true'] {
+  border-color: var(--series-1);
+  color: var(--series-1);
+  font-weight: 600;
+}
+
+#tab-dashboard[hidden],
+#tab-tradelog[hidden],
+#tradelog-summary[hidden],
+#tradelog-bridge[hidden],
+#tradelog-insights[hidden],
+#tradelog-empty[hidden],
+#tradelog-note[hidden] {
+  display: none;
+}
+
+.tradelog-insights {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  margin-bottom: 14px;
+}
+
+.tradelog-insights .ti-head {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.tradelog-insights .ti-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 5px;
+}
+
+.tradelog-insights li {
+  display: flex;
+  gap: 8px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+.tradelog-insights .ti-mark {
+  flex: 0 0 auto;
+  font-weight: 700;
+}
+
+.tradelog-insights .ti-good .ti-mark {
+  color: var(--success-text);
+}
+
+.tradelog-insights .ti-improve .ti-mark {
+  color: var(--warning);
+}
+
+/* ---------------- trade log ---------------- */
+
+.tradelog-nav {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.tradelog-nav #tradelog-pick {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 460px;
+}
+
+.tradelog-nav #tradelog-ticker {
+  flex: 0 1 170px;
+  min-width: 0;
+}
+
+/* Closed wheels are salmon in the dropdown list. Only the options are tinted --
+   styling the <select> itself bleeds its background onto every option. */
+#tradelog-pick option {
+  background-color: var(--surface-1);
+  color: var(--text-primary);
+}
+
+#tradelog-pick option.closed {
+  background-color: var(--closed-bg);
+}
+
+.tradelog-nav button {
+  min-width: 34px;
+}
+
+.tradelog-bridge {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin-bottom: 14px;
+  overflow-x: auto;
+}
+
+.tradelog-bridge svg {
+  display: block;
+  font-size: 12px;
+}
+
+.tradelog-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 14px;
+}
+
+.tradelog-summary.closed {
+  background: var(--closed-bg);
+  border-color: var(--closed-bg);
+}
+
+.tradelog-summary .tl-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tradelog-summary .tl-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.tradelog-summary .tl-value {
+  font-size: 16px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.tradelog-summary .tl-value.help {
+  cursor: help;
+  text-decoration: underline dotted var(--text-muted);
+  text-underline-offset: 3px;
+}
+
+.tradelog-summary .tl-foot {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+#tradelog-table tr.synthetic td {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* Rows for a position that is no longer active -- both the open (STO/BTO) and
+   its closes (BTC/STC/expiry/assignment), plus sales -- get a light-grey row
+   background so the still-active trades stand out. Font colours are untouched. */
+#tradelog-table tr.settled td {
+  background-color: var(--mid);
+}
+
+/* Stock fills (Buy / Sell Shares) read blue so they stand apart from the
+   option rows in the Type column. */
+#tradelog-table td.shares-type {
+  color: var(--series-1);
+  font-weight: 600;
 }

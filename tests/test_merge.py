@@ -32,6 +32,25 @@ class TestDedupKey(unittest.TestCase):
         b = tx("2025-10-08", STO, "-MU251010P182.5", -1, 0.68, 67.33, row_id=2)
         self.assertNotEqual(dedup_key(a), dedup_key(b))
 
+    def test_broker_recomputed_fees_still_match(self):
+        """The same fill in two exports, with fees/amount re-rounded by a cent
+        (Fidelity does this between downloads), is one trade -- not two.
+        """
+        from dataclasses import replace
+
+        base = tx("2026-08-21", BTC, "-PLTR260828P170", 2, 1.30, -261.33, row_id=1, commission=1.30, fees=0.03)
+        rerounded = replace(base, fees=0.02, amount=-261.32, row_id=2)
+        self.assertEqual(dedup_key(base), dedup_key(rerounded))
+
+    def test_penny_reround_across_two_files_dedups_to_one(self):
+        from dataclasses import replace
+
+        a = tx("2026-08-21", BTC, "-PLTR260828P170", 2, 1.30, -261.33, commission=1.30, fees=0.03)
+        b = replace(a, fees=0.02, amount=-261.32)
+        merged, report = merge_transactions([("newer.csv", [a]), ("older.csv", [b])])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(report.duplicates_removed, 1)
+
     def test_inconsistent_broker_spacing_still_matches(self):
         """One export writes 'FINL INC NOV', another 'FINL INCNOV'."""
         from dataclasses import replace
