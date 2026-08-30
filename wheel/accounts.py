@@ -838,6 +838,7 @@ class AccountRegistry:
             "net_worth": net_worth,
             "benchmark": _combine_benchmark(payloads),
             "wheel_return": _combine_wheel_return(payloads),
+            "trade_log": _combine_trade_log(payloads),
         }
 
 
@@ -902,6 +903,24 @@ def _combine_cycles(payloads: dict[str, dict]) -> list[dict]:
             combined.append(tagged)
     combined.sort(key=lambda cycle: (cycle["start_date"] or "", cycle["underlying"]))
     return combined
+
+
+def _combine_trade_log(payloads: dict[str, dict]) -> dict[str, Any]:
+    """Concatenate every account's Trade Log wheels, tagging ``cycle_id`` the
+    same way ``_combine_cycles`` does so click-through from the (already
+    account-prefixed) timeline lines up.
+    """
+    wheels: list[dict] = []
+    warnings: list[str] = []
+    for account_id, payload in payloads.items():
+        trade_log = payload.get("trade_log") or {}
+        for wheel in trade_log.get("wheels", []):
+            wheels.append(
+                {**wheel, "account_id": account_id, "cycle_id": f"{account_id}:{wheel['cycle_id']}"}
+            )
+        warnings.extend(f"[{account_id}] {w}" for w in trade_log.get("warnings", []))
+    wheels.sort(key=lambda wheel: (wheel["start_date"] or "", wheel["underlying"]))
+    return {"wheels": wheels, "warnings": warnings}
 
 
 def _combine_tickers(payloads: dict[str, dict]) -> list[dict]:

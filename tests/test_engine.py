@@ -23,7 +23,7 @@ from wheel.engine import (  # noqa: E402
     SHORT,
     build_cycles,
 )
-from wheel.parser import ASSIGNED, BTC, BTO, EXPIRED, STC, STO, Transaction  # noqa: E402
+from wheel.parser import ASSIGNED, BTC, BTO, BUY_STOCK, EXPIRED, STC, STO, Transaction  # noqa: E402
 
 _counter = itertools.count()
 
@@ -609,18 +609,67 @@ class TestTickerRename(unittest.TestCase):
 
 
 class TestCycleBoundaries(unittest.TestCase):
-    def test_flat_then_reopen_starts_a_second_cycle(self):
+    def test_flat_then_reopen_next_year_starts_a_second_cycle(self):
         cycles, _ = build_cycles(
             [
-                tx("2025-09-19", STO, "-MU250926P150", -1, 3.35, 334.33, row_id=1),
-                tx("2025-09-25", BTC, "-MU250926P150", 1, 0.95, -95.67, row_id=2),
-                tx("2025-10-06", STO, "-MU251010P175", -1, 0.75, 74.33, row_id=3),
+                tx("2025-12-05", STO, "-MU251219P150", -1, 3.35, 334.33, row_id=1),
+                tx("2025-12-19", EXPIRED, "-MU251219P150", 1, None, 0.0, row_id=2, as_of="2025-12-19"),
+                tx("2026-01-06", STO, "-MU260116P175", -1, 0.75, 74.33, row_id=3),
             ]
         )
         self.assertEqual(len(cycles), 2)
-        self.assertEqual([cycle.cycle_id for cycle in cycles], ["MU-2025-1", "MU-2025-2"])
+        self.assertEqual([cycle.cycle_id for cycle in cycles], ["MU-2025-1", "MU-2026-1"])
         self.assertEqual(cycles[0].status, CLOSED)
         self.assertEqual(cycles[1].status, ACTIVE)
+
+    def test_flat_then_reopen_same_year_stays_one_cycle(self):
+        """Selling puts, letting them expire, and selling more months later --
+        with a flat gap between -- is one ongoing wheel while the year holds and
+        nothing was ever called away (the NBR-2026-1 / -2 case).
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2026-02-26", STO, "-NBR260320P75", -3, 3.75, 1122.98, row_id=1),
+                tx("2026-03-20", EXPIRED, "-NBR260320P75", 3, None, 0.0, row_id=2, as_of="2026-03-20"),
+                tx("2026-06-09", STO, "-NBR260619P70", -1, 2.0, 199.33, row_id=3),
+            ]
+        )
+        self.assertEqual(len(cycles), 1)
+        self.assertEqual(cycles[0].cycle_id, "NBR-2026-1")
+        self.assertEqual(cycles[0].start_date, date(2026, 2, 26))
+        self.assertTrue(cycles[0].is_open)
+        self.assertEqual(len(cycles[0].legs), 2)
+
+    def test_called_away_wheel_does_not_resume_same_year(self):
+        """A completed rotation -- put assigned, then the covered call assigned
+        and the stock called away -- is a finished wheel; the next entry the
+        same year is a new cycle.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2026-01-05", STO, "-MU260116P100", -1, 3.0, 299.33, row_id=1),
+                tx("2026-01-16", ASSIGNED, "-MU260116P100", 1, None, 0.0, row_id=2, as_of="2026-01-16"),
+                tx("2026-01-20", STO, "-MU260220C110", -1, 2.0, 199.33, row_id=3),
+                tx("2026-02-20", ASSIGNED, "-MU260220C110", 1, None, 0.0, row_id=4, as_of="2026-02-20"),
+                tx("2026-03-02", STO, "-MU260320P95", -1, 2.5, 249.33, row_id=5),
+            ]
+        )
+        self.assertEqual(len(cycles), 2)
+        self.assertEqual(cycles[0].status, ASSIGNED_STATUS)
+        self.assertEqual(cycles[0].cycle_id, "MU-2026-1")
+        self.assertEqual(cycles[1].cycle_id, "MU-2026-2")
+
+    def test_same_year_resume_only_applies_to_option_reentry(self):
+        """A bare stock purchase after a flat gap opens its own cycle."""
+        cycles, _ = build_cycles(
+            [
+                tx("2025-09-05", STO, "-MU250912P150", -1, 3.0, 299.33, row_id=1),
+                tx("2025-09-12", EXPIRED, "-MU250912P150", 1, None, 0.0, row_id=2, as_of="2025-09-12"),
+                tx("2025-11-20", BUY_STOCK, "MU", 100, 150.0, -15000.0, row_id=3),
+            ]
+        )
+        self.assertEqual(len(cycles), 2)
+        self.assertEqual(cycles[0].status, CLOSED)
 
     def test_different_tickers_never_share_a_cycle(self):
         cycles, _ = build_cycles(
@@ -656,7 +705,9 @@ class TestCycleBoundaries(unittest.TestCase):
                 tx("2026-01-05", STO, "-MU260116P200", -1, 4.00, 399.33, row_id=5),
             ]
         )
-        self.assertEqual([cycle.cycle_id for cycle in cycles], ["MU-2024-1", "MU-2025-2", "MU-2026-3"])
+        # The sequence restarts each calendar year -- the year already separates
+        # them, so every year's first MU cycle is "MU-<year>-1".
+        self.assertEqual([cycle.cycle_id for cycle in cycles], ["MU-2024-1", "MU-2025-1", "MU-2026-1"])
         self.assertEqual(cycles[0].legs[0].expiry, date(2024, 4, 19))
         self.assertEqual(cycles[2].legs[0].expiry, date(2026, 1, 16))
         self.assertEqual(cycles[2].status, ACTIVE)

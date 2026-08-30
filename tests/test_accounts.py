@@ -206,6 +206,21 @@ class TestAccountRegistry(unittest.TestCase):
         self.assertEqual(len(cycle_ids), len(set(cycle_ids)))
         self.assertTrue(all(":" in cid for cid in cycle_ids))
 
+    def test_combined_trade_log_is_concatenated_and_id_prefixed(self):
+        combined = self.registry.build("combined")
+        trade_log = combined["trade_log"]
+        self.assertEqual(sorted(trade_log.keys()), ["warnings", "wheels"])
+        self.assertEqual(len(trade_log["wheels"]), 2)
+        self.assertEqual({w["account_id"] for w in trade_log["wheels"]}, {"ira", "taxable"})
+        cycle_ids = [w["cycle_id"] for w in trade_log["wheels"]]
+        self.assertEqual(len(cycle_ids), len(set(cycle_ids)))
+        self.assertTrue(all(":" in cid for cid in cycle_ids))
+        # Same tagged id the combined timeline chart emits, so click-through lines up.
+        self.assertEqual(
+            {w["cycle_id"] for w in trade_log["wheels"]},
+            {c["cycle_id"] for c in combined["cycles"]},
+        )
+
     def test_combined_net_worth_and_avg_days_in_trade_present(self):
         combined = self.registry.build("combined")
         # Regression guard: avg_days_in_trade must exist on the combined payload

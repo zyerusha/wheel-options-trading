@@ -9,6 +9,7 @@ derived from the same slice, so the numbers always agree with each other.
 from __future__ import annotations
 
 import os
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime
@@ -17,7 +18,7 @@ from typing import Any, Sequence
 from wheel import benchmark as bm
 from wheel import cashflow as cf
 from wheel import marketdata
-from wheel.engine import Cycle, WheelEngine, build_cycles
+from wheel.engine import LONG, Cycle, WheelEngine, build_cycles
 from wheel.fileio import peek_text
 from wheel.metrics import (
     capital_timeline,
@@ -34,14 +35,25 @@ from wheel.metrics import (
     wheel_terminal_value,
 )
 from wheel.parser import (
+    ASSIGNED,
+    BTC,
+    BTO,
+    BUY_STOCK,
+    EXPIRED,
     OPTION_ACTIONS,
+    OPTION_MULTIPLIER,
+    SELL_STOCK,
+    STC,
+    STO,
     TRADE_ACTIONS,
     MergeReport,
     ParseReport,
     Transaction,
+    company_name_from_description,
     parse_exports,
 )
 from wheel.positions import discover_position_snapshots, latest_snapshot, latest_snapshot_per_account, load_snapshots
+from wheel.statmath import DAYS_PER_YEAR
 
 EXPORT_DIRS = (".", "data")
 
@@ -296,6 +308,298 @@ def _cycle_payload(
     return payload
 
 
+# --------------------------------------------------------------------------
+# Trade Log -- one wheel's transactions, end to end.
+#
+# Always built from the account's *full* history (``all_cycles``), never the
+# filtered slice: a wheel is a historical unit, so a date/ticker/status filter
+# must not slice it in half here. Two attribution paths, chosen per underlying
+# (see ``Dashboard._build_trade_log``):
+#   * common -- filter raw ``Transaction``s by underlying + inclusive date span,
+#     safe only when a ticker's cycles are strictly separated in time;
+#   * engine-exact -- derive rows from the engine's own ``cycle_id``-tagged
+#     legs/closes/assignments, used when two same-ticker cycles touch or overlap
+#     (a legal same-day close/reopen). Its one cost: legs carry commission and
+#     fees combined, so those rows show a single Fees figure.
+# --------------------------------------------------------------------------
+
+_OPEN_TYPE = {
+    (STO, "P"): "Sell Put",
+    (STO, "C"): "Sell Call",
+    (BTO, "P"): "Buy Put",
+    (BTO, "C"): "Buy Call",
+}
+_CLOSE_TYPE = {
+    (BTC, "P"): "Buy Put",
+    (BTC, "C"): "Buy Call",
+    (STC, "P"): "Sell Put",
+    (STC, "C"): "Sell Call",
+    (EXPIRED, "P"): "Put Expired",
+    (EXPIRED, "C"): "Call Expired",
+    (ASSIGNED, "P"): "Put Assigned",
+    (ASSIGNED, "C"): "Call Assigned",
+}
+
+
+_CLOSING_ACTIONS = frozenset({BTC, STC, EXPIRED, ASSIGNED})
+
+
+def _close_return_pct(open_price: float | None, close_price: float | None, side: str) -> float | None:
+    """Realized return on the contract this closing fill shut, as a % of the
+    premium at open. Short: ``(open - close) / open`` -- a put sold at 0.50 and
+    bought back at 0.25 kept 50%. Long: ``(close - open) / open`` -- a call
+    bought at 1.00 and sold at 0.20 lost 80%. Expiry/assignment closes at 0.
+    """
+    if not open_price:
+        return None
+    settle = 0.0 if close_price is None else close_price
+    gain = (settle - open_price) if side == LONG else (open_price - settle)
+    return 100.0 * gain / open_price
+
+
+def _trade_log_txn_type(transaction: Transaction, dividend_row_ids: set[int]) -> str:
+    if transaction.row_id in dividend_row_ids:
+        return "Dividend"
+    if transaction.action == BUY_STOCK:
+        return "Buy Shares"
+    if transaction.action == SELL_STOCK:
+        return "Sell Shares"
+    right = transaction.right or ""
+    if transaction.action in (STO, BTO):
+        return _OPEN_TYPE.get((transaction.action, right), "Other")
+    if transaction.action in (BTC, STC, EXPIRED, ASSIGNED):
+        return _CLOSE_TYPE.get((transaction.action, right), "Other")
+    return "Other"
+
+
+def _trade_log_raw_row(
+    transaction: Transaction, type_: str, close_return_pct: float | None = None
+) -> dict[str, Any]:
+    quantity = abs(transaction.contracts)
+    is_csp_open = (
+        transaction.action == STO
+        and transaction.right == "P"
+        and transaction.strike is not None
+    )
+    csp = transaction.strike * OPTION_MULTIPLIER * quantity if is_csp_open else None
+    return {
+        "type": type_,
+        "date": _iso(transaction.event_date),
+        "expiration": _iso(transaction.expiry),
+        "strike": transaction.strike,
+        "quantity": quantity,
+        # Signed: long/bought positive, short/sold negative. `contracts` already
+        # carries that sign from the parser; 0 (a dividend) becomes None so the
+        # column shows a dash rather than "+0".
+        "signed_quantity": transaction.contracts or None,
+        "price": transaction.price,
+        "initial_csp_collateral": _money(csp),
+        "fees": _money(transaction.fees),
+        "commission": _money(transaction.commission),
+        "net_cash_flow": _money(transaction.amount),
+        # Only a closing fill has one; filled in by the caller, which knows the
+        # opening price of the contract this row shut.
+        "close_return_pct": close_return_pct,
+        "synthetic": False,
+        "_sort": (transaction.event_date, 1, transaction.row_id),
+    }
+
+
+def _trade_log_engine_rows(cycle: Cycle) -> list[dict[str, Any]]:
+    """Rows for one cycle taken from the engine's own structures -- exact
+    ``cycle_id`` attribution, no date-boundary ambiguity. Commission and fees
+    are combined on a leg, so those rows report a single Fees figure.
+    """
+    rows: list[dict[str, Any]] = []
+    for leg in cycle.legs:
+        is_csp_open = leg.open_action == STO and leg.right == "P"
+        csp = leg.strike * OPTION_MULTIPLIER * leg.contracts if is_csp_open else None
+        rows.append(
+            {
+                "type": _OPEN_TYPE.get((leg.open_action, leg.right), "Other"),
+                "date": _iso(leg.open_date),
+                "expiration": _iso(leg.expiry),
+                "strike": leg.strike,
+                "quantity": leg.contracts,
+                "signed_quantity": -leg.contracts if leg.open_action == STO else leg.contracts,
+                "price": leg.open_price,
+                "initial_csp_collateral": _money(csp),
+                "fees": _money(leg.open_fees),
+                "commission": None,
+                "net_cash_flow": _money(leg.open_cash),
+                "close_return_pct": None,
+                "synthetic": False,
+                "_sort": (leg.open_date, 0, 0),
+            }
+        )
+        for close in leg.closes:
+            rows.append(
+                {
+                    "type": _CLOSE_TYPE.get((close.action, leg.right), "Other"),
+                    "date": _iso(close.date),
+                    "expiration": _iso(leg.expiry),
+                    "strike": leg.strike,
+                    "quantity": close.contracts,
+                    # Closing a short is a buy (+), closing a long is a sell (-).
+                    "signed_quantity": close.contracts if leg.open_action == STO else -close.contracts,
+                    "price": close.price,
+                    "initial_csp_collateral": None,
+                    "fees": _money(close.fees),
+                    "commission": None,
+                    "net_cash_flow": _money(close.cash),
+                    "close_return_pct": _close_return_pct(leg.open_price, close.price, leg.side),
+                    "synthetic": False,
+                    "_sort": (close.date, 1, 0),
+                }
+            )
+    return rows
+
+
+def _trade_log_assignment_row(assignment) -> dict[str, Any]:
+    acquire = assignment.direction == "ACQUIRE"
+    return {
+        "type": "Shares Assigned" if acquire else "Shares Called Away",
+        "date": _iso(assignment.date),
+        "expiration": None,
+        "strike": assignment.strike,
+        "quantity": assignment.shares,
+        "signed_quantity": assignment.shares if acquire else -assignment.shares,
+        "price": assignment.strike,
+        "initial_csp_collateral": None,
+        "fees": 0.0,
+        "commission": 0.0,
+        "net_cash_flow": _money(assignment.cash),
+        "close_return_pct": None,
+        "synthetic": assignment.synthetic,
+        "_sort": (assignment.date, 2, 0),
+    }
+
+
+def _trade_log_entry(
+    cycle: Cycle,
+    transactions: Sequence[Transaction],
+    through: date,
+    *,
+    name: str | None,
+    dividend_row_ids: set[int],
+    dividends: float,
+    engine_exact: bool,
+) -> dict[str, Any]:
+    metrics = cycle_metrics(cycle, through, dividends=dividends)
+
+    if engine_exact:
+        rows = _trade_log_engine_rows(cycle)
+        rows += [_trade_log_assignment_row(a) for a in cycle.assignments]
+        attribution_note = (
+            "Same-day close/reopen on this ticker: rows are attributed via the "
+            "engine, and Fees combines commission + fees."
+        )
+    else:
+        end = cycle.end_date or through
+        # Contract-weighted opening price + side per (symbol, close-day), taken
+        # from the engine's own FIFO matching, so a raw closing fill can report
+        # its return against the premium it actually opened at -- even after a
+        # roll or a scaled entry at several prices.
+        close_ref: dict[tuple[str, date], list[tuple[float, float, str]]] = {}
+        for leg in cycle.legs:
+            for close in leg.closes:
+                close_ref.setdefault((leg.occ_symbol, close.date), []).append(
+                    (close.contracts, leg.open_price, leg.side)
+                )
+
+        def _raw_close_pct(t: Transaction) -> float | None:
+            if t.action not in _CLOSING_ACTIONS:
+                return None
+            items = [i for i in close_ref.get((t.occ_symbol, t.event_date), []) if i[1]]
+            total = sum(qty for qty, _op, _sd in items)
+            if total <= 0:
+                return None
+            wavg_open = sum(qty * op for qty, op, _sd in items) / total
+            return _close_return_pct(wavg_open, t.price, items[0][2])
+
+        rows = [
+            _trade_log_raw_row(t, _trade_log_txn_type(t, dividend_row_ids), _raw_close_pct(t))
+            for t in transactions
+            if t.underlying == cycle.underlying
+            and cycle.start_date <= t.event_date <= end
+            and (t.is_option or t.action in (BUY_STOCK, SELL_STOCK) or t.row_id in dividend_row_ids)
+        ]
+        # A broker export that carries the equity leg already yields a real
+        # Buy/Sell Shares row above; only the synthesized legs need adding.
+        rows += [_trade_log_assignment_row(a) for a in cycle.assignments if a.synthetic]
+        attribution_note = None
+
+    rows.sort(key=lambda row: row.pop("_sort"))
+    running = 0.0
+    for row in rows:
+        running += row.get("net_cash_flow") or 0.0
+        row["running_cash_flow"] = _money(running)
+
+    held_lots = [lot for lot in cycle.share_lots if lot.remaining > 1e-9]
+    known = [lot for lot in held_lots if lot.basis_known and lot.basis_per_share is not None]
+    shares_held = sum(lot.remaining for lot in held_lots)
+    cost_basis = (
+        sum(lot.basis_per_share * lot.remaining for lot in known) / sum(lot.remaining for lot in known)
+        if known
+        else None
+    )
+    break_even_lots = [
+        (lot.remaining, net_adjusted_cost_basis(cycle, lot))
+        for lot in held_lots
+    ]
+    break_even_lots = [(qty, value) for qty, value in break_even_lots if value is not None]
+    break_even = (
+        sum(qty * value for qty, value in break_even_lots) / sum(qty for qty, value in break_even_lots)
+        if break_even_lots
+        else None
+    )
+    total_fees_commissions = sum(
+        (row.get("fees") or 0.0) + (row.get("commission") or 0.0) for row in rows
+    )
+
+    # Wheel ROC annualized by trade turnover (365 / avg days a leg is held)
+    # rather than by the wheel's calendar span (365 / days_active).
+    roc_on_avg_days = (
+        metrics.roi_on_avg_wheel_pct * (DAYS_PER_YEAR / metrics.avg_days_in_trade)
+        if metrics.roi_on_avg_wheel_pct is not None and metrics.avg_days_in_trade
+        else None
+    )
+
+    return {
+        "cycle_id": cycle.cycle_id,
+        "underlying": cycle.underlying,
+        "name": name,
+        "status": cycle.status,
+        "is_open": cycle.is_open,
+        "start_date": _iso(cycle.start_date),
+        "end_date": _iso(cycle.end_date),
+        "cost_basis_per_share": _money(cost_basis),
+        "break_even_per_share": _money(break_even),
+        "shares_held": round(shares_held, 4),
+        "open_contracts": round(sum(leg.remaining_contracts for leg in cycle.legs if leg.is_open), 4),
+        "gross_premium_received": _money(metrics.premium_received),
+        "option_realized_pl": _money(metrics.option_realized_pl),
+        "stock_realized_pl": _money(metrics.stock_realized_pl),
+        "net_realized_pl": _money(metrics.net_realized_pl),
+        "dividends": _money(dividends),
+        "total_fees_commissions": _money(total_fees_commissions),
+        "capital_committed_now": _money(metrics.current_collateral),
+        "capital_estimated": cycle.capital_estimated,
+        "days_active": metrics.days_active,
+        "profit_per_day": _money(metrics.profit_per_day),
+        "win_rate_pct": metrics.win_rate_pct,
+        "wins": metrics.wins,
+        "losses": metrics.losses,
+        "avg_days_in_trade": metrics.avg_days_in_trade,
+        "avg_collateral": _money(metrics.avg_collateral),
+        "roi_on_avg_wheel_pct": metrics.roi_on_avg_wheel_pct,
+        "annualized_wheel_roc_pct": metrics.annualized_wheel_roc_pct,
+        "annualized_wheel_roc_on_avg_days_pct": roc_on_avg_days,
+        "attribution_note": attribution_note,
+        "transactions": rows,
+    }
+
+
 def _reconciliation(
     transactions: Sequence[Transaction],
     cycles: Sequence[Cycle],
@@ -456,6 +760,22 @@ class Dashboard:
         # which needs the same network fetch _price_cache above is guarding
         # against repeating, so it can't be computed any earlier than that.
         self._wheel_return: dict[str, Any] | None = None
+
+        # Best-effort issuer name per ticker, for the Trade Log summary only.
+        # Option descriptions are the most standardized and by far the most
+        # numerous, so only they feed the vote -- dividend/ledger prose stays out.
+        name_votes: dict[str, Counter] = {}
+        for transaction in self.transactions:
+            if not transaction.is_option:
+                continue
+            name = company_name_from_description(transaction.description, transaction.underlying)
+            if name:
+                name_votes.setdefault(transaction.underlying, Counter())[name] += 1
+        self._company_names = {
+            ticker: votes.most_common(1)[0][0] for ticker, votes in name_votes.items()
+        }
+        # Filter-independent (built from all_cycles), so cached after first build().
+        self._trade_log: dict[str, Any] | None = None
 
     # ---- market data ----
 
@@ -805,6 +1125,54 @@ class Dashboard:
         }
         return payload
 
+    def _build_trade_log(self) -> dict[str, Any]:
+        """One entry per wheel (``all_cycles``), each with its whole-history
+        transaction ledger -- deliberately independent of any ticker/date/status
+        filter, the same "a wheel is a historical unit" reasoning
+        ``_build_wheel_return`` / ``_build_net_worth`` follow.
+
+        Transaction attribution is by underlying + inclusive date span, which is
+        only safe while a ticker's cycles are strictly separated in time. The
+        engine can legally close one cycle and open the next on the same day, so
+        any same-ticker pair that touches (or, defensively, overlaps) switches to
+        engine-exact attribution instead -- see ``_trade_log_entry``.
+        """
+        through = self.last_date or date.today()
+        dividend_row_ids = {t.row_id for t in cf.dividend_transactions(self.transactions)}
+        dividends = dividends_by_cycle(self.all_cycles, self.transactions)
+
+        by_underlying: dict[str, list[Cycle]] = {}
+        for cycle in self.all_cycles:
+            by_underlying.setdefault(cycle.underlying, []).append(cycle)
+
+        engine_exact: set[str] = set()
+        warnings: list[str] = []
+        for group in by_underlying.values():
+            ordered = sorted(group, key=lambda cycle: cycle.start_date)
+            for prev, nxt in zip(ordered, ordered[1:]):
+                prev_end = prev.end_date or through
+                if nxt.start_date <= prev_end:
+                    engine_exact.update((prev.cycle_id, nxt.cycle_id))
+                    if prev.end_date is not None and nxt.start_date < prev.end_date:
+                        warnings.append(
+                            f"{prev.underlying}: cycles {prev.cycle_id} and {nxt.cycle_id} "
+                            "overlap in time -- Trade Log attributed them via the engine"
+                        )
+
+        wheels = [
+            _trade_log_entry(
+                cycle,
+                self.transactions,
+                through,
+                name=self._company_names.get(cycle.underlying),
+                dividend_row_ids=dividend_row_ids,
+                dividends=dividends.get(cycle.cycle_id, 0.0),
+                engine_exact=cycle.cycle_id in engine_exact,
+            )
+            for cycle in sorted(self.all_cycles, key=lambda cycle: (cycle.start_date, cycle.underlying))
+        ]
+        return {"wheels": wheels, "warnings": warnings}
+
     # ---- query ----
 
     def build(self, filters: Filters | None = None) -> dict[str, Any]:
@@ -882,6 +1250,8 @@ class Dashboard:
         dividends = dividends_by_cycle(cycles, transactions)
         if self._wheel_return is None:
             self._wheel_return = self._build_wheel_return(current_prices)
+        if self._trade_log is None:
+            self._trade_log = self._build_trade_log()
 
         portfolio = portfolio_metrics(
             cycles,
@@ -993,4 +1363,5 @@ class Dashboard:
             "net_worth": self._net_worth,
             "benchmark": self._benchmark,
             "wheel_return": self._wheel_return,
+            "trade_log": self._trade_log,
         }

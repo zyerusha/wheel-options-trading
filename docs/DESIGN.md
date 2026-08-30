@@ -56,10 +56,28 @@ prefers the as-of date, which is what puts them in the right cycle.
 ### Cycles
 
 A **cycle** is one campaign in one underlying: it opens on the first position taken
-and closes only when that ticker is completely flat — no open contracts, no shares.
+and closes when that ticker is completely flat — no open contracts, no shares.
 Rolls, scaled entries, assignment and the covered calls that follow all land inside
 one cycle without contract-to-contract chaining, which matters because real rolls do
 not preserve size (this book closes 4 contracts and opens 2 on 2025-10-20).
+
+**A flat gap does not end the wheel; a completed rotation or the year turning does.**
+Selling puts, closing them, and selling more later — with a flat stretch in between —
+is one ongoing wheel, not a string of tiny ones. So when a ticker goes flat and is
+then re-entered *with an option (STO/BTO)*, the engine reopens the most recent cycle
+(`WheelEngine._resumable_cycle`) rather than starting a new one, **unless** either:
+
+- that cycle already **completed a full rotation** — a covered call was assigned and
+  its stock called away (a `DISPOSE` assignment). That is a finished wheel; the next
+  entry is a new one. A cycle that only ever sold puts (assigned or not) has not
+  completed and stays resumable.
+- the re-entry falls in a **later calendar year**. The year is a deliberate cut point
+  (it also resets the `-<n>` sequence), so a position carried across New Year's still
+  starts a fresh `<ticker>-<year>-1`.
+
+A bare stock purchase after a flat gap also starts its own cycle. A resumed cycle
+keeps its original id and simply spans the flat days; committed capital reads $0
+across them.
 
 Status is `ACTIVE` while anything is open, otherwise `ASSIGNED` if the campaign went
 through an assignment, otherwise `CLOSED`.
@@ -395,13 +413,19 @@ copies of a trade are taken from a single chosen file so their relative order �
 the intra-day sequencing depends on — stays intact.
 
 **The identity test has to tolerate the broker's own inconsistency.** Comparing rows
-verbatim fails on two axes that vary between exports of the same account:
+verbatim fails on three axes that vary between exports of the same account:
 
 - spacing: `BRIGHTHOUSE FINL INC NOV 21 25` vs `BRIGHTHOUSE FINL INCNOV 21 25`;
-- the as-of date format: `as of Sep-17-2025` vs `as of 2025-09-17`.
+- the as-of date format: `as of Sep-17-2025` vs `as of 2025-09-17`;
+- the cash columns: one PLTR buy-back downloaded twice shows `Fees 0.02 / Amount
+  −261.32` in the newer file and `0.03 / −261.33` in the older — Fidelity re-rounds
+  commission, fees and the net amount between downloads.
 
-So the key strips all whitespace and replaces the whole as-of phrase — the parsed
-`as_of_date` already carries that information as a real field.
+So the key strips all whitespace, replaces the whole as-of phrase (the parsed
+`as_of_date` already carries that), and is built from the fields that actually define
+a fill — date, symbol, action, direction, size, quoted price — **not** `commission`,
+`fees` or `amount`. A genuinely repeated fill within one file still survives, because
+the merged count is the max seen in any one file, not a set membership test.
 
 **Row order has to be normalized first.** Some exports are oldest-first, others
 newest-first. Since `row_id` breaks ties between events on the same day, a
@@ -472,10 +496,14 @@ exports of the *same* account are (`merge_transactions` has no account field to
 key on) — so combined `cycles` and `tickers` are the **concatenation** of every
 account's own rows, each tagged with the account it came from, never re-merged.
 
-**`cycle_id` is regenerated per account** (e.g. both accounts' first MU cycle is
-naturally `"MU-1"`), and the dashboard uses it as a set key for expand/collapse
-state — so the combined view prefixes it with the account id. Without that, two
-unrelated cycles sharing a generated id would expand and collapse together.
+**`cycle_id` is `"<ticker>-<start year>-<n>"`, and `n` restarts at 1 each calendar
+year** (`WheelEngine._cycle_counter` is keyed on `(underlying, year)`) — the first MU
+campaign of 2026 is `MU-2026-1` no matter how many MU campaigns ran in 2025, since the
+year already separates them. It is also regenerated per account, so both accounts'
+first 2026 MU cycle would be `MU-2026-1`; the dashboard uses `cycle_id` as a set key
+for expand/collapse state, so the combined view prefixes it with the account id.
+Without that, two unrelated cycles sharing a generated id would expand and collapse
+together.
 
 **Combined return figures are recomputed from the combined absolutes, never
 averaged from each account's own percentage** — the same principle

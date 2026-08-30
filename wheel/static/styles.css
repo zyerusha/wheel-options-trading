@@ -29,6 +29,8 @@
   --critical: #d03b3b;
   --success-text: #006300;
 
+  --closed-bg: #ffe6df; /* salmon - a closed wheel in the Trade Log */
+
   --radius: 10px;
   --gap: 18px;
 }
@@ -53,6 +55,7 @@
     --neg: #e66767;
     --mid: #383835;
     --success-text: #0ca30c;
+    --closed-bg: #4a2b25;
   }
 }
 
@@ -75,6 +78,7 @@
   --neg: #e66767;
   --mid: #383835;
   --success-text: #0ca30c;
+  --closed-bg: #4a2b25;
 }
 
 * {
@@ -553,6 +557,13 @@ svg .hit {
   cursor: pointer;
 }
 
+/* Full-row click target behind the per-leg hits in the wheel timeline -- opens
+   that wheel in the Trade Log tab. Painted first, so leg tooltips still win. */
+svg .row-hit {
+  fill: transparent;
+  cursor: pointer;
+}
+
 /* The overlay is transparent, so ring the plot area rather than relying on an
    outline, which SVG renders inconsistently. */
 svg .hit:focus {
@@ -830,4 +841,122 @@ tr.detail > td {
   .chip-row {
     max-width: 100%;
   }
+}
+
+/* ---------------- tabs ---------------- */
+
+.tabs {
+  display: flex;
+  gap: 6px;
+  margin-bottom: var(--gap);
+}
+
+.tab {
+  border: 1px solid var(--axis);
+  border-radius: 999px;
+  padding: 5px 14px;
+  font-size: 12.5px;
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  min-height: 30px;
+}
+
+.tab[aria-selected='true'] {
+  border-color: var(--series-1);
+  color: var(--series-1);
+  font-weight: 600;
+}
+
+#tab-dashboard[hidden],
+#tab-tradelog[hidden],
+#tradelog-summary[hidden],
+#tradelog-empty[hidden],
+#tradelog-note[hidden] {
+  display: none;
+}
+
+/* ---------------- trade log ---------------- */
+
+.tradelog-nav {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.tradelog-nav #tradelog-pick {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 460px;
+}
+
+.tradelog-nav #tradelog-ticker {
+  flex: 0 1 170px;
+  min-width: 0;
+}
+
+/* Closed wheels are salmon in the dropdown list. Only the options are tinted --
+   styling the <select> itself bleeds its background onto every option. */
+#tradelog-pick option {
+  background-color: var(--surface-1);
+  color: var(--text-primary);
+}
+
+#tradelog-pick option.closed {
+  background-color: var(--closed-bg);
+}
+
+.tradelog-nav button {
+  min-width: 34px;
+}
+
+.tradelog-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 14px;
+}
+
+.tradelog-summary.closed {
+  background: var(--closed-bg);
+  border-color: var(--closed-bg);
+}
+
+.tradelog-summary .tl-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.tradelog-summary .tl-label {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.tradelog-summary .tl-value {
+  font-size: 16px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.tradelog-summary .tl-value.help {
+  cursor: help;
+  text-decoration: underline dotted var(--text-muted);
+  text-underline-offset: 3px;
+}
+
+.tradelog-summary .tl-foot {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+#tradelog-table tr.synthetic td {
+  color: var(--text-muted);
+  font-style: italic;
 }

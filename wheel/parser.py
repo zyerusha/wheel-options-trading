@@ -101,6 +101,34 @@ _AS_OF_ANY_RE = re.compile(r"as of\s+[\w-]+", re.IGNORECASE)
 _DESC_EXPIRY_RE = re.compile(r"\b([A-Z]{3})\s+(\d{2})\s+(\d{2})\b")
 _DESC_STRIKE_RE = re.compile(r"\$(\d+(?:\.\d+)?)")
 
+_MONTH_TOKENS = frozenset(
+    ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
+)
+# One leading chunk of Fidelity action verbiage, before the issuer name.
+# ``company_name_from_description`` strips this repeatedly, so each alternative
+# only needs to match one token/phrase:
+#   "CALL (IWM) ISHARES RUSSELL 2000JAN 09 26 $253 (100 SHS)"
+#   "YOU BOUGHT ASSIGNED PUTS AS OF ... MICRON TECHNOLOGY"
+_NAME_PREFIX_RE = re.compile(
+    r"^\s*(?:"
+    r"YOU\s+(?:BOUGHT|SOLD)"
+    r"|(?:ASSIGNED|EXERCISED)"
+    r"|(?:OPENING|CLOSING)(?:\s+TRANSACTION)?"
+    r"|TRANSACTION"
+    r"|(?:PUTS?|CALLS?)\s*\([A-Z.]{1,6}\)"
+    r"|(?:PUTS?|CALLS?)"
+    r")\s+",
+    re.IGNORECASE,
+)
+# The option expiry that trails the issuer name -- Fidelity glues the two
+# together ("...RUSSELL 2000JAN 09 26"), so no leading word boundary. This is
+# where the name ends; deliberately no ``\b`` so a name ending in a digit
+# (iShares Russell 2000) survives intact.
+_NAME_DATE_TAIL_RE = re.compile(
+    r"(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\s+\d{1,2}\s+\d{2,4}",
+    re.IGNORECASE,
+)
+
 _HEADER_KEY = "run date"
 
 # Two dialects of the same four dollar/quantity columns -- see the module
@@ -285,6 +313,45 @@ def _expiry_from_description(description: str) -> date | None:
         return datetime.strptime(f"{month} {day} {year}", "%b %d %y").date()
     except ValueError:
         return None
+
+
+def company_name_from_description(description: str, underlying: str) -> str | None:
+    """Best-effort issuer name pulled from a Fidelity description string.
+
+    ``'MICRON TECHNOLOGY OCT 03 25 $157.5 CALL (MU)'`` -> ``'Micron Technology'``.
+
+    Cosmetic only -- the ticker stays the sole identifier everywhere this is
+    used.  Returns ``None`` whenever what survives the trim still looks like a
+    half-parsed fragment (a digit, a ``$``, a month token) rather than a clean
+    name, so a caller can fall back to showing just the ticker.
+    """
+    text = _AS_OF_ANY_RE.sub(" ", (description or "").upper()).strip()
+    for _ in range(6):  # peel one verbiage chunk at a time
+        peeled = _NAME_PREFIX_RE.sub("", text, count=1).strip()
+        if peeled == text:
+            break
+        text = peeled
+
+    date_tail = _NAME_DATE_TAIL_RE.search(text)
+    strike = _DESC_STRIKE_RE.search(text)
+    if date_tail:
+        text = text[: date_tail.start()]
+    elif strike:
+        text = text[: strike.start()]
+
+    text = re.sub(r"\(\s*\d+\s*SH(?:S|ARES)?\s*\)\s*$", "", text)  # trailing "(100 SHS)"
+    text = re.sub(r"\(\s*[A-Z.]{1,6}\s*\)\s*$", "", text)  # trailing "(TICKER)"
+    text = re.sub(r"\b(PUT|CALL)S?\s*$", "", text)
+    text = re.sub(r"[\s,&/\-]+$", "", text)  # trailing punctuation from a truncated name
+    text = re.sub(r"\s{2,}", " ", text).strip()
+
+    # A name legitimately can carry digits (iShares Russell 2000, 3M), so only
+    # reject the tells of a half-parsed fragment: a stray "$", or a lone month.
+    if not text or text == (underlying or "").upper():
+        return None
+    if "$" in text or text in _MONTH_TOKENS:
+        return None
+    return " ".join(word.capitalize() for word in text.split())
 
 
 def _as_of(text: str) -> date | None:
@@ -602,12 +669,21 @@ class MergeReport:
 def dedup_key(transaction: Transaction) -> tuple:
     """Identity of a trade for the purpose of spotting it in two exports.
 
-    Every economic field the broker prints, plus the action text with **all
+    The fields that actually define a fill -- its date, symbol, action,
+    direction, size and quoted price -- plus the action text with **all
     whitespace stripped**.  The spacing is not stable between exports -- the same
     call shows as ``BRIGHTHOUSE FINL INC NOV 21 25`` in one file and
     ``BRIGHTHOUSE FINL INCNOV 21 25`` in another -- so comparing it verbatim would
-    treat identical trades as distinct.  ``row_id`` and ``source`` are excluded
-    because they differ by construction.
+    treat identical trades as distinct.
+
+    ``commission``, ``fees`` and ``amount`` are deliberately **excluded**: the
+    broker re-rounds them between downloads (a buy-back reported as ``fees 0.02 /
+    amount -261.32`` in one export and ``0.03 / -261.33`` in another is one
+    fill, not two), and they add nothing to identity that ``contracts x price``
+    doesn't already carry.  A genuine repeated fill within one file is still
+    kept, because :func:`merge_transactions` takes the *max count per file*, not
+    a set.  ``row_id`` and ``source`` are excluded because they differ by
+    construction.
     """
     return (
         transaction.run_date,
@@ -617,9 +693,6 @@ def dedup_key(transaction: Transaction) -> tuple:
         transaction.occ_symbol or transaction.underlying,
         transaction.contracts,
         transaction.price,
-        transaction.commission,
-        transaction.fees,
-        transaction.amount,
         transaction.as_of_date,
     )
 

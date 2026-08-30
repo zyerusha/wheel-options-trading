@@ -420,7 +420,10 @@ class WheelEngine:
         self._open_legs: dict[str, list[OptionLeg]] = {}  # occ_symbol -> FIFO lots
         self._share_lots: dict[str, list[ShareLot]] = {}  # underlying -> FIFO lots
         self._active_cycle: dict[str, Cycle] = {}
-        self._cycle_counter: dict[str, int] = {}
+        # (underlying, calendar year) -> count. The sequence restarts every year,
+        # so the first MU cycle of 2026 is "MU-2026-1" regardless of how many MU
+        # cycles ran in 2025 -- the year already separates them.
+        self._cycle_counter: dict[tuple[str, int], int] = {}
         self._ids = itertools.count(1)
         self._settlements = self._index_settlements()
         # Consumption is tracked here, not on the Transaction objects: those are
@@ -511,12 +514,22 @@ class WheelEngine:
 
     # ---------------- cycle bookkeeping ----------------
 
-    def _cycle_for(self, underlying: str, when: date) -> Cycle:
+    def _cycle_for(self, underlying: str, when: date, *, resume: bool = False) -> Cycle:
         cycle = self._active_cycle.get(underlying)
         if cycle is not None:
             return cycle
-        sequence = self._cycle_counter.get(underlying, 0) + 1
-        self._cycle_counter[underlying] = sequence
+        # A wheel that went flat but is re-entered with another option in the
+        # *same calendar year* is the same campaign -- selling puts, closing
+        # them, and selling more later is one ongoing wheel until it either
+        # completes a full rotation (stock called away) or the year turns.
+        if resume:
+            revived = self._resumable_cycle(underlying, when)
+            if revived is not None:
+                revived.end_date = None
+                self._active_cycle[underlying] = revived
+                return revived
+        sequence = self._cycle_counter.get((underlying, when.year), 0) + 1
+        self._cycle_counter[(underlying, when.year)] = sequence
         cycle = Cycle(
             cycle_id=f"{underlying}-{when.year}-{sequence}",
             underlying=underlying,
@@ -526,6 +539,24 @@ class WheelEngine:
         self._active_cycle[underlying] = cycle
         self.cycles.append(cycle)
         return cycle
+
+    def _resumable_cycle(self, underlying: str, when: date) -> Cycle | None:
+        """The most recent cycle for ``underlying`` that a re-entry on ``when``
+        should rejoin instead of opening a fresh cycle: it closed earlier in the
+        same calendar year, and it never completed a full wheel rotation -- no
+        call assignment took its stock away. A cycle whose shares were called
+        away is a finished wheel; the next entry, even the same year, is new.
+        """
+        for cycle in reversed(self.cycles):
+            if cycle.underlying != underlying:
+                continue
+            if cycle.end_date is None:
+                return None  # still open -- would have been the active cycle
+            if cycle.end_date.year != when.year or when < cycle.end_date:
+                return None
+            called_away = any(event.direction == "DISPOSE" for event in cycle.assignments)
+            return None if called_away else cycle
+        return None
 
     def _is_flat(self, underlying: str) -> bool:
         legs_open = any(leg.is_open for leg in self._open_legs_for(underlying))
@@ -591,7 +622,9 @@ class WheelEngine:
     # ---------------- opens ----------------
 
     def _apply_open(self, underlying: str, row: Transaction) -> dict | None:
-        cycle = self._cycle_for(underlying, row.event_date)
+        # Only a fresh option open (STO/BTO) may revive a same-month flat wheel;
+        # a bare stock purchase starts its own cycle as before.
+        cycle = self._cycle_for(underlying, row.event_date, resume=row.action in (STO, BTO))
 
         if row.action == BUY_STOCK:
             shares = abs(row.contracts)

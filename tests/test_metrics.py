@@ -402,16 +402,16 @@ class TestDividendAttribution(unittest.TestCase):
         self.assertAlmostEqual(result[cycles[0].cycle_id], 12.50)
 
     def test_dividend_routes_to_the_correct_one_of_two_sequential_cycles(self):
-        """Same ticker, two separate campaigns with a flat gap between them:
-        each dividend must land in its own cycle's window, never the other's.
+        """Same ticker, two separate campaigns a year apart: each dividend must
+        land in its own cycle's window, never the other's.
         """
         transactions = [
             tx("2025-01-01", STO, "-XYZ250201P100", -1, 3.00, 300.0, row_id=1),
             tx("2025-02-01", EXPIRED, "-XYZ250201P100", 1, None, 0.0, row_id=2, as_of="2025-02-01"),
             tx("2025-01-15", "OTHER", "XYZ", 0, amount=10.0, row_id=3, action_raw="DIVIDEND RECEIVED XYZ"),
-            tx("2025-06-01", STO, "-XYZ250701P100", -1, 3.00, 300.0, row_id=4),
-            tx("2025-07-01", EXPIRED, "-XYZ250701P100", 1, None, 0.0, row_id=5, as_of="2025-07-01"),
-            tx("2025-06-15", "OTHER", "XYZ", 0, amount=20.0, row_id=6, action_raw="DIVIDEND RECEIVED XYZ"),
+            tx("2026-06-01", STO, "-XYZ260701P100", -1, 3.00, 300.0, row_id=4),
+            tx("2026-07-01", EXPIRED, "-XYZ260701P100", 1, None, 0.0, row_id=5, as_of="2026-07-01"),
+            tx("2026-06-15", "OTHER", "XYZ", 0, amount=20.0, row_id=6, action_raw="DIVIDEND RECEIVED XYZ"),
         ]
         cycles, _ = build_cycles(transactions)
         self.assertEqual(len(cycles), 2)
@@ -522,18 +522,21 @@ class TestCapitalSeriesGaps(unittest.TestCase):
     """
 
     def gapped(self):
-        """One cycle, a long flat stretch, then another cycle."""
+        """One cycle in 2025, a long flat stretch across year-end, another in
+        2026 -- the year turn keeps them two cycles, so the portfolio series has
+        a real months-long hole to fill.
+        """
         return build_cycles(
             [
                 tx("2025-01-01", STO, "-MU250110P100", -1, 1.00, 99.33, row_id=1),
                 tx("2025-01-10", EXPIRED, "-MU250110P100", 1, None, 0.0, row_id=2, as_of="2025-01-10"),
-                tx("2025-06-01", STO, "-MU250620P100", -1, 1.00, 99.33, row_id=3),
-                tx("2025-06-20", EXPIRED, "-MU250620P100", 1, None, 0.0, row_id=4, as_of="2025-06-20"),
+                tx("2026-06-01", STO, "-MU260619P100", -1, 1.00, 99.33, row_id=3),
+                tx("2026-06-19", EXPIRED, "-MU260619P100", 1, None, 0.0, row_id=4, as_of="2026-06-19"),
             ]
         )[0]
 
     def test_gap_days_are_emitted_as_zero(self):
-        series = portfolio_capital_series(self.gapped(), date(2025, 6, 20))
+        series = portfolio_capital_series(self.gapped(), date(2026, 6, 19))
         span = (series[-1].day - series[0].day).days + 1
         self.assertEqual(len(series), span)
 
@@ -541,13 +544,13 @@ class TestCapitalSeriesGaps(unittest.TestCase):
         self.assertEqual(days, sorted(days))
         self.assertEqual(len(set(days)), len(days))
 
-        idle = next(p for p in series if p.day == date(2025, 3, 15))
+        idle = next(p for p in series if p.day == date(2025, 9, 15))
         self.assertEqual(idle.total, 0.0)
 
     def test_gap_fill_does_not_extend_past_the_last_live_day(self):
         """Extending to `through` would rewrite capital_deployed_now."""
-        series = portfolio_capital_series(self.gapped(), date(2025, 12, 31))
-        self.assertEqual(series[-1].day, date(2025, 6, 20))
+        series = portfolio_capital_series(self.gapped(), date(2026, 12, 31))
+        self.assertEqual(series[-1].day, date(2026, 6, 19))
         self.assertEqual(series[0].day, date(2025, 1, 1))
 
     def test_gap_fill_leaves_average_peak_and_current_unchanged(self):
@@ -559,9 +562,9 @@ class TestCapitalSeriesGaps(unittest.TestCase):
         and a maximum ignores them, so nothing downstream moves.
         """
         cycles = self.gapped()
-        filled = portfolio_capital_series(cycles, date(2025, 6, 20))
+        filled = portfolio_capital_series(cycles, date(2026, 6, 19))
 
-        live = {point.day for cycle in cycles for point in capital_timeline(cycle, date(2025, 6, 20))}
+        live = {point.day for cycle in cycles for point in capital_timeline(cycle, date(2026, 6, 19))}
         before = [point for point in filled if point.day in live]
         self.assertLess(len(before), len(filled))  # there really was a gap to fill
 

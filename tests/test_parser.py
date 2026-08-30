@@ -21,6 +21,7 @@ from wheel.parser import (  # noqa: E402
     STO,
     FidelityFormatError,
     classify_action,
+    company_name_from_description,
     parse_fidelity_csv,
     parse_occ_symbol,
 )
@@ -116,6 +117,40 @@ class TestActionClassification(unittest.TestCase):
             classify_action("ASSIGNED as of Feb-20-2026 PUT (DCH) AMERICAN AXLE & FEB 20 26 $8"),
             ASSIGNED,
         )
+
+
+class TestCompanyName(unittest.TestCase):
+    """Best-effort, cosmetic-only issuer name for the Trade Log summary."""
+
+    def test_option_description(self):
+        self.assertEqual(
+            company_name_from_description("PUT (MU) MICRON TECHNOLOGY JAN 17 25 $100 (100 SHS)", "MU"),
+            "Micron Technology",
+        )
+
+    def test_name_ending_in_digits_survives(self):
+        self.assertEqual(
+            company_name_from_description("CALL (IWM) ISHARES RUSSELL 2000JAN 09 26 $253 (100 SHS)", "IWM"),
+            "Ishares Russell 2000",
+        )
+
+    def test_assignment_settlement_description(self):
+        self.assertEqual(
+            company_name_from_description("YOU BOUGHT ASSIGNED PUTS AS OF 02-20-26 MICRON TECHNOLOGY", "MU"),
+            "Micron Technology",
+        )
+
+    def test_ticker_only_trailer_is_rejected(self):
+        self.assertIsNone(company_name_from_description("(MU)", "MU"))
+
+    def test_bare_ticker_is_rejected(self):
+        self.assertIsNone(company_name_from_description("MU", "MU"))
+
+    def test_empty_description_is_rejected(self):
+        self.assertIsNone(company_name_from_description("", "MU"))
+
+    def test_fragment_with_stray_dollar_is_rejected(self):
+        self.assertIsNone(company_name_from_description("PUT (MU) $100", "MU"))
 
 
 class TestColumnOrientation(unittest.TestCase):

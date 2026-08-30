@@ -18,6 +18,14 @@
         </div>
       </header>
 
+      <!-- Top-level view switch. Dashboard = every analytics card; Trade Log =
+           one wheel's transactions end to end. The account switcher stays
+           outside, shared by both. -->
+      <nav class="tabs" id="tab-bar" aria-label="View">
+        <button class="tab" type="button" data-tab="dashboard" aria-selected="true">Dashboard</button>
+        <button class="tab" type="button" data-tab="tradelog" aria-selected="false">Trade Log</button>
+      </nav>
+
       <!-- Account switcher: which data/<account>/ folder to view. "Combined"
            aggregates every discovered account without merging their cycles. -->
       <section class="accounts" id="accounts-bar" aria-label="Account" hidden>
@@ -25,6 +33,7 @@
         <div class="chip-row" id="account-chips" role="group" aria-labelledby="account-label"></div>
       </section>
 
+      <div id="tab-dashboard">
       <!-- Data source: choose an export, or upload a new one. Nothing is
            evaluated until Load is pressed. -->
       <section class="source" aria-label="Data source">
@@ -176,7 +185,7 @@
           <h2>Monthly cash flow</h2>
           <button class="toggle" data-twin="cashflow-table" aria-pressed="false">Table</button>
         </header>
-        <p class="hint">Net cash flow = Realized credits − Realized debits − Fees, booked the day cash actually settles:</p>
+        <p class="hint">Net cash flow = Realized credits - Realized debits - Fees, booked the day cash actually settles:</p>
         <ul class="hint-list">
           <li>Credits: premium sold, dividends</li>
           <li>Debits: premium paid to close a short or open a hedge</li>
@@ -284,6 +293,30 @@
         <p class="hint">None is "the" right answer — different lenses on the same cycle.</p>
         <div style="overflow-x: auto"><table id="cycles-table"></table></div>
       </section>
+      </div><!-- /#tab-dashboard -->
+
+      <div id="tab-tradelog" hidden>
+        <section class="card">
+          <header><h2>Trade Log</h2></header>
+          <p class="hint">
+            A selected wheel always shows its transactions end to end — the full wheel.
+            The list below follows the Dashboard's date range (open wheels always shown);
+            narrow it further by ticker here. Salmon = closed.
+          </p>
+          <div class="tradelog-nav">
+            <select id="tradelog-ticker" aria-label="Ticker"></select>
+            <button id="tradelog-prev" type="button" aria-label="Previous wheel">◀</button>
+            <select id="tradelog-pick" aria-label="Wheel"></select>
+            <button id="tradelog-next" type="button" aria-label="Next wheel">▶</button>
+          </div>
+          <div id="tradelog-empty" class="hint">
+            Pick a wheel above, or click one in the Dashboard's “Wheel timelines” chart.
+          </div>
+          <div id="tradelog-note" class="notice" hidden></div>
+          <div id="tradelog-summary" class="tradelog-summary" hidden></div>
+          <div style="overflow-x: auto"><div id="tradelog-table"></div></div>
+        </section>
+      </div>
     </div>
 
     <div id="tooltip" role="tooltip" aria-live="polite"></div>

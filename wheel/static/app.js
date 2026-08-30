@@ -35,6 +35,12 @@ const state = {
   // account aggregated without merging their cycles. Affects every chart and
   // table on the page, not just Net worth & benchmark.
   account: COMBINED_ACCOUNT_ID,
+  // Top-level view: 'dashboard' (every analytics card) or 'tradelog' (one
+  // wheel's transaction ledger). `tradeLogCycleId` is which wheel it shows;
+  // `tradeLogTicker` (null = all) narrows the wheel list to one ticker.
+  activeTab: 'dashboard',
+  tradeLogCycleId: null,
+  tradeLogTicker: null,
 };
 
 /* ---------------------------------------------------------------- utilities */
@@ -74,7 +80,7 @@ function money(value, { cents = false, sign = false } = {}) {
     ? { minimumFractionDigits: 2, maximumFractionDigits: 2 }
     : { maximumFractionDigits: 0 };
   const text = Math.abs(value).toLocaleString('en-US', options);
-  const prefix = value < 0 ? '−$' : sign ? '+$' : '$';
+  const prefix = value < 0 ? '-$' : sign ? '+$' : '$';
   return value === 0 ? '$0' : prefix + text;
 }
 
@@ -83,7 +89,7 @@ function compactMoney(value) {
   const unit = abs >= 1e6 ? [1e6, 'M'] : abs >= 1e3 ? [1e3, 'k'] : [1, ''];
   const scaled = value / unit[0];
   const digits = unit[0] === 1 ? 0 : Math.abs(scaled) < 10 ? 1 : 0;
-  return (value < 0 ? '−$' : '$') + Math.abs(scaled).toFixed(digits) + unit[1];
+  return (value < 0 ? '-$' : '$') + Math.abs(scaled).toFixed(digits) + unit[1];
 }
 
 function pct(value, digits = 1) {
@@ -1295,7 +1301,7 @@ const CASHFLOW_TABLE_HEAD = [
   {
     text: 'Net cash flow',
     title: formula([
-      'Net cash flow = Gross credits − Gross debits − Fees',
+      'Net cash flow = Gross credits - Gross debits - Fees',
       'Dated to when cash actually settles -- premium sold, dividends',
       '  received, a roll\'s debit -- not to when the underlying position',
       '  finally closes.',
@@ -1439,8 +1445,8 @@ function drawCashFlow(rows, trailing, pnlSeries) {
         { label: 'Monthly yield', value: pct(row.monthly_yield_pct, 2) },
       ],
       formula([
-        'Net cash flow = Gross credits − Gross debits − Fees',
-        `= ${money(row.gross_credits, { cents: true })} − ${money(row.gross_debits, { cents: true })} − ${money(row.fees, { cents: true })}`,
+        'Net cash flow = Gross credits - Gross debits - Fees',
+        `= ${money(row.gross_credits, { cents: true })} - ${money(row.gross_debits, { cents: true })} - ${money(row.fees, { cents: true })}`,
         `= ${money(row.net_cash_flow, { cents: true })}`,
         '',
         'Monthly yield % = Net cash flow ÷ Avg allocated collateral × 100',
@@ -1751,8 +1757,8 @@ function drawCashFlowGap(rows, pnlSeries) {
         { label: 'Cumulative gap', value: money(cumGaps[index], { cents: true }) },
       ],
       formula([
-        'Monthly gap = Net cash flow − Wheel realized P/L',
-        `= ${money(row.net_cash_flow, { cents: true })} − ${money(wheelPl[index].total_pl, { cents: true })}`,
+        'Monthly gap = Net cash flow - Wheel realized P/L',
+        `= ${money(row.net_cash_flow, { cents: true })} - ${money(wheelPl[index].total_pl, { cents: true })}`,
         `= ${money(value, { cents: true })}`,
         '',
         "Cumulative gap = running total of every month's gap so far",
@@ -1902,11 +1908,11 @@ function renderCashFlowTiles(trailing, rows, pnlSeries) {
       // so it shouldn't be colored red/green like a win/loss figure would be.
       label: 'Cash flow vs. wheel P/L gap',
       value: money(gap, { cents: true }),
-      foot: `${money(trailing.cash_flow, { cents: true })} cash flow − ${money(rangeWheelPl, { cents: true })} wheel P/L`,
+      foot: `${money(trailing.cash_flow, { cents: true })} cash flow - ${money(rangeWheelPl, { cents: true })} wheel P/L`,
       formula: formula([
-        'Gap = Cash flow − Wheel realized P/L',
+        'Gap = Cash flow - Wheel realized P/L',
         `  (both over the selected range, ${trailing.months_counted} month(s))`,
-        `= ${money(trailing.cash_flow, { cents: true })} − ${money(rangeWheelPl, { cents: true })}`,
+        `= ${money(trailing.cash_flow, { cents: true })} - ${money(rangeWheelPl, { cents: true })}`,
         `= ${money(gap, { cents: true })}`,
         '',
         'Positive: premium collected is running ahead of what has been realized --',
@@ -2376,19 +2382,32 @@ function drawTimeline(cycles, through) {
       );
     }
 
-    group.appendChild(
-      svgEl(
-        'text',
-        {
-          x: margin.left - 10,
-          y: top + rowHeight / 2 + 4,
-          'text-anchor': 'end',
-          fill: 'var(--text-secondary)',
-          'font-weight': 600,
-        },
-        row.cycle.cycle_id
-      )
+    // Full-row click target -- opens this wheel in the Trade Log tab. Painted
+    // before the per-leg `.hit` rects so their hover tooltips still win.
+    const rowHit = svgEl('rect', {
+      class: 'row-hit',
+      x: 0,
+      y: top - rowPad / 2,
+      width,
+      height: rowHeight + rowPad,
+    });
+    rowHit.addEventListener('click', () => openTradeLog(row.cycle.cycle_id));
+    group.appendChild(rowHit);
+
+    const label = svgEl(
+      'text',
+      {
+        x: margin.left - 10,
+        y: top + rowHeight / 2 + 4,
+        'text-anchor': 'end',
+        fill: 'var(--text-secondary)',
+        'font-weight': 600,
+      },
+      row.cycle.cycle_id
     );
+    label.style.cursor = 'pointer';
+    label.addEventListener('click', () => openTradeLog(row.cycle.cycle_id));
+    group.appendChild(label);
 
     row.placed.forEach(({ leg, lane }) => {
       const style = LEG_STYLES[leg.strategy] || LEG_STYLES.CSP;
@@ -2464,6 +2483,7 @@ function drawTimeline(cycles, through) {
         ...(leg.opened_by_roll ? [{ label: 'Opened by', value: 'roll ' + leg.opened_by_roll }] : []),
         ...(closedByRolls.length ? [{ label: 'Closed by', value: 'roll ' + closedByRolls.join(', ') }] : []),
       ], legCollateralFormula(leg));
+      hit.addEventListener('click', () => openTradeLog(row.cycle.cycle_id));
       group.appendChild(hit);
     });
   });
@@ -2625,7 +2645,7 @@ function cycleFormulas(cycle) {
     cycle.annualized_net_option_yield_pct === null
       ? formula([
           'Annualized Net Option Yield =',
-          '  (Net premium income − Debit adjustments − Fees) ÷ Initial collateral × (365 ÷ Days active)',
+          '  (Net premium income - Debit adjustments - Fees) ÷ Initial collateral × (365 ÷ Days active)',
           '',
           'N/A -- no initial collateral committed in this cycle.',
         ])
@@ -2686,7 +2706,7 @@ function cycleFormulas(cycle) {
 
   const ppd = formula([
     'Profit Per Day (PPD) =',
-    '  (Realized premium collected − Closeout cost) ÷ Days active',
+    '  (Realized premium collected - Closeout cost) ÷ Days active',
     '  Option premium only -- never includes stock profit/loss.',
     '',
     `= ${money(cycle.option_realized_pl, { cents: true })} ÷ ${cycle.days_active}`,
@@ -2702,7 +2722,7 @@ function cycleFormulas(cycle) {
 
   const days = formula([
     'Days = (End date, or the filter\'s "through" date if still open)',
-    '  − Start date, at least 1 day',
+    '  - Start date, at least 1 day',
     `= ${cycle.days_active}`,
   ]);
 
@@ -2879,7 +2899,7 @@ function legCollateralFormula(leg) {
       ? [
           `${leg.paired_contracts} of ${leg.contracts} contract(s) are paired into a spread`,
           '  -- a matched same-day short + long position whose collateral is',
-          '  netted as one |short strike − long strike| figure, not priced here.',
+          '  netted as one |short strike - long strike| figure, not priced here.',
           `  Only the remaining ${contracts} naked contract(s) are priced below.`,
           '',
         ]
@@ -2927,11 +2947,11 @@ function legCollateralFormula(leg) {
  */
 function spreadCollateralFormula(spread) {
   return formula([
-    'Collateral = |Short strike − Long strike| × 100 × Paired contracts',
-    `= |$${spread.short_strike} − $${spread.long_strike}| × 100 × ${spread.paired_contracts}`,
+    'Collateral = |Short strike - Long strike| × 100 × Paired contracts',
+    `= |$${spread.short_strike} - $${spread.long_strike}| × 100 × ${spread.paired_contracts}`,
     `= ${money(spread.collateral)}`,
     '',
-    'Net credit = Short premium received − Long premium paid (paired portion only)',
+    'Net credit = Short premium received - Long premium paid (paired portion only)',
     `= ${money(spread.net_credit, { cents: true })}`,
   ]);
 }
@@ -3022,7 +3042,7 @@ function cycleDetail(cycle) {
           text: lot.net_adjusted_cost_basis === null ? 'N/A' : money(lot.net_adjusted_cost_basis),
           title: formula([
             'Net adjusted cost basis = Tax basis',
-            '  − (this cycle\'s net option cash flow ÷ share, pro-rated to this lot)',
+            '  - (this cycle\'s net option cash flow ÷ share, pro-rated to this lot)',
             '  Distinct from tax basis: this is the wheel\'s own economic',
             '  break-even, not the raw price a 1099-B would show.',
             '',
@@ -3110,7 +3130,7 @@ function cycleDetail(cycle) {
           text: 'Implied cash',
           title: formula([
             'Cash the share movement implies at the strike price:',
-            '  ACQUIRE = −Strike × Shares (buying the stock)',
+            '  ACQUIRE = -Strike × Shares (buying the stock)',
             '  DISPOSE = +Strike × Shares (selling the stock, i.e. called away)',
             'From the broker\'s own equity fill when the export supplies one;',
             'synthesized at the strike price otherwise.',
@@ -3179,7 +3199,7 @@ function renderTiles(portfolio, reconciliation) {
       tone: portfolio.profit_per_day >= 0 ? 'pos' : 'neg',
       primary: true,
       formula: formula([
-        'Portfolio PPD = Σ (Premium collected − Closeout cost) ÷ Days',
+        'Portfolio PPD = Σ (Premium collected - Closeout cost) ÷ Days',
         '  Every cycle\'s realized option P/L; never stock P/L.',
         '',
         `= ${money(portfolio.option_realized_pl, { cents: true })} ÷ ${portfolio.days_span}`,
@@ -3375,10 +3395,10 @@ function renderTiles(portfolio, reconciliation) {
       tone: reconciliation.balanced ? 'pos' : 'neg',
       formula: formula([
         'Balanced = |Δ| < $0.005',
-        'Δ = File cash total − Model cash total − Unmatched cash',
+        'Δ = File cash total - Model cash total - Unmatched cash',
         '  (unmatched: closes whose opening leg sits outside this window)',
         '',
-        `= ${money(reconciliation.file_cash_total, { cents: true })} − ${money(reconciliation.model_cash_total, { cents: true })} − ${money(reconciliation.unmatched_cash, { cents: true })}`,
+        `= ${money(reconciliation.file_cash_total, { cents: true })} - ${money(reconciliation.model_cash_total, { cents: true })} - ${money(reconciliation.unmatched_cash, { cents: true })}`,
         `= ${reconciliation.delta}`,
       ]),
     },
@@ -3413,7 +3433,7 @@ function renderNotices(meta, reconciliation) {
     el(
       'li',
       {},
-      `${reconciliation.rows_checked} priced rows re-derived from price × quantity − fees; ` +
+      `${reconciliation.rows_checked} priced rows re-derived from price × quantity - fees; ` +
         `${reconciliation.row_failures.length} mismatches. Modelled cash ` +
         `${money(reconciliation.model_cash_total, { cents: true })} vs file ` +
         `${money(reconciliation.file_cash_total, { cents: true })}.`
@@ -3543,11 +3563,11 @@ function renderNetWorthTiles(netWorth, benchmark, wheelReturn) {
           foot: `${money(wheelReturn.terminal_value)} wheel vs ${money(wb.terminal_value)} in SPY`,
           tone: (wheelReturn.value_added ?? 0) >= 0 ? 'pos' : 'neg',
           formula: formula([
-            'Value added = Wheel terminal value − SPY terminal value',
+            'Value added = Wheel terminal value - SPY terminal value',
             '  (same cash-flow timing replayed into both, so this isolates',
             '  strategy performance from when money happened to move)',
             '',
-            `= ${money(wheelReturn.terminal_value)} − ${money(wb.terminal_value)}`,
+            `= ${money(wheelReturn.terminal_value)} - ${money(wb.terminal_value)}`,
             `= ${money(wheelReturn.value_added, { sign: true })}`,
           ]),
         }
@@ -3570,7 +3590,7 @@ function renderNetWorthTiles(netWorth, benchmark, wheelReturn) {
       tone: (benchmark.actual.xirr_pct ?? 0) >= 0 ? 'pos' : 'neg',
       formula: formula([
         'Money-weighted return (XIRR): the annualized rate r solving',
-        '  Σ amount_i ÷ (1 + r)^((date_i − date_0) / 365) = 0',
+        '  Σ amount_i ÷ (1 + r)^((date_i - date_0) / 365) = 0',
         `  over ${events.length} cash-flow event(s) -- the opening balance`,
         '  plus every external deposit/withdrawal found in the transaction',
         `  history, ${span} -- valued against the account's`,
@@ -4111,6 +4131,23 @@ function wireFilters() {
     });
   });
 
+  document.querySelectorAll('.tab').forEach((button) => {
+    button.addEventListener('click', () => switchTab(button.dataset.tab));
+  });
+  $('tradelog-ticker').addEventListener('change', (event) => {
+    state.tradeLogTicker = event.target.value || null;
+    // The current wheel may not belong to the new ticker; renderTradeLog
+    // re-resolves the selection against the narrowed list.
+    state.tradeLogCycleId = null;
+    renderTradeLog();
+  });
+  $('tradelog-pick').addEventListener('change', (event) => {
+    state.tradeLogCycleId = event.target.value || null;
+    renderTradeLog();
+  });
+  $('tradelog-prev').addEventListener('click', () => stepTradeLog(-1));
+  $('tradelog-next').addEventListener('click', () => stepTradeLog(1));
+
   $('theme-toggle').addEventListener('click', () => {
     const root = document.documentElement;
     const isDark =
@@ -4190,6 +4227,346 @@ async function load() {
     $('preset').value = defaultRangeToApply;
     await load();
   }
+}
+
+/* --------------------------------------------------------------- trade log */
+
+/**
+ * Whether a wheel is shown given the dashboard's date-range filter: it overlaps
+ * the window, or it is still open (an open wheel always shows, even one opened
+ * long before a 10-day window). Ignores the Trade Log's own ticker select.
+ */
+function tradeLogInWindow(wheel) {
+  const filters = (state.data && state.data.meta && state.data.meta.filters) || {};
+  const start = filters.start || null;
+  const end = filters.end || null;
+  if (wheel.is_open) return true;
+  if (!start && !end) return true;
+  const closed = wheel.end_date || '9999-12-31';
+  if (start && closed < start) return false; // wheel ended before the window
+  if (end && wheel.start_date > end) return false; // wheel started after it
+  return true;
+}
+
+/**
+ * Wheels for the picker / prev-next, newest-started first: the ones in the
+ * date window, then narrowed to one ticker if the Trade Log's ticker select
+ * is set.
+ */
+function orderedTradeLog() {
+  const wheels = (state.data && state.data.trade_log && state.data.trade_log.wheels) || [];
+  const ticker = state.tradeLogTicker || null;
+  return wheels
+    .filter((wheel) => (!ticker || wheel.underlying === ticker) && tradeLogInWindow(wheel))
+    .sort((a, b) =>
+      a.start_date < b.start_date ? 1 : a.start_date > b.start_date ? -1 : a.cycle_id.localeCompare(b.cycle_id)
+    );
+}
+
+/** Tickers that have at least one wheel displayable under the date window, sorted. */
+function tradeLogTickers() {
+  const wheels = (state.data && state.data.trade_log && state.data.trade_log.wheels) || [];
+  return [...new Set(wheels.filter(tradeLogInWindow).map((wheel) => wheel.underlying))].sort();
+}
+
+function renderTabs() {
+  const onTradelog = state.activeTab === 'tradelog';
+  $('tab-dashboard').hidden = onTradelog;
+  $('tab-tradelog').hidden = !onTradelog;
+  document
+    .querySelectorAll('.tab')
+    .forEach((btn) => btn.setAttribute('aria-selected', btn.dataset.tab === state.activeTab ? 'true' : 'false'));
+}
+
+function switchTab(name) {
+  state.activeTab = name;
+  renderTabs();
+  if (name === 'tradelog') renderTradeLog();
+}
+
+/** Click-through from the Dashboard's Wheel-timelines chart. */
+function openTradeLog(cycleId) {
+  state.tradeLogCycleId = cycleId;
+  state.tradeLogTicker = null; // don't let a stale ticker filter hide the clicked wheel
+  switchTab('tradelog');
+}
+
+function stepTradeLog(delta) {
+  const wheels = orderedTradeLog();
+  const index = wheels.findIndex((w) => w.cycle_id === state.tradeLogCycleId);
+  const next = index < 0 ? (delta > 0 ? 0 : wheels.length - 1) : index + delta;
+  if (next < 0 || next >= wheels.length) return;
+  state.tradeLogCycleId = wheels[next].cycle_id;
+  renderTradeLog();
+}
+
+function tradeLogCell(label, value, { help, foot } = {}) {
+  const cell = el('div', { class: 'tl-cell' });
+  cell.appendChild(el('div', { class: 'tl-label' }, label));
+  // An array value stacks each part on its own line (e.g. a date range), so a
+  // long value never wraps mid-token across two lines.
+  const valueNode = el('div', { class: 'tl-value' + (help ? ' help' : '') });
+  for (const part of Array.isArray(value) ? value : [value]) {
+    valueNode.appendChild(el('div', {}, part));
+  }
+  if (help) setFormula(valueNode, help);
+  cell.appendChild(valueNode);
+  if (foot) cell.appendChild(el('div', { class: 'tl-foot' }, foot));
+  return cell;
+}
+
+function renderTradeLogSummary(entry) {
+  const host = $('tradelog-summary');
+  clear(host);
+  host.hidden = false;
+  host.classList.toggle('closed', !entry.is_open);
+
+  const cents = (value) => money(value, { cents: true });
+  const perShare = (value) => (value === null || value === undefined ? '—' : '$' + value.toFixed(2));
+
+  host.appendChild(tradeLogCell('Ticker', entry.underlying + (entry.capital_estimated ? ' ~' : '')));
+  host.appendChild(tradeLogCell('Name', entry.name || '—'));
+  host.appendChild(tradeLogCell('Status', entry.status));
+  host.appendChild(tradeLogCell('Entries', String(entry.transactions.length)));
+  host.appendChild(
+    tradeLogCell('Date range', [entry.start_date, `→ ${entry.end_date || 'current'}`])
+  );
+  host.appendChild(
+    tradeLogCell('Cost basis / share', perShare(entry.cost_basis_per_share), {
+      help: formula([
+        'Average purchase price of shares still held.',
+        'Raw tax-lot basis — what a 1099-B shows.',
+        '— when the wheel holds no shares.',
+      ]),
+    })
+  );
+  host.appendChild(
+    tradeLogCell('Break-even / share', perShare(entry.break_even_per_share), {
+      help: formula([
+        'Net adjusted cost basis of the shares currently held.',
+        "Includes the wheel's applicable option cash flows and adjustments.",
+        'The price at which the remaining position exits flat.',
+        '— when the wheel holds no shares.',
+      ]),
+    })
+  );
+  host.appendChild(
+    tradeLogCell('Shares held', (entry.shares_held || 0).toLocaleString('en-US'))
+  );
+  host.appendChild(tradeLogCell('Open contracts', String(entry.open_contracts || 0)));
+  host.appendChild(tradeLogCell('Gross premium received', cents(entry.gross_premium_received)));
+  host.appendChild(tradeLogCell('Dividends', cents(entry.dividends)));
+  host.appendChild(tradeLogCell('Total fees & commissions', cents(entry.total_fees_commissions)));
+  host.appendChild(tradeLogCell('Capital committed now', money(entry.capital_committed_now)));
+  host.appendChild(
+    tradeLogCell('Realized P&L', cents(entry.net_realized_pl), {
+      foot: `${cents(entry.option_realized_pl)} option · ${cents(entry.stock_realized_pl)} stock`,
+    })
+  );
+
+  const days1 = (value) => (value === null || value === undefined ? '—' : value.toFixed(1));
+  host.appendChild(
+    tradeLogCell('PPD', entry.profit_per_day === null ? '—' : cents(entry.profit_per_day) + '/day', {
+      help: formula([
+        'Profit Per Day = Option P/L ÷ days the wheel has been active',
+        `= ${cents(entry.option_realized_pl)} ÷ ${entry.days_active}`,
+        `= ${entry.profit_per_day === null ? '—' : cents(entry.profit_per_day)}/day`,
+      ]),
+    })
+  );
+  host.appendChild(
+    tradeLogCell('Win rate', pct(entry.win_rate_pct), {
+      foot: `${entry.wins} / ${entry.wins + entry.losses} closed legs`,
+      help: formula([
+        'Winning legs ÷ (winning + losing) closed legs.',
+        'Open legs and exact break-evens are excluded from the count.',
+      ]),
+    })
+  );
+  host.appendChild(
+    tradeLogCell('Avg days in trade', days1(entry.avg_days_in_trade), {
+      help: formula(['Mean calendar days each closed leg of this wheel was held.']),
+    })
+  );
+  host.appendChild(
+    tradeLogCell('Annualized Wheel ROC', pct(entry.annualized_wheel_roc_on_avg_days_pct), {
+      foot:
+        entry.annualized_wheel_roc_pct === null
+          ? null
+          : `${pct(entry.annualized_wheel_roc_pct)} by calendar span`,
+      help: formula([
+        '(Option P/L ÷ Avg collateral) × (365 ÷ Avg days in trade)',
+        `= (${cents(entry.option_realized_pl)} ÷ ${money(entry.avg_collateral)})` +
+          ` × (365 ÷ ${days1(entry.avg_days_in_trade)})`,
+        `= ${pct(entry.annualized_wheel_roc_on_avg_days_pct)}`,
+        'Annualized by trade turnover, not the wheel’s calendar span.',
+      ]),
+    })
+  );
+
+  const note = $('tradelog-note');
+  clear(note);
+  if (entry.attribution_note) {
+    note.hidden = false;
+    note.appendChild(el('span', {}, entry.attribution_note));
+  } else {
+    note.hidden = true;
+  }
+}
+
+function renderTradeLogTable(entry) {
+  const host = $('tradelog-table');
+  clear(host);
+  const head = [
+    'Type',
+    'Date',
+    'Expiration',
+    'Strike',
+    'Shares / Contracts',
+    'Price / Premium',
+    'Return %',
+    'Initial CSP collateral',
+    'Fees',
+    'Commissions',
+    'Net cash flow',
+    'Cumulative cash flow',
+  ];
+  const table = el('table');
+  const thead = el('thead');
+  const headRow = el('tr');
+  head.forEach((label, index) => {
+    const th = el('th', { class: index === 0 ? 'left' : '' }, label);
+    if (label === 'Return %') {
+      setFormula(
+        th,
+        formula([
+          "This closing fill's realized return, as a % of the premium at open:",
+          '  short  (open - close) ÷ open   — sold 0.50, bought back 0.25 → 50%',
+          '  long   (close - open) ÷ open   — bought 1.00, sold 0.20 → -80%',
+          'Expiry / assignment closes at 0. Opening fills have none.',
+        ])
+      );
+    }
+    headRow.appendChild(th);
+  });
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const cents = (value) => (value === null || value === undefined ? '—' : money(value, { cents: true }));
+  const bare = (value) => (value === null || value === undefined ? '—' : '$' + value);
+  // Long/bought positive with a leading +, short/sold negative with -.
+  // No direction (a dividend) shows a dash.
+  const signedQty = (value) =>
+    value === null || value === undefined || value === 0
+      ? '—'
+      : (value > 0 ? '+' : '-') + Math.abs(value).toLocaleString('en-US');
+
+  const tbody = el('tbody');
+  for (const row of entry.transactions) {
+    const tr = el('tr');
+    if (row.synthetic) {
+      tr.className = 'synthetic';
+      tr.title = 'synthesized at strike — the broker export has no share leg for this assignment';
+    }
+    const cells = [
+      row.type,
+      row.date,
+      row.expiration || '—',
+      bare(row.strike),
+      signedQty(row.signed_quantity),
+      bare(row.price),
+      typeof row.close_return_pct === 'number' ? pct(row.close_return_pct, 0) : '—',
+      cents(row.initial_csp_collateral),
+      cents(row.fees),
+      row.commission === null || row.commission === undefined ? '—' : cents(row.commission),
+      cents(row.net_cash_flow),
+      cents(row.running_cash_flow),
+    ];
+    cells.forEach((value, index) => {
+      const td = el('td', { class: index === 0 ? 'left' : 'num' }, value);
+      if (index === 4 && typeof row.signed_quantity === 'number' && row.signed_quantity !== 0) {
+        td.classList.add(row.signed_quantity > 0 ? 'pos' : 'neg');
+      }
+      if (index === 6 && typeof row.close_return_pct === 'number') {
+        td.classList.add(row.close_return_pct >= 0 ? 'pos' : 'neg');
+      }
+      if (index === 10 && typeof row.net_cash_flow === 'number') {
+        td.classList.add(row.net_cash_flow >= 0 ? 'pos' : 'neg');
+      }
+      if (index === 11 && typeof row.running_cash_flow === 'number') {
+        td.classList.add(row.running_cash_flow >= 0 ? 'pos' : 'neg');
+      }
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  host.appendChild(table);
+  if (!entry.transactions.length) {
+    host.appendChild(el('p', { class: 'hint' }, 'No transactions recorded for this wheel.'));
+  }
+}
+
+function renderTradeLog() {
+  const tickerSel = $('tradelog-ticker');
+  clear(tickerSel);
+  tickerSel.appendChild(el('option', { value: '' }, 'All tickers'));
+  for (const ticker of tradeLogTickers()) {
+    tickerSel.appendChild(el('option', { value: ticker }, ticker));
+  }
+  if (state.tradeLogTicker && !tradeLogTickers().includes(state.tradeLogTicker)) {
+    state.tradeLogTicker = null;
+  }
+  tickerSel.value = state.tradeLogTicker || '';
+
+  const wheels = orderedTradeLog();
+  const pick = $('tradelog-pick');
+  clear(pick);
+  for (const wheel of wheels) {
+    const label =
+      `${wheel.cycle_id} · ${wheel.underlying}` +
+      (wheel.name ? ` (${wheel.name})` : '') +
+      ` · ${wheel.start_date} → ${wheel.end_date || 'current'}` +
+      ` · ${wheel.transactions.length} entries`;
+    // Closed (or assigned-and-flat) wheels are tinted salmon in the list.
+    pick.appendChild(el('option', { value: wheel.cycle_id, class: wheel.is_open ? '' : 'closed' }, label));
+  }
+
+  const empty = $('tradelog-empty');
+  if (!wheels.length) {
+    empty.hidden = false;
+    empty.textContent = 'No wheels in this account yet.';
+    $('tradelog-summary').hidden = true;
+    $('tradelog-note').hidden = true;
+    clear($('tradelog-table'));
+    return;
+  }
+
+  // Nothing valid selected (first open, ticker just changed, prior wheel
+  // filtered out) -> default to the first wheel in the list.
+  if (!wheels.some((wheel) => wheel.cycle_id === state.tradeLogCycleId)) {
+    state.tradeLogCycleId = wheels[0].cycle_id;
+  }
+  pick.value = state.tradeLogCycleId;
+
+  const index = wheels.findIndex((wheel) => wheel.cycle_id === state.tradeLogCycleId);
+  $('tradelog-prev').disabled = index <= 0;
+  $('tradelog-next').disabled = index < 0 || index >= wheels.length - 1;
+
+  const entry = index < 0 ? null : wheels[index];
+  if (!entry) {
+    empty.hidden = false;
+    empty.textContent =
+      'Pick a wheel above, or click one in the Dashboard’s “Wheel timelines” chart.';
+    $('tradelog-summary').hidden = true;
+    $('tradelog-note').hidden = true;
+    clear($('tradelog-table'));
+    return;
+  }
+
+  empty.hidden = true;
+  renderTradeLogSummary(entry);
+  renderTradeLogTable(entry);
 }
 
 function render() {
@@ -4279,7 +4656,7 @@ function render() {
       {
         text: money(row.profit_per_day, { cents: true }) + '/day',
         title: formula([
-          'Profit Per Day (PPD) = (Premium collected − Closeout cost) ÷ Days',
+          'Profit Per Day (PPD) = (Premium collected - Closeout cost) ÷ Days',
           '',
           `= ${money(row.option_realized_pl, { cents: true })} ÷ ${row.days_span}`,
           `= ${money(row.profit_per_day, { cents: true })}/day`,
@@ -4409,6 +4786,11 @@ function render() {
 
   drawTimeline(cycles, meta.through);
   renderCycles(cycles);
+
+  // The Trade Log is filter-independent (payload's `trade_log` is built from
+  // full history), but re-render it so the picker tracks an account switch.
+  renderTabs();
+  if (state.activeTab === 'tradelog') renderTradeLog();
 }
 
 wireFilters();
