@@ -4361,7 +4361,9 @@ function drawTradeLogBridge(entry) {
   svg.appendChild(g);
   const green = cssVar('--good');
   const red = cssVar('--critical');
-  const sign = (v) => (v >= 0 ? '+' : '') + compactMoney(v);
+  // Accounting style: no leading + on gains, negatives wrapped in parentheses.
+  const acctMoney = (v) => (v < 0 ? `(${compactMoney(-v)})` : compactMoney(v));
+  const acctMoneyFull = (v) => (v < 0 ? `(${money(-v)})` : money(v));
 
   for (let i = 0; i <= 4; i += 1) {
     const v = lo + ((hi - lo) * i) / 4;
@@ -4434,6 +4436,7 @@ function drawTradeLogBridge(entry) {
       })
     );
 
+    const valueText = anchor ? acctMoneyFull(step.running) : acctMoney(step.delta);
     g.appendChild(
       svgEl(
         'text',
@@ -4445,7 +4448,7 @@ function drawTradeLogBridge(entry) {
           'font-weight': anchor ? 700 : 500,
           'font-variant-numeric': 'tabular-nums',
         },
-        anchor ? money(step.running) : sign(step.delta)
+        valueText
       )
     );
 
