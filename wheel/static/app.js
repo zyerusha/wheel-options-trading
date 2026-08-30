@@ -2715,14 +2715,26 @@ function drawTimeline(cycles, through) {
     return;
   }
 
-  // Label each row with the *real* wheel id from the Trade Log (built from full
-  // history), so the two views agree even when a date filter has renumbered the
-  // cycles here.
+  // Label each row with the *real* wheel id and status from the Trade Log
+  // (built from full history), so the two views agree even when a date filter
+  // has renumbered or clipped the cycles here -- a wheel still open in full
+  // history must not read "closed" just because the window cuts off its tail.
   const byStart = (a, b) => parseDay(a.start_date) - parseDay(b.start_date) || a.cycle_id.localeCompare(b.cycle_id);
   const byTicker = (a, b) => a.underlying.localeCompare(b.underlying) || byStart(a, b);
   const ordered = cycles
     .slice()
-    .map((cycle) => ({ ...cycle, cycle_id: (matchTradeLogWheel(cycle) || cycle).cycle_id }))
+    .map((cycle) => {
+      const match = matchTradeLogWheel(cycle);
+      return match
+        ? {
+            ...cycle,
+            cycle_id: match.cycle_id,
+            status: match.status,
+            is_wheel: match.is_wheel,
+            kind: match.kind,
+          }
+        : cycle;
+    })
     .sort(state.timelineSort === 'time' ? byStart : byTicker);
 
   const endOf = (leg) => leg.close_date || through;
@@ -2829,6 +2841,10 @@ function drawTimeline(cycles, through) {
     rowHit.addEventListener('click', () => openTradeLog(row.cycle));
     group.appendChild(rowHit);
 
+    // Status cues on the wheel id: CLOSED (terminal) is struck through;
+    // NO_ACTIVITY (flat but resumable) gets an amber dot in the gutter;
+    // ACTIVE gets nothing.
+    const status = row.cycle.status;
     const nonWheel = row.cycle.is_wheel === false;
     const label = svgEl(
       'text',
@@ -2836,25 +2852,32 @@ function drawTimeline(cycles, through) {
         x: margin.left - 10,
         y: top + rowHeight / 2 + 4,
         'text-anchor': 'end',
-        fill: nonWheel ? 'var(--text-muted)' : 'var(--text-secondary)',
+        fill: nonWheel || status === 'CLOSED' ? 'var(--text-muted)' : 'var(--text-secondary)',
         'font-weight': 600,
+        'text-decoration': status === 'CLOSED' ? 'line-through' : 'none',
       },
       nonWheel ? row.cycle.cycle_id + ' ◇' : row.cycle.cycle_id
     );
     label.style.cursor = 'pointer';
-    if (nonWheel) {
-      label.appendChild(
-        svgEl(
-          'title',
-          {},
-          row.cycle.kind === 'hold'
-            ? 'Buy-and-hold (non-wheel): shares only, no option ever written. Excluded from wheel-return figures.'
-            : 'Directional (non-wheel): long options only. Excluded from wheel-return figures.'
-        )
-      );
-    }
+    const titleText = nonWheel
+      ? row.cycle.kind === 'hold'
+        ? 'Buy-and-hold (non-wheel): shares only, no option ever written. Excluded from wheel-return figures.'
+        : 'Directional (non-wheel): long options only. Excluded from wheel-return figures.'
+      : statusLabel(status);
+    label.appendChild(svgEl('title', {}, titleText));
     label.addEventListener('click', () => openTradeLog(row.cycle));
     group.appendChild(label);
+
+    if (status === 'NO_ACTIVITY') {
+      const dot = svgEl('circle', {
+        cx: margin.left - 5,
+        cy: top + rowHeight / 2 + 1,
+        r: 3.2,
+        fill: cssVar('--warning'),
+      });
+      dot.appendChild(svgEl('title', {}, 'NO ACTIVITY'));
+      group.appendChild(dot);
+    }
 
     row.placed.forEach(({ item, lane }) => {
       const y = top + lane * laneHeight;
@@ -2996,6 +3019,23 @@ function drawTimeline(cycles, through) {
   legend.appendChild(stockItem);
   legend.appendChild(el('span', {}, '▲ sold to open   ▼ bought to close   ◆ assigned   ■ bought shares   □ sold shares'));
   legend.appendChild(el('span', {}, 'Faded bar = still open'));
+
+  const statusItem = el('span');
+  const naDot = el('i');
+  naDot.style.background = cssVar('--warning');
+  naDot.style.borderRadius = '50%';
+  naDot.style.width = '8px';
+  naDot.style.height = '8px';
+  const closedText = el('span', {}, 'DCH-2026-1');
+  closedText.style.textDecoration = 'line-through';
+  closedText.style.color = 'var(--text-muted)';
+  statusItem.append(
+    naDot,
+    document.createTextNode(' no activity   '),
+    closedText,
+    document.createTextNode(' closed')
+  );
+  legend.appendChild(statusItem);
 
   buildTable(
     'timeline-table',
