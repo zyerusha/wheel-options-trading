@@ -148,6 +148,31 @@ class TestTransactionRows(unittest.TestCase):
             wheel["mark_to_market_pl"], 100.0 * (92.0 - wheel["break_even_price"]), places=2
         )
 
+    def test_pl_bridge_sums_to_mark_to_market(self):
+        rows = _trade_log(
+            [
+                tx("2025-01-02", STO, "-MU250117P100", -1, 3.0, 300.0, row_id=1),
+                tx("2025-01-10", BTC, "-MU250117P100", 1, 1.0, -100.0, row_id=2),
+                tx("2025-01-12", STO, "-MU250207P95", -1, 2.5, 250.0, row_id=3),
+                tx("2025-02-07", ASSIGNED, "-MU250207P95", 1, None, 0.0, row_id=4, as_of="2025-02-07"),
+                tx("2025-02-10", STO, "-MU250307C100", -1, 1.5, 150.0, row_id=5),
+            ],
+            prices={"MU": 90.0},
+        )
+        (wheel,) = rows["wheels"]
+        bridge = wheel["pl_bridge"]
+        self.assertEqual(bridge[0]["label"], "Premium sold")
+        self.assertEqual(bridge[-1]["kind"], "total")
+        # every step's running is the prior running plus its own delta
+        run = 0.0
+        for step in bridge:
+            if step["kind"] == "step":
+                run += step["delta"]
+                self.assertAlmostEqual(step["running"], round(run, 2), places=2)
+            else:
+                self.assertAlmostEqual(step["running"], round(run, 2), places=2)
+        self.assertAlmostEqual(bridge[-1]["running"], wheel["mark_to_market_pl"], places=2)
+
     def test_mark_to_market_pl_is_none_without_a_price(self):
         rows = _trade_log(
             [

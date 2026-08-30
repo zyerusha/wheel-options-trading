@@ -640,6 +640,38 @@ def _trade_log_entry(
         else None
     )
 
+    # A waterfall from gross premium sold down to where the wheel stands now.
+    # Each `step` floats on the previous `running`; the two `anchor` rows are
+    # subtotals pinned at 0. The steps provably sum: premium + short-close cash
+    # + hedge P&L = option realized P&L; + stock realized + dividends + open
+    # options + shares unrealized = mark-to-market P&L.
+    pl_bridge: list[dict[str, Any]] = []
+    _run = 0.0
+
+    def _step(label: str, delta: float) -> None:
+        nonlocal _run
+        _run += delta
+        pl_bridge.append({"label": label, "delta": _money(delta), "running": _money(_run), "kind": "step"})
+
+    def _anchor(label: str, kind: str) -> None:
+        pl_bridge.append({"label": label, "delta": None, "running": _money(_run), "kind": kind})
+
+    _step("Premium sold", metrics.premium_received)
+    _step("Bought back shorts", metrics.wheel_core_realized_pl - metrics.premium_received)
+    if metrics.hedge_realized_pl:
+        _step("Hedge P&L", metrics.hedge_realized_pl)
+    _anchor("Option P&L", "subtotal")
+    if metrics.stock_realized_pl:
+        _step("Shares sold/away", metrics.stock_realized_pl)
+    if dividends:
+        _step("Dividends", dividends)
+    if open_option_pl:
+        _step("Open options", open_option_pl)
+    shares_priced = not (shares_held > 1e-9 and stock_unrealized is None)
+    if stock_unrealized:
+        _step("Held shares P&L", stock_unrealized)
+    _anchor("P&L now" if shares_priced else "P&L now (no price)", "total")
+
     return {
         "cycle_id": cycle.cycle_id,
         "underlying": cycle.underlying,
@@ -662,6 +694,7 @@ def _trade_log_entry(
         "current_price": _money(current_price),
         "break_even_price": _money(break_even_price),
         "dollars_to_break_even": _money(dollars_to_break_even),
+        "pl_bridge": pl_bridge,
         "dividends": _money(dividends),
         "total_fees_commissions": _money(total_fees_commissions),
         "capital_committed_now": _money(metrics.current_collateral),

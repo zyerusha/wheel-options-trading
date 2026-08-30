@@ -4318,6 +4318,156 @@ function tradeLogCell(label, value, { help, foot, tone } = {}) {
   return cell;
 }
 
+/**
+ * A vertical waterfall: y is the running money value, x is each action, read
+ * left to right -- the first action (Premium sold) is the leftmost column,
+ * "P&L now" is the rightmost. `step` bars float between consecutive running
+ * totals (green up / red down); `subtotal` and `total` bars rise from $0.
+ * Data comes from `entry.pl_bridge` -- see `_trade_log_entry` in wheel/api.py.
+ */
+function drawTradeLogBridge(entry) {
+  const host = $('tradelog-bridge');
+  clear(host);
+  const steps = entry.pl_bridge || [];
+  if (steps.length < 2) {
+    host.hidden = true;
+    return;
+  }
+  host.hidden = false;
+
+  const svg = svgEl('svg', { role: 'img' });
+  host.appendChild(svg);
+
+  const n = steps.length;
+  const margin = { top: 18, right: 14, bottom: 78, left: 62 };
+  const width = chartWidth(svg, Math.max(520, n * 96));
+  const height = 300;
+  const colW = (width - margin.left - margin.right) / n;
+  const barW = Math.min(48, colW * 0.58);
+  svg.setAttribute('width', width);
+  svg.setAttribute('height', height);
+  svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+
+  const runs = steps.map((s) => s.running);
+  let lo = Math.min(0, ...runs);
+  let hi = Math.max(0, ...runs);
+  const pad = (hi - lo) * 0.14 || 1;
+  lo -= pad;
+  hi += pad;
+  const y = (v) => margin.top + (1 - (v - lo) / (hi - lo)) * (height - margin.top - margin.bottom);
+  const colX = (j) => margin.left + (j + 0.5) * colW;
+
+  const g = svgEl('g');
+  svg.appendChild(g);
+  const green = cssVar('--good');
+  const red = cssVar('--critical');
+  const sign = (v) => (v >= 0 ? '+' : '') + compactMoney(v);
+
+  for (let i = 0; i <= 4; i += 1) {
+    const v = lo + ((hi - lo) * i) / 4;
+    const gy = y(v);
+    g.appendChild(
+      svgEl('line', {
+        x1: margin.left,
+        x2: width - margin.right,
+        y1: gy,
+        y2: gy,
+        stroke: cssVar('--gridline'),
+        'stroke-width': 1,
+      })
+    );
+    g.appendChild(
+      svgEl(
+        'text',
+        { x: margin.left - 8, y: gy + 4, 'text-anchor': 'end', fill: 'var(--text-muted)', 'font-variant-numeric': 'tabular-nums' },
+        compactMoney(v)
+      )
+    );
+  }
+  g.appendChild(
+    svgEl('line', {
+      x1: margin.left,
+      x2: width - margin.right,
+      y1: y(0),
+      y2: y(0),
+      stroke: cssVar('--axis'),
+      'stroke-width': 1.5,
+    })
+  );
+
+  steps.forEach((step, j) => {
+    const cx = colX(j);
+    const anchor = step.kind !== 'step';
+    const from = anchor ? 0 : step.running - step.delta;
+    const to = step.running;
+    const top = Math.min(y(from), y(to));
+    const bot = Math.max(y(from), y(to));
+    const up = anchor ? step.running >= 0 : step.delta >= 0;
+
+    // connector from the previous action's level (that column is to the LEFT)
+    if (j > 0) {
+      const ry = y(steps[j - 1].running);
+      g.appendChild(
+        svgEl('line', {
+          x1: colX(j - 1) + barW / 2,
+          x2: cx - barW / 2,
+          y1: ry,
+          y2: ry,
+          stroke: cssVar('--text-muted'),
+          'stroke-width': 1,
+          'stroke-dasharray': '2 2',
+        })
+      );
+    }
+
+    g.appendChild(
+      svgEl('rect', {
+        x: cx - barW / 2,
+        y: top,
+        width: barW,
+        height: Math.max(2, bot - top),
+        rx: 2,
+        fill: up ? green : red,
+        'fill-opacity': anchor ? (step.kind === 'total' ? 0.95 : 0.55) : 0.85,
+        stroke: anchor ? (up ? green : red) : 'none',
+        'stroke-width': step.kind === 'total' ? 1.5 : 1,
+      })
+    );
+
+    g.appendChild(
+      svgEl(
+        'text',
+        {
+          x: cx,
+          y: up ? top - 6 : bot + 13,
+          'text-anchor': 'middle',
+          fill: up ? 'var(--success-text)' : 'var(--critical)',
+          'font-weight': anchor ? 700 : 500,
+          'font-variant-numeric': 'tabular-nums',
+        },
+        anchor ? money(step.running) : sign(step.delta)
+      )
+    );
+
+    const lx = cx;
+    const ly = height - margin.bottom + 14;
+    g.appendChild(
+      svgEl(
+        'text',
+        {
+          x: lx,
+          y: ly,
+          'text-anchor': 'end',
+          fill: 'var(--text-secondary)',
+          'font-weight': anchor ? 650 : 400,
+          transform: `rotate(-35 ${lx} ${ly})`,
+        },
+        step.label
+      )
+    );
+  });
+}
+
 function renderTradeLogSummary(entry) {
   const host = $('tradelog-summary');
   clear(host);
@@ -4717,6 +4867,7 @@ function renderTradeLog() {
     empty.hidden = false;
     empty.textContent = 'No wheels in this account yet.';
     $('tradelog-summary').hidden = true;
+    $('tradelog-bridge').hidden = true;
     $('tradelog-note').hidden = true;
     clear($('tradelog-table'));
     return;
@@ -4739,12 +4890,14 @@ function renderTradeLog() {
     empty.textContent =
       'Pick a wheel above, or click one in the Dashboard’s “Wheel timelines” chart.';
     $('tradelog-summary').hidden = true;
+    $('tradelog-bridge').hidden = true;
     $('tradelog-note').hidden = true;
     clear($('tradelog-table'));
     return;
   }
 
   empty.hidden = true;
+  drawTradeLogBridge(entry);
   renderTradeLogSummary(entry);
   renderTradeLogTable(entry);
 }

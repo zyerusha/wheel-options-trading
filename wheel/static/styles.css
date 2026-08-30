@@ -870,6 +870,7 @@ tr.detail > td {
 #tab-dashboard[hidden],
 #tab-tradelog[hidden],
 #tradelog-summary[hidden],
+#tradelog-bridge[hidden],
 #tradelog-empty[hidden],
 #tradelog-note[hidden] {
   display: none;
@@ -908,6 +909,19 @@ tr.detail > td {
 
 .tradelog-nav button {
   min-width: 34px;
+}
+
+.tradelog-bridge {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin-bottom: 14px;
+  overflow-x: auto;
+}
+
+.tradelog-bridge svg {
+  display: block;
+  font-size: 12px;
 }
 
 .tradelog-summary {
