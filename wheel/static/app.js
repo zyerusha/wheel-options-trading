@@ -31,6 +31,10 @@ const state = {
   // How the capital chart expresses its bands: 'value' (dollars) or 'share' (%
   // of the day's total). A view of one chart, not a filter -- it changes no data.
   capitalMode: 'value',
+  // Row order for the Wheel timelines chart: 'ticker' (A-Z, a ticker's cycles
+  // together -- the default, best for lookup) or 'time' (by start date -- the
+  // account's history top to bottom). View-only, changes no data.
+  timelineSort: 'ticker',
   // Which data/<account>/ folder is active, or COMBINED_ACCOUNT_ID for every
   // account aggregated without merging their cycles. Affects every chart and
   // table on the page, not just Net worth & benchmark.
@@ -198,7 +202,8 @@ function showTooltip(event, title, rows, formula) {
     key.appendChild(document.createTextNode(row.label));
     line.appendChild(key);
     // Value leads: it is the strong element, the series name is secondary.
-    line.appendChild(el('span', { class: 'tt-val' }, row.value));
+    // `valueClass` ('pos'/'neg') tints P&L green for a gain, red for a loss.
+    line.appendChild(el('span', { class: 'tt-val' + (row.valueClass ? ' ' + row.valueClass : '') }, row.value));
     tooltip.appendChild(line);
   }
   if (formula) {
@@ -2607,6 +2612,100 @@ const LEG_STYLES = {
   LONG_CALL: { label: 'Long call', varName: '--series-4' },
 };
 
+/**
+ * One share lot on the Wheel-timelines chart: a bar over the days it was held
+ * (--series-3, the same colour "Shares held" uses elsewhere), a filled square
+ * at the buy, and an outlined square at each sale / call-away. This is the only
+ * mark a plain buy-and-hold cycle has.
+ */
+function drawTimelineStock(group, cycle, lot, y, laneHeight, x, through, surface, onClick) {
+  const color = cssVar('--series-3');
+  const sells = (lot.disposals || []).slice().sort((a, b) => (a.date < b.date ? -1 : 1));
+  const held = lot.remaining > 1e-9 || !sells.length;
+  const endIso = held ? through : sells[sells.length - 1].date;
+  const x1 = x(lot.acquired);
+  const x2 = Math.max(x(endIso), x1 + 3);
+  const mid = y + (laneHeight - 1) / 2;
+
+  group.appendChild(
+    svgEl('rect', {
+      class: 'mark',
+      x: x1,
+      y: y + 1.5,
+      width: x2 - x1,
+      height: laneHeight - 4,
+      rx: 3,
+      fill: color,
+      'fill-opacity': lot.remaining > 1e-9 ? 0.35 : 0.75,
+      stroke: surface,
+      'stroke-width': 1.5,
+    })
+  );
+  // ■ bought
+  const s = 3.4;
+  group.appendChild(
+    svgEl('rect', { x: x1 - s, y: mid - s, width: s * 2, height: s * 2, fill: color, stroke: surface, 'stroke-width': 1.5 })
+  );
+  // □ sold / called away
+  for (const d of sells) {
+    const sx = x(d.date);
+    group.appendChild(
+      svgEl('rect', {
+        x: sx - s,
+        y: mid - s,
+        width: s * 2,
+        height: s * 2,
+        fill: surface,
+        stroke: color,
+        'stroke-width': 1.75,
+      })
+    );
+  }
+
+  const realized = sells.reduce((sum, d) => sum + (typeof d.realized === 'number' ? d.realized : 0), 0);
+  const showPl = sells.length && lot.basis_known !== false;
+
+  // `lot.source` alone under-detects assignment: a broker-supplied
+  // "YOU BOUGHT ASSIGNED PUTS ..." row is booked as an ordinary PURCHASE. Match
+  // the acquire date against the cycle's ACQUIRE assignment events instead.
+  const acquireDates = new Set(
+    (cycle.assignment_events || []).filter((a) => a.direction === 'ACQUIRE').map((a) => a.date)
+  );
+  const assigned = lot.source === 'PUT_ASSIGNMENT' || acquireDates.has(lot.acquired);
+  const preHistory = lot.source === 'PRE_HISTORY' || lot.basis_known === false;
+  const strategy = assigned
+    ? 'Assigned shares'
+    : preHistory
+    ? 'Shares (basis pre-dates export)'
+    : cycle.kind === 'hold'
+    ? 'Buy-and-hold'
+    : 'Bought shares';
+
+  const hit = svgEl('rect', { class: 'hit', x: x1 - 8, y: y - 2, width: x2 - x1 + 16, height: laneHeight + 4 });
+  attachTip(
+    hit,
+    `${cycle.underlying} shares`,
+    [
+      { label: 'Strategy', value: strategy, color },
+      { label: 'Bought', value: `${lot.acquired} · ${lot.shares} sh @ ${lot.basis_per_share ?? '—'}` },
+      ...sells.map((d) => ({ label: 'Sold', value: `${d.date} · ${d.shares} sh @ ${d.price ?? '—'}` })),
+      ...(showPl
+        ? [
+            {
+              label: 'Realized P/L',
+              value: money(realized, { cents: true, sign: true }),
+              valueClass: realized > 0 ? 'pos' : realized < 0 ? 'neg' : '',
+            },
+          ]
+        : []),
+      { label: lot.remaining > 1e-9 ? 'Still held' : 'Position', value: lot.remaining > 1e-9 ? `${lot.remaining} shares` : 'closed' },
+    ],
+    null
+  );
+  hit.addEventListener('click', onClick);
+  group.appendChild(hit);
+}
+
 function drawTimeline(cycles, through) {
   const svg = $('chart-timeline');
   const legend = $('legend-timeline');
@@ -2619,31 +2718,54 @@ function drawTimeline(cycles, through) {
   // Label each row with the *real* wheel id from the Trade Log (built from full
   // history), so the two views agree even when a date filter has renumbered the
   // cycles here.
+  const byStart = (a, b) => parseDay(a.start_date) - parseDay(b.start_date) || a.cycle_id.localeCompare(b.cycle_id);
+  const byTicker = (a, b) => a.underlying.localeCompare(b.underlying) || byStart(a, b);
   const ordered = cycles
     .slice()
     .map((cycle) => ({ ...cycle, cycle_id: (matchTradeLogWheel(cycle) || cycle).cycle_id }))
-    .sort((a, b) => parseDay(a.start_date) - parseDay(b.start_date) || a.cycle_id.localeCompare(b.cycle_id));
+    .sort(state.timelineSort === 'time' ? byStart : byTicker);
 
   const endOf = (leg) => leg.close_date || through;
   const laneHeight = 11;
   const margin = { top: 10, right: 18, bottom: 30, left: 108 };
+  const DAY = 86400000;
 
-  // Pack each cycle's legs into sub-lanes so overlapping positions stay legible.
+  // Pack each cycle's items -- option legs *and* share lots -- into sub-lanes so
+  // overlapping positions stay legible. A share lot spans its acquisition to
+  // its last disposal, or to `through` while any of it is still held; a
+  // buy-and-hold cycle (no legs) shows only these.
   const laid = ordered.map((cycle) => {
-    const legs = cycle.legs
-      .slice()
-      .sort((a, b) => parseDay(a.open_date) - parseDay(b.open_date));
+    const items = [];
+    for (const leg of cycle.legs) {
+      items.push({
+        kind: 'leg',
+        leg,
+        start: parseDay(leg.open_date).getTime(),
+        finish: parseDay(endOf(leg)).getTime(),
+      });
+    }
+    for (const lot of cycle.share_lots || []) {
+      if (!(lot.shares > 0)) continue;
+      const sells = (lot.disposals || []).map((d) => parseDay(d.date).getTime());
+      const held = lot.remaining > 1e-9 || !sells.length;
+      items.push({
+        kind: 'stock',
+        lot,
+        start: parseDay(lot.acquired).getTime(),
+        finish: held ? parseDay(through).getTime() : Math.max(...sells),
+      });
+    }
+    items.sort((a, b) => a.start - b.start);
+
     const laneEnds = [];
-    const placed = legs.map((leg) => {
-      const start = parseDay(leg.open_date).getTime();
-      const finish = parseDay(endOf(leg)).getTime();
-      let lane = laneEnds.findIndex((end) => end <= start);
+    const placed = items.map((item) => {
+      let lane = laneEnds.findIndex((end) => end <= item.start);
       if (lane === -1) {
         lane = laneEnds.length;
         laneEnds.push(0);
       }
-      laneEnds[lane] = finish + 86400000 / 2;
-      return { leg, lane };
+      laneEnds[lane] = item.finish + DAY / 2;
+      return { item, lane };
     });
     return { cycle, placed, lanes: Math.max(1, laneEnds.length) };
   });
@@ -2722,16 +2844,31 @@ function drawTimeline(cycles, through) {
     label.style.cursor = 'pointer';
     if (nonWheel) {
       label.appendChild(
-        svgEl('title', {}, 'Directional (non-wheel): long options only. Excluded from wheel-return figures.')
+        svgEl(
+          'title',
+          {},
+          row.cycle.kind === 'hold'
+            ? 'Buy-and-hold (non-wheel): shares only, no option ever written. Excluded from wheel-return figures.'
+            : 'Directional (non-wheel): long options only. Excluded from wheel-return figures.'
+        )
       );
     }
     label.addEventListener('click', () => openTradeLog(row.cycle));
     group.appendChild(label);
 
-    row.placed.forEach(({ leg, lane }) => {
+    row.placed.forEach(({ item, lane }) => {
+      const y = top + lane * laneHeight;
+
+      if (item.kind === 'stock') {
+        drawTimelineStock(group, row.cycle, item.lot, y, laneHeight, x, through, surface, () =>
+          openTradeLog(row.cycle, item.lot.acquired)
+        );
+        return;
+      }
+
+      const leg = item.leg;
       const style = LEG_STYLES[leg.strategy] || LEG_STYLES.CSP;
       const color = cssVar(style.varName);
-      const y = top + lane * laneHeight;
       const x1 = x(leg.open_date);
       const x2 = Math.max(x(endOf(leg)), x1 + 3);
 
@@ -2797,7 +2934,11 @@ function drawTimeline(cycles, through) {
           label: leg.close_date ? 'Closed' : 'Status',
           value: leg.close_date ? `${leg.close_date} · ${leg.outcome}` : 'OPEN',
         },
-        { label: 'Realized P/L', value: money(leg.realized_pl, { cents: true }) },
+        {
+          label: 'Realized P/L',
+          value: money(leg.realized_pl, { cents: true, sign: true }),
+          valueClass: leg.realized_pl > 0 ? 'pos' : leg.realized_pl < 0 ? 'neg' : '',
+        },
         { label: 'Collateral', value: money(leg.collateral) },
         ...(leg.opened_by_roll ? [{ label: 'Opened by', value: 'roll ' + leg.opened_by_roll }] : []),
         ...(closedByRolls.length ? [{ label: 'Closed by', value: 'roll ' + closedByRolls.join(', ') }] : []),
@@ -2847,14 +2988,20 @@ function drawTimeline(cycles, through) {
     item.appendChild(document.createTextNode(style.label));
     legend.appendChild(item);
   }
-  legend.appendChild(el('span', {}, '▲ sold to open   ▼ bought to close   ◆ assigned'));
+  const stockItem = el('span');
+  const stockSwatch = el('i');
+  stockSwatch.style.background = cssVar('--series-3');
+  stockItem.appendChild(stockSwatch);
+  stockItem.appendChild(document.createTextNode('Shares held'));
+  legend.appendChild(stockItem);
+  legend.appendChild(el('span', {}, '▲ sold to open   ▼ bought to close   ◆ assigned   ■ bought shares   □ sold shares'));
   legend.appendChild(el('span', {}, 'Faded bar = still open'));
 
   buildTable(
     'timeline-table',
     ['Cycle', 'Symbol', 'Strategy', 'Opened', 'Closed', 'Contracts', 'Outcome', 'Realized P/L'],
-    ordered.flatMap((cycle) =>
-      cycle.legs.map((leg) => [
+    ordered.flatMap((cycle) => {
+      const legRows = cycle.legs.map((leg) => [
         cycle.cycle_id,
         leg.symbol,
         leg.strategy,
@@ -2863,8 +3010,25 @@ function drawTimeline(cycles, through) {
         leg.contracts,
         leg.outcome,
         money(leg.realized_pl, { cents: true }),
-      ])
-    )
+      ]);
+      const stockRows = (cycle.share_lots || [])
+        .filter((lot) => lot.shares > 0)
+        .map((lot) => {
+          const sells = (lot.disposals || []).slice().sort((a, b) => (a.date < b.date ? -1 : 1));
+          const realized = sells.reduce((sum, d) => sum + (typeof d.realized === 'number' ? d.realized : 0), 0);
+          return [
+            cycle.cycle_id,
+            cycle.underlying,
+            'SHARES',
+            lot.acquired,
+            lot.remaining > 1e-9 || !sells.length ? '—' : sells[sells.length - 1].date,
+            lot.shares,
+            lot.remaining > 1e-9 ? 'HELD' : 'SOLD',
+            sells.length ? money(realized, { cents: true }) : '—',
+          ];
+        });
+      return [...legRows, ...stockRows];
+    })
   );
 }
 
@@ -3139,10 +3303,13 @@ function renderCycles(cycles) {
     setFormula(statusBadge, CYCLE_STATUS_MEANING[cycle.status] || null);
     statusCell.appendChild(statusBadge);
     if (cycle.is_wheel === false) {
-      const tag = el('span', { class: 'badge DIRECTIONAL' }, 'directional');
+      const isHold = cycle.kind === 'hold';
+      const tag = el('span', { class: 'badge DIRECTIONAL' }, isHold ? 'buy & hold' : 'directional');
       setFormula(
         tag,
-        'Long options only -- no cash-secured put, covered call, shares or assignment. ' +
+        (isHold
+          ? 'Shares only -- no option has ever been written against them. Selling a covered call makes it a wheel. '
+          : 'Long options only -- no cash-secured put, covered call, shares or assignment. ') +
           'P&L counts toward every total, but the wheel-return ratios (Wheel ROC, PPD, ' +
           'Net Option Yield) are withheld and show as a dash.'
       );
@@ -3957,54 +4124,52 @@ function renderNetWorthTiles(netWorth, benchmark, wheelReturn) {
     const events = wheelReturn.cash_flow_events || [];
     const span = events.length ? `${events[0].date} → ${events[events.length - 1].date}` : '—';
     const wb = wheelReturn.benchmark;
-    tiles.push({
-      label: 'Wheel-only return (XIRR)',
-      value: pct(wheelReturn.xirr_pct, 1),
-      foot: `${span} · ${money(wheelReturn.terminal_value)} still committed`,
-      tone: (wheelReturn.xirr_pct ?? 0) >= 0 ? 'pos' : 'neg',
-      formula: formula([
-        'XIRR (money-weighted annualized return): the single rate that makes',
-        '  every dated cash flow -- each option-leg open/close, each wheel-',
-        '  active share purchase/sale -- discount to zero against the',
-        '  capital still committed today.',
-        `${events.length} events, ${span} = ${pct(wheelReturn.xirr_pct, 1)}`,
-        '',
-        'Not risk-adjusted; fast turnover inflates this vs. buy-and-hold.',
-        'Spreads not netted; dividends excluded.',
-      ]),
-    });
+    const hasBench = wb && wb.xirr_pct !== null && wb.xirr_pct !== undefined;
 
-    if (wb && wb.xirr_pct !== null && wb.xirr_pct !== undefined) {
-      tiles.push(
-        {
-          label: 'Wheel vs. S&P 500 (XIRR)',
-          value: pct(wb.xirr_pct, 1),
-          tone: (wb.xirr_pct ?? 0) >= 0 ? 'pos' : 'neg',
-          formula: formula([
-            'The wheel\'s own option-leg opens/closes and share buys/sells,',
-            '  replayed into SPY (an S&P 500 index fund) shares priced on',
-            `  each date instead, then valued at SPY's price on ${wheelReturn.as_of}`,
-            `  -- terminal value ${money(wb.terminal_value)}.`,
-            '',
-            'Answers "did the wheel itself beat buy-and-hold SPY," isolated',
-            '  from whatever else -- other ETFs, other stock -- sits in this account.',
-          ]),
-        },
-        {
-          label: 'Wheel value added vs. S&P 500',
-          value: money(wheelReturn.value_added, { cents: true, sign: true }),
-          foot: `${money(wheelReturn.terminal_value)} wheel vs ${money(wb.terminal_value)} in SPY`,
-          tone: (wheelReturn.value_added ?? 0) >= 0 ? 'pos' : 'neg',
-          formula: formula([
-            'Value added = Wheel terminal value - SPY terminal value',
-            '  (same cash-flow timing replayed into both, so this isolates',
-            '  strategy performance from when money happened to move)',
-            '',
-            `= ${money(wheelReturn.terminal_value)} - ${money(wb.terminal_value)}`,
-            `= ${money(wheelReturn.value_added, { sign: true })}`,
-          ]),
-        }
-      );
+    if (hasBench) {
+      // One tile, one comparison: the wheel's own dated flows measured two
+      // ways -- as run, and replayed into SPY -- plus the dollar difference.
+      const beat = (wheelReturn.value_added ?? 0) >= 0;
+      tiles.push({
+        label: 'Wheel vs. S&P 500 (XIRR)',
+        value: `${pct(wheelReturn.xirr_pct, 0)} ${beat ? '›' : '‹'} ${pct(wb.xirr_pct, 0)}`,
+        foot: `Wheel vs. the same dated flows in SPY -- value added ${money(wheelReturn.value_added, { cents: true, sign: true })}.`,
+        tone: beat ? 'pos' : 'neg',
+        formula: formula([
+          "The wheel's own cash flows -- every option-leg open/close and every",
+          '  wheel-active share buy/sell, on their real dates -- measured two ways:',
+          '',
+          `Wheel-only return (XIRR)       ${pct(wheelReturn.xirr_pct, 1)}`,
+          `  actual money-weighted return on those ${events.length} flows (${span}),`,
+          `  ${money(wheelReturn.terminal_value)} still committed today.`,
+          `Same flows replayed into SPY   ${pct(wb.xirr_pct, 1)}`,
+          `  each flow bought/sold SPY at that day's price instead;`,
+          `  SPY holding valued ${money(wb.terminal_value)} on ${wheelReturn.as_of}.`,
+          `Value added                    ${money(wheelReturn.value_added, { cents: true, sign: true })}`,
+          `  = ${money(wheelReturn.terminal_value)} - ${money(wb.terminal_value)} terminal value.`,
+          '',
+          'Same timing on both sides, so it isolates strategy from when money',
+          '  moved. Not risk-adjusted; fast turnover inflates XIRR vs. buy-and-',
+          '  hold. Spreads not netted; dividends excluded.',
+        ]),
+      });
+    } else {
+      tiles.push({
+        label: 'Wheel-only return (XIRR)',
+        value: pct(wheelReturn.xirr_pct, 1),
+        foot: `${span} · ${money(wheelReturn.terminal_value)} still committed`,
+        tone: (wheelReturn.xirr_pct ?? 0) >= 0 ? 'pos' : 'neg',
+        formula: formula([
+          'XIRR (money-weighted annualized return): the single rate that makes',
+          '  every dated cash flow -- each option-leg open/close, each wheel-',
+          '  active share purchase/sale -- discount to zero against the',
+          '  capital still committed today.',
+          `${events.length} events, ${span} = ${pct(wheelReturn.xirr_pct, 1)}`,
+          '',
+          'Not risk-adjusted; fast turnover inflates this vs. buy-and-hold.',
+          'Spreads not netted; dividends excluded.',
+        ]),
+      });
     }
   }
 
@@ -4018,8 +4183,9 @@ function renderNetWorthTiles(netWorth, benchmark, wheelReturn) {
     // Wheel-only tiles above for a same-question comparison built from real
     // transaction history instead of a guessed starting balance.
     tiles.push({
-      label: 'Actual return (XIRR)',
+      label: 'Whole-account return (XIRR)',
       value: pct(benchmark.actual.xirr_pct, 1),
+      foot: 'Every dollar in the account -- cash, buy-and-hold, wheel -- since the configured opening balance. Not a wheel figure.',
       tone: (benchmark.actual.xirr_pct ?? 0) >= 0 ? 'pos' : 'neg',
       formula: formula([
         'Money-weighted return (XIRR): the annualized rate r solving',
@@ -4028,6 +4194,10 @@ function renderNetWorthTiles(netWorth, benchmark, wheelReturn) {
         '  plus every external deposit/withdrawal found in the transaction',
         `  history, ${span} -- valued against the account's`,
         `  terminal value of ${money(benchmark.actual.terminal_value)} on ${benchmark.as_of}.`,
+        '',
+        'Covers the ENTIRE account, and starts at the opening balance in',
+        '  data/accounts.json -- which can pre-date the wheel. For the',
+        '  wheel-vs-SPY question use the two tiles above instead.',
       ]),
     });
   }
@@ -4555,6 +4725,14 @@ function wireFilters() {
     if (state.data) drawCapital(state.data.capital_series, state.data.net_worth);
   });
 
+  $('timeline-sort').addEventListener('click', (event) => {
+    const toTime = event.currentTarget.getAttribute('aria-pressed') !== 'true';
+    event.currentTarget.setAttribute('aria-pressed', toTime ? 'true' : 'false');
+    event.currentTarget.textContent = toTime ? 'Sort by ticker' : 'Sort by time';
+    state.timelineSort = toTime ? 'time' : 'ticker';
+    if (state.data) drawTimeline(state.data.cycles, state.data.meta.through);
+  });
+
   document.querySelectorAll('.toggle[data-twin]').forEach((button) => {
     button.addEventListener('click', () => {
       const twin = $(button.dataset.twin);
@@ -4695,8 +4873,8 @@ function orderedTradeLog() {
         wheel.cycle_id === state.tradeLogCycleId || // the current selection is never filtered out
         ((!ticker || wheel.underlying === ticker) && tradeLogInWindow(wheel))
     )
-    .sort((a, b) =>
-      a.start_date < b.start_date ? 1 : a.start_date > b.start_date ? -1 : a.cycle_id.localeCompare(b.cycle_id)
+    .sort(
+      (a, b) => a.underlying.localeCompare(b.underlying) || a.cycle_id.localeCompare(b.cycle_id)
     );
 }
 
@@ -5024,12 +5202,18 @@ function renderTradeLogSummary(entry) {
   const cents = (value) => money(value, { cents: true });
   const perShare = (value) => (value === null || value === undefined ? '—' : '$' + value.toFixed(2));
 
-  // Wheel-return ratios are withheld for a directional (non-wheel) cycle --
-  // show "n/a" with a pointer to the Kind cell rather than a bare dash.
+  // Wheel-return ratios are withheld for a non-wheel cycle -- show "n/a" with a
+  // pointer to the Kind cell rather than a bare dash.
   const notWheel = entry.is_wheel === false;
+  const kindLabel =
+    entry.kind === 'hold'
+      ? 'Buy-and-hold (non-wheel)'
+      : entry.kind === 'directional'
+      ? 'Directional (non-wheel)'
+      : 'Wheel';
   const wheelHelp = formula([
-    'Not a wheel -- this cycle only ever held long options,',
-    'so wheel-return ratios do not apply here. See "Kind" above.',
+    'Not a wheel (see "Kind" above), so the wheel-return ratios',
+    'do not apply here. The P&L is still real.',
   ]);
 
   host.appendChild(
@@ -5056,15 +5240,21 @@ function renderTradeLogSummary(entry) {
     })
   );
   host.appendChild(
-    tradeLogCell('Kind', entry.is_wheel === false ? 'Directional (non-wheel)' : 'Wheel', {
+    tradeLogCell('Kind', kindLabel, {
       help: formula(
-        entry.is_wheel === false
+        entry.kind === 'hold'
           ? [
-              'This cycle only ever held long options -- no cash-secured put,',
-              'no covered call, no shares, no assignment.',
-              'Its P&L is real and counts toward every total, but wheel-return',
-              'ratios (Wheel ROC, win rate, P&L / day held) are withheld: they',
-              'would just annualize a short-dated premium bet into nonsense.',
+              'Plain buy-and-hold: shares were bought but no option has ever',
+              'been written against them -- no cash-secured put, no covered call.',
+              'Not a wheel. Its P&L counts toward every total, but the wheel-return',
+              'ratios are withheld. Selling a covered call turns it into a wheel.',
+            ]
+          : entry.kind === 'directional'
+          ? [
+              'Directional: only long options were bought -- no cash-secured put,',
+              'no covered call, no shares. Not a wheel; its P&L counts but the',
+              'wheel-return ratios are withheld (they would annualize a short-dated',
+              'premium bet into nonsense).',
             ]
           : [
               'This cycle is running the wheel: it sold cash-secured puts and/or',

@@ -802,6 +802,14 @@ tr.detail > td {
   font-variant-numeric: tabular-nums;
 }
 
+#tooltip .tt-val.pos {
+  color: var(--success-text);
+}
+
+#tooltip .tt-val.neg {
+  color: var(--critical);
+}
+
 /* The calculation behind the value(s) above -- how, not just what. */
 #tooltip .tt-formula {
   margin-top: 6px;

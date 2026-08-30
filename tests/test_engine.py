@@ -591,6 +591,27 @@ class TestTickerRename(unittest.TestCase):
         self.assertEqual(leg.outcome, "ASSIGNED")
         self.assertTrue(any("ticker change" in w for w in engine.warnings))
 
+    def test_rename_folds_the_campaign_into_one_cycle(self):
+        """Put sold as AXL, assigned as DCH: the legs and the assigned shares
+        belong to a single wheel, not one AXL cycle plus one DCH cycle.
+        """
+        cycles, engine = build_cycles(
+            [
+                tx("2026-01-30", STO, "-AXL260220P8", -1, 0.55, 54.33, row_id=1),
+                tx("2026-02-23", ASSIGNED, "-DCH260220P8", 1, None, 0.0, row_id=2, as_of="2026-02-20"),
+            ]
+        )
+        self.assertEqual(len(cycles), 1)
+        (cycle,) = cycles
+        self.assertEqual(cycle.underlying, "DCH")
+        self.assertEqual(cycle.start_date, date(2026, 1, 30))  # the put's open date
+        self.assertEqual(len(cycle.legs), 1)
+        self.assertEqual(cycle.legs[0].underlying, "DCH")
+        self.assertEqual(cycle.legs[0].cycle_id, cycle.cycle_id)
+        self.assertEqual(len(cycle.assignments), 1)
+        self.assertEqual(sum(l.shares for l in cycle.share_lots), 100)
+        self.assertTrue(cycle.is_wheel)
+
     def test_ambiguous_series_match_is_left_unmatched(self):
         """Two tickers with the same series is not enough to guess from."""
         cycles, engine = build_cycles(
@@ -749,9 +770,22 @@ class TestIsWheel(unittest.TestCase):
         cycles, _ = build_cycles([tx("2025-01-01", BTO, "-XYZ250601P100", 1, 10.0, -1000.0, row_id=1)])
         self.assertFalse(cycles[0].is_wheel)
 
-    def test_bought_shares_make_it_a_wheel(self):
+    def test_bought_shares_alone_are_not_a_wheel(self):
+        # A plain stock buy with no option ever written against it is buy-and-
+        # hold, not a wheel opening.
         cycles, _ = build_cycles([tx("2025-01-01", BUY_STOCK, "XYZ", 100, 50.0, -5000.0, row_id=1)])
+        self.assertFalse(cycles[0].is_wheel)
+        self.assertEqual(cycles[0].kind, "hold")
+
+    def test_bought_shares_then_covered_call_is_a_wheel(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", BUY_STOCK, "XYZ", 100, 50.0, -5000.0, row_id=1),
+                tx("2025-01-06", STO, "-XYZ250207C55", -1, 1.5, 150.0, row_id=2),
+            ]
+        )
         self.assertTrue(cycles[0].is_wheel)
+        self.assertEqual(cycles[0].kind, "wheel")
 
     def test_assignment_makes_it_a_wheel(self):
         cycles, _ = build_cycles(
@@ -761,6 +795,12 @@ class TestIsWheel(unittest.TestCase):
             ]
         )
         self.assertTrue(cycles[0].is_wheel)
+
+    def test_kind_directional_vs_hold(self):
+        long_only, _ = build_cycles([tx("2025-01-01", BTO, "-XYZ250601C60", 1, 2.0, -200.0, row_id=1)])
+        self.assertEqual(long_only[0].kind, "directional")
+        hold, _ = build_cycles([tx("2025-01-01", BUY_STOCK, "XYZ", 100, 50.0, -5000.0, row_id=1)])
+        self.assertEqual(hold[0].kind, "hold")
 
     def test_long_hedge_inside_a_wheel_stays_a_wheel(self):
         cycles, _ = build_cycles(

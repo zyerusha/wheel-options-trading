@@ -295,5 +295,38 @@ class TestBuildPayload(unittest.TestCase):
         self.assertEqual([r["type"] for r in wheel["transactions"]], ["Sell Put", "Put Expired"])
 
 
+class TestRenamedTicker(unittest.TestCase):
+    def test_pre_rename_option_rows_appear_in_the_merged_wheel(self):
+        # Put sold as AXL, assigned as DCH -> one DCH wheel. Its ledger must
+        # still carry the AXL sell-to-open rows, not just the DCH side.
+        rows = _trade_log(
+            [
+                tx("2026-01-30", STO, "-AXL260220P8", -10, 0.55, 543.30, row_id=1),
+                tx("2026-02-23", ASSIGNED, "-DCH260220P8", 10, None, 0.0, row_id=2, as_of="2026-02-20"),
+            ]
+        )
+        (wheel,) = rows["wheels"]
+        self.assertEqual(wheel["underlying"], "DCH")
+        types = [r["type"] for r in wheel["transactions"]]
+        self.assertIn("Sell Put", types)  # the AXL open
+        self.assertIn("Put Assigned", types)  # the DCH assignment
+        self.assertAlmostEqual(wheel["gross_premium_received"], 543.30, places=2)
+
+    def test_symbol_change_bookkeeping_rows_are_not_shown(self):
+        # A "DISTRIBUTION NAME/SYMBOL CHANGE" pair nets to $0 and is not a trade.
+        rows = _trade_log(
+            [
+                tx("2026-01-30", STO, "-AXL260220P8", -1, 0.55, 54.33, row_id=1),
+                tx("2026-02-05", OTHER, "-AXL260220P8", 1, None, 300.0, row_id=2,
+                   action_raw="DISTRIBUTION NAME/SYMBOL CHANGE PUT (AXL)"),
+                tx("2026-02-05", OTHER, "-DCH260220P8", -1, None, -300.0, row_id=3,
+                   action_raw="DISTRIBUTION NAME/SYMBOL CHANGE PUT (DCH)"),
+                tx("2026-02-23", ASSIGNED, "-DCH260220P8", 1, None, 0.0, row_id=4, as_of="2026-02-20"),
+            ]
+        )
+        (wheel,) = rows["wheels"]
+        self.assertNotIn("Other", [r["type"] for r in wheel["transactions"]])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

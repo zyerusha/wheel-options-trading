@@ -30,6 +30,9 @@ class TestStrengths(unittest.TestCase):
         )
         self.assertTrue(any("48%" in s and "16%" in s for s in r["strengths"]))
         self.assertIn("$126,843", _text(r))
+        # Must be explicit that it is wheel dollars only, not the whole account.
+        self.assertIn("committed to the wheel", r["strengths"][0])
+        self.assertIn("excluded", r["strengths"][0])
 
     def test_no_strength_when_wheel_only_matches_benchmark(self):
         r = portfolio_insights(
@@ -58,7 +61,9 @@ class TestStrengths(unittest.TestCase):
 
 
 class TestImprovements(unittest.TestCase):
-    def test_account_trailing_buy_and_hold(self):
+    def test_whole_account_benchmark_is_not_turned_into_an_insight(self):
+        # It blends in idle cash + buy-and-hold and rests on a configured
+        # opening balance -- the wheel-vs-SPY comparison is wheel_return, above.
         r = portfolio_insights(
             {},
             [],
@@ -70,10 +75,7 @@ class TestImprovements(unittest.TestCase):
                 "value_added": -125803.0,
             },
         )
-        joined = _text(r)
-        self.assertIn("14%", joined)
-        self.assertIn("20%", joined)
-        self.assertIn("$125,803", joined)
+        self.assertEqual(r, {"strengths": [], "improvements": []})
 
     def test_underwater_wheels_are_summed_and_named(self):
         wheels = [
@@ -84,7 +86,7 @@ class TestImprovements(unittest.TestCase):
         ]
         r = portfolio_insights({}, wheels, [])
         imp = " ".join(r["improvements"])
-        self.assertIn("2 active wheels are underwater", imp)
+        self.assertIn("2 active positions are underwater", imp)
         self.assertIn("-$16,588", imp)  # -14397.5 + -2190.0, rounded
         self.assertIn("TIGR", imp)
         self.assertNotIn("CLSD", imp)  # closed wheel excluded
@@ -120,14 +122,18 @@ class TestImprovements(unittest.TestCase):
         )
         self.assertTrue(any("QQQ is 34%" in s for s in big["improvements"]))
 
-    def test_non_wheel_losses(self):
+    def test_directional_losses_are_flagged_buy_and_hold_is_not(self):
         wheels = [
-            {"underlying": "TQQQ", "is_wheel": False, "net_realized_pl": -398.0},
-            {"underlying": "MU", "is_wheel": True, "net_realized_pl": 5000.0},
+            {"underlying": "TQQQ", "is_wheel": False, "kind": "directional", "net_realized_pl": -398.0},
+            {"underlying": "TIGR", "is_wheel": False, "kind": "hold", "net_realized_pl": -900.0},
+            {"underlying": "MU", "is_wheel": True, "kind": "wheel", "net_realized_pl": 5000.0},
         ]
         r = portfolio_insights({}, wheels, [])
-        self.assertTrue(any("directional (non-wheel)" in s.lower() for s in r["improvements"]))
+        joined = " ".join(r["improvements"]).lower()
+        self.assertIn("directional (non-wheel) option trades", joined)
+        # Only the directional -$398 counts -- the buy-and-hold -$900 does not.
         self.assertIn("-$398", " ".join(r["improvements"]))
+        self.assertNotIn("-$1,298", " ".join(r["improvements"]))
 
     def test_hedge_in_wind_down_window(self):
         r = portfolio_insights(
@@ -183,19 +189,18 @@ class TestShape(unittest.TestCase):
         self.assertEqual(r, {"strengths": [], "improvements": []})
 
     def test_improvements_ranked_by_dollar_impact(self):
-        # A big benchmark gap should outrank a small underwater cluster.
+        # A big underwater cluster outranks a smaller idle-shares opportunity.
         r = portfolio_insights(
             {},
-            [{"underlying": "X", "status": "ACTIVE", "mark_to_market_pl": -300.0, "is_wheel": True}],
+            [
+                {"underlying": "BIG", "status": "ACTIVE", "mark_to_market_pl": -40000.0, "is_wheel": True},
+                {"underlying": "SML", "status": "ACTIVE", "mark_to_market_pl": -900.0, "is_wheel": True},
+            ],
             [],
-            benchmark={
-                "available": True,
-                "actual": {"xirr_pct": 5.0},
-                "benchmark": {"xirr_pct": 20.0},
-                "value_added": -90000.0,
-            },
+            wheel_state={"buckets": {"holding": {"amount": 60000.0, "cycles": 4}}},
         )
-        self.assertIn("trails", r["improvements"][0])
+        self.assertIn("underwater", r["improvements"][0])
+        self.assertIn("BIG", r["improvements"][0])
 
 
 if __name__ == "__main__":

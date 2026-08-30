@@ -238,6 +238,7 @@ def _cycle_payload(
     payload["start_date"] = _iso(metrics.start_date)
     payload["end_date"] = _iso(metrics.end_date)
     payload["win_rate_pct"] = metrics.win_rate_pct
+    payload["kind"] = cycle.kind  # "wheel" | "directional" | "hold"
     payload["last_activity"] = _iso(cycle.last_activity)
     # CycleMetrics already exposes integer `rolls` / `assignments` counts, so the
     # detail lists take distinct names rather than shadowing them.
@@ -285,6 +286,17 @@ def _cycle_payload(
             "synthetic": lot.synthetic,
             "basis_known": lot.basis_known,
             "cost": _money(lot.cost),
+            # When shares from this lot left, so the timeline can draw the
+            # holding period and mark each sale/call-away.
+            "disposals": [
+                {
+                    "date": _iso(d["date"]),
+                    "shares": d["shares"],
+                    "price": round(d["proceeds"] / d["shares"], 4) if d["shares"] else None,
+                    "realized": _money(d["realized"]),
+                }
+                for d in lot.disposals
+            ],
         }
         for lot in cycle.share_lots
     ]
@@ -511,6 +523,7 @@ def _trade_log_entry(
     dividends: float,
     engine_exact: bool,
     current_price: float | None = None,
+    also_tickers: frozenset[str] | set[str] = frozenset(),
 ) -> dict[str, Any]:
     metrics = cycle_metrics(cycle, through, current_price=current_price, dividends=dividends)
 
@@ -588,9 +601,13 @@ def _trade_log_entry(
                 ),
             )
             for t in transactions
-            if t.underlying == cycle.underlying
+            if (t.underlying == cycle.underlying or t.underlying in also_tickers)
             and cycle.start_date <= t.event_date <= end
-            and (t.is_option or t.action in (BUY_STOCK, SELL_STOCK) or t.row_id in dividend_row_ids)
+            and (
+                t.action in OPTION_ACTIONS
+                or t.action in (BUY_STOCK, SELL_STOCK)
+                or t.row_id in dividend_row_ids
+            )
         ]
         # A broker export that carries the equity leg already yields a real
         # Buy/Sell Shares row above; only the synthesized legs need adding.
@@ -716,6 +733,7 @@ def _trade_log_entry(
         "status": cycle.status,
         "is_open": cycle.is_open,
         "is_wheel": cycle.is_wheel,
+        "kind": cycle.kind,  # "wheel" | "directional" | "hold"
         "start_date": _iso(cycle.start_date),
         "end_date": _iso(cycle.end_date),
         "cost_basis_per_share": _money(cost_basis),
@@ -1481,6 +1499,14 @@ class Dashboard:
         for cycle in self.all_cycles:
             by_underlying.setdefault(cycle.underlying, []).append(cycle)
 
+        # A corporate action renamed one ticker into another mid-campaign (see
+        # WheelEngine._merge_renamed_cycle): the engine folded both into the new
+        # ticker's cycle, so the raw-transaction filter below has to accept the
+        # old ticker's rows too or the pre-rename legs go missing.
+        former_of: dict[str, set[str]] = {}
+        for old, new in getattr(self.engine, "_ticker_alias", {}).items():
+            former_of.setdefault(new, set()).add(old)
+
         engine_exact: set[str] = set()
         warnings: list[str] = []
         for group in by_underlying.values():
@@ -1505,6 +1531,7 @@ class Dashboard:
                 dividends=dividends.get(cycle.cycle_id, 0.0),
                 engine_exact=cycle.cycle_id in engine_exact,
                 current_price=current_prices.get(cycle.underlying),
+                also_tickers=former_of.get(cycle.underlying, frozenset()),
             )
             for cycle in sorted(self.all_cycles, key=lambda cycle: (cycle.start_date, cycle.underlying))
         ]

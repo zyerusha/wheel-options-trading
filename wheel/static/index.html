@@ -292,11 +292,15 @@
       <section class="card" style="margin-bottom: var(--gap)">
         <header>
           <h2>Wheel timelines</h2>
-          <button class="toggle" data-twin="timeline-table" aria-pressed="false">Table</button>
+          <div class="card-actions">
+            <button class="toggle" id="timeline-sort" aria-pressed="false">Sort by time</button>
+            <button class="toggle" data-twin="timeline-table" aria-pressed="false">Table</button>
+          </div>
         </header>
         <p class="hint">
-          One row per cycle. Each bar is an option leg — hover for the trade. ▲ marks a sell-to-open,
-          ▼ a buy-to-close, ◆ an assignment.
+          One row per cycle. Bars are option legs; a green bar is a share lot over the days it was
+          held (the only mark a buy-and-hold cycle has). Hover any bar for the trade. ▲ sell-to-open,
+          ▼ buy-to-close, ◆ assignment, ■ shares bought, □ shares sold.
         </p>
         <div class="chart-scroll"><svg id="chart-timeline" role="img"></svg></div>
         <div class="legend" id="legend-timeline"></div>

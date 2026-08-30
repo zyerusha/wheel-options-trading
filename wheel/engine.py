@@ -398,25 +398,39 @@ class Cycle:
 
     @property
     def is_wheel(self) -> bool:
-        """True when this cycle is running the wheel, not just holding long
-        options.
+        """True only when this cycle actually ran the wheel: it sold a
+        cash-secured put or a covered call somewhere in its life (or took an
+        assignment -- defensive, in case the option leg itself sits outside the
+        export window).
 
-        A wheel sells cash-secured puts and/or covered calls, and often takes
-        assignment of shares along the way. A cycle that only ever *bought*
-        options -- a lone directional call or put, an unpaired protective leg
-        -- ties up nothing but its own premium and closes in days, so the
-        wheel-framed ratios (Annualized Wheel ROC, Net Option Yield, win rate,
-        P&L per day held) are meaningless for it: annualizing a total loss of
-        a $400 premium over a two-day hold produces a five-figure "ROC". Its
-        realized P&L is still real and still counts toward every P&L total --
-        only the ratios are withheld. See ``metrics.cycle_metrics`` and the
-        ``is_wheel`` gate in ``metrics.portfolio_metrics`` / ``ticker_summary``.
+        Everything else is not a wheel and its wheel-framed ratios (Annualized
+        Wheel ROC, Net Option Yield, win rate, P&L per day held) are withheld,
+        though its realized P&L still counts toward every P&L total:
+
+        * a lone directional call/put or an unpaired protective leg -- bought
+          options only, tying up nothing but premium (see ``kind`` ->
+          ``"directional"``);
+        * a plain buy-and-hold of shares that never had an option written
+          against it -- an ordinary stock position, not a wheel opening
+          (``kind`` -> ``"hold"``). The moment a covered call is written the
+          cycle gains a ``COVERED_CALL`` leg and flips to a wheel.
+
+        See ``Cycle.kind``, ``metrics.cycle_metrics`` and the ``is_wheel`` gate
+        in ``metrics.portfolio_metrics`` / ``ticker_summary``.
         """
         if any(leg.strategy in WHEEL_STRATEGIES for leg in self.legs):
             return True
-        if any(lot.shares for lot in self.share_lots):
-            return True
         return bool(self.assignments)
+
+    @property
+    def kind(self) -> str:
+        """``"wheel"`` | ``"directional"`` (bought options only) | ``"hold"``
+        (shares only, no option ever written against them)."""
+        if self.is_wheel:
+            return "wheel"
+        if any(leg.side == LONG for leg in self.legs):
+            return "directional"
+        return "hold"
 
     @property
     def last_activity(self) -> date:
@@ -447,6 +461,10 @@ class WheelEngine:
         self._open_legs: dict[str, list[OptionLeg]] = {}  # occ_symbol -> FIFO lots
         self._share_lots: dict[str, list[ShareLot]] = {}  # underlying -> FIFO lots
         self._active_cycle: dict[str, Cycle] = {}
+        # former ticker -> current ticker, filled when a corporate action renames
+        # an underlying mid-campaign (see _lots_under_former_ticker). Later rows
+        # under the old ticker are routed to the new ticker's cycle.
+        self._ticker_alias: dict[str, str] = {}
         # (underlying, calendar year) -> count. The sequence restarts every year,
         # so the first MU cycle of 2026 is "MU-2026-1" regardless of how many MU
         # cycles ran in 2025 -- the year already separates them.
@@ -535,7 +553,7 @@ class WheelEngine:
     def run(self) -> list[Cycle]:
         for event_date, batch in _group_by_day(self.transactions):
             for underlying, rows in _group_by_underlying(batch):
-                self._process_day(underlying, event_date, rows)
+                self._process_day(self._ticker_alias.get(underlying, underlying), event_date, rows)
         self._finalize()
         return self.cycles
 
@@ -850,15 +868,53 @@ class WheelEngine:
             return []
 
         former, legs = next(iter(matches.items()))
-        cycle = self._active_cycle.get(former)
         message = (
             f"{row.event_date}: {row.occ_symbol} matched open lots of {legs[0].occ_symbol}; "
             f"treating {former} -> {row.underlying} as a ticker change"
         )
-        if cycle is not None and message not in cycle.warnings:
-            cycle.warnings.append(message)
         self.warnings.append(message)
+        # Fold the former ticker's campaign into the new one so the wheel stays
+        # a single cycle (the put sold as AXL and the shares assigned as DCH are
+        # one position). Do this before returning: the caller then closes these
+        # legs and books the assignment against the merged cycle.
+        self._merge_renamed_cycle(former, row.underlying, row.event_date, message)
         return legs
+
+    def _merge_renamed_cycle(self, former: str, new: str, when: date, note: str) -> None:
+        """A corporate action renamed ``former`` -> ``new`` mid-campaign. Move
+        the former ticker's open cycle -- its legs, share lots, rolls, spreads
+        and assignments -- into the new ticker's cycle, re-key the engine's
+        per-underlying tracking, drop the emptied former cycle, and remember the
+        alias so any later ``former`` row routes to ``new`` too.
+        """
+        self._ticker_alias[former] = new
+        src = self._active_cycle.pop(former, None)
+        if src is None:
+            return
+        dst = self._active_cycle.get(new) or self._cycle_for(new, when)
+        if dst is src:
+            return
+
+        for leg in src.legs:
+            leg.underlying = new
+            leg.cycle_id = dst.cycle_id
+        for lot in src.share_lots:
+            lot.underlying = new
+            lot.cycle_id = dst.cycle_id
+        dst.legs.extend(src.legs)
+        dst.share_lots.extend(src.share_lots)
+        dst.rolls.extend(src.rolls)
+        dst.spreads.extend(src.spreads)
+        dst.assignments.extend(src.assignments)
+        dst.warnings.extend(w for w in [*src.warnings, note] if w not in dst.warnings)
+        dst.start_date = min(dst.start_date, src.start_date)
+        dst.capital_estimated = dst.capital_estimated or src.capital_estimated
+
+        moved_lots = self._share_lots.pop(former, None)
+        if moved_lots:
+            self._share_lots.setdefault(new, []).extend(moved_lots)
+
+        self.cycles = [cycle for cycle in self.cycles if cycle is not src]
 
     # ---------------- assignment -> shares ----------------
 

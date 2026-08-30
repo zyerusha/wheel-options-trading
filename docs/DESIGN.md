@@ -75,8 +75,9 @@ then re-entered *with an option (STO/BTO)*, the engine reopens the most recent c
   (it also resets the `-<n>` sequence), so a position carried across New Year's still
   starts a fresh `<ticker>-<year>-1`.
 - the flat cycle **is not a wheel** (`Cycle.is_wheel` is `False` — a lone directional
-  option punt, see below). A later put must not fold that unrelated trade's premium
-  into a wheel's cost basis and metrics, so it opens a fresh cycle instead.
+  option punt, or plain buy-and-hold shares; see below). A later put must not fold that
+  unrelated trade's premium into a wheel's cost basis and metrics, so it opens a fresh
+  cycle instead.
 
 A bare stock purchase after a flat gap also starts its own cycle. A resumed cycle
 keeps its original id and simply spans the flat days; committed capital reads $0
@@ -91,21 +92,31 @@ or the cycle was never a wheel to begin with (a directional option trade is done
 its option closes). The frontend renders `NO_ACTIVITY` as "NO ACTIVITY" and tints only
 `CLOSED` wheels salmon.
 
-### Wheel vs directional cycles
+### Wheel vs directional vs buy-and-hold cycles
 
-`Cycle.is_wheel` is `False` for a cycle that only ever *bought* options — a lone
-directional call or put, an unpaired protective leg — and never sold a cash-secured
-put or covered call, never held shares, never took assignment. Such a cycle ties up
-nothing but its own premium and closes in days, so annualizing its result produces a
-meaningless five-figure "ROC" (a $400 premium lost over two days ≈ −18,000%). Its
-realized P&L is still real and still counts toward every P&L total — `net_realized_pl`,
-`option_realized_pl`, the account rollups. Only the **wheel-framed ratios** are
-withheld: `annualized_wheel_roc_pct`, `roi_on_avg_wheel_pct`, `net_option_yield_pct`,
-`profit_per_day`, `win_rate_pct` all come back `None` from `cycle_metrics`, and
-`portfolio_metrics` / `ticker_summary` compute those ratios from wheel cycles only
-(the XIRR ledger in `wheel_cash_flow_events` / `wheel_terminal_value` skips them too).
-The Trade Log tags the cycle "Directional (non-wheel)", the Dashboard cycle table adds
-a `directional` badge, and the timeline marks the row with a `◇`.
+`Cycle.is_wheel` is `True` only when the cycle actually **sold a cash-secured put or a
+covered call** somewhere in its life (or took an assignment — defensive, for when the
+option leg sits outside the export window). `Cycle.kind` names the three cases:
+
+| `kind` | what it is |
+|---|---|
+| `"wheel"` | sold a CSP / covered call (or took an assignment) |
+| `"directional"` | only *bought* options — a lone call/put, an unpaired protective leg |
+| `"hold"` | bought shares, **no option ever written against them** — plain buy-and-hold |
+
+Note **shares alone no longer make a cycle a wheel.** Buying stock and holding it is an
+ordinary position; the moment a covered call is written, the cycle gains a
+`COVERED_CALL` leg and flips to `"wheel"`.
+
+For a non-wheel cycle the realized P&L is still real and still counts toward every P&L
+total (`net_realized_pl`, `option_realized_pl`, the account rollups), but the
+**wheel-framed ratios** are withheld: `annualized_wheel_roc_pct`, `roi_on_avg_wheel_pct`,
+`net_option_yield_pct`, `profit_per_day`, `win_rate_pct` all come back `None` from
+`cycle_metrics`, and `portfolio_metrics` / `ticker_summary` compute those ratios from
+wheel cycles only (the XIRR ledger in `wheel_cash_flow_events` / `wheel_terminal_value`
+skips them too). The Trade Log tags the cycle "Directional (non-wheel)" or "Buy-and-hold
+(non-wheel)", the Dashboard cycle table adds a `directional` / `buy & hold` badge, and
+the timeline marks the row with a `◇`.
 
 ### Open-hedge banner
 
@@ -155,14 +166,21 @@ row highlighted for as long as it stays open (`is_open_long` on the row).
 - `portfolio_insights(portfolio, wheels, open_hedges, …)` — the whole book, shown
   under the headline tiles inside the Dashboard's *Performance* card (`data.insights`;
   also built for the Combined view). Up to three each. It reads only already-serialized payload dicts — the filtered
-  `PortfolioMetrics`, the full-history Trade Log wheels, the open hedges, and the two
-  XIRR blocks — so it never re-derives a figure. Rules cover: the wheel's own XIRR vs
-  a same-timing SPY replay; book-wide win rate and Wheel ROC; dividends; the whole
-  account's XIRR vs a SPY buy-and-hold (the wheel can win while the account, dragged
-  by idle cash, loses); active wheels underwater on a mark-to-market basis; assigned
-  shares with no covered call written against them; single-ticker concentration;
-  directional (non-wheel) losses; hedges in the wind-down window; and the
-  strike-proxy-capital caveat.
+  `PortfolioMetrics`, the full-history Trade Log wheels, the open hedges, and the
+  wheel-only XIRR block — so it never re-derives a figure. Rules cover: the wheel's own
+  money-weighted return vs the *same dollars, same dates* put in SPY instead
+  (`wheel_return` — idle cash and buy-and-hold positions excluded from both sides);
+  book-wide win rate and Wheel ROC; dividends; active wheels underwater on a
+  mark-to-market basis; assigned shares with no covered call written against them;
+  single-ticker concentration; directional (non-wheel) losses; hedges in the
+  wind-down window; and the strike-proxy-capital caveat.
+
+  The *whole-account* XIRR-vs-SPY-buy-and-hold figure is deliberately **not** an
+  insight. It blends in idle cash and deliberate buy-and-hold holdings and rests on
+  the hand-configured opening balance, so "trails SPY" there is an allocation
+  observation, not a verdict on the wheel — the apples-to-apples wheel comparison is
+  `wheel_return`. The whole-account number still lives on the *Net worth & benchmark*
+  card with its full context.
 
 ### Intra-day ordering
 
@@ -218,6 +236,17 @@ Corporation. The option series — expiry, right, strike — is untouched, so wh
 close finds no lot under its own symbol the engine looks for open lots matching all
 three under exactly one other ticker. One match is treated as a rename and reported;
 anything ambiguous is left unmatched rather than guessed at.
+
+On a match the former ticker's open campaign is **folded into the new ticker's cycle**
+(`_merge_renamed_cycle`): its legs, share lots, rolls, spreads and assignments move
+across, the engine's per-underlying tracking is re-keyed, the emptied cycle is dropped,
+and `former -> new` is remembered so any later row under the old ticker routes to the
+new cycle too. So the put sold as AXL and the shares assigned as DCH read as one wheel,
+not an AXL cycle plus a DCH cycle. Legs keep their historical `occ_symbol` (`AXL…`);
+only `underlying` / `cycle_id` are re-tagged. `_build_trade_log` reads the same
+`_ticker_alias` so its raw-transaction filter accepts the old ticker's rows for the
+merged wheel (its `also_tickers`); the `DISTRIBUTION NAME/SYMBOL CHANGE` bookkeeping
+rows themselves — action `OTHER`, netting to $0 — are excluded from the ledger.
 
 ### Capital
 
@@ -342,18 +371,14 @@ At the **per-ticker** level (`ticker_summary`), the wheel ratios -- Wheel ROC,
 Net Option Yield, and Profit Per Day -- are reported as `None` (rendered "—",
 and the ticker is dropped from the Wheel ROC chart/scatter entirely) for a
 ticker that never actually sold a put or call: a plain buy-and-hold of shares.
-`Cycle.is_wheel` still counts those shares as wheel *capital* on purpose (a
-wheel often opens by buying stock, and the capital charts should show it), but
-with no premium ever collected against them the premium-return ratios are
+With no premium ever collected against them the premium-return ratios are
 undefined, not `0%` -- and a page full of `0%` bars for long-term equity
-holdings is just noise. The gate is the presence of a real CSP or
-covered-call leg anywhere in the ticker's `since`-cropped cycles. It is
-deliberately *not* keyed on `cycle.assignments`: a genuine wheel that took a
-put assignment still carries its CSP leg, whereas a lone `ASSIGNED` row with
-no option leg behind it (an incomplete export, or a stray corporate-action
-row on a plain stock position) is not evidence the wheel was ever run. A
-genuine wheel that merely sat idle in the selected window still reports its
-ratios, since the gate looks at full history, not the window.
+holdings is just noise. The gate is the same as `Cycle.is_wheel`: a real CSP
+or covered-call leg (or an assignment) anywhere in the ticker's
+`since`-cropped cycles. Held shares still show as *capital* in the capital
+charts even before the first call is written, but they don't make the ticker a
+wheel. A genuine wheel that merely sat idle in the selected window still
+reports its ratios, since the gate looks at full history, not the window.
 
 `option_realized_pl` sums every leg in the cycle -- it always has, since nothing
 here filters by `WHEEL_STRATEGIES` -- so protective puts and both legs of a
