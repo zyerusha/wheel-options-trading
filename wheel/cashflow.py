@@ -47,7 +47,7 @@ from __future__ import annotations
 import argparse
 import re
 from calendar import monthrange
-from datetime import date
+from datetime import date, timedelta
 from typing import Sequence
 
 from wheel.parser import BTC, BTO, OTHER, STC, STO, Transaction
@@ -253,6 +253,82 @@ def monthly_cashflow_series(
 
     if since is not None:
         rows = [row for row in rows if (row["year"], row["month"]) >= (since.year, since.month)]
+    return rows
+
+
+# --------------------------------------------------------------------------
+# Weekly bucketing
+# --------------------------------------------------------------------------
+
+
+def _week_start(day: date) -> date:
+    """The Monday on or before ``day`` -- ISO week anchor. ``date.weekday()``
+    is 0 for Monday, so subtracting it lands on that week's Monday."""
+    return day - timedelta(days=day.weekday())
+
+
+def weekly_cashflow_series(
+    transactions: Sequence[Transaction],
+    through: date,
+    since: date | None = None,
+) -> list[dict]:
+    """Realized wheel cash flow, one row per ISO week (Monday-anchored).
+
+    A finer-grained companion to :func:`monthly_cashflow_series` for the
+    "Cash flow vs. wheel P/L gap" chart, which wants more x-axis resolution
+    than one point per month. Only the cash columns are reported -- no
+    average collateral or yield-%, since that chart uses neither.
+
+    Bucketing is by each transaction's own ``event_date``, exactly as the
+    monthly series does. Weeks between the first and last active week are
+    filled in at zero rather than skipped, so a quiet stretch draws as real
+    zero activity rather than a gap in the data. Weeks are never fabricated
+    before the first cash flow or after ``through``.
+
+    ``since``, if given, crops the returned rows to the week containing that
+    date onward -- a display crop applied after the full week range has been
+    walked, mirroring ``monthly_cashflow_series``'s own ``since`` handling.
+    """
+    buckets: dict[date, list[float]] = {}
+    for transaction in transactions:
+        effect = _cash_effect(transaction)
+        if effect is None:
+            continue
+        credit, debit, fee = effect
+        if credit == 0.0 and debit == 0.0 and fee == 0.0:
+            continue
+        slot = buckets.setdefault(_week_start(transaction.event_date), [0.0, 0.0, 0.0])
+        slot[0] += credit
+        slot[1] += debit
+        slot[2] += fee
+
+    if not buckets:
+        return []
+
+    first_week = min(buckets)
+    last_week = min(max(buckets), _week_start(through))
+
+    rows: list[dict] = []
+    week = first_week
+    while week <= last_week:
+        credit, debit, fee = buckets.get(week, [0.0, 0.0, 0.0])
+        net = credit - debit - fee
+        rows.append(
+            {
+                "period": week.isoformat(),
+                "week_start": week.isoformat(),
+                "week_end": (week + timedelta(days=6)).isoformat(),
+                "gross_credits": round(credit, 2),
+                "gross_debits": round(debit, 2),
+                "fees": round(fee, 2),
+                "net_cash_flow": round(net, 2),
+            }
+        )
+        week += timedelta(days=7)
+
+    if since is not None:
+        cutoff = _week_start(since)
+        rows = [row for row in rows if date.fromisoformat(row["week_start"]) >= cutoff]
     return rows
 
 

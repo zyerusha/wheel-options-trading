@@ -128,7 +128,8 @@ from typing import TYPE_CHECKING, Any, Sequence
 from wheel import benchmark as bm
 from wheel import cashflow as cf
 from wheel.api import Dashboard, Filters, discover_exports, discover_multi_account_exports
-from wheel.metrics import roi_and_annualized, time_weighted_average
+from wheel.insights import portfolio_insights
+from wheel.metrics import roi_and_annualized, time_weighted_average, weekly_ppd_series
 from wheel.positions import discover_position_snapshots, latest_snapshot, latest_snapshot_per_account, load_snapshots
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -824,21 +825,37 @@ class AccountRegistry:
 
         capital_series = _combine_capital_series(payloads)
         net_worth = _combine_net_worth(payloads)
+        combined_portfolio = _combine_portfolio(payloads, capital_series)
+        combined_trade_log = _combine_trade_log(payloads)
+        combined_hedges = _combine_open_hedges(payloads)
+        combined_wheel_state = _combine_wheel_state(payloads)
+        combined_benchmark = _combine_benchmark(payloads)
+        combined_wheel_return = _combine_wheel_return(payloads)
 
         return {
             "meta": _combine_meta(payloads, labels, self._build_warnings),
-            "portfolio": _combine_portfolio(payloads, capital_series),
+            "portfolio": combined_portfolio,
+            "insights": portfolio_insights(
+                combined_portfolio,
+                combined_trade_log.get("wheels", []),
+                combined_hedges,
+                wheel_return=combined_wheel_return,
+                benchmark=combined_benchmark,
+                wheel_state=combined_wheel_state,
+            ),
             "cycles": _combine_cycles(payloads),
             "tickers": _combine_tickers(payloads),
             "capital_series": capital_series,
             "pnl_series": _combine_pnl_series(payloads),
+            "ppd_series": _combine_ppd_series(payloads, combined_portfolio),
             "cash_flow": _combine_cash_flow(payloads, capital_series),
-            "wheel_state": _combine_wheel_state(payloads),
+            "wheel_state": combined_wheel_state,
             "reconciliation": _combine_reconciliation(payloads),
             "net_worth": net_worth,
-            "benchmark": _combine_benchmark(payloads),
-            "wheel_return": _combine_wheel_return(payloads),
-            "trade_log": _combine_trade_log(payloads),
+            "benchmark": combined_benchmark,
+            "wheel_return": combined_wheel_return,
+            "trade_log": combined_trade_log,
+            "open_hedges": combined_hedges,
         }
 
 
@@ -923,6 +940,20 @@ def _combine_trade_log(payloads: dict[str, dict]) -> dict[str, Any]:
     return {"wheels": wheels, "warnings": warnings}
 
 
+def _combine_open_hedges(payloads: dict[str, dict]) -> list[dict]:
+    """Every account's open hedges in one list, ``cycle_id`` account-prefixed to
+    match the combined timeline / Trade Log; soonest-expiry first.
+    """
+    hedges: list[dict] = []
+    for account_id, payload in payloads.items():
+        for hedge in payload.get("open_hedges") or []:
+            hedges.append(
+                {**hedge, "account_id": account_id, "cycle_id": f"{account_id}:{hedge['cycle_id']}"}
+            )
+    hedges.sort(key=lambda hedge: hedge["days_to_expiry"])
+    return hedges
+
+
 def _combine_tickers(payloads: dict[str, dict]) -> list[dict]:
     combined = [
         {**row, "account_id": account_id} for account_id, payload in payloads.items() for row in payload["tickers"]
@@ -996,6 +1027,37 @@ def _combine_pnl_series(payloads: dict[str, dict]) -> list[dict]:
     return series
 
 
+def _combine_wheel_pnl_series(payloads: dict[str, dict]) -> list[dict]:
+    """Sum each account's *wheel-only* daily P/L by date, running totals
+    recomputed -- the same shape as :func:`_combine_pnl_series` but from
+    ``pnl_series_wheel`` (non-wheel cycles excluded), used only to build the
+    Combined PPD track.
+    """
+    buckets: dict[str, float] = {}
+    for payload in payloads.values():
+        for point in payload.get("pnl_series_wheel", []):
+            buckets[point["date"]] = buckets.get(point["date"], 0.0) + (point.get("option_pl") or 0.0)
+    series: list[dict] = []
+    cum = 0.0
+    for day in sorted(buckets):
+        cum += buckets[day]
+        series.append({"date": day, "option_pl": round(buckets[day], 2), "cum_option_pl": round(cum, 2)})
+    return series
+
+
+def _combine_ppd_series(payloads: dict[str, dict], combined_portfolio: dict[str, Any]) -> list[dict]:
+    """Weekly Wheel PPD for the Combined view. Numerator is wheel-only option
+    P/L summed across accounts; the running denominator uses the combined
+    ``first_date`` so the last point matches the Combined Profit-Per-Day tile.
+    """
+    first = combined_portfolio.get("first_date")
+    last = combined_portfolio.get("last_date")
+    wheel_pnl = _combine_wheel_pnl_series(payloads)
+    if not wheel_pnl or not first or not last:
+        return []
+    return weekly_ppd_series(wheel_pnl, date.fromisoformat(first), date.fromisoformat(last))
+
+
 def _combine_cash_flow(payloads: dict[str, dict], capital_series: list[dict]) -> dict[str, Any]:
     """Sum every account's monthly credits/debits/fees by calendar month, then
     recompute average collateral and monthly yield from the already-combined
@@ -1012,6 +1074,36 @@ def _combine_cash_flow(payloads: dict[str, dict], capital_series: list[dict]) ->
             bucket["credits"] += row["gross_credits"]
             bucket["debits"] += row["gross_debits"]
             bucket["fees"] += row["fees"]
+
+    # Weekly rows (for the cash-flow-vs-wheel gap chart) combine the same way
+    # -- sum credits/debits/fees per ISO week -- but carry no collateral or
+    # yield-%, so there is nothing here to recompute from capital_series.
+    week_buckets: dict[str, dict[str, float]] = {}
+    for payload in payloads.values():
+        for row in payload["cash_flow"].get("weeks", []):
+            week_bucket = week_buckets.setdefault(
+                row["period"],
+                {"week_start": row["week_start"], "week_end": row["week_end"], "credits": 0.0, "debits": 0.0, "fees": 0.0},
+            )
+            week_bucket["credits"] += row["gross_credits"]
+            week_bucket["debits"] += row["gross_debits"]
+            week_bucket["fees"] += row["fees"]
+
+    week_rows: list[dict] = []
+    for period in sorted(week_buckets):
+        week_bucket = week_buckets[period]
+        net = week_bucket["credits"] - week_bucket["debits"] - week_bucket["fees"]
+        week_rows.append(
+            {
+                "period": period,
+                "week_start": week_bucket["week_start"],
+                "week_end": week_bucket["week_end"],
+                "gross_credits": round(week_bucket["credits"], 2),
+                "gross_debits": round(week_bucket["debits"], 2),
+                "fees": round(week_bucket["fees"], 2),
+                "net_cash_flow": round(net, 2),
+            }
+        )
 
     capital_points = [(date.fromisoformat(point["date"]), point["total"]) for point in capital_series]
 
@@ -1038,7 +1130,7 @@ def _combine_cash_flow(payloads: dict[str, dict], capital_series: list[dict]) ->
         date.fromisoformat(payload["meta"]["through"]) for payload in payloads.values() if payload["meta"]["through"]
     ]
     through = max(throughs) if throughs else date.today()
-    return {"months": rows, "trailing": cf.range_summary(rows, capital_points, through)}
+    return {"months": rows, "weeks": week_rows, "trailing": cf.range_summary(rows, capital_points, through)}
 
 
 def _combine_wheel_state(payloads: dict[str, dict]) -> dict[str, Any]:
@@ -1090,6 +1182,7 @@ def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) ->
         "premium_received": sum(p["premium_received"] for p in portfolios),
         "premium_paid": sum(p["premium_paid"] for p in portfolios),
         "option_realized_pl": sum(p["option_realized_pl"] for p in portfolios),
+        "wheel_option_realized_pl": sum(p.get("wheel_option_realized_pl", p["option_realized_pl"]) for p in portfolios),
         "wheel_core_realized_pl": sum(p["wheel_core_realized_pl"] for p in portfolios),
         "hedge_realized_pl": sum(p["hedge_realized_pl"] for p in portfolios),
         "stock_realized_pl": sum(p["stock_realized_pl"] for p in portfolios),
@@ -1112,8 +1205,9 @@ def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) ->
         if combined["first_date"] and combined["last_date"]
         else 0
     )
+    # Wheel-only numerator, matching portfolio_metrics after the is_wheel split.
     combined["profit_per_day"] = (
-        combined["option_realized_pl"] / combined["days_span"] if combined["days_span"] else 0.0
+        combined["wheel_option_realized_pl"] / combined["days_span"] if combined["days_span"] else 0.0
     )
     decided = combined["wins"] + combined["losses"]
     combined["win_rate_pct"] = round(100.0 * combined["wins"] / decided, 2) if decided else None
@@ -1138,7 +1232,7 @@ def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) ->
     combined["avg_capital"] = round(avg_capital, 2)
 
     combined["roi_on_avg_wheel_pct"], combined["annualized_wheel_roc_pct"] = roi_and_annualized(
-        combined["option_realized_pl"], avg_capital, combined["days_span"]
+        combined["wheel_option_realized_pl"], avg_capital, combined["days_span"]
     )
 
     # Same figures again, narrowed to capital actually backing an open put or
@@ -1157,7 +1251,7 @@ def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) ->
     combined["avg_active_capital"] = round(avg_active_capital, 2)
 
     combined["roi_on_avg_active_capital_pct"], combined["annualized_active_wheel_roc_pct"] = roi_and_annualized(
-        combined["option_realized_pl"], avg_active_capital, combined["days_span"]
+        combined["wheel_option_realized_pl"], avg_active_capital, combined["days_span"]
     )
 
     # Dual-track pair, quoted against total_initial_collateral -- the sum of
@@ -1166,7 +1260,7 @@ def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) ->
     # figure here, recomputed from the combined absolutes rather than
     # averaging each account's own percentage.
     combined["net_option_yield_pct"], combined["annualized_net_option_yield_pct"] = roi_and_annualized(
-        combined["option_realized_pl"], combined["total_initial_collateral"], combined["days_span"]
+        combined["wheel_option_realized_pl"], combined["total_initial_collateral"], combined["days_span"]
     )
     total_position_pl = (
         combined["option_realized_pl"]
@@ -1182,6 +1276,7 @@ def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) ->
         "premium_received",
         "premium_paid",
         "option_realized_pl",
+        "wheel_option_realized_pl",
         "wheel_core_realized_pl",
         "hedge_realized_pl",
         "stock_realized_pl",

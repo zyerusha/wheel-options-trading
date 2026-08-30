@@ -107,6 +107,63 @@ withheld: `annualized_wheel_roc_pct`, `roi_on_avg_wheel_pct`, `net_option_yield_
 The Trade Log tags the cycle "Directional (non-wheel)", the Dashboard cycle table adds
 a `directional` badge, and the timeline marks the row with a `◇`.
 
+### Open-hedge banner
+
+A common pattern in this book is to sell short puts for income and buy one far-dated,
+lower-strike long put to cap the tail risk, then keep writing puts over the months the
+hedge is alive so the accumulated premium pays for it — winding the hedge down ~2 months
+before expiry to salvage its remaining time value. The failure mode is giving up early:
+closing the hedge after a few weeks locks in its decay with little premium collected
+against it (the TQQQ Joint cycle — $633 hedge closed at −$230 after ~5 weeks).
+
+`Dashboard._build_open_hedges` (`wheel/api.py`, filter-independent like the Trade Log)
+surfaces every **open, unpaired long option leg** — `leg.is_open and leg.side == LONG`,
+not part of a `Spread`. Per leg `_open_hedge_entry` computes:
+
+- `days_to_expiry` → **phase**, against `HEDGE_WIND_DOWN_DAYS` (60) and
+  `HEDGE_EXPIRING_DAYS` (7): **runway** (> 60), **wind_down** (8–60), **expiring** (≤ 7).
+- `cost` — the debit paid.
+- `wheel_pl_now` — the cycle's **mark-to-market P&L** (realized option + realized stock
+  + dividends + open-option value at expiry + unrealized stock). This is the honest
+  "are we winning" figure and it drives the message tone: a runway hedge on a
+  *losing* wheel gets "hold it, this is the leg that pays if it keeps falling — don't
+  close while underwater"; on a winning wheel, "there's runway to keep writing puts,
+  plan to wind down ~2 months out."
+- `premium_written_since` — net realized P&L of every CSP/covered-call leg in the cycle
+  that *closed* on or after the hedge opened. Reported as a plain fact, **not** as "the
+  hedge is paid for": that premium may have become shares now underwater, which is
+  exactly why `wheel_pl_now` is shown alongside it. There is deliberately no `funded`
+  flag.
+- `intrinsic_now` — floor only; there is no options-quote feed to mark the hedge's own
+  time value.
+
+A leg in a non-wheel cycle is still listed, flagged "directional", with no
+`premium_written_since`. The dashboard renders `data.open_hedges` as a banner directly
+above *Net worth & benchmark*; the Trade Log repeats the same card (`#tradelog-hedge`,
+scoped to the wheel on screen) directly under that wheel's Insights. Both are hidden
+when there is nothing to show. The Trade Log also keeps the long leg's own transaction
+row highlighted for as long as it stays open (`is_open_long` on the row).
+
+### Insights
+
+`wheel/insights.py` is plain-rules commentary — no model, no network — in one shape,
+`{"strengths": [...], "improvements": [...]}`, rendered as a `✓` / `▸` list.
+
+- `wheel_insights(cycle, metrics, …)` — one wheel, on the Trade Log. Up to two
+  strengths (curated priority order) and three improvements (ranked by dollar impact,
+  costliest first). A non-wheel cycle gets one honest line instead.
+- `portfolio_insights(portfolio, wheels, open_hedges, …)` — the whole book, shown
+  under the headline tiles inside the Dashboard's *Performance* card (`data.insights`;
+  also built for the Combined view). Up to three each. It reads only already-serialized payload dicts — the filtered
+  `PortfolioMetrics`, the full-history Trade Log wheels, the open hedges, and the two
+  XIRR blocks — so it never re-derives a figure. Rules cover: the wheel's own XIRR vs
+  a same-timing SPY replay; book-wide win rate and Wheel ROC; dividends; the whole
+  account's XIRR vs a SPY buy-and-hold (the wheel can win while the account, dragged
+  by idle cash, loses); active wheels underwater on a mark-to-market basis; assigned
+  shares with no covered call written against them; single-ticker concentration;
+  directional (non-wheel) losses; hedges in the wind-down window; and the
+  strike-proxy-capital caveat.
+
 ### Intra-day ordering
 
 Events within one ticker-day run in three phases, because a single ordering cannot
@@ -281,6 +338,23 @@ the stock's. `stock_realized_pl` and `net_realized_pl` remain available as their
 figures for anyone who wants the stock's own P/L or the full investment picture --
 this tracker's ROC just doesn't fold them in.
 
+At the **per-ticker** level (`ticker_summary`), the wheel ratios -- Wheel ROC,
+Net Option Yield, and Profit Per Day -- are reported as `None` (rendered "—",
+and the ticker is dropped from the Wheel ROC chart/scatter entirely) for a
+ticker that never actually sold a put or call: a plain buy-and-hold of shares.
+`Cycle.is_wheel` still counts those shares as wheel *capital* on purpose (a
+wheel often opens by buying stock, and the capital charts should show it), but
+with no premium ever collected against them the premium-return ratios are
+undefined, not `0%` -- and a page full of `0%` bars for long-term equity
+holdings is just noise. The gate is the presence of a real CSP or
+covered-call leg anywhere in the ticker's `since`-cropped cycles. It is
+deliberately *not* keyed on `cycle.assignments`: a genuine wheel that took a
+put assignment still carries its CSP leg, whereas a lone `ASSIGNED` row with
+no option leg behind it (an incomplete export, or a stray corporate-action
+row on a plain stock position) is not evidence the wheel was ever run. A
+genuine wheel that merely sat idle in the selected window still reports its
+ratios, since the gate looks at full history, not the window.
+
 `option_realized_pl` sums every leg in the cycle -- it always has, since nothing
 here filters by `WHEEL_STRATEGIES` -- so protective puts and both legs of a
 credit-spread hedge are already in it, each leg's own `realized_pl` already
@@ -304,6 +378,32 @@ excluded so a gap between legs does not dilute the result. The portfolio-level
 annualized figure is computed against the portfolio's own time-weighted average
 capital rather than by averaging per-cycle percentages, which would weight a one-day
 $1,400 trade the same as a two-month $60,000 one.
+
+After the wheel/directional split (see "Wheel vs directional cycles"), the
+portfolio ROC / Net Option Yield / PPD numerators are `wheel_option_realized_pl` --
+`option_realized_pl` summed over wheel cycles only, exposed on `PortfolioMetrics`
+so `accounts._combine_portfolio` can use the same numerator and the Combined view
+stays consistent with a single account. `total_position_roi_pct` still uses the
+full `option_realized_pl` (it is the everything-included figure).
+
+### Wheel PPD by week
+
+`metrics.weekly_ppd_series(pnl_rows, first_date, through)` resolves PPD to ISO
+weeks (Monday-anchored, zero-filled between the first and last active week) from
+`realized_pl_series` output. `pnl_rows` is filtered to **wheel cycles only** by the
+caller so the numerator matches `portfolio.profit_per_day`. Two tracks per week:
+
+- `weekly_ppd` = that week's realized option P&L ÷ 7. Spiky -- realized P&L lands
+  in lumps when legs close.
+- `cum_ppd` = running option P&L ÷ running calendar days from `first_date`. Its
+  final point equals the headline Profit-Per-Day tile exactly (the last, partial
+  week's denominator runs through `through`, i.e. `days_span`).
+
+It ships in the payload as `ppd_series` for the current filter (Dashboard *Wheel
+PPD by week* card -- bars for `weekly_ppd`, a bold line for `cum_ppd` with a dashed
+marker at its current level) and per wheel inside each Trade Log entry (empty for a
+non-wheel cycle). The Combined view sums each account's wheel-only daily P&L
+(`pnl_series_wheel`) before bucketing.
 
 ### Cost basis: tax basis vs. net adjusted cost basis
 

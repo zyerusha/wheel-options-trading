@@ -1296,6 +1296,69 @@ class TestNonWheelExclusion(unittest.TestCase):
         self.assertAlmostEqual(result.net_realized_pl, -398.02, places=2)
 
 
+class TestBuyAndHoldTickerHasNoWheelRatios(unittest.TestCase):
+    """A ticker whose only activity is buying (and maybe selling) shares --
+    never a put or call written against them -- keeps its capital and stock
+    P&L on screen, but its premium-return ratios read N/A, not a misleading
+    0%. A genuine wheel that merely sat idle in the window still reports them.
+    """
+
+    def test_shares_only_ticker_gets_none_for_wheel_ratios(self):
+        cycles, _ = build_cycles(
+            [tx("2025-01-06", "BUY_STOCK", "CRESY", 300, 8.0, -2400.0, row_id=1)]
+        )
+        row = next(r for r in ticker_summary(cycles, date(2025, 6, 30)) if r["underlying"] == "CRESY")
+        self.assertGreater(row["avg_capital"], 0.0)  # still real, funded capital
+        self.assertIsNone(row["annualized_wheel_roc_pct"])
+        self.assertIsNone(row["roi_on_avg_wheel_pct"])
+        self.assertIsNone(row["annualized_net_option_yield_pct"])
+        self.assertIsNone(row["profit_per_day"])
+
+    def test_assignment_row_with_no_option_leg_is_not_enough(self):
+        """A stray ASSIGNED row with no CSP/CC leg behind it (an incomplete
+        export, or a stock position with an odd corporate-action row) is not
+        evidence the wheel was ever run -- ratios stay N/A.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-02-10", "BUY_STOCK", "DCH", 1000, 8.0, -8000.0, row_id=1),
+                tx("2025-03-15", ASSIGNED, "-DCH250321P8", 1, None, 0.0, row_id=2, as_of="2025-03-15"),
+            ]
+        )
+        row = next(r for r in ticker_summary(cycles, date(2025, 6, 30)) if r["underlying"] == "DCH")
+        self.assertIsNone(row["annualized_wheel_roc_pct"])
+        self.assertIsNone(row["profit_per_day"])
+
+    def test_one_covered_call_makes_the_ratios_defined_again(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-06", "BUY_STOCK", "CRESY", 300, 8.0, -2400.0, row_id=1),
+                tx("2025-02-03", STO, "-CRESY250321C9", -3, 0.40, 119.0, row_id=2),
+            ]
+        )
+        row = next(r for r in ticker_summary(cycles, date(2025, 6, 30)) if r["underlying"] == "CRESY")
+        self.assertIsNotNone(row["annualized_wheel_roc_pct"])
+        self.assertIsNotNone(row["profit_per_day"])
+
+    def test_dormant_real_wheel_still_reports_ratios(self):
+        # CSP sold and assigned last year; the display window is later, so the
+        # ticker has no in-window premium -- but it did run the wheel, so the
+        # ratios stay defined (here 0%-ish, not None).
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-02", STO, "-MU250117P100", -1, 3.0, 300.0, row_id=1),
+                tx("2025-01-17", ASSIGNED, "-MU250117P100", 1, None, 0.0, row_id=2, as_of="2025-01-17"),
+            ]
+        )
+        since = date(2025, 3, 1)
+        row = next(
+            r
+            for r in ticker_summary([], date(2025, 6, 30), capital_cycles=cycles, since=since)
+            if r["underlying"] == "MU"
+        )
+        self.assertIsNotNone(row["annualized_wheel_roc_pct"])
+
+
 class TestHedgePL(unittest.TestCase):
     """Protective puts and credit-spread hedges are ordinary option legs to the
     engine -- LONG_PUT/LONG_CALL for the long side, CSP/COVERED_CALL for a

@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.test_engine import tx  # noqa: E402
 from wheel.api import Dashboard, _trade_log_entry  # noqa: E402
 from wheel.engine import build_cycles  # noqa: E402
-from wheel.parser import ASSIGNED, BTC, BTO, EXPIRED, STC, STO  # noqa: E402
+from wheel.parser import ASSIGNED, BTC, BTO, EXPIRED, OTHER, STC, STO  # noqa: E402
 
 
 def _trade_log(transactions, names=None, prices=None) -> dict:
@@ -55,6 +55,22 @@ class TestTransactionRows(unittest.TestCase):
         # Cumulative is the running sum.
         self.assertEqual(sell["running_cash_flow"], 199.34)
         self.assertAlmostEqual(buy["running_cash_flow"], 159.32)
+
+    def test_dividend_row_is_settled_immediately(self):
+        rows = _trade_log(
+            [
+                tx("2025-01-02", STO, "-MU250207P100", -1, 3.00, 300.0, row_id=1),
+                tx("2025-01-17", ASSIGNED, "-MU250207P100", 1, None, 0.0, row_id=2, as_of="2025-01-17"),
+                tx("2025-02-01", OTHER, "MU", 0, None, 12.34, row_id=3, action_raw="DIVIDEND RECEIVED MICRON"),
+            ]
+        )
+        (wheel,) = rows["wheels"]
+        div = [r for r in wheel["transactions"] if r["type"] == "Dividend"]
+        self.assertEqual(len(div), 1)
+        # A dividend is cash received, complete on arrival -> greyed like a
+        # closed leg (frontend keys the row style off is_settled).
+        self.assertTrue(div[0]["is_settled"])
+        self.assertEqual(div[0]["net_cash_flow"], 12.34)
 
     def test_synthetic_assignment_row_when_export_has_no_equity_leg(self):
         rows = _trade_log(
