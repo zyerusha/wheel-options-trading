@@ -1449,7 +1449,7 @@ class Dashboard:
                 "data_first_date": _iso(self.first_date),
                 "data_last_date": _iso(self.last_date),
                 "available_tickers": self.available_tickers(),
-                "statuses": ["ACTIVE", "CLOSED", "ASSIGNED"],
+                "statuses": ["ACTIVE", "NO_ACTIVITY", "CLOSED"],
                 "transactions_in_slice": len(transactions),
                 "transactions_total": len(self.transactions),
                 "columns_swapped": any(report.columns_swapped for report in self.reports),

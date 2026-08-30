@@ -13,8 +13,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from wheel.engine import (  # noqa: E402
     ACTIVE,
-    ASSIGNED_STATUS,
     CLOSED,
+    NO_ACTIVITY,
     COVERED_CALL,
     CSP,
     FROM_PRE_HISTORY,
@@ -85,7 +85,9 @@ class TestBasicLifecycle(unittest.TestCase):
         self.assertEqual(leg.outcome, "CLOSED")
         self.assertAlmostEqual(leg.realized_pl, 238.66, places=2)
         self.assertEqual(leg.days_held, 6)
-        self.assertEqual(cycle.status, CLOSED)
+        # Flat, but the book's latest trade is still 2025 -- another put would
+        # resume this wheel, so it is dormant (NO_ACTIVITY), not terminal.
+        self.assertEqual(cycle.status, NO_ACTIVITY)
         self.assertEqual(cycle.end_date, date(2025, 9, 25))
 
     def test_expired_short_put_keeps_full_premium(self):
@@ -111,7 +113,7 @@ class TestBasicLifecycle(unittest.TestCase):
         leg = cycles[0].legs[0]
         self.assertEqual(leg.side, LONG)
         self.assertAlmostEqual(leg.realized_pl, 1258.66, places=2)
-        self.assertEqual(cycles[0].status, CLOSED)
+        self.assertEqual(cycles[0].status, NO_ACTIVITY)
 
 
 class TestPartialFillsAndFIFO(unittest.TestCase):
@@ -443,7 +445,7 @@ class TestAssignment(unittest.TestCase):
         )
         self.assertEqual(len(cycles), 1)
         cycle = cycles[0]
-        self.assertEqual(cycle.status, ASSIGNED_STATUS)
+        self.assertEqual(cycle.status, CLOSED)
         self.assertEqual(cycle.end_date, date(2025, 11, 28))
 
         # Stock leg: bought at 230, called away at 235 => $500 on 100 shares.
@@ -527,7 +529,7 @@ class TestBrokerSuppliedShareLegs(unittest.TestCase):
         # Bought at 230, called away at 235, on the broker's own numbers.
         self.assertAlmostEqual(lot.disposals[0]["realized"], 500.0, places=2)
         self.assertTrue(all(not a.synthetic for a in cycle.assignments))
-        self.assertEqual(cycle.status, ASSIGNED_STATUS)
+        self.assertEqual(cycle.status, CLOSED)
 
     def test_synthesis_still_happens_when_no_share_row_exists(self):
         cycles, _ = build_cycles(
@@ -655,7 +657,7 @@ class TestCycleBoundaries(unittest.TestCase):
             ]
         )
         self.assertEqual(len(cycles), 2)
-        self.assertEqual(cycles[0].status, ASSIGNED_STATUS)
+        self.assertEqual(cycles[0].status, CLOSED)
         self.assertEqual(cycles[0].cycle_id, "MU-2026-1")
         self.assertEqual(cycles[1].cycle_id, "MU-2026-2")
 

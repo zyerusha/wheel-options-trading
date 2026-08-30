@@ -79,8 +79,12 @@ A bare stock purchase after a flat gap also starts its own cycle. A resumed cycl
 keeps its original id and simply spans the flat days; committed capital reads $0
 across them.
 
-Status is `ACTIVE` while anything is open, otherwise `ASSIGNED` if the campaign went
-through an assignment, otherwise `CLOSED`.
+Status is `ACTIVE` while anything is open. A flat cycle is `NO_ACTIVITY` while it is
+still resumable — its `end_date` falls in the same calendar year as the latest trade
+in the book and its stock was not called away, so another option on the ticker would
+reopen it. Otherwise it is `CLOSED` (terminal): the year has turned since the last
+trade, or a covered call was assigned and the stock disposed. The frontend renders
+`NO_ACTIVITY` as "NO ACTIVITY" and tints only `CLOSED` wheels salmon.
 
 ### Intra-day ordering
 

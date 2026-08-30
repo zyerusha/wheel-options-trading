@@ -74,7 +74,7 @@ class TestTransactionRows(unittest.TestCase):
         self.assertTrue(wheel["is_open"])  # still holding the shares
         self.assertEqual(wheel["status"], "ACTIVE")
 
-    def test_closed_wheel_summary_fields(self):
+    def test_flat_wheel_summary_fields(self):
         rows = _trade_log(
             [
                 tx("2025-01-06", STO, "-MU250117P100", -1, 2.00, 199.33, row_id=1, commission=0.65, fees=0.02),
@@ -83,7 +83,8 @@ class TestTransactionRows(unittest.TestCase):
         )
         (wheel,) = rows["wheels"]
         self.assertFalse(wheel["is_open"])
-        self.assertEqual(wheel["status"], "CLOSED")
+        # Flat, but the book's latest trade is still 2025 -> dormant, not terminal.
+        self.assertEqual(wheel["status"], "NO_ACTIVITY")
         self.assertEqual(wheel["capital_committed_now"], 0.0)
         self.assertEqual(wheel["gross_premium_received"], 199.33)
         self.assertIsNone(wheel["cost_basis_per_share"])

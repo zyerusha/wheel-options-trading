@@ -2735,9 +2735,14 @@ function cycleFormulas(cycle) {
 
 const CYCLE_STATUS_MEANING = {
   ACTIVE: 'ACTIVE: something is still open -- a short leg, a long hedge, or shares held.',
-  CLOSED: 'CLOSED: fully flat -- no open contracts, no shares. Never went through an assignment.',
-  ASSIGNED: 'ASSIGNED: fully flat now, but this campaign went through at least one option assignment along the way.',
+  NO_ACTIVITY: 'NO ACTIVITY: flat right now, but still within the same calendar year as the latest trade in the book -- another put or call on this ticker would resume this wheel.',
+  CLOSED: 'CLOSED: terminal. The year has turned since the last trade, or the stock was called away.',
 };
+
+const STATUS_LABELS = { ACTIVE: 'ACTIVE', NO_ACTIVITY: 'NO ACTIVITY', CLOSED: 'CLOSED' };
+function statusLabel(status) {
+  return STATUS_LABELS[status] || String(status || '').replace(/_/g, ' ');
+}
 
 const CYCLE_COLUMNS = [
   { key: 'cycle_id', label: 'Cycle', left: true },
@@ -2810,7 +2815,7 @@ function renderCycles(cycles) {
     tr.appendChild(idCell);
 
     const statusCell = el('td', { class: 'left' });
-    const statusBadge = el('span', { class: 'badge ' + cycle.status }, cycle.status);
+    const statusBadge = el('span', { class: 'badge ' + cycle.status }, statusLabel(cycle.status));
     setFormula(statusBadge, CYCLE_STATUS_MEANING[cycle.status] || null);
     statusCell.appendChild(statusBadge);
     tr.appendChild(statusCell);
@@ -4025,11 +4030,11 @@ function resetSelectionState() {
   $('end').value = '';
 }
 
-function renderChips(hostId, values, selected, onToggle) {
+function renderChips(hostId, values, selected, onToggle, labelFn) {
   const host = $(hostId);
   clear(host);
   for (const value of values) {
-    const chip = el('button', { class: 'chip', type: 'button' }, value);
+    const chip = el('button', { class: 'chip', type: 'button' }, labelFn ? labelFn(value) : value);
     chip.setAttribute('aria-pressed', selected.has(value) ? 'true' : 'false');
     chip.addEventListener('click', () => onToggle(value));
     host.appendChild(chip);
@@ -4549,7 +4554,8 @@ function renderTradeLogSummary(entry) {
   const host = $('tradelog-summary');
   clear(host);
   host.hidden = false;
-  host.classList.toggle('closed', !entry.is_open);
+  host.classList.toggle('closed', entry.status === 'CLOSED');
+  host.classList.toggle('no-activity', entry.status === 'NO_ACTIVITY');
 
   const cents = (value) => money(value, { cents: true });
   const perShare = (value) => (value === null || value === undefined ? '—' : '$' + value.toFixed(2));
@@ -4568,11 +4574,12 @@ function renderTradeLogSummary(entry) {
     })
   );
   host.appendChild(
-    tradeLogCell('Status', entry.status, {
+    tradeLogCell('Status', statusLabel(entry.status), {
       help: formula([
         'ACTIVE: something is still open (a contract or shares).',
-        'CLOSED: flat, and never went through an assignment.',
-        'ASSIGNED: flat now, but an assignment happened along the way.',
+        'NO ACTIVITY: flat, but still the same calendar year as the latest trade in the book.',
+        'A new put or call on this ticker would resume the wheel.',
+        'CLOSED: terminal. The year has turned, or the stock was called away.',
       ]),
     })
   );
@@ -4939,8 +4946,10 @@ function renderTradeLog() {
       (wheel.name ? ` (${wheel.name})` : '') +
       ` · ${wheel.start_date} → ${wheel.end_date || 'current'}` +
       ` · ${wheel.transactions.length} entries`;
-    // Closed (or assigned-and-flat) wheels are tinted salmon in the list.
-    pick.appendChild(el('option', { value: wheel.cycle_id, class: wheel.is_open ? '' : 'closed' }, label));
+    // Terminal (CLOSED) wheels are tinted salmon in the list; dormant
+    // (NO_ACTIVITY) wheels are tinted amber.
+    const optClass = wheel.status === 'CLOSED' ? 'closed' : wheel.status === 'NO_ACTIVITY' ? 'no-activity' : '';
+    pick.appendChild(el('option', { value: wheel.cycle_id, class: optClass }, label));
   }
 
   const empty = $('tradelog-empty');
@@ -5021,11 +5030,17 @@ function render() {
     else state.tickers.add(value);
     load();
   });
-  renderChips('status-chips', meta.statuses, state.statuses, (value) => {
-    if (state.statuses.has(value)) state.statuses.delete(value);
-    else state.statuses.add(value);
-    load();
-  });
+  renderChips(
+    'status-chips',
+    meta.statuses,
+    state.statuses,
+    (value) => {
+      if (state.statuses.has(value)) state.statuses.delete(value);
+      else state.statuses.add(value);
+      load();
+    },
+    statusLabel
+  );
 
   renderNotices(meta, reconciliation);
   renderTiles(portfolio, reconciliation);

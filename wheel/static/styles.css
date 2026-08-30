@@ -30,6 +30,7 @@
   --success-text: #006300;
 
   --closed-bg: #ffe6df; /* salmon - a closed wheel in the Trade Log */
+  --noactivity-bg: #fff4d6; /* pale amber - a NO_ACTIVITY (dormant) wheel */
 
   --radius: 10px;
   --gap: 18px;
@@ -56,6 +57,7 @@
     --mid: #383835;
     --success-text: #0ca30c;
     --closed-bg: #4a2b25;
+    --noactivity-bg: #4a4325;
   }
 }
 
@@ -79,6 +81,7 @@
   --mid: #383835;
   --success-text: #0ca30c;
   --closed-bg: #4a2b25;
+  --noactivity-bg: #4a4325;
 }
 
 * {
@@ -676,13 +679,13 @@ th.sortable:hover {
   border-color: var(--series-1);
 }
 
-.badge.CLOSED {
-  color: var(--text-secondary);
+.badge.NO_ACTIVITY {
+  color: var(--warning);
+  border-color: var(--warning);
 }
 
-.badge.ASSIGNED {
-  color: var(--series-2);
-  border-color: var(--series-2);
+.badge.CLOSED {
+  color: var(--text-secondary);
 }
 
 .ticker-cell {
@@ -942,8 +945,9 @@ tr.detail > td {
   min-width: 0;
 }
 
-/* Closed wheels are salmon in the dropdown list. Only the options are tinted --
-   styling the <select> itself bleeds its background onto every option. */
+/* Closed wheels are salmon and dormant (NO_ACTIVITY) wheels are amber in the
+   dropdown list. Only the options are tinted -- styling the <select> itself
+   bleeds its background onto every option. */
 #tradelog-pick option {
   background-color: var(--surface-1);
   color: var(--text-primary);
@@ -951,6 +955,10 @@ tr.detail > td {
 
 #tradelog-pick option.closed {
   background-color: var(--closed-bg);
+}
+
+#tradelog-pick option.no-activity {
+  background-color: var(--noactivity-bg);
 }
 
 .tradelog-nav button {
@@ -983,6 +991,11 @@ tr.detail > td {
 .tradelog-summary.closed {
   background: var(--closed-bg);
   border-color: var(--closed-bg);
+}
+
+.tradelog-summary.no-activity {
+  background: var(--noactivity-bg);
+  border-color: var(--noactivity-bg);
 }
 
 .tradelog-summary .tl-cell {

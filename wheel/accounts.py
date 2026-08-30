@@ -867,7 +867,7 @@ def _combine_meta(
         "data_first_date": min(first_dates) if first_dates else None,
         "data_last_date": max(last_dates) if last_dates else None,
         "available_tickers": sorted({ticker for meta in metas for ticker in meta["available_tickers"]}),
-        "statuses": ["ACTIVE", "CLOSED", "ASSIGNED"],
+        "statuses": ["ACTIVE", "NO_ACTIVITY", "CLOSED"],
         "transactions_in_slice": sum(meta["transactions_in_slice"] for meta in metas),
         "transactions_total": sum(meta["transactions_total"] for meta in metas),
         "columns_swapped": any(meta["columns_swapped"] for meta in metas),

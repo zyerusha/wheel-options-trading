@@ -70,9 +70,9 @@ LONG_CALL = "LONG_CALL"
 WHEEL_STRATEGIES = frozenset({CSP, COVERED_CALL})
 
 # Cycle status
-ACTIVE = "ACTIVE"
-CLOSED = "CLOSED"
-ASSIGNED_STATUS = "ASSIGNED"
+ACTIVE = "ACTIVE"  # something is still open
+NO_ACTIVITY = "NO_ACTIVITY"  # flat, but a same-year trade would resume this cycle
+CLOSED = "CLOSED"  # terminal: the year has turned, or the stock was called away
 
 # Share-lot provenance
 FROM_PUT_ASSIGNMENT = "PUT_ASSIGNMENT"
@@ -376,6 +376,11 @@ class Cycle:
     # True when some committed capital is a proxy (short calls backed by stock
     # acquired before this export) rather than a figure derived from the file.
     capital_estimated: bool = False
+    # Set by the engine once the whole book is built: this cycle went flat but a
+    # same-year option trade on the ticker would re-open it (see
+    # ``_resumable_cycle``). Terminal cycles -- year turned, or stock called
+    # away -- have this False.
+    resumable: bool = False
 
     @property
     def is_open(self) -> bool:
@@ -385,7 +390,7 @@ class Cycle:
     def status(self) -> str:
         if self.is_open:
             return ACTIVE
-        return ASSIGNED_STATUS if self.assignments else CLOSED
+        return NO_ACTIVITY if self.resumable else CLOSED
 
     @property
     def had_assignment(self) -> bool:
@@ -1107,6 +1112,23 @@ class WheelEngine:
     # ---------------- finalize ----------------
 
     def _finalize(self) -> None:
+        # A flat cycle is NO_ACTIVITY (resumable) while a same-year trade could
+        # re-open it -- i.e. it closed in the same calendar year as the book's
+        # latest activity and its stock was not called away. Otherwise CLOSED.
+        last_year = _last_date(self.transactions).year if self.transactions else date.today().year
+        latest_by_underlying: dict[str, Cycle] = {}
+        for cycle in self.cycles:
+            latest_by_underlying[cycle.underlying] = cycle
+        for cycle in self.cycles:
+            if cycle.end_date is None:
+                continue  # still open -> ACTIVE
+            # Only the ticker's most recent cycle can be resumed; an older one is
+            # shadowed by whatever came after it and is terminal.
+            if latest_by_underlying.get(cycle.underlying) is not cycle:
+                continue
+            called_away = any(a.direction == "DISPOSE" for a in cycle.assignments)
+            cycle.resumable = (not called_away) and cycle.end_date.year == last_year
+
         for underlying, legs in self._open_legs.items():
             for leg in legs:
                 if leg.is_open and leg.expiry and leg.expiry < _last_date(self.transactions):

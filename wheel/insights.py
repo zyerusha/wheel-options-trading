@@ -118,7 +118,7 @@ def wheel_insights(
             "annualized on the capital it tied up."
         )
     if not cycle.is_open and mark_to_market_pl is not None and mark_to_market_pl > 0:
-        strengths.append(f"This wheel closed flat at +{_money(mark_to_market_pl)}.")
+        strengths.append(f"This wheel is flat and green right now at +{_money(mark_to_market_pl)}.")
 
     # ---------------- improvements (ranked by $ impact) ----------------
 
