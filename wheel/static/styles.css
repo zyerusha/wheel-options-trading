@@ -871,9 +871,55 @@ tr.detail > td {
 #tab-tradelog[hidden],
 #tradelog-summary[hidden],
 #tradelog-bridge[hidden],
+#tradelog-insights[hidden],
 #tradelog-empty[hidden],
 #tradelog-note[hidden] {
   display: none;
+}
+
+.tradelog-insights {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  margin-bottom: 14px;
+}
+
+.tradelog-insights .ti-head {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
+.tradelog-insights .ti-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 5px;
+}
+
+.tradelog-insights li {
+  display: flex;
+  gap: 8px;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
+
+.tradelog-insights .ti-mark {
+  flex: 0 0 auto;
+  font-weight: 700;
+}
+
+.tradelog-insights .ti-good .ti-mark {
+  color: var(--success-text);
+}
+
+.tradelog-insights .ti-improve .ti-mark {
+  color: var(--warning);
 }
 
 /* ---------------- trade log ---------------- */

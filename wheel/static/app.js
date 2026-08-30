@@ -2307,8 +2307,12 @@ function drawTimeline(cycles, through) {
     return;
   }
 
+  // Label each row with the *real* wheel id from the Trade Log (built from full
+  // history), so the two views agree even when a date filter has renumbered the
+  // cycles here.
   const ordered = cycles
     .slice()
+    .map((cycle) => ({ ...cycle, cycle_id: (matchTradeLogWheel(cycle) || cycle).cycle_id }))
     .sort((a, b) => parseDay(a.start_date) - parseDay(b.start_date) || a.cycle_id.localeCompare(b.cycle_id));
 
   const endOf = (leg) => leg.close_date || through;
@@ -2391,7 +2395,7 @@ function drawTimeline(cycles, through) {
       width,
       height: rowHeight + rowPad,
     });
-    rowHit.addEventListener('click', () => openTradeLog(row.cycle.cycle_id));
+    rowHit.addEventListener('click', () => openTradeLog(row.cycle));
     group.appendChild(rowHit);
 
     const label = svgEl(
@@ -2406,7 +2410,7 @@ function drawTimeline(cycles, through) {
       row.cycle.cycle_id
     );
     label.style.cursor = 'pointer';
-    label.addEventListener('click', () => openTradeLog(row.cycle.cycle_id));
+    label.addEventListener('click', () => openTradeLog(row.cycle));
     group.appendChild(label);
 
     row.placed.forEach(({ leg, lane }) => {
@@ -2483,7 +2487,7 @@ function drawTimeline(cycles, through) {
         ...(leg.opened_by_roll ? [{ label: 'Opened by', value: 'roll ' + leg.opened_by_roll }] : []),
         ...(closedByRolls.length ? [{ label: 'Closed by', value: 'roll ' + closedByRolls.join(', ') }] : []),
       ], legCollateralFormula(leg));
-      hit.addEventListener('click', () => openTradeLog(row.cycle.cycle_id));
+      hit.addEventListener('click', () => openTradeLog(row.cycle, leg.open_date));
       group.appendChild(hit);
     });
   });
@@ -4257,16 +4261,24 @@ function orderedTradeLog() {
   const wheels = (state.data && state.data.trade_log && state.data.trade_log.wheels) || [];
   const ticker = state.tradeLogTicker || null;
   return wheels
-    .filter((wheel) => (!ticker || wheel.underlying === ticker) && tradeLogInWindow(wheel))
+    .filter(
+      (wheel) =>
+        wheel.cycle_id === state.tradeLogCycleId || // the current selection is never filtered out
+        ((!ticker || wheel.underlying === ticker) && tradeLogInWindow(wheel))
+    )
     .sort((a, b) =>
       a.start_date < b.start_date ? 1 : a.start_date > b.start_date ? -1 : a.cycle_id.localeCompare(b.cycle_id)
     );
 }
 
-/** Tickers that have at least one wheel displayable under the date window, sorted. */
+/** Tickers with a wheel displayable under the date window (plus the selected
+ *  wheel's ticker, so a click-through selection never drops its own option). */
 function tradeLogTickers() {
   const wheels = (state.data && state.data.trade_log && state.data.trade_log.wheels) || [];
-  return [...new Set(wheels.filter(tradeLogInWindow).map((wheel) => wheel.underlying))].sort();
+  const tickers = new Set(wheels.filter(tradeLogInWindow).map((wheel) => wheel.underlying));
+  const selected = wheels.find((wheel) => wheel.cycle_id === state.tradeLogCycleId);
+  if (selected) tickers.add(selected.underlying);
+  return [...tickers].sort();
 }
 
 function renderTabs() {
@@ -4282,12 +4294,45 @@ function switchTab(name) {
   state.activeTab = name;
   renderTabs();
   if (name === 'tradelog') renderTradeLog();
+  // A new top-level view -- don't leave the reader parked wherever the old
+  // (often much taller) page was scrolled.
+  const tabs = document.querySelector('nav.tabs');
+  if (tabs) tabs.scrollIntoView({ block: 'start' });
+}
+
+/**
+ * Resolve a Dashboard cycle (possibly renumbered by a date filter) to its real
+ * Trade Log wheel: same ticker + account, then the wheel whose date span
+ * contains a probe date that is definitely inside the one the user aimed at --
+ * a specific leg's open date if given, otherwise the cycle's last activity.
+ */
+function matchTradeLogWheel(cycle, atDate) {
+  const wheels = (state.data && state.data.trade_log && state.data.trade_log.wheels) || [];
+  const same = wheels.filter(
+    (w) =>
+      w.underlying === cycle.underlying && (cycle.account_id == null || w.account_id === cycle.account_id)
+  );
+  const probe = atDate || cycle.last_activity || cycle.end_date || cycle.start_date;
+  const byStart = (a, b) => (a.start_date < b.start_date ? 1 : -1);
+  return (
+    same.find((w) => w.start_date <= probe && (w.end_date === null || probe <= w.end_date)) ||
+    same
+      .filter(
+        (w) => w.start_date <= (cycle.end_date || '9999') && (w.end_date || '9999') >= cycle.start_date
+      )
+      .sort(byStart)[0] ||
+    same.slice().sort(byStart)[0] ||
+    null
+  );
 }
 
 /** Click-through from the Dashboard's Wheel-timelines chart. */
-function openTradeLog(cycleId) {
-  state.tradeLogCycleId = cycleId;
-  state.tradeLogTicker = null; // don't let a stale ticker filter hide the clicked wheel
+function openTradeLog(cycle, atDate) {
+  const match = matchTradeLogWheel(cycle, atDate);
+  if (match) {
+    state.tradeLogCycleId = match.cycle_id;
+    state.tradeLogTicker = match.underlying; // scope the picker to this ticker
+  }
   switchTab('tradelog');
 }
 
@@ -4316,6 +4361,35 @@ function tradeLogCell(label, value, { help, foot, tone } = {}) {
   cell.appendChild(valueNode);
   if (foot) cell.appendChild(el('div', { class: 'tl-foot' }, foot));
   return cell;
+}
+
+/**
+ * Rule-based commentary for the selected wheel: strengths (green check) and
+ * things to improve (amber arrow), from `entry.insights` -- see
+ * `wheel/insights.py`. Hidden when there is nothing to say.
+ */
+function renderTradeLogInsights(entry) {
+  const host = $('tradelog-insights');
+  clear(host);
+  const insights = entry.insights || { strengths: [], improvements: [] };
+  const lines = [
+    ...insights.strengths.map((text) => ['good', '✓', text]),
+    ...insights.improvements.map((text) => ['improve', '▸', text]),
+  ];
+  if (!lines.length) {
+    host.hidden = true;
+    return;
+  }
+  host.hidden = false;
+  host.appendChild(el('div', { class: 'ti-head' }, 'Insights'));
+  const list = el('ul', { class: 'ti-list' });
+  for (const [cls, mark, text] of lines) {
+    const li = el('li', { class: 'ti-' + cls });
+    li.appendChild(el('span', { class: 'ti-mark' }, mark));
+    li.appendChild(el('span', {}, text));
+    list.appendChild(li);
+  }
+  host.appendChild(list);
 }
 
 /**
@@ -4576,6 +4650,10 @@ function renderTradeLogSummary(entry) {
   );
   host.appendChild(
     tradeLogCell('Capital committed now', money(entry.capital_committed_now), {
+      foot:
+        entry.capital_committed_pct === null || entry.capital_committed_pct === undefined
+          ? null
+          : `${pct(entry.capital_committed_pct, 1)} of ${entry.capital_committed_pct_of}`,
       help: formula([
         'Collateral tied up right now, the sum of:',
         'short-put collateral (strike × 100 × contracts),',
@@ -4871,6 +4949,7 @@ function renderTradeLog() {
     empty.textContent = 'No wheels in this account yet.';
     $('tradelog-summary').hidden = true;
     $('tradelog-bridge').hidden = true;
+    $('tradelog-insights').hidden = true;
     $('tradelog-note').hidden = true;
     clear($('tradelog-table'));
     return;
@@ -4894,12 +4973,14 @@ function renderTradeLog() {
       'Pick a wheel above, or click one in the Dashboard’s “Wheel timelines” chart.';
     $('tradelog-summary').hidden = true;
     $('tradelog-bridge').hidden = true;
+    $('tradelog-insights').hidden = true;
     $('tradelog-note').hidden = true;
     clear($('tradelog-table'));
     return;
   }
 
   empty.hidden = true;
+  renderTradeLogInsights(entry);
   drawTradeLogBridge(entry);
   renderTradeLogSummary(entry);
   renderTradeLogTable(entry);

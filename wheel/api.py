@@ -20,6 +20,7 @@ from wheel import cashflow as cf
 from wheel import marketdata
 from wheel.engine import LONG, Cycle, WheelEngine, build_cycles
 from wheel.fileio import peek_text
+from wheel.insights import wheel_insights
 from wheel.metrics import (
     capital_timeline,
     cycle_metrics,
@@ -629,11 +630,15 @@ def _trade_log_entry(
     )
     # The stock price at which the whole campaign nets to $0: raw cost of the
     # shares still held, less every other dollar the campaign has banked or paid.
+    # <= 0 means the premium/profit already banked exceeds the share cost -- there
+    # is no "price to reach", so it is reported as None (an insight covers it).
     break_even_price = (
         cost_basis - non_stock_pl / shares_held
         if shares_held > 1e-9 and cost_basis is not None
         else None
     )
+    if break_even_price is not None and break_even_price <= 0:
+        break_even_price = None
     dollars_to_break_even = (
         shares_held * (break_even_price - current_price)
         if break_even_price is not None and current_price is not None
@@ -695,6 +700,15 @@ def _trade_log_entry(
         "break_even_price": _money(break_even_price),
         "dollars_to_break_even": _money(dollars_to_break_even),
         "pl_bridge": pl_bridge,
+        "insights": wheel_insights(
+            cycle,
+            metrics,
+            current_price=current_price,
+            cost_basis=cost_basis,
+            dividends=dividends,
+            break_even_price=break_even_price,
+            mark_to_market_pl=mark_to_market_pl,
+        ),
         "dividends": _money(dividends),
         "total_fees_commissions": _money(total_fees_commissions),
         "capital_committed_now": _money(metrics.current_collateral),
@@ -1289,6 +1303,21 @@ class Dashboard:
             )
             for cycle in sorted(self.all_cycles, key=lambda cycle: (cycle.start_date, cycle.underlying))
         ]
+
+        # Each wheel's currently-committed capital as a share of the account:
+        # of total account value when a Positions snapshot is on hand, otherwise
+        # of the capital committed across every wheel right now.
+        net_worth = getattr(self, "_net_worth", None) or {}
+        if net_worth.get("available") and net_worth.get("total_value"):
+            denom, denom_label = net_worth["total_value"], "account value"
+        else:
+            denom = sum(w["capital_committed_now"] or 0.0 for w in wheels)
+            denom_label = "capital in wheels"
+        for wheel in wheels:
+            cap = wheel["capital_committed_now"] or 0.0
+            wheel["capital_committed_pct"] = round(100.0 * cap / denom, 1) if denom and cap else None
+            wheel["capital_committed_pct_of"] = denom_label
+
         return {"wheels": wheels, "warnings": warnings}
 
     # ---- query ----
