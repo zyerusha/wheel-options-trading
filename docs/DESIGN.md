@@ -74,17 +74,38 @@ then re-entered *with an option (STO/BTO)*, the engine reopens the most recent c
 - the re-entry falls in a **later calendar year**. The year is a deliberate cut point
   (it also resets the `-<n>` sequence), so a position carried across New Year's still
   starts a fresh `<ticker>-<year>-1`.
+- the flat cycle **is not a wheel** (`Cycle.is_wheel` is `False` — a lone directional
+  option punt, see below). A later put must not fold that unrelated trade's premium
+  into a wheel's cost basis and metrics, so it opens a fresh cycle instead.
 
 A bare stock purchase after a flat gap also starts its own cycle. A resumed cycle
 keeps its original id and simply spans the flat days; committed capital reads $0
 across them.
 
 Status is `ACTIVE` while anything is open. A flat cycle is `NO_ACTIVITY` while it is
-still resumable — its `end_date` falls in the same calendar year as the latest trade
-in the book and its stock was not called away, so another option on the ticker would
-reopen it. Otherwise it is `CLOSED` (terminal): the year has turned since the last
-trade, or a covered call was assigned and the stock disposed. The frontend renders
-`NO_ACTIVITY` as "NO ACTIVITY" and tints only `CLOSED` wheels salmon.
+still resumable — it is an actual wheel whose `end_date` falls in the same calendar
+year as the latest trade in the book and whose stock was not called away, so another
+option on the ticker would reopen it. Otherwise it is `CLOSED` (terminal): the year
+has turned since the last trade, a covered call was assigned and the stock disposed,
+or the cycle was never a wheel to begin with (a directional option trade is done when
+its option closes). The frontend renders `NO_ACTIVITY` as "NO ACTIVITY" and tints only
+`CLOSED` wheels salmon.
+
+### Wheel vs directional cycles
+
+`Cycle.is_wheel` is `False` for a cycle that only ever *bought* options — a lone
+directional call or put, an unpaired protective leg — and never sold a cash-secured
+put or covered call, never held shares, never took assignment. Such a cycle ties up
+nothing but its own premium and closes in days, so annualizing its result produces a
+meaningless five-figure "ROC" (a $400 premium lost over two days ≈ −18,000%). Its
+realized P&L is still real and still counts toward every P&L total — `net_realized_pl`,
+`option_realized_pl`, the account rollups. Only the **wheel-framed ratios** are
+withheld: `annualized_wheel_roc_pct`, `roi_on_avg_wheel_pct`, `net_option_yield_pct`,
+`profit_per_day`, `win_rate_pct` all come back `None` from `cycle_metrics`, and
+`portfolio_metrics` / `ticker_summary` compute those ratios from wheel cycles only
+(the XIRR ledger in `wheel_cash_flow_events` / `wheel_terminal_value` skips them too).
+The Trade Log tags the cycle "Directional (non-wheel)", the Dashboard cycle table adds
+a `directional` badge, and the timeline marks the row with a `◇`.
 
 ### Intra-day ordering
 

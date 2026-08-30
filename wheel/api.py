@@ -614,6 +614,14 @@ def _trade_log_entry(
     total_days_held = sum(leg_days)
     pl_per_day_held = closed_leg_pl / total_days_held if total_days_held else None
 
+    # A lone directional/long-only cycle keeps its real P&L below but is not
+    # running the wheel, so the wheel-framed ratios are withheld -- see
+    # Cycle.is_wheel. (annualized_wheel_roc_pct / roi_on_avg_wheel_pct /
+    # win_rate_pct already come back None from cycle_metrics; these two are
+    # derived here, so they're nulled here.)
+    if not cycle.is_wheel:
+        pl_per_day_held = None
+
     # Where the campaign really stands right now, vs the misleading realized-only
     # figure. Open option legs are valued at expiry (`option_open_premium`: a
     # long put's whole debit is a loss, a short call's whole credit a gain) --
@@ -683,6 +691,7 @@ def _trade_log_entry(
         "name": name,
         "status": cycle.status,
         "is_open": cycle.is_open,
+        "is_wheel": cycle.is_wheel,
         "start_date": _iso(cycle.start_date),
         "end_date": _iso(cycle.end_date),
         "cost_basis_per_share": _money(cost_basis),

@@ -113,7 +113,10 @@ class TestBasicLifecycle(unittest.TestCase):
         leg = cycles[0].legs[0]
         self.assertEqual(leg.side, LONG)
         self.assertAlmostEqual(leg.realized_pl, 1258.66, places=2)
-        self.assertEqual(cycles[0].status, NO_ACTIVITY)
+        # A lone directional long is not a wheel, so it is terminal once flat --
+        # never NO_ACTIVITY (a later put would open a fresh wheel, not resume this).
+        self.assertFalse(cycles[0].is_wheel)
+        self.assertEqual(cycles[0].status, CLOSED)
 
 
 class TestPartialFillsAndFIFO(unittest.TestCase):
@@ -726,6 +729,65 @@ class TestCycleBoundaries(unittest.TestCase):
         self.assertEqual(engine.unmatched_closes, [])
         self.assertEqual(cycles[0].start_date, date(2025, 11, 17))
         self.assertEqual(cycles[0].legs[1].strategy, COVERED_CALL)
+
+
+class TestIsWheel(unittest.TestCase):
+    def test_cash_secured_put_is_a_wheel(self):
+        cycles, _ = build_cycles([tx("2025-01-02", STO, "-MU250117P100", -1, 3.0, 300.0, row_id=1)])
+        self.assertTrue(cycles[0].is_wheel)
+
+    def test_lone_long_call_is_not_a_wheel(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2026-02-04", BTO, "-TQQQ260206C51", 3, 1.32, -398.02, row_id=1),
+                tx("2026-02-06", EXPIRED, "-TQQQ260206C51", -3, None, 0.0, row_id=2, as_of="2026-02-06"),
+            ]
+        )
+        self.assertFalse(cycles[0].is_wheel)
+
+    def test_lone_long_put_is_not_a_wheel(self):
+        cycles, _ = build_cycles([tx("2025-01-01", BTO, "-XYZ250601P100", 1, 10.0, -1000.0, row_id=1)])
+        self.assertFalse(cycles[0].is_wheel)
+
+    def test_bought_shares_make_it_a_wheel(self):
+        cycles, _ = build_cycles([tx("2025-01-01", BUY_STOCK, "XYZ", 100, 50.0, -5000.0, row_id=1)])
+        self.assertTrue(cycles[0].is_wheel)
+
+    def test_assignment_makes_it_a_wheel(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-02", STO, "-MU250117P100", -1, 3.0, 300.0, row_id=1),
+                tx("2025-01-17", ASSIGNED, "-MU250117P100", 1, None, 0.0, row_id=2, as_of="2025-01-17"),
+            ]
+        )
+        self.assertTrue(cycles[0].is_wheel)
+
+    def test_long_hedge_inside_a_wheel_stays_a_wheel(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250601P90", -1, 1.0, 100.0, row_id=1),
+                tx("2025-01-01", BTO, "-XYZ250201P100", 1, 10.0, -1000.0, row_id=2),
+            ]
+        )
+        self.assertTrue(cycles[0].is_wheel)
+
+    def test_a_directional_cycle_does_not_absorb_a_later_wheel(self):
+        """A lone call that expired, then a cash-secured put on the same ticker
+        the same year: the put opens a fresh wheel, it does not resume the
+        directional cycle (whose status is therefore terminal CLOSED).
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2026-02-04", BTO, "-TQQQ260206C51", 3, 1.32, -398.02, row_id=1),
+                tx("2026-02-06", EXPIRED, "-TQQQ260206C51", -3, None, 0.0, row_id=2, as_of="2026-02-06"),
+                tx("2026-05-01", STO, "-TQQQ260516P45", -1, 1.50, 150.0, row_id=3),
+            ]
+        )
+        self.assertEqual(len(cycles), 2)
+        self.assertFalse(cycles[0].is_wheel)
+        self.assertEqual(cycles[0].status, CLOSED)
+        self.assertTrue(cycles[1].is_wheel)
+        self.assertEqual([c.cycle_id for c in cycles], ["TQQQ-2026-1", "TQQQ-2026-2"])
 
 
 if __name__ == "__main__":

@@ -2398,18 +2398,24 @@ function drawTimeline(cycles, through) {
     rowHit.addEventListener('click', () => openTradeLog(row.cycle));
     group.appendChild(rowHit);
 
+    const nonWheel = row.cycle.is_wheel === false;
     const label = svgEl(
       'text',
       {
         x: margin.left - 10,
         y: top + rowHeight / 2 + 4,
         'text-anchor': 'end',
-        fill: 'var(--text-secondary)',
+        fill: nonWheel ? 'var(--text-muted)' : 'var(--text-secondary)',
         'font-weight': 600,
       },
-      row.cycle.cycle_id
+      nonWheel ? row.cycle.cycle_id + ' ◇' : row.cycle.cycle_id
     );
     label.style.cursor = 'pointer';
+    if (nonWheel) {
+      label.appendChild(
+        svgEl('title', {}, 'Directional (non-wheel): long options only. Excluded from wheel-return figures.')
+      );
+    }
     label.addEventListener('click', () => openTradeLog(row.cycle));
     group.appendChild(label);
 
@@ -2804,7 +2810,12 @@ function renderCycles(cycles) {
   }
 
   for (const cycle of sorted) {
-    const tr = el('tr', { class: 'cycle-row' + (state.expanded.has(cycle.cycle_id) ? ' open' : '') });
+    const tr = el('tr', {
+      class:
+        'cycle-row' +
+        (state.expanded.has(cycle.cycle_id) ? ' open' : '') +
+        (cycle.is_wheel === false ? ' non-wheel' : ''),
+    });
 
     const idCell = el('td', { class: 'left ticker-cell' });
     idCell.appendChild(document.createTextNode(cycle.cycle_id));
@@ -2818,6 +2829,16 @@ function renderCycles(cycles) {
     const statusBadge = el('span', { class: 'badge ' + cycle.status }, statusLabel(cycle.status));
     setFormula(statusBadge, CYCLE_STATUS_MEANING[cycle.status] || null);
     statusCell.appendChild(statusBadge);
+    if (cycle.is_wheel === false) {
+      const tag = el('span', { class: 'badge DIRECTIONAL' }, 'directional');
+      setFormula(
+        tag,
+        'Long options only -- no cash-secured put, covered call, shares or assignment. ' +
+          'P&L counts toward every total, but the wheel-return ratios (Wheel ROC, PPD, ' +
+          'Net Option Yield) are withheld and show as a dash.'
+      );
+      statusCell.appendChild(tag);
+    }
     tr.appendChild(statusCell);
 
     tr.appendChild(el('td', { class: 'left' }, cycle.start_date));
@@ -4560,6 +4581,14 @@ function renderTradeLogSummary(entry) {
   const cents = (value) => money(value, { cents: true });
   const perShare = (value) => (value === null || value === undefined ? '—' : '$' + value.toFixed(2));
 
+  // Wheel-return ratios are withheld for a directional (non-wheel) cycle --
+  // show "n/a" with a pointer to the Kind cell rather than a bare dash.
+  const notWheel = entry.is_wheel === false;
+  const wheelHelp = formula([
+    'Not a wheel -- this cycle only ever held long options,',
+    'so wheel-return ratios do not apply here. See "Kind" above.',
+  ]);
+
   host.appendChild(
     tradeLogCell('Ticker', entry.underlying + (entry.capital_estimated ? ' ~' : ''), {
       help: formula([
@@ -4581,6 +4610,24 @@ function renderTradeLogSummary(entry) {
         'A new put or call on this ticker would resume the wheel.',
         'CLOSED: terminal. The year has turned, or the stock was called away.',
       ]),
+    })
+  );
+  host.appendChild(
+    tradeLogCell('Kind', entry.is_wheel === false ? 'Directional (non-wheel)' : 'Wheel', {
+      help: formula(
+        entry.is_wheel === false
+          ? [
+              'This cycle only ever held long options -- no cash-secured put,',
+              'no covered call, no shares, no assignment.',
+              'Its P&L is real and counts toward every total, but wheel-return',
+              'ratios (Wheel ROC, win rate, P&L / day held) are withheld: they',
+              'would just annualize a short-dated premium bet into nonsense.',
+            ]
+          : [
+              'This cycle is running the wheel: it sold cash-secured puts and/or',
+              'covered calls, and may have taken assignment of shares.',
+            ]
+      ),
     })
   );
   host.appendChild(
@@ -4713,27 +4760,32 @@ function renderTradeLogSummary(entry) {
   host.appendChild(
     tradeLogCell(
       'P&L / day held',
-      entry.pl_per_day_held === null ? '—' : cents(entry.pl_per_day_held) + '/day',
+      notWheel ? 'n/a' : entry.pl_per_day_held === null ? '—' : cents(entry.pl_per_day_held) + '/day',
       {
-        foot: entry.closed_leg_count
-          ? `${entry.closed_leg_count} closed legs over ${entry.total_days_held} days held`
-          : null,
-        help: formula([
-          'Total option P&L divided by total days a position was held.',
-          `= ${cents(entry.closed_leg_pl)} ÷ ${entry.total_days_held} days`,
-          `= ${entry.pl_per_day_held === null ? '—' : cents(entry.pl_per_day_held)}/day`,
-          'Closed legs only. Each roll segment counts on its own.',
-        ]),
+        foot:
+          notWheel || !entry.closed_leg_count
+            ? null
+            : `${entry.closed_leg_count} closed legs over ${entry.total_days_held} days held`,
+        help: notWheel
+          ? wheelHelp
+          : formula([
+              'Total option P&L divided by total days a position was held.',
+              `= ${cents(entry.closed_leg_pl)} ÷ ${entry.total_days_held} days`,
+              `= ${entry.pl_per_day_held === null ? '—' : cents(entry.pl_per_day_held)}/day`,
+              'Closed legs only. Each roll segment counts on its own.',
+            ]),
       }
     )
   );
   host.appendChild(
-    tradeLogCell('Win rate', pct(entry.win_rate_pct), {
-      foot: `${entry.wins} / ${entry.wins + entry.losses} closed legs`,
-      help: formula([
-        'Winning legs ÷ (winning + losing) closed legs.',
-        'Open legs and exact break-evens are excluded from the count.',
-      ]),
+    tradeLogCell('Win rate', notWheel ? 'n/a' : pct(entry.win_rate_pct), {
+      foot: notWheel ? null : `${entry.wins} / ${entry.wins + entry.losses} closed legs`,
+      help: notWheel
+        ? wheelHelp
+        : formula([
+            'Winning legs ÷ (winning + losing) closed legs.',
+            'Open legs and exact break-evens are excluded from the count.',
+          ]),
     })
   );
   host.appendChild(
@@ -4742,21 +4794,23 @@ function renderTradeLogSummary(entry) {
     })
   );
   host.appendChild(
-    tradeLogCell('Annualized Wheel ROC', pct(entry.annualized_wheel_roc_pct), {
+    tradeLogCell('Annualized Wheel ROC', notWheel ? 'n/a' : pct(entry.annualized_wheel_roc_pct), {
       tone:
-        entry.annualized_wheel_roc_pct === null
+        notWheel || entry.annualized_wheel_roc_pct === null
           ? null
           : entry.annualized_wheel_roc_pct >= 0
           ? 'pos'
           : 'neg',
-      help: formula([
-        'Option P/L on the capital it tied up, scaled to a year.',
-        '(Option P/L ÷ Avg collateral) × (365 ÷ Days active)',
-        `= (${cents(entry.option_realized_pl)} ÷ ${money(entry.avg_collateral)})` +
-          ` × (365 ÷ ${entry.days_active})`,
-        `= ${pct(entry.annualized_wheel_roc_pct)}`,
-        'Option P/L only, never stock P/L. Same figure the Dashboard shows.',
-      ]),
+      help: notWheel
+        ? wheelHelp
+        : formula([
+            'Option P/L on the capital it tied up, scaled to a year.',
+            '(Option P/L ÷ Avg collateral) × (365 ÷ Days active)',
+            `= (${cents(entry.option_realized_pl)} ÷ ${money(entry.avg_collateral)})` +
+              ` × (365 ÷ ${entry.days_active})`,
+            `= ${pct(entry.annualized_wheel_roc_pct)}`,
+            'Option P/L only, never stock P/L. Same figure the Dashboard shows.',
+          ]),
     })
   );
 

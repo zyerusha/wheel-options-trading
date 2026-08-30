@@ -397,6 +397,28 @@ class Cycle:
         return bool(self.assignments)
 
     @property
+    def is_wheel(self) -> bool:
+        """True when this cycle is running the wheel, not just holding long
+        options.
+
+        A wheel sells cash-secured puts and/or covered calls, and often takes
+        assignment of shares along the way. A cycle that only ever *bought*
+        options -- a lone directional call or put, an unpaired protective leg
+        -- ties up nothing but its own premium and closes in days, so the
+        wheel-framed ratios (Annualized Wheel ROC, Net Option Yield, win rate,
+        P&L per day held) are meaningless for it: annualizing a total loss of
+        a $400 premium over a two-day hold produces a five-figure "ROC". Its
+        realized P&L is still real and still counts toward every P&L total --
+        only the ratios are withheld. See ``metrics.cycle_metrics`` and the
+        ``is_wheel`` gate in ``metrics.portfolio_metrics`` / ``ticker_summary``.
+        """
+        if any(leg.strategy in WHEEL_STRATEGIES for leg in self.legs):
+            return True
+        if any(lot.shares for lot in self.share_lots):
+            return True
+        return bool(self.assignments)
+
+    @property
     def last_activity(self) -> date:
         dates = [leg.open_date for leg in self.legs]
         dates += [close.date for leg in self.legs for close in leg.closes]
@@ -548,9 +570,12 @@ class WheelEngine:
     def _resumable_cycle(self, underlying: str, when: date) -> Cycle | None:
         """The most recent cycle for ``underlying`` that a re-entry on ``when``
         should rejoin instead of opening a fresh cycle: it closed earlier in the
-        same calendar year, and it never completed a full wheel rotation -- no
-        call assignment took its stock away. A cycle whose shares were called
-        away is a finished wheel; the next entry, even the same year, is new.
+        same calendar year, it is an actual wheel, and it never completed a full
+        wheel rotation -- no call assignment took its stock away. A cycle whose
+        shares were called away is a finished wheel; the next entry, even the
+        same year, is new. A non-wheel cycle (a lone directional option punt --
+        see ``Cycle.is_wheel``) is terminal too: a later put must not fold that
+        unrelated trade's premium into a wheel's cost basis and metrics.
         """
         for cycle in reversed(self.cycles):
             if cycle.underlying != underlying:
@@ -558,6 +583,8 @@ class WheelEngine:
             if cycle.end_date is None:
                 return None  # still open -- would have been the active cycle
             if cycle.end_date.year != when.year or when < cycle.end_date:
+                return None
+            if not cycle.is_wheel:
                 return None
             called_away = any(event.direction == "DISPOSE" for event in cycle.assignments)
             return None if called_away else cycle
@@ -1113,8 +1140,9 @@ class WheelEngine:
 
     def _finalize(self) -> None:
         # A flat cycle is NO_ACTIVITY (resumable) while a same-year trade could
-        # re-open it -- i.e. it closed in the same calendar year as the book's
-        # latest activity and its stock was not called away. Otherwise CLOSED.
+        # re-open it -- i.e. it is an actual wheel that closed in the same
+        # calendar year as the book's latest activity and its stock was not
+        # called away. Otherwise CLOSED. Kept in lockstep with _resumable_cycle.
         last_year = _last_date(self.transactions).year if self.transactions else date.today().year
         latest_by_underlying: dict[str, Cycle] = {}
         for cycle in self.cycles:
@@ -1127,7 +1155,9 @@ class WheelEngine:
             if latest_by_underlying.get(cycle.underlying) is not cycle:
                 continue
             called_away = any(a.direction == "DISPOSE" for a in cycle.assignments)
-            cycle.resumable = (not called_away) and cycle.end_date.year == last_year
+            cycle.resumable = (
+                cycle.is_wheel and (not called_away) and cycle.end_date.year == last_year
+            )
 
         for underlying, legs in self._open_legs.items():
             for leg in legs:

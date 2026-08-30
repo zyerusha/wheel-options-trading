@@ -36,6 +36,20 @@ def wheel_insights(
     strengths: list[str] = []
     improvements: list[tuple[float | None, str]] = []
 
+    # Not a wheel -- a lone directional/long-only cycle. Wheel coaching (strike
+    # selection, buyback drag, break-even, idle shares) does not apply; every
+    # rule below is wheel-shaped, so short-circuit with one honest line.
+    if not cycle.is_wheel:
+        net = metrics.net_realized_pl + metrics.option_open_premium
+        outcome = f"closed up {_money(net)}" if net > 0 else f"closed down {_money(net)}" if net < 0 else "closed flat"
+        return {
+            "strengths": [],
+            "improvements": [
+                f"This was a directional long-option position, not a wheel ({outcome}). "
+                "It is kept out of the wheel-return figures; only its P&L counts."
+            ],
+        }
+
     closed = [leg for leg in cycle.legs if not leg.is_open]
     open_legs = [leg for leg in cycle.legs if leg.is_open]
     shares_held = sum(lot.remaining for lot in cycle.share_lots if lot.remaining > 1e-9)

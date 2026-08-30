@@ -109,7 +109,12 @@ class TestTransactionRows(unittest.TestCase):
         # total P&L / total days held: 237.36 / 15
         self.assertAlmostEqual(wheel["pl_per_day_held"], 15.82, places=2)
 
-    def test_pl_per_day_held_is_negative_for_a_losing_long(self):
+    def test_lone_directional_long_is_flagged_non_wheel_and_withholds_ratios(self):
+        """A single bought-and-expired long option is not a wheel: its loss is
+        real (closed_leg_pl, net_realized_pl) but the wheel-framed ratios --
+        P&L / day held, win rate, Wheel ROC -- come back None (see
+        Cycle.is_wheel), so a two-day premium bet cannot skew the wheel stats.
+        """
         rows = _trade_log(
             [
                 tx("2025-03-01", BTO, "-MU250321P90", 1, 1.0, -100.66, row_id=1),
@@ -117,8 +122,13 @@ class TestTransactionRows(unittest.TestCase):
             ]
         )
         (wheel,) = rows["wheels"]
+        self.assertFalse(wheel["is_wheel"])
         self.assertAlmostEqual(wheel["closed_leg_pl"], -100.66, places=2)
-        self.assertLess(wheel["pl_per_day_held"], 0)
+        self.assertAlmostEqual(wheel["net_realized_pl"], -100.66, places=2)
+        self.assertIsNone(wheel["pl_per_day_held"])
+        self.assertIsNone(wheel["win_rate_pct"])
+        self.assertIsNone(wheel["annualized_wheel_roc_pct"])
+        self.assertIsNone(wheel["roi_on_avg_wheel_pct"])
 
     def test_pl_per_day_held_is_none_when_no_leg_has_closed(self):
         rows = _trade_log([tx("2025-01-01", STO, "-MU250131P100", -1, 1.0, 99.34, row_id=1)])

@@ -345,6 +345,7 @@ class CycleMetrics:
     start_date: date
     end_date: date | None
     days_active: int
+    is_wheel: bool = True  # False for a lone directional/long-only cycle -- see Cycle.is_wheel
 
     premium_received: float = 0.0  # credits taken in on short opens
     premium_paid: float = 0.0  # debits paid to close shorts (negative)
@@ -370,7 +371,7 @@ class CycleMetrics:
     roi_on_peak_pct: float | None = None  # net P/L (incl. stock) vs peak collateral
     roi_on_avg_wheel_pct: float | None = None  # option P/L only, vs time-weighted avg collateral
     annualized_wheel_roc_pct: float | None = None  # the headline Wheel ROC: option P/L only
-    profit_per_day: float = 0.0  # option_realized_pl / days_active -- see module docstring's "Profit Per Day"
+    profit_per_day: float | None = 0.0  # option_realized_pl / days_active; None for a non-wheel cycle
 
     # Dual-track pair, reported side by side with the figures above rather
     # than replacing them -- see the module docstring's "Dual-track returns"
@@ -408,6 +409,8 @@ class CycleMetrics:
         when nothing has been decided yet, since 0% would misreport "no data"
         as "all losses".
         """
+        if not self.is_wheel:
+            return None
         decided = self.wins + self.losses
         return 100.0 * self.wins / decided if decided else None
 
@@ -470,6 +473,8 @@ def cycle_metrics(
     annualized_wheel_roc = None
     if average > 1e-9:
         annualized_wheel_roc = 100.0 * (option_realized / average) * (DAYS_PER_YEAR / days_active)
+    roi_on_avg_wheel = _safe_pct(option_realized, average)
+    profit_per_day = option_realized / days_active
 
     # Stock Unrealized P&L: mark every share still held to `current_price`.
     # None (not 0.0) when nothing is held or no price was supplied -- both are
@@ -489,6 +494,18 @@ def cycle_metrics(
         net_option_yield_pct * (DAYS_PER_YEAR / days_active) if net_option_yield_pct is not None else None
     )
 
+    # A cycle that only ever held long options is not running the wheel (see
+    # Cycle.is_wheel). Its realized P&L stays real -- every P&L field above is
+    # untouched -- but the wheel-framed *ratios* are withheld: dividing a
+    # premium-only loss by its own tiny denominator and annualizing a two-day
+    # hold yields a meaningless five-figure percentage.
+    if not cycle.is_wheel:
+        annualized_wheel_roc = None
+        roi_on_avg_wheel = None
+        net_option_yield_pct = None
+        annualized_net_option_yield = None
+        profit_per_day = None
+
     total_position_pl = option_realized + stock_realized + (stock_unrealized or 0.0) + dividends
     total_position_roi_pct = _safe_pct(total_position_pl, initial)
     annualized_total_position_roi = (
@@ -502,6 +519,7 @@ def cycle_metrics(
         start_date=cycle.start_date,
         end_date=cycle.end_date,
         days_active=days_active,
+        is_wheel=cycle.is_wheel,
         premium_received=premium_received,
         premium_paid=premium_paid,
         option_realized_pl=option_realized,
@@ -522,9 +540,9 @@ def cycle_metrics(
         capital_estimated=cycle.capital_estimated,
         roi_pct=_safe_pct(net_realized, initial),
         roi_on_peak_pct=_safe_pct(net_realized, peak),
-        roi_on_avg_wheel_pct=_safe_pct(option_realized, average),
+        roi_on_avg_wheel_pct=roi_on_avg_wheel,
         annualized_wheel_roc_pct=annualized_wheel_roc,
-        profit_per_day=option_realized / days_active,
+        profit_per_day=profit_per_day,
         dividends_received=dividends,
         stock_unrealized_pl=stock_unrealized,
         net_option_yield_pct=net_option_yield_pct,
@@ -733,8 +751,13 @@ def portfolio_metrics(
         )
         for cycle in cycles
     ]
-    series = portfolio_capital_series(
-        capital_cycles if capital_cycles is not None else cycles, capital_through or through, since
+    capital_source = list(capital_cycles if capital_cycles is not None else cycles)
+    series = portfolio_capital_series(capital_source, capital_through or through, since)
+    # Wheel-only twin of the capital series: the ROC denominators must not be
+    # diluted by a lone directional call's premium (see Cycle.is_wheel). P&L
+    # totals below stay on every cycle -- only the ratios are wheel-scoped.
+    wheel_series = portfolio_capital_series(
+        [cycle for cycle in capital_source if cycle.is_wheel], capital_through or through, since
     )
 
     result = PortfolioMetrics(
@@ -749,6 +772,10 @@ def portfolio_metrics(
     result.last_date = through
     result.days_span = max((result.last_date - result.first_date).days, 1)
 
+    # Wheel-scoped numerators for the ROC / yield / PPD ratios -- option P&L and
+    # initial collateral from wheel cycles only.
+    wheel_option_realized_pl = 0.0
+    wheel_initial_collateral = 0.0
     for metric in per_cycle:
         result.premium_received += metric.premium_received
         result.premium_paid += metric.premium_paid
@@ -763,13 +790,16 @@ def portfolio_metrics(
         result.open_legs += metric.legs_open
         result.rolls += metric.rolls
         result.assignments += metric.assignments
-        result.wins += metric.wins
-        result.losses += metric.losses
         result.total_initial_collateral += metric.initial_collateral
         result.dividends_received += metric.dividends_received
         result.stock_unrealized_pl += metric.stock_unrealized_pl or 0.0
+        if metric.is_wheel:
+            result.wins += metric.wins
+            result.losses += metric.losses
+            wheel_option_realized_pl += metric.option_realized_pl
+            wheel_initial_collateral += metric.initial_collateral
 
-    result.profit_per_day = result.option_realized_pl / result.days_span
+    result.profit_per_day = wheel_option_realized_pl / result.days_span
 
     result.capital_deployed_now = series[-1].total if series else 0.0
     result.peak_capital = max((point.total for point in series), default=0.0)
@@ -779,14 +809,17 @@ def portfolio_metrics(
     result.peak_active_capital = max((point.working_capital for point in series), default=0.0)
     result.avg_active_capital = time_weighted_average(series, lambda point: point.working_capital)
 
+    wheel_avg_capital = time_weighted_average(wheel_series)
+    wheel_avg_active_capital = time_weighted_average(wheel_series, lambda point: point.working_capital)
+
     result.roi_on_avg_wheel_pct, result.annualized_wheel_roc_pct = roi_and_annualized(
-        result.option_realized_pl, result.avg_capital, result.days_span
+        wheel_option_realized_pl, wheel_avg_capital, result.days_span
     )
     result.roi_on_avg_active_capital_pct, result.annualized_active_wheel_roc_pct = roi_and_annualized(
-        result.option_realized_pl, result.avg_active_capital, result.days_span
+        wheel_option_realized_pl, wheel_avg_active_capital, result.days_span
     )
     result.net_option_yield_pct, result.annualized_net_option_yield_pct = roi_and_annualized(
-        result.option_realized_pl, result.total_initial_collateral, result.days_span
+        wheel_option_realized_pl, wheel_initial_collateral, result.days_span
     )
     total_position_pl = (
         result.option_realized_pl
@@ -867,6 +900,15 @@ def ticker_summary(
         stock_unrealized_total = sum(metric.stock_unrealized_pl or 0.0 for metric in metrics)
         stock_realized_total = sum(metric.stock_realized_pl for metric in metrics)
         total_position_pl = option_net + stock_realized_total + stock_unrealized_total + dividends_total
+        # Wheel-scoped twins for the ROC / yield / PPD ratios -- a lone
+        # directional call on this ticker keeps its P&L in the totals above
+        # but is kept out of the ratios (see Cycle.is_wheel).
+        wheel_metrics = [metric for metric in metrics if metric.is_wheel]
+        wheel_option_net = sum(metric.option_realized_pl for metric in wheel_metrics)
+        wheel_total_initial = sum(metric.initial_collateral for metric in wheel_metrics)
+        wheel_series = portfolio_capital_series([c for c in cap_group if c.is_wheel], through, since)
+        wheel_average = time_weighted_average(wheel_series)
+        ticker_is_wheel = bool(wheel_metrics) or any(c.is_wheel for c in cap_group)
         if metrics:
             span = max((through - min(metric.start_date for metric in metrics)).days, 1)
         elif series:
@@ -876,8 +918,10 @@ def ticker_summary(
             span = max((through - series[0].day).days, 1)
         else:
             span = 1
-        roi_on_avg_wheel_pct, annualized_wheel_roc_pct = roi_and_annualized(option_net, average, span)
-        net_option_yield_pct, annualized_net_option_yield_pct = roi_and_annualized(option_net, total_initial, span)
+        roi_on_avg_wheel_pct, annualized_wheel_roc_pct = roi_and_annualized(wheel_option_net, wheel_average, span)
+        net_option_yield_pct, annualized_net_option_yield_pct = roi_and_annualized(
+            wheel_option_net, wheel_total_initial, span
+        )
         total_position_roi_pct, annualized_total_position_roi_pct = roi_and_annualized(
             total_position_pl, total_initial, span
         )
@@ -900,13 +944,14 @@ def ticker_summary(
                 "open_legs": sum(metric.legs_open for metric in metrics),
                 "rolls": sum(metric.rolls for metric in metrics),
                 "assignments": sum(metric.assignments for metric in metrics),
-                "wins": sum(metric.wins for metric in metrics),
-                "losses": sum(metric.losses for metric in metrics),
+                "wins": sum(metric.wins for metric in wheel_metrics),
+                "losses": sum(metric.losses for metric in wheel_metrics),
+                "is_wheel": ticker_is_wheel,
                 "avg_capital": average,
                 "peak_capital": max((point.total for point in series), default=0.0),
                 "capital_now": series[-1].total if series else 0.0,
                 "days_span": span,  # denominator of the 365/span annualizing factor below
-                "profit_per_day": option_net / span,
+                "profit_per_day": wheel_option_net / span if ticker_is_wheel else None,
                 "roi_on_avg_wheel_pct": roi_on_avg_wheel_pct,
                 "annualized_wheel_roc_pct": annualized_wheel_roc_pct,
                 "total_initial_collateral": total_initial,
@@ -1214,6 +1259,10 @@ def wheel_cash_flow_events(cycles: Sequence[Cycle]) -> list[tuple[date, float, s
     """
     events: list[tuple[date, float, str]] = []
     for cycle in cycles:
+        if not cycle.is_wheel:
+            # A lone directional/long-only cycle is not wheel capital -- same
+            # exclusion the never-covered-call buy-and-hold lot gets below.
+            continue
         for leg in cycle.legs:
             unit = leg.collateral_per_contract
             if unit > 1e-9:
@@ -1281,6 +1330,8 @@ def wheel_terminal_value(
     prices = current_prices or {}
     total = 0.0
     for cycle in cycles:
+        if not cycle.is_wheel:
+            continue  # not wheel capital -- see wheel_cash_flow_events
         for leg in cycle.legs:
             if leg.is_open:
                 total += leg.remaining_contracts * leg.collateral_per_contract

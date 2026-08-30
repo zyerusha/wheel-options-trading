@@ -688,6 +688,15 @@ th.sortable:hover {
   color: var(--text-secondary);
 }
 
+.badge.DIRECTIONAL {
+  color: var(--series-2);
+  border-color: var(--series-2);
+  margin-left: 4px;
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.03em;
+}
+
 .ticker-cell {
   font-weight: 620;
 }
