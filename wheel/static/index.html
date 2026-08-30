@@ -96,7 +96,16 @@
 
       <div id="notices"></div>
 
-      <section class="tiles" id="tiles" aria-label="Headline metrics"></section>
+      <section id="hedge-banner" aria-label="Open hedges" hidden></section>
+
+      <!-- Headline figures for the current filter, plus book-level commentary,
+           grouped in one card like every other section. -->
+      <section class="card" id="performance-card" style="margin-bottom: var(--gap)">
+        <header><h2>Performance</h2></header>
+        <p class="hint">Headline figures for the current date/ticker/status filter — click any value for its formula.</p>
+        <div class="tiles" id="tiles" aria-label="Headline metrics"></div>
+        <div id="dashboard-insights" class="insights-box" aria-label="Portfolio insights" hidden></div>
+      </section>
 
       <section class="card" id="net-worth-card" style="margin-bottom: var(--gap)" hidden>
         <header>
@@ -210,11 +219,27 @@
         <ul class="hint-list">
           <li><strong>Rising</strong> — collecting more premium than you're realizing, usually because open positions are building up (normal for a growing wheel, worth knowing)</li>
           <li><strong>Flattening or falling</strong> — closes are catching up to, or outpacing, new premium sold</li>
-          <li>Climbing for months with no pullback is the thing to watch — can mean premium sitting in open risk, not banked profit</li>
+          <li>Climbing week after week with no pullback is the thing to watch — can mean premium sitting in open risk, not banked profit</li>
         </ul>
         <div class="chart-scroll"><svg id="chart-gap" role="img"></svg></div>
         <div class="legend" id="legend-gap"></div>
         <div class="table-twin" id="gap-table" hidden></div>
+      </section>
+
+      <section class="card" style="margin-bottom: var(--gap)">
+        <header>
+          <h2>Wheel PPD by week</h2>
+          <button class="toggle" data-twin="ppd-table" aria-pressed="false">Table</button>
+        </header>
+        <p class="hint">
+          Profit Per Day = realized option P/L (never stock P/L) ÷ calendar days. The
+          <strong>line</strong> is the wheel's PPD to date — its right edge is your PPD right now, and
+          it tracks toward the headline figure above. The <strong>bars</strong> are each week's own
+          realized P/L ÷ 7, spiky because P/L lands in lumps when positions close.
+        </p>
+        <div class="chart-scroll"><svg id="chart-ppd" role="img"></svg></div>
+        <div class="legend" id="legend-ppd"></div>
+        <div class="table-twin" id="ppd-table" hidden></div>
       </section>
 
       <div class="grid two">
@@ -313,8 +338,14 @@
             Pick a wheel above, or click one in the Dashboard's “Wheel timelines” chart.
           </div>
           <div id="tradelog-note" class="notice" hidden></div>
-          <div id="tradelog-insights" class="tradelog-insights" hidden></div>
+          <div id="tradelog-insights" class="insights-box" hidden></div>
+          <section id="tradelog-hedge" aria-label="Open hedge" hidden></section>
           <div id="tradelog-bridge" class="tradelog-bridge" hidden></div>
+          <div id="tradelog-ppd" class="tradelog-ppd" hidden>
+            <div class="ti-head">PPD by week</div>
+            <div class="chart-scroll"><svg id="chart-tradelog-ppd" role="img"></svg></div>
+            <div class="legend" id="legend-tradelog-ppd"></div>
+          </div>
           <div id="tradelog-summary" class="tradelog-summary" hidden></div>
           <div style="overflow-x: auto"><div id="tradelog-table"></div></div>
         </section>

@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.test_engine import tx  # noqa: E402
 from wheel.api import Dashboard, _trade_log_entry  # noqa: E402
 from wheel.engine import build_cycles  # noqa: E402
-from wheel.parser import ASSIGNED, BTC, BTO, EXPIRED, STC, STO  # noqa: E402
+from wheel.parser import ASSIGNED, BTC, BTO, EXPIRED, OTHER, STC, STO  # noqa: E402
 
 
 def _trade_log(transactions, names=None, prices=None) -> dict:
@@ -56,6 +56,22 @@ class TestTransactionRows(unittest.TestCase):
         self.assertEqual(sell["running_cash_flow"], 199.34)
         self.assertAlmostEqual(buy["running_cash_flow"], 159.32)
 
+    def test_dividend_row_is_settled_immediately(self):
+        rows = _trade_log(
+            [
+                tx("2025-01-02", STO, "-MU250207P100", -1, 3.00, 300.0, row_id=1),
+                tx("2025-01-17", ASSIGNED, "-MU250207P100", 1, None, 0.0, row_id=2, as_of="2025-01-17"),
+                tx("2025-02-01", OTHER, "MU", 0, None, 12.34, row_id=3, action_raw="DIVIDEND RECEIVED MICRON"),
+            ]
+        )
+        (wheel,) = rows["wheels"]
+        div = [r for r in wheel["transactions"] if r["type"] == "Dividend"]
+        self.assertEqual(len(div), 1)
+        # A dividend is cash received, complete on arrival -> greyed like a
+        # closed leg (frontend keys the row style off is_settled).
+        self.assertTrue(div[0]["is_settled"])
+        self.assertEqual(div[0]["net_cash_flow"], 12.34)
+
     def test_synthetic_assignment_row_when_export_has_no_equity_leg(self):
         rows = _trade_log(
             [
@@ -74,7 +90,7 @@ class TestTransactionRows(unittest.TestCase):
         self.assertTrue(wheel["is_open"])  # still holding the shares
         self.assertEqual(wheel["status"], "ACTIVE")
 
-    def test_closed_wheel_summary_fields(self):
+    def test_flat_wheel_summary_fields(self):
         rows = _trade_log(
             [
                 tx("2025-01-06", STO, "-MU250117P100", -1, 2.00, 199.33, row_id=1, commission=0.65, fees=0.02),
@@ -83,7 +99,8 @@ class TestTransactionRows(unittest.TestCase):
         )
         (wheel,) = rows["wheels"]
         self.assertFalse(wheel["is_open"])
-        self.assertEqual(wheel["status"], "CLOSED")
+        # Flat, but the book's latest trade is still 2025 -> dormant, not terminal.
+        self.assertEqual(wheel["status"], "NO_ACTIVITY")
         self.assertEqual(wheel["capital_committed_now"], 0.0)
         self.assertEqual(wheel["gross_premium_received"], 199.33)
         self.assertIsNone(wheel["cost_basis_per_share"])
@@ -108,7 +125,12 @@ class TestTransactionRows(unittest.TestCase):
         # total P&L / total days held: 237.36 / 15
         self.assertAlmostEqual(wheel["pl_per_day_held"], 15.82, places=2)
 
-    def test_pl_per_day_held_is_negative_for_a_losing_long(self):
+    def test_lone_directional_long_is_flagged_non_wheel_and_withholds_ratios(self):
+        """A single bought-and-expired long option is not a wheel: its loss is
+        real (closed_leg_pl, net_realized_pl) but the wheel-framed ratios --
+        P&L / day held, win rate, Wheel ROC -- come back None (see
+        Cycle.is_wheel), so a two-day premium bet cannot skew the wheel stats.
+        """
         rows = _trade_log(
             [
                 tx("2025-03-01", BTO, "-MU250321P90", 1, 1.0, -100.66, row_id=1),
@@ -116,8 +138,13 @@ class TestTransactionRows(unittest.TestCase):
             ]
         )
         (wheel,) = rows["wheels"]
+        self.assertFalse(wheel["is_wheel"])
         self.assertAlmostEqual(wheel["closed_leg_pl"], -100.66, places=2)
-        self.assertLess(wheel["pl_per_day_held"], 0)
+        self.assertAlmostEqual(wheel["net_realized_pl"], -100.66, places=2)
+        self.assertIsNone(wheel["pl_per_day_held"])
+        self.assertIsNone(wheel["win_rate_pct"])
+        self.assertIsNone(wheel["annualized_wheel_roc_pct"])
+        self.assertIsNone(wheel["roi_on_avg_wheel_pct"])
 
     def test_pl_per_day_held_is_none_when_no_leg_has_closed(self):
         rows = _trade_log([tx("2025-01-01", STO, "-MU250131P100", -1, 1.0, 99.34, row_id=1)])

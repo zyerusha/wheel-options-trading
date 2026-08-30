@@ -18,9 +18,9 @@ from typing import Any, Sequence
 from wheel import benchmark as bm
 from wheel import cashflow as cf
 from wheel import marketdata
-from wheel.engine import LONG, Cycle, WheelEngine, build_cycles
+from wheel.engine import COVERED_CALL, CSP, LONG, Cycle, WheelEngine, build_cycles
 from wheel.fileio import peek_text
-from wheel.insights import wheel_insights
+from wheel.insights import portfolio_insights, wheel_insights
 from wheel.metrics import (
     capital_timeline,
     cycle_metrics,
@@ -31,6 +31,7 @@ from wheel.metrics import (
     portfolio_metrics,
     realized_pl_series,
     ticker_summary,
+    weekly_ppd_series,
     wheel_cash_flow_events,
     wheel_state_breakdown,
     wheel_terminal_value,
@@ -343,6 +344,11 @@ _CLOSE_TYPE = {
 
 _CLOSING_ACTIONS = frozenset({BTC, STC, EXPIRED, ASSIGNED})
 
+# Open-hedge banner: how many days before a long protective leg's expiry the
+# advice flips from "keep writing premium against it" to "wind it down."
+HEDGE_WIND_DOWN_DAYS = 60  # the user's "two months"
+HEDGE_EXPIRING_DAYS = 7
+
 
 def _close_return_pct(open_price: float | None, close_price: float | None, side: str) -> float | None:
     """Realized return on the contract this closing fill shut, as a % of the
@@ -378,6 +384,7 @@ def _trade_log_raw_row(
     close_return_pct: float | None = None,
     *,
     is_settled: bool = False,
+    is_open_long: bool = False,
 ) -> dict[str, Any]:
     quantity = abs(transaction.contracts)
     is_csp_open = (
@@ -409,6 +416,10 @@ def _trade_log_raw_row(
         # frontend greys the whole row. The caller resolves it against the
         # engine's leg state; see `_trade_log_entry`.
         "is_settled": is_settled,
+        # A bought (long) option leg with no matching close yet -- an open
+        # protective put / directional long. The frontend keeps this row
+        # highlighted for as long as it stays unpaired.
+        "is_open_long": is_open_long,
         "synthetic": False,
         "_sort": (transaction.event_date, 1, transaction.row_id),
     }
@@ -438,6 +449,7 @@ def _trade_log_engine_rows(cycle: Cycle) -> list[dict[str, Any]]:
                 "net_cash_flow": _money(leg.open_cash),
                 "close_return_pct": None,
                 "is_settled": not leg.is_open,
+                "is_open_long": leg.is_open and leg.side == LONG,
                 "synthetic": False,
                 "_sort": (leg.open_date, 0, 0),
             }
@@ -459,6 +471,7 @@ def _trade_log_engine_rows(cycle: Cycle) -> list[dict[str, Any]]:
                     "net_cash_flow": _money(close.cash),
                     "close_return_pct": _close_return_pct(leg.open_price, close.price, leg.side),
                     "is_settled": not leg.is_open,
+                    "is_open_long": False,
                     "synthetic": False,
                     "_sort": (close.date, 1, 0),
                 }
@@ -482,6 +495,7 @@ def _trade_log_assignment_row(assignment, *, is_settled: bool) -> dict[str, Any]
         "net_cash_flow": _money(assignment.cash),
         "close_return_pct": None,
         "is_settled": is_settled,
+        "is_open_long": False,
         "synthetic": assignment.synthetic,
         "_sort": (assignment.date, 2, 0),
     }
@@ -527,6 +541,11 @@ def _trade_log_entry(
         # row is greyed together with its closes once the position is done.
         open_settled: dict[tuple[str, date], bool] = {}
         close_settled: dict[tuple[str, date], bool] = {}
+        open_long_keys: set[tuple[str, date]] = {
+            (leg.occ_symbol, leg.open_date)
+            for leg in cycle.legs
+            if leg.is_open and leg.side == LONG
+        }
         for leg in cycle.legs:
             open_settled[(leg.occ_symbol, leg.open_date)] = not leg.is_open
             for close in leg.closes:
@@ -546,6 +565,8 @@ def _trade_log_entry(
             return _close_return_pct(wavg_open, t.price, items[0][2])
 
         def _raw_settled(t: Transaction) -> bool:
+            if t.row_id in dividend_row_ids:
+                return True  # a dividend is cash received, complete on arrival
             if t.action in (STO, BTO):
                 return open_settled.get((t.occ_symbol, t.event_date), False)
             if t.action in _CLOSING_ACTIONS:
@@ -562,6 +583,9 @@ def _trade_log_entry(
                 _trade_log_txn_type(t, dividend_row_ids),
                 _raw_close_pct(t),
                 is_settled=_raw_settled(t),
+                is_open_long=(
+                    t.action == BTO and (t.occ_symbol, t.event_date) in open_long_keys
+                ),
             )
             for t in transactions
             if t.underlying == cycle.underlying
@@ -613,6 +637,14 @@ def _trade_log_entry(
     closed_leg_pl = sum(leg.realized_pl for leg in closed_legs)
     total_days_held = sum(leg_days)
     pl_per_day_held = closed_leg_pl / total_days_held if total_days_held else None
+
+    # A lone directional/long-only cycle keeps its real P&L below but is not
+    # running the wheel, so the wheel-framed ratios are withheld -- see
+    # Cycle.is_wheel. (annualized_wheel_roc_pct / roi_on_avg_wheel_pct /
+    # win_rate_pct already come back None from cycle_metrics; these two are
+    # derived here, so they're nulled here.)
+    if not cycle.is_wheel:
+        pl_per_day_held = None
 
     # Where the campaign really stands right now, vs the misleading realized-only
     # figure. Open option legs are valued at expiry (`option_open_premium`: a
@@ -683,6 +715,7 @@ def _trade_log_entry(
         "name": name,
         "status": cycle.status,
         "is_open": cycle.is_open,
+        "is_wheel": cycle.is_wheel,
         "start_date": _iso(cycle.start_date),
         "end_date": _iso(cycle.end_date),
         "cost_basis_per_share": _money(cost_basis),
@@ -726,8 +759,168 @@ def _trade_log_entry(
         "avg_collateral": _money(metrics.avg_collateral),
         "roi_on_avg_wheel_pct": metrics.roi_on_avg_wheel_pct,
         "annualized_wheel_roc_pct": metrics.annualized_wheel_roc_pct,
+        # Weekly PPD track for this one wheel. Empty for a non-wheel cycle --
+        # profit_per_day is withheld there, so a running PPD makes no sense.
+        "ppd_series": (
+            weekly_ppd_series(realized_pl_series([cycle]), cycle.start_date, through)
+            if cycle.is_wheel
+            else []
+        ),
         "attribution_note": attribution_note,
         "transactions": rows,
+    }
+
+
+def _hedge_pl_phrase(value: float | None) -> str:
+    if value is None:
+        return "at an unknown mark"
+    if value > 1:
+        return f"up +${value:,.0f}"
+    if value < -1:
+        return f"down -${abs(value):,.0f}"
+    return "roughly flat"
+
+
+def _open_hedge_entry(
+    cycle: Cycle,
+    leg,
+    through: date,
+    *,
+    name: str | None,
+    current_price: float | None,
+    dividends: float,
+) -> dict[str, Any]:
+    """One open, unpaired long option leg -- a protective put/call still on the
+    books -- with the timing and position figures the banner needs to say "keep
+    writing premium against it" vs "wind it down."
+
+    The decision is driven by ``days_to_expiry`` (the phase) and by where the
+    whole wheel actually stands: ``wheel_pl_now`` is the cycle's mark-to-market
+    P&L -- realized option + realized stock + dividends + open-option value at
+    expiry + unrealized stock. ``premium_written_since`` (net realized P&L of
+    every CSP/covered-call leg in the cycle that *closed* on or after this hedge
+    opened) is reported as a plain fact, not as "the hedge is paid for": that
+    premium may have turned into shares now underwater. There is no options
+    quote feed here, so the hedge's own market value can't be shown -- only its
+    ``intrinsic_now`` floor.
+    """
+    days_to_expiry = (leg.expiry - through).days
+    days_open = max((through - leg.open_date).days, 0)
+    cost = abs(leg.open_cash)  # debit paid, as a positive number
+    contracts = leg.remaining_contracts
+    is_put = leg.right == "P"
+    kind = "put" if is_put else "call"
+
+    if days_to_expiry <= HEDGE_EXPIRING_DAYS:
+        phase = "expiring"
+    elif days_to_expiry <= HEDGE_WIND_DOWN_DAYS:
+        phase = "wind_down"
+    else:
+        phase = "runway"
+
+    intrinsic = None
+    if current_price is not None and leg.strike is not None:
+        per_share = max(0.0, leg.strike - current_price) if is_put else max(0.0, current_price - leg.strike)
+        intrinsic = per_share * OPTION_MULTIPLIER * contracts
+
+    metrics = cycle_metrics(cycle, through, current_price=current_price, dividends=dividends)
+    shares_held = sum(lot.remaining for lot in cycle.share_lots if lot.remaining > 1e-9)
+    non_stock_pl = (
+        metrics.option_realized_pl + metrics.stock_realized_pl + dividends + metrics.option_open_premium
+    )
+    stock_unrealized = metrics.stock_unrealized_pl
+    wheel_pl_now = (
+        None
+        if shares_held > 1e-9 and stock_unrealized is None
+        else non_stock_pl + (stock_unrealized or 0.0)
+    )
+
+    premium_written_since = None
+    if cycle.is_wheel:
+        premium_written_since = sum(
+            other.realized_pl
+            for other in cycle.legs
+            if other.strategy in (CSP, COVERED_CALL)
+            and other.close_date is not None
+            and other.close_date >= leg.open_date
+        )
+
+    months = days_to_expiry / 30.4
+    span = f"{months:.1f} months" if days_to_expiry >= 45 else f"{days_to_expiry} days"
+    label = f"long ${leg.strike:g} {kind}"
+    pl_phrase = _hedge_pl_phrase(wheel_pl_now)
+    losing = wheel_pl_now is not None and wheel_pl_now < -1
+    intrinsic_phrase = f" (${intrinsic:,.0f} today)" if intrinsic is not None else ""
+
+    if not cycle.is_wheel:
+        headline = f"DIRECTIONAL · {days_to_expiry}d"
+        if phase == "runway":
+            message = (
+                f"Directional {kind} with {span} to run and no wheel selling premium behind "
+                f"it -- theta is working against its ${cost:,.0f} cost every day. Decide whether "
+                f"you still want the exposure or should cut it."
+            )
+        else:
+            message = (
+                f"Directional {kind}, {days_to_expiry} days left. Close it for whatever time "
+                f"value remains, or hold it for the move -- it finances nothing."
+            )
+    elif phase == "runway":
+        headline = f"RUNWAY · {days_to_expiry}d"
+        if losing:
+            message = (
+                f"{span} of downside protection left, and the wheel is {pl_phrase} right now"
+                f"{' with shares below cost' if shares_held > 1e-9 else ''}. This "
+                f"${leg.strike:g} {kind} is the leg that pays if {cycle.underlying} keeps "
+                f"falling -- hold it, and keep writing puts to carry its ${cost:,.0f} cost. "
+                f"Do not close it while the wheel is underwater."
+            )
+        else:
+            message = (
+                f"{span} of protection left; the wheel is {pl_phrase}. There is still runway "
+                f"to write puts against this hedge -- plan to sell it around two months out to "
+                f"salvage its time value rather than letting it decay."
+            )
+    elif phase == "wind_down":
+        headline = f"WIND DOWN · {days_to_expiry}d"
+        message = (
+            f"{days_to_expiry} days left -- inside two months. Sell the hedge now to recover its "
+            f"remaining time value{intrinsic_phrase}, then stop adding puts against it."
+        )
+        if losing:
+            message += (
+                f" The wheel is {pl_phrase}; if you still want protection, roll to a later "
+                f"expiry instead of holding this one into its decay."
+            )
+    else:  # expiring
+        headline = f"EXPIRING · {days_to_expiry}d"
+        message = (
+            f"{days_to_expiry} days left -- time value is nearly gone{intrinsic_phrase}. Close "
+            f"it or let it lapse; it will not finance more premium."
+        )
+
+    return {
+        "cycle_id": cycle.cycle_id,
+        "underlying": cycle.underlying,
+        "name": name,
+        "is_wheel": cycle.is_wheel,
+        "right": leg.right,
+        "strike": leg.strike,
+        "label": label,
+        "expiry": _iso(leg.expiry),
+        "opened": _iso(leg.open_date),
+        "contracts": contracts,
+        "shares_held": round(shares_held, 4),
+        "days_open": days_open,
+        "days_to_expiry": days_to_expiry,
+        "cost": _money(cost),
+        "wheel_pl_now": _money(wheel_pl_now),
+        "premium_written_since": _money(premium_written_since),
+        "current_price": _money(current_price),
+        "intrinsic_now": _money(intrinsic),
+        "phase": phase,
+        "headline": headline,
+        "message": message,
     }
 
 
@@ -907,6 +1100,7 @@ class Dashboard:
         }
         # Filter-independent (built from all_cycles), so cached after first build().
         self._trade_log: dict[str, Any] | None = None
+        self._open_hedges: list[dict[str, Any]] | None = None
 
     # ---- market data ----
 
@@ -918,14 +1112,15 @@ class Dashboard:
         that ticker only (wheel.marketdata never raises), which flows through
         to that cycle's stock_unrealized_pl as "unavailable," not a crash.
 
-        Fetched in parallel, not one ticker at a time: each is an independent
-        network round trip (its own URL, its own cache file under
-        ``data/prices/``), so nothing about them requires serializing, and a
-        cold cache with a few dozen tickers turned a single-digit-second page
-        load into a multi-second one when fetched sequentially. ``pool.map``
-        keeps `tickers`' order, so building `prices`/`warnings` from the
-        zipped results needs no lock -- every dict/list write still happens
-        on this thread, only the network wait itself overlaps.
+        Two passes so the common case pays nothing for threads: first resolve
+        every ticker that a fresh cache or the in-process memo can answer
+        without network (``local_only=True``), then fan the genuine misses --
+        typically only the first page load after a trading session closes --
+        out across a thread pool, since each is an independent network round
+        trip (its own URL, its own cache file under ``data/prices/``). A cold
+        pull of a few dozen tickers one at a time turned a single-digit-second
+        page load into a multi-second one; spinning the pool up when there is
+        nothing to fetch was itself costing ~1.5s per Combined build.
         """
         if self._price_cache is not None:
             return self._price_cache
@@ -939,9 +1134,19 @@ class Dashboard:
         )
         prices: dict[str, float | None] = {}
         warnings: list[str] = []
-        if tickers:
-            with ThreadPoolExecutor(max_workers=min(8, len(tickers))) as pool:
-                for ticker, (points, ticker_warnings) in zip(tickers, pool.map(marketdata.get_price_series, tickers)):
+        misses: list[str] = []
+        for ticker in tickers:
+            local = marketdata.get_price_series(ticker, local_only=True)
+            if local is None:
+                misses.append(ticker)
+                continue
+            points, ticker_warnings = local
+            warnings.extend(ticker_warnings)
+            prices[ticker] = points[-1].close if points else None
+
+        if misses:
+            with ThreadPoolExecutor(max_workers=min(8, len(misses))) as pool:
+                for ticker, (points, ticker_warnings) in zip(misses, pool.map(marketdata.get_price_series, misses)):
                     warnings.extend(ticker_warnings)
                     prices[ticker] = points[-1].close if points else None
 
@@ -1320,6 +1525,41 @@ class Dashboard:
 
         return {"wheels": wheels, "warnings": warnings}
 
+    def _build_open_hedges(self, current_prices: dict[str, float | None]) -> list[dict[str, Any]]:
+        """Every open, unpaired long option leg across ``all_cycles`` -- a
+        protective put/call (or a lone directional long) still on the books.
+
+        Filter-independent, like the Trade Log: a hedge needs managing whatever
+        date window is on screen. A leg paired into a same-day ``Spread`` is
+        excluded -- its risk is already defined, there is nothing to "wind down."
+        Sorted soonest-expiry first, so the most urgent row leads the banner.
+        """
+        through = self.last_date or date.today()
+        dividends = dividends_by_cycle(self.all_cycles, self.transactions)
+        hedges: list[dict[str, Any]] = []
+        for cycle in self.all_cycles:
+            spread_leg_ids: set[str] = set()
+            for spread in cycle.spreads:
+                spread_leg_ids.add(spread.short_leg_id)
+                spread_leg_ids.add(spread.long_leg_id)
+            for leg in cycle.legs:
+                if not leg.is_open or leg.side != LONG or leg.expiry is None:
+                    continue
+                if leg.leg_id in spread_leg_ids:
+                    continue
+                hedges.append(
+                    _open_hedge_entry(
+                        cycle,
+                        leg,
+                        through,
+                        name=self._company_names.get(cycle.underlying),
+                        current_price=current_prices.get(cycle.underlying),
+                        dividends=dividends.get(cycle.cycle_id, 0.0),
+                    )
+                )
+        hedges.sort(key=lambda h: h["days_to_expiry"])
+        return hedges
+
     # ---- query ----
 
     def build(self, filters: Filters | None = None) -> dict[str, Any]:
@@ -1399,6 +1639,8 @@ class Dashboard:
             self._wheel_return = self._build_wheel_return(current_prices)
         if self._trade_log is None:
             self._trade_log = self._build_trade_log(current_prices)
+        if self._open_hedges is None:
+            self._open_hedges = self._build_open_hedges(current_prices)
 
         portfolio = portfolio_metrics(
             cycles,
@@ -1426,8 +1668,27 @@ class Dashboard:
         cash_flow_rows = cf.monthly_cashflow_series(transactions, capital_points, through, since)
         cash_flow = {
             "months": cash_flow_rows,
+            "weeks": cf.weekly_cashflow_series(transactions, through, since),
             "trailing": cf.range_summary(cash_flow_rows, capital_points, through),
         }
+
+        portfolio_payload = {
+            **{
+                key: (_money(value) if isinstance(value, float) else value)
+                for key, value in asdict(portfolio).items()
+            },
+            "first_date": _iso(portfolio.first_date),
+            "last_date": _iso(portfolio.last_date),
+            "win_rate_pct": portfolio.win_rate_pct,
+        }
+        dashboard_insights = portfolio_insights(
+            portfolio_payload,
+            (self._trade_log or {}).get("wheels", []),
+            self._open_hedges or [],
+            wheel_return=self._wheel_return,
+            benchmark=self._benchmark,
+            wheel_state=wheel_state,
+        )
 
         return {
             "meta": {
@@ -1449,7 +1710,7 @@ class Dashboard:
                 "data_first_date": _iso(self.first_date),
                 "data_last_date": _iso(self.last_date),
                 "available_tickers": self.available_tickers(),
-                "statuses": ["ACTIVE", "CLOSED", "ASSIGNED"],
+                "statuses": ["ACTIVE", "NO_ACTIVITY", "CLOSED"],
                 "transactions_in_slice": len(transactions),
                 "transactions_total": len(self.transactions),
                 "columns_swapped": any(report.columns_swapped for report in self.reports),
@@ -1468,15 +1729,8 @@ class Dashboard:
                     "statuses": filters.statuses,
                 },
             },
-            "portfolio": {
-                **{
-                    key: (_money(value) if isinstance(value, float) else value)
-                    for key, value in asdict(portfolio).items()
-                },
-                "first_date": _iso(portfolio.first_date),
-                "last_date": _iso(portfolio.last_date),
-                "win_rate_pct": portfolio.win_rate_pct,
-            },
+            "portfolio": portfolio_payload,
+            "insights": dashboard_insights,
             "cycles": [
                 _cycle_payload(
                     cycle,
@@ -1502,6 +1756,16 @@ class Dashboard:
                 for point in capital
             ],
             "pnl_series": realized_pl_series(cycles),
+            # Wheel-only realized P/L series, and the weekly PPD track built from
+            # it. PPD's numerator is wheel-only (matches portfolio.profit_per_day
+            # after the is_wheel split); its denominator spans every cycle, so
+            # the last cum_ppd point equals the Performance tile exactly.
+            "pnl_series_wheel": realized_pl_series([c for c in cycles if c.is_wheel]),
+            "ppd_series": weekly_ppd_series(
+                realized_pl_series([c for c in cycles if c.is_wheel]),
+                min((cycle.start_date for cycle in cycles), default=through),
+                through,
+            ),
             "cash_flow": cash_flow,
             "wheel_state": wheel_state,
             "reconciliation": _reconciliation(
@@ -1511,4 +1775,5 @@ class Dashboard:
             "benchmark": self._benchmark,
             "wheel_return": self._wheel_return,
             "trade_log": self._trade_log,
+            "open_hedges": self._open_hedges,
         }

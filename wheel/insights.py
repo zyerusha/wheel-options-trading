@@ -1,18 +1,28 @@
-"""Plain-rules commentary for one wheel: what is working, where to improve.
+"""Plain-rules commentary: what is working, where to improve.
 
-No model and no network -- every line is a threshold on figures the engine and
-:mod:`wheel.metrics` already produce, phrased as advice. Strengths keep a
-curated priority order; improvements are ranked by dollar impact so the
-costliest problem shows first. The Trade Log renders up to two of each.
+Two entry points, same shape (``{"strengths": [...], "improvements": [...]}``)
+and same house style -- no model, no network, every line a threshold on figures
+:mod:`wheel.metrics` / :mod:`wheel.api` already produce, phrased as advice.
+Strengths keep a curated priority order; improvements are ranked by dollar
+impact so the costliest problem shows first.
+
+* :func:`wheel_insights` -- one wheel (Trade Log), up to two strengths / three
+  improvements.
+* :func:`portfolio_insights` -- the whole book (Dashboard), up to three each,
+  working purely off the already-serialized payload dicts.
 """
 
 from __future__ import annotations
+
+from typing import Any
 
 from wheel.engine import COVERED_CALL, CSP, LONG, Cycle
 from wheel.metrics import CycleMetrics
 
 _MAX_STRENGTHS = 2
 _MAX_IMPROVEMENTS = 3
+_MAX_PORTFOLIO_STRENGTHS = 3
+_MAX_PORTFOLIO_IMPROVEMENTS = 3
 
 
 def _money(value: float) -> str:
@@ -35,6 +45,20 @@ def wheel_insights(
 ) -> dict[str, list[str]]:
     strengths: list[str] = []
     improvements: list[tuple[float | None, str]] = []
+
+    # Not a wheel -- a lone directional/long-only cycle. Wheel coaching (strike
+    # selection, buyback drag, break-even, idle shares) does not apply; every
+    # rule below is wheel-shaped, so short-circuit with one honest line.
+    if not cycle.is_wheel:
+        net = metrics.net_realized_pl + metrics.option_open_premium
+        outcome = f"closed up {_money(net)}" if net > 0 else f"closed down {_money(net)}" if net < 0 else "closed flat"
+        return {
+            "strengths": [],
+            "improvements": [
+                f"This was a directional long-option position, not a wheel ({outcome}). "
+                "It is kept out of the wheel-return figures; only its P&L counts."
+            ],
+        }
 
     closed = [leg for leg in cycle.legs if not leg.is_open]
     open_legs = [leg for leg in cycle.legs if leg.is_open]
@@ -118,7 +142,7 @@ def wheel_insights(
             "annualized on the capital it tied up."
         )
     if not cycle.is_open and mark_to_market_pl is not None and mark_to_market_pl > 0:
-        strengths.append(f"This wheel closed flat at +{_money(mark_to_market_pl)}.")
+        strengths.append(f"This wheel is flat and green right now at +{_money(mark_to_market_pl)}.")
 
     # ---------------- improvements (ranked by $ impact) ----------------
 
@@ -221,4 +245,180 @@ def wheel_insights(
     return {
         "strengths": strengths[:_MAX_STRENGTHS],
         "improvements": [text for _, text in improvements[:_MAX_IMPROVEMENTS]],
+    }
+
+
+def _num(value: Any) -> float | None:
+    return value if isinstance(value, (int, float)) else None
+
+
+def portfolio_insights(
+    portfolio: dict,
+    wheels: list[dict],
+    open_hedges: list[dict],
+    *,
+    wheel_return: dict | None = None,
+    benchmark: dict | None = None,
+    wheel_state: dict | None = None,
+) -> dict[str, list[str]]:
+    """Book-level commentary for the Dashboard, from the already-built payload.
+
+    Everything here reads serialized dicts -- ``portfolio`` (the filtered
+    ``PortfolioMetrics``), the full-history Trade Log ``wheels``, the
+    ``open_hedges`` list, and the two XIRR blocks -- so it is trivially testable
+    and never re-derives a figure the API already computed.
+    """
+    portfolio = portfolio or {}
+    wheels = wheels or []
+    open_hedges = open_hedges or []
+    strengths: list[str] = []
+    improvements: list[tuple[float | None, str]] = []
+
+    active = [w for w in wheels if w.get("status") == "ACTIVE"]
+
+    # ---------------- strengths (curated order) ----------------
+
+    wr = wheel_return or {}
+    wr_xirr = _num(wr.get("xirr_pct"))
+    wr_bench = _num((wr.get("benchmark") or {}).get("xirr_pct"))
+    if wr.get("available") and wr_xirr is not None and wr_bench is not None and wr_xirr - wr_bench >= 3:
+        added = _num(wr.get("value_added"))
+        added_s = f", {_money(added)} ahead of that replay" if added else ""
+        bench_name = (wr.get("benchmark") or {}).get("name", "SPY")
+        strengths.append(
+            f"The wheel's money-weighted return is {wr_xirr:.0f}% vs {wr_bench:.0f}% for a "
+            f"same-timing {bench_name} replay{added_s}."
+        )
+
+    win_rate = _num(portfolio.get("win_rate_pct"))
+    decided = (portfolio.get("wins") or 0) + (portfolio.get("losses") or 0)
+    if win_rate is not None and win_rate >= 70 and decided >= 20:
+        strengths.append(
+            f"{portfolio.get('wins', 0)} of {decided} decided legs finished green "
+            f"({win_rate:.0f}% win rate across the book)."
+        )
+
+    roc = _num(portfolio.get("annualized_wheel_roc_pct"))
+    if roc is not None and roc >= 10 and (portfolio.get("option_realized_pl") or 0) > 0:
+        avg_cap = _num(portfolio.get("avg_capital")) or 0.0
+        strengths.append(
+            f"Option writing has returned {roc:.0f}% annualized on about {_money(avg_cap)} of "
+            "average committed capital."
+        )
+
+    div = _num(portfolio.get("dividends_received")) or 0.0
+    if div >= 500:
+        strengths.append(f"{_money(div)} in dividends on assigned shares, on top of option premium.")
+
+    runway_hedges = [h for h in open_hedges if h.get("phase") == "runway"]
+    if runway_hedges:
+        names = ", ".join(dict.fromkeys(h["underlying"] for h in runway_hedges[:3]))
+        strengths.append(
+            f"{len(runway_hedges)} protective hedge(s) in place with runway ({names}) -- "
+            "downside is capped while premium keeps coming in."
+        )
+
+    # ---------------- improvements (ranked by $ impact) ----------------
+
+    bm = benchmark or {}
+    act_xirr = _num((bm.get("actual") or {}).get("xirr_pct"))
+    ref_xirr = _num((bm.get("benchmark") or {}).get("xirr_pct"))
+    if bm.get("available") and act_xirr is not None and ref_xirr is not None and act_xirr < ref_xirr - 2:
+        va = _num(bm.get("value_added"))
+        bench_name = (bm.get("benchmark") or {}).get("name", "SPY")
+        gap_s = f" -- about {_money(abs(va))} of return forgone" if va else ""
+        improvements.append(
+            (
+                va,
+                f"The whole account's money-weighted return ({act_xirr:.0f}%) trails a "
+                f"{bench_name} buy-and-hold ({ref_xirr:.0f}%){gap_s}. The wheel itself "
+                "outperformed; the drag is elsewhere -- idle cash or non-wheel holdings.",
+            )
+        )
+
+    underwater = sorted(
+        (w for w in active if (_num(w.get("mark_to_market_pl")) or 0.0) < -200),
+        key=lambda w: w["mark_to_market_pl"],
+    )
+    if underwater:
+        total = sum(w["mark_to_market_pl"] for w in underwater)
+        worst = ", ".join(f"{w['underlying']} {_money(w['mark_to_market_pl'])}" for w in underwater[:3])
+        improvements.append(
+            (
+                total,
+                f"{len(underwater)} active wheels are underwater by {_money(total)} "
+                f"mark-to-market (worst: {worst}). Covered calls at or above their break-even "
+                "close the gap without adding downside.",
+            )
+        )
+
+    holding = ((wheel_state or {}).get("buckets") or {}).get("holding") or {}
+    hold_amt = _num(holding.get("amount")) or 0.0
+    hold_n = holding.get("cycles") or 0
+    if hold_amt >= 20000 and hold_n >= 2:
+        improvements.append(
+            (
+                -hold_amt * 0.01,
+                f"{_money(hold_amt)} of assigned shares across {hold_n} wheels have no covered "
+                "call written -- that capital collects no premium. Selling calls at or above "
+                "break-even adds income against stock already owned.",
+            )
+        )
+
+    if wheels:
+        top = max(wheels, key=lambda w: _num(w.get("capital_committed_pct")) or 0.0)
+        pct = _num(top.get("capital_committed_pct")) or 0.0
+        amt = _num(top.get("capital_committed_now")) or 0.0
+        # >=15% of the book AND a real position size -- the Combined view keeps
+        # each wheel's own account-scoped %, so a lone small wheel can read 100%.
+        if pct >= 15 and amt >= 25000:
+            of = top.get("capital_committed_pct_of", "the book")
+            improvements.append(
+                (
+                    amt,
+                    f"{top['underlying']} is {pct:.0f}% of {of} ({_money(amt)}). A drawdown "
+                    "there moves the whole book.",
+                )
+            )
+
+    nw_net = sum(_num(w.get("net_realized_pl")) or 0.0 for w in wheels if not w.get("is_wheel"))
+    if nw_net < -100:
+        improvements.append(
+            (
+                nw_net,
+                f"Directional (non-wheel) trades have cost {_money(nw_net)} net. They stay out "
+                "of the wheel-return figures, but the loss is real.",
+            )
+        )
+
+    urgent = [h for h in open_hedges if h.get("phase") in ("wind_down", "expiring")]
+    if urgent:
+        names = ", ".join(f"{h['underlying']} ({h['days_to_expiry']}d)" for h in urgent[:3])
+        improvements.append(
+            (
+                None,
+                f"{len(urgent)} protective hedge(s) are inside the wind-down window ({names}) -- "
+                "sell them for their remaining time value or roll them out before they decay.",
+            )
+        )
+
+    est = list(
+        dict.fromkeys(w["underlying"] for w in active if w.get("capital_estimated"))
+    )
+    if est:
+        improvements.append(
+            (
+                None,
+                f"{len(est)} active wheels ({', '.join(est)}) price capital with a strike-based "
+                "proxy for pre-export shares -- their ROC figures are approximate.",
+            )
+        )
+
+    improvements.sort(
+        key=lambda item: (item[0] is not None, abs(item[0]) if item[0] is not None else 0.0),
+        reverse=True,
+    )
+    return {
+        "strengths": strengths[:_MAX_PORTFOLIO_STRENGTHS],
+        "improvements": [text for _, text in improvements[:_MAX_PORTFOLIO_IMPROVEMENTS]],
     }

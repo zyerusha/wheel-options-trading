@@ -1241,6 +1241,124 @@ class TestWinRate(unittest.TestCase):
         self.assertAlmostEqual(result.win_rate_pct, 50.0)
 
 
+class TestNonWheelExclusion(unittest.TestCase):
+    """A cycle that only ever held long options keeps its P&L in the totals
+    but is kept out of every wheel-framed ratio -- see ``Cycle.is_wheel``.
+    """
+
+    def _book(self):
+        # One real wheel (CSP assigned -> covered call called away, +$1000) and
+        # one lone directional call that expired worthless (-$400).
+        return build_cycles(
+            [
+                tx("2025-01-02", STO, "-MU250117P100", -1, 3.0, 300.0, row_id=1),
+                tx("2025-01-17", ASSIGNED, "-MU250117P100", 1, None, 0.0, row_id=2, as_of="2025-01-17"),
+                tx("2025-01-20", STO, "-MU250221C110", -1, 2.0, 200.0, row_id=3),
+                tx("2025-02-21", ASSIGNED, "-MU250221C110", 1, None, 0.0, row_id=4, as_of="2025-02-21"),
+                tx("2025-03-03", BTO, "-NVDA250307C130", 4, 1.0, -400.0, row_id=5),
+                tx("2025-03-07", EXPIRED, "-NVDA250307C130", -4, None, 0.0, row_id=6, as_of="2025-03-07"),
+            ]
+        )[0]
+
+    def test_directional_loss_stays_in_realized_pl_totals(self):
+        result = portfolio_metrics(self._book(), date(2025, 3, 31))
+        # -400 directional + wheel option P&L are both in the total.
+        self.assertLess(result.option_realized_pl, result.wheel_core_realized_pl)
+        self.assertAlmostEqual(
+            result.option_realized_pl, result.wheel_core_realized_pl + result.hedge_realized_pl, places=6
+        )
+        self.assertAlmostEqual(result.hedge_realized_pl, -400.0, places=2)
+
+    def test_directional_cycle_excluded_from_wheel_roc_and_win_rate(self):
+        book = self._book()
+        full = portfolio_metrics(book, date(2025, 3, 31))
+        wheel_only = portfolio_metrics([c for c in book if c.is_wheel], date(2025, 3, 31))
+        # The ROC / win-rate / PPD are identical whether or not the directional
+        # cycle is in the input -- it is filtered out internally either way.
+        self.assertEqual(full.annualized_wheel_roc_pct, wheel_only.annualized_wheel_roc_pct)
+        self.assertEqual(full.win_rate_pct, wheel_only.win_rate_pct)
+        self.assertEqual(full.profit_per_day, wheel_only.profit_per_day)
+        # ... but net realized P&L is NOT identical -- the -$400 only rides with the full book.
+        self.assertNotAlmostEqual(full.net_realized_pl, wheel_only.net_realized_pl, places=2)
+
+    def test_lone_directional_book_has_no_wheel_ratios(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2026-02-04", BTO, "-TQQQ260206C51", 3, 1.32, -398.02, row_id=1),
+                tx("2026-02-06", EXPIRED, "-TQQQ260206C51", -3, None, 0.0, row_id=2, as_of="2026-02-06"),
+            ]
+        )
+        result = portfolio_metrics(cycles, date(2026, 2, 28))
+        self.assertIsNone(result.annualized_wheel_roc_pct)
+        self.assertIsNone(result.roi_on_avg_wheel_pct)
+        self.assertIsNone(result.win_rate_pct)
+        self.assertAlmostEqual(result.profit_per_day, 0.0)
+        self.assertAlmostEqual(result.net_realized_pl, -398.02, places=2)
+
+
+class TestBuyAndHoldTickerHasNoWheelRatios(unittest.TestCase):
+    """A ticker whose only activity is buying (and maybe selling) shares --
+    never a put or call written against them -- keeps its capital and stock
+    P&L on screen, but its premium-return ratios read N/A, not a misleading
+    0%. A genuine wheel that merely sat idle in the window still reports them.
+    """
+
+    def test_shares_only_ticker_gets_none_for_wheel_ratios(self):
+        cycles, _ = build_cycles(
+            [tx("2025-01-06", "BUY_STOCK", "CRESY", 300, 8.0, -2400.0, row_id=1)]
+        )
+        row = next(r for r in ticker_summary(cycles, date(2025, 6, 30)) if r["underlying"] == "CRESY")
+        self.assertGreater(row["avg_capital"], 0.0)  # still real, funded capital
+        self.assertIsNone(row["annualized_wheel_roc_pct"])
+        self.assertIsNone(row["roi_on_avg_wheel_pct"])
+        self.assertIsNone(row["annualized_net_option_yield_pct"])
+        self.assertIsNone(row["profit_per_day"])
+
+    def test_assignment_row_with_no_option_leg_is_not_enough(self):
+        """A stray ASSIGNED row with no CSP/CC leg behind it (an incomplete
+        export, or a stock position with an odd corporate-action row) is not
+        evidence the wheel was ever run -- ratios stay N/A.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-02-10", "BUY_STOCK", "DCH", 1000, 8.0, -8000.0, row_id=1),
+                tx("2025-03-15", ASSIGNED, "-DCH250321P8", 1, None, 0.0, row_id=2, as_of="2025-03-15"),
+            ]
+        )
+        row = next(r for r in ticker_summary(cycles, date(2025, 6, 30)) if r["underlying"] == "DCH")
+        self.assertIsNone(row["annualized_wheel_roc_pct"])
+        self.assertIsNone(row["profit_per_day"])
+
+    def test_one_covered_call_makes_the_ratios_defined_again(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-06", "BUY_STOCK", "CRESY", 300, 8.0, -2400.0, row_id=1),
+                tx("2025-02-03", STO, "-CRESY250321C9", -3, 0.40, 119.0, row_id=2),
+            ]
+        )
+        row = next(r for r in ticker_summary(cycles, date(2025, 6, 30)) if r["underlying"] == "CRESY")
+        self.assertIsNotNone(row["annualized_wheel_roc_pct"])
+        self.assertIsNotNone(row["profit_per_day"])
+
+    def test_dormant_real_wheel_still_reports_ratios(self):
+        # CSP sold and assigned last year; the display window is later, so the
+        # ticker has no in-window premium -- but it did run the wheel, so the
+        # ratios stay defined (here 0%-ish, not None).
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-02", STO, "-MU250117P100", -1, 3.0, 300.0, row_id=1),
+                tx("2025-01-17", ASSIGNED, "-MU250117P100", 1, None, 0.0, row_id=2, as_of="2025-01-17"),
+            ]
+        )
+        since = date(2025, 3, 1)
+        row = next(
+            r
+            for r in ticker_summary([], date(2025, 6, 30), capital_cycles=cycles, since=since)
+            if r["underlying"] == "MU"
+        )
+        self.assertIsNotNone(row["annualized_wheel_roc_pct"])
+
+
 class TestHedgePL(unittest.TestCase):
     """Protective puts and credit-spread hedges are ordinary option legs to the
     engine -- LONG_PUT/LONG_CALL for the long side, CSP/COVERED_CALL for a
@@ -1394,9 +1512,11 @@ class TestHedgePL(unittest.TestCase):
         metrics = cycle_metrics(cycles[0], through)
         self.assertAlmostEqual(metrics.hedge_realized_pl, 0.0)
         self.assertAlmostEqual(metrics.option_realized_pl, 0.0)
-        # Capital is committed (the debit paid), so this is a real, decided 0%
-        # -- not None, which is reserved for "no capital committed at all".
-        self.assertAlmostEqual(metrics.annualized_wheel_roc_pct, 0.0)
+        # A lone long put is not a wheel (no CSP/covered call, no shares, no
+        # assignment), so wheel-framed ratios are withheld entirely.
+        self.assertFalse(metrics.is_wheel)
+        self.assertIsNone(metrics.annualized_wheel_roc_pct)
+        self.assertIsNone(metrics.roi_on_avg_wheel_pct)
 
         points = capital_timeline(cycles[0], through)
         self.assertAlmostEqual(points[0].long_premium, 1000.0)
@@ -1751,15 +1871,34 @@ class TestWheelCashFlowEvents(unittest.TestCase):
         self.assertEqual(events[1], (date(2025, 10, 17), -59131.33, "QQQ COVERED_CALL close"))
 
     def test_protective_put_open_and_close_use_the_debit_paid(self):
+        """A hedge leg *inside a wheel* contributes its actual debit, not its
+        notional. The anchor CSP never closes, so the cycle stays a wheel and
+        the long put rides in it.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250601P90", -1, 1.00, 100.0, row_id=1),
+                tx("2025-01-01", BTO, "-XYZ250201P100", 1, 10.00, -1000.0, row_id=2),
+                tx("2025-01-10", STC, "-XYZ250201P100", -1, 7.00, 700.0, row_id=3),
+            ]
+        )
+        events = wheel_cash_flow_events(cycles)
+        self.assertIn((date(2025, 1, 1), 1000.0, "XYZ LONG_PUT open"), events)
+        self.assertIn((date(2025, 1, 10), -700.0, "XYZ LONG_PUT close"), events)
+
+    def test_lone_directional_long_is_not_wheel_capital(self):
+        """A cycle that only ever bought options -- no CSP, covered call,
+        shares or assignment -- is not the wheel; its dollars stay out of the
+        wheel cash-flow ledger and terminal value entirely (see Cycle.is_wheel).
+        """
         cycles, _ = build_cycles(
             [
                 tx("2025-01-01", BTO, "-XYZ250201P100", 1, 10.00, -1000.0, row_id=1),
                 tx("2025-01-10", STC, "-XYZ250201P100", -1, 7.00, 700.0, row_id=2),
             ]
         )
-        events = wheel_cash_flow_events(cycles)
-        self.assertEqual(events[0], (date(2025, 1, 1), 1000.0, "XYZ LONG_PUT open"))
-        self.assertEqual(events[1], (date(2025, 1, 10), -700.0, "XYZ LONG_PUT close"))
+        self.assertEqual(wheel_cash_flow_events(cycles), [])
+        self.assertAlmostEqual(wheel_terminal_value(cycles, date(2025, 2, 15), {}), 0.0)
 
     def test_plain_stock_purchase_with_no_covered_call_is_excluded(self):
         """Shares bought outright, with no covered call ever written against

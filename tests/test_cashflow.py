@@ -20,6 +20,7 @@ from wheel.cashflow import (  # noqa: E402
     month_average_collateral,
     monthly_cashflow_series,
     range_summary,
+    weekly_cashflow_series,
 )
 from wheel.parser import BTC, BTO, OTHER, STC, STO, Transaction  # noqa: E402
 
@@ -213,6 +214,79 @@ class TestMonthlyBucketing(unittest.TestCase):
 
     def test_no_transactions_returns_empty(self):
         self.assertEqual(monthly_cashflow_series([], [], date(2025, 1, 1)), [])
+
+
+class TestWeeklyCashflowSeries(unittest.TestCase):
+    """The finer-grained weekly companion for the cash-flow-vs-wheel gap
+    chart: same event_date bucketing as the monthly series, Monday-anchored
+    ISO weeks, zero-filled gaps, no collateral/yield columns.
+    """
+
+    def test_buckets_by_iso_week_monday_anchor(self):
+        # 2025-09-19 is a Friday; its ISO week starts Monday 2025-09-15.
+        rows = weekly_cashflow_series(
+            [tx("2025-09-19", STO, "-MU250926P150", -1, 3.35, 335.0)],
+            date(2025, 9, 26),
+        )
+        self.assertEqual(rows[0]["period"], "2025-09-15")
+        self.assertEqual(rows[0]["week_start"], "2025-09-15")
+        self.assertEqual(rows[0]["week_end"], "2025-09-21")
+        self.assertAlmostEqual(rows[0]["net_cash_flow"], 335.0, places=2)
+        self.assertNotIn("avg_collateral", rows[0])
+        self.assertNotIn("monthly_yield_pct", rows[0])
+
+    def test_same_week_transactions_combine_across_a_month_boundary(self):
+        # Mon 2025-09-29 and Wed 2025-10-01 are the same ISO week (starts 09-29).
+        rows = weekly_cashflow_series(
+            [
+                tx("2025-09-29", STO, "-MU250926P150", -1, 1.0, 100.0),
+                tx("2025-10-01", STO, "-MU250926P150", -1, 1.0, 50.0),
+            ],
+            date(2025, 10, 3),
+        )
+        self.assertEqual([row["period"] for row in rows], ["2025-09-29"])
+        self.assertAlmostEqual(rows[0]["net_cash_flow"], 150.0, places=2)
+
+    def test_gap_weeks_are_filled_at_zero(self):
+        rows = weekly_cashflow_series(
+            [
+                tx("2025-09-01", STO, "-MU250926P150", -1, 1.0, 100.0),
+                tx("2025-09-22", STO, "-MU250926P150", -1, 1.0, 100.0),
+            ],
+            date(2025, 9, 30),
+        )
+        self.assertEqual(
+            [row["period"] for row in rows],
+            ["2025-09-01", "2025-09-08", "2025-09-15", "2025-09-22"],
+        )
+        self.assertAlmostEqual(rows[1]["net_cash_flow"], 0.0)
+        self.assertAlmostEqual(rows[2]["net_cash_flow"], 0.0)
+
+    def test_never_extends_past_through(self):
+        # The Oct 20 transaction is well past `through` (Sep 10), so no week
+        # after the one containing `through` (starts Sep 8) is emitted.
+        rows = weekly_cashflow_series(
+            [
+                tx("2025-09-01", STO, "-MU250926P150", -1, 1.0, 100.0),
+                tx("2025-10-20", STO, "-MU250926P150", -1, 1.0, 100.0),
+            ],
+            date(2025, 9, 10),
+        )
+        self.assertEqual([row["period"] for row in rows], ["2025-09-01", "2025-09-08"])
+
+    def test_since_crops_to_the_week_containing_it(self):
+        rows = weekly_cashflow_series(
+            [
+                tx("2025-09-01", STO, "-MU250926P150", -1, 1.0, 100.0),
+                tx("2025-09-22", STO, "-MU250926P150", -1, 1.0, 100.0),
+            ],
+            date(2025, 9, 30),
+            since=date(2025, 9, 17),  # Wednesday of the week starting 2025-09-15
+        )
+        self.assertEqual([row["period"] for row in rows], ["2025-09-15", "2025-09-22"])
+
+    def test_no_transactions_returns_empty(self):
+        self.assertEqual(weekly_cashflow_series([], date(2025, 1, 1)), [])
 
 
 class TestMonthlyYield(unittest.TestCase):

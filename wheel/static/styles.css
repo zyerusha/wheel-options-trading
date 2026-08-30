@@ -30,6 +30,7 @@
   --success-text: #006300;
 
   --closed-bg: #ffe6df; /* salmon - a closed wheel in the Trade Log */
+  --noactivity-bg: #fff4d6; /* pale amber - a NO_ACTIVITY (dormant) wheel */
 
   --radius: 10px;
   --gap: 18px;
@@ -56,6 +57,7 @@
     --mid: #383835;
     --success-text: #0ca30c;
     --closed-bg: #4a2b25;
+    --noactivity-bg: #4a4325;
   }
 }
 
@@ -79,6 +81,7 @@
   --mid: #383835;
   --success-text: #0ca30c;
   --closed-bg: #4a2b25;
+  --noactivity-bg: #4a4325;
 }
 
 * {
@@ -441,6 +444,12 @@ button.primary {
   min-width: 0;
 }
 
+/* A chart card with nothing to plot for the current filter is hidden by JS
+   (see toggleChartCard) rather than left blank. */
+.card[hidden] {
+  display: none;
+}
+
 .card > header {
   display: flex;
   align-items: baseline;
@@ -676,13 +685,22 @@ th.sortable:hover {
   border-color: var(--series-1);
 }
 
+.badge.NO_ACTIVITY {
+  color: var(--warning);
+  border-color: var(--warning);
+}
+
 .badge.CLOSED {
   color: var(--text-secondary);
 }
 
-.badge.ASSIGNED {
+.badge.DIRECTIONAL {
   color: var(--series-2);
   border-color: var(--series-2);
+  margin-left: 4px;
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.03em;
 }
 
 .ticker-cell {
@@ -829,6 +847,113 @@ tr.detail > td {
   color: var(--text-muted);
 }
 
+/* ---- open-hedge banner ---- */
+#hedge-banner {
+  margin-bottom: var(--gap);
+  display: grid;
+  gap: 8px;
+}
+
+.hedge-banner-head {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.hedge-row {
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--series-1);
+  border-radius: 8px;
+  background: var(--surface-1);
+  padding: 11px 14px;
+  display: grid;
+  gap: 5px;
+  cursor: pointer;
+}
+
+.hedge-row.runway {
+  border-left-color: var(--series-1);
+}
+.hedge-row.wind_down {
+  border-left-color: var(--warning);
+  background: var(--noactivity-bg);
+}
+.hedge-row.expiring {
+  border-left-color: var(--critical);
+  background: var(--closed-bg);
+}
+
+.hedge-row-main {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.hedge-chip {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid currentColor;
+  white-space: nowrap;
+}
+.hedge-row.runway .hedge-chip {
+  color: var(--series-1);
+}
+.hedge-row.wind_down .hedge-chip {
+  color: var(--warning);
+}
+.hedge-row.expiring .hedge-chip {
+  color: var(--critical);
+}
+
+.hedge-title {
+  font-weight: 650;
+  color: var(--text-primary);
+}
+
+.hedge-econ {
+  font-size: 12px;
+  color: var(--text-secondary);
+  display: flex;
+  gap: 6px 14px;
+  flex-wrap: wrap;
+}
+.hedge-econ .pos {
+  color: var(--success-text);
+  font-weight: 600;
+}
+.hedge-econ .neg {
+  color: var(--critical);
+  font-weight: 600;
+}
+
+.hedge-detail {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.hedge-msg {
+  font-size: 12.5px;
+  color: var(--text-secondary);
+}
+
+#tradelog-hedge {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+/* an open long option leg still on the books, in the Trade Log table */
+#tradelog-table tr.open-hedge td {
+  background-color: var(--noactivity-bg);
+  box-shadow: inset 3px 0 0 var(--warning);
+}
+
 .loading {
   opacity: 0.45;
   transition: opacity 0.15s;
@@ -871,20 +996,36 @@ tr.detail > td {
 #tab-tradelog[hidden],
 #tradelog-summary[hidden],
 #tradelog-bridge[hidden],
+#tradelog-ppd[hidden],
 #tradelog-insights[hidden],
 #tradelog-empty[hidden],
-#tradelog-note[hidden] {
+#tradelog-note[hidden],
+#dashboard-insights[hidden] {
   display: none;
 }
 
-.tradelog-insights {
+.insights-box {
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 10px 14px;
   margin-bottom: 14px;
 }
 
-.tradelog-insights .ti-head {
+/* Portfolio insights sit inside the Performance card, under the tiles -- no
+   nested border/box, just a divider from the tile grid above. */
+#performance-card .tiles {
+  margin-bottom: 0;
+}
+
+#performance-card #dashboard-insights {
+  border: 0;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+  padding: 12px 0 0;
+  margin: 12px 0 0;
+}
+
+.insights-box .ti-head {
   font-size: 10.5px;
   font-weight: 700;
   letter-spacing: 0.04em;
@@ -893,7 +1034,7 @@ tr.detail > td {
   margin-bottom: 6px;
 }
 
-.tradelog-insights .ti-list {
+.insights-box .ti-list {
   margin: 0;
   padding: 0;
   list-style: none;
@@ -901,7 +1042,7 @@ tr.detail > td {
   gap: 5px;
 }
 
-.tradelog-insights li {
+.insights-box li {
   display: flex;
   gap: 8px;
   font-size: 12.5px;
@@ -909,16 +1050,16 @@ tr.detail > td {
   color: var(--text-secondary);
 }
 
-.tradelog-insights .ti-mark {
+.insights-box .ti-mark {
   flex: 0 0 auto;
   font-weight: 700;
 }
 
-.tradelog-insights .ti-good .ti-mark {
+.insights-box .ti-good .ti-mark {
   color: var(--success-text);
 }
 
-.tradelog-insights .ti-improve .ti-mark {
+.insights-box .ti-improve .ti-mark {
   color: var(--warning);
 }
 
@@ -942,8 +1083,9 @@ tr.detail > td {
   min-width: 0;
 }
 
-/* Closed wheels are salmon in the dropdown list. Only the options are tinted --
-   styling the <select> itself bleeds its background onto every option. */
+/* Closed wheels are salmon and dormant (NO_ACTIVITY) wheels are amber in the
+   dropdown list. Only the options are tinted -- styling the <select> itself
+   bleeds its background onto every option. */
 #tradelog-pick option {
   background-color: var(--surface-1);
   color: var(--text-primary);
@@ -951,6 +1093,10 @@ tr.detail > td {
 
 #tradelog-pick option.closed {
   background-color: var(--closed-bg);
+}
+
+#tradelog-pick option.no-activity {
+  background-color: var(--noactivity-bg);
 }
 
 .tradelog-nav button {
@@ -970,6 +1116,22 @@ tr.detail > td {
   font-size: 12px;
 }
 
+.tradelog-ppd {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin-bottom: 14px;
+}
+
+.tradelog-ppd .ti-head {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+
 .tradelog-summary {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
@@ -983,6 +1145,11 @@ tr.detail > td {
 .tradelog-summary.closed {
   background: var(--closed-bg);
   border-color: var(--closed-bg);
+}
+
+.tradelog-summary.no-activity {
+  background: var(--noactivity-bg);
+  border-color: var(--noactivity-bg);
 }
 
 .tradelog-summary .tl-cell {
