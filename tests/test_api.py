@@ -111,16 +111,21 @@ class TestCurrentPrices(unittest.TestCase):
 
     def test_tickers_are_fetched_concurrently_not_one_at_a_time(self):
         """Regression guard for the sequential-fetch slowdown: N tickers that
-        each take ``delay`` seconds must finish in close to ``delay`` total,
-        not ``N * delay`` -- proving the pool actually overlaps the waits
-        rather than merely wrapping the same serial loop in a pool object.
+        each need a network fetch taking ``delay`` seconds must finish in
+        close to ``delay`` total, not ``N * delay`` -- proving the pool
+        actually overlaps the waits rather than merely wrapping the same
+        serial loop in a pool object.
         """
         tickers = [f"T{i}" for i in range(6)]
         with tempfile.TemporaryDirectory() as tmp:
             dashboard = _dashboard_with_held_shares(tmp, tickers)
             delay = 0.2
 
-            def slow_get_price_series(ticker, **kwargs):
+            def slow_get_price_series(ticker, *, local_only=False, **kwargs):
+                # No local cache/memo -> every ticker is a network miss the
+                # caller must batch through the pool.
+                if local_only:
+                    return None
                 time.sleep(delay)
                 return [PricePoint(day=date(2026, 1, 1), close=100.0)], []
 

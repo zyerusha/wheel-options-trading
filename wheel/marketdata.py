@@ -162,6 +162,38 @@ def save_cache(points: Sequence[PricePoint], cache_path: str) -> None:
 # --------------------------------------------------------------------------
 
 
+# Per-process, per-day memo of resolved series, keyed by cache-file path. A
+# long-lived server builds the dashboard once per account (six-plus times for
+# the Combined view) and every build asks for the same tickers; without this
+# each build re-reads every cache file and, on a stale day, re-fetches every
+# ticker once per account. The memo is only trusted for the current calendar
+# date, so tomorrow's first build still refreshes. Bypassed entirely when a
+# caller injects ``fetch``/``cache_path`` (tests), so it never leaks across them.
+_SERIES_MEMO: dict[str, tuple[date, list["PricePoint"]]] = {}
+
+
+def _sessions_elapsed(last_day: date, today: date) -> int:
+    """Weekday count in ``(last_day, today]`` -- how many regular-session
+    closes could exist that ``last_day`` does not yet cover.
+
+    Using this instead of a raw calendar-day delta stops a Friday close from
+    reading as "stale" all weekend (Sat/Sun add nothing to fetch), which was
+    turning every Saturday-through-Monday dashboard load into a full re-fetch
+    of every ticker. Market holidays are not modelled -- at worst that costs
+    one redundant fetch a year per ticker, not worth a holiday calendar in a
+    stdlib-only project.
+    """
+    if last_day >= today:
+        return 0
+    sessions = 0
+    day = last_day
+    while day < today:
+        day += timedelta(days=1)
+        if day.weekday() < 5:
+            sessions += 1
+    return sessions
+
+
 def get_price_series(
     ticker: str = "SPY",
     *,
@@ -169,15 +201,23 @@ def get_price_series(
     cache_path: str | None = None,
     max_age_days: int = 1,
     force_refresh: bool = False,
-) -> tuple[list[PricePoint], list[str]]:
+    local_only: bool = False,
+) -> tuple[list[PricePoint], list[str]] | None:
     """The best available daily-close series for ``ticker``, refreshing the
     cache when stale.
 
+    With ``local_only=True`` the network is never touched: returns the resolved
+    series when it can be answered from the in-process memo or a still-fresh
+    cache file, or ``None`` when a fetch would otherwise be needed (so the
+    caller can batch those). Every other path returns a ``(points, warnings)``
+    tuple and never raises.
+
     Never raises. Order of attempts:
 
-    1. If ``force_refresh`` is set, or no cache exists, or the cache's last
-       point is more than ``max_age_days`` behind today, try ``fetch()``. On
-       success the parsed series is cached and returned with no warning.
+    1. If ``force_refresh`` is set, or no cache exists, or more than
+       ``max_age_days`` regular market sessions (weekdays) have closed since
+       the cache's last point, try ``fetch()``. On success the parsed series
+       is cached and returned with no warning.
     2. If the fetch was skipped (cache already fresh), the cache is returned
        as-is, no warning.
     3. If the fetch was attempted and failed, fall back to the existing cache
@@ -190,17 +230,29 @@ def get_price_series(
     own cache file (see :func:`yahoo_chart_url`, :func:`_default_cache_path`)
     when omitted; tests inject both to avoid any real network access.
     """
+    memoable = fetch is None and cache_path is None and not force_refresh
     path = cache_path or _default_cache_path(ticker)
     fetch = fetch or (lambda: fetch_yahoo_chart(yahoo_chart_url(ticker)))
+    today = date.today()
+
+    if memoable:
+        memo = _SERIES_MEMO.get(path)
+        if memo is not None and memo[0] == today:
+            return list(memo[1]), []
 
     cached = load_cache(path)
     stale = (
         force_refresh
         or not cached
-        or (date.today() - cached[-1].day) > timedelta(days=max_age_days)
+        or _sessions_elapsed(cached[-1].day, today) > max_age_days
     )
     if not stale:
+        if memoable:
+            _SERIES_MEMO[path] = (today, cached)
         return cached, []
+
+    if local_only:
+        return None
 
     try:
         points = parse_yahoo_chart(fetch())
@@ -215,6 +267,8 @@ def get_price_series(
         return [], [f"{ticker} price fetch returned no usable rows and no cached data is available"]
 
     save_cache(points, path)
+    if memoable:
+        _SERIES_MEMO[path] = (today, points)
     return points, []
 
 

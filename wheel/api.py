@@ -918,14 +918,15 @@ class Dashboard:
         that ticker only (wheel.marketdata never raises), which flows through
         to that cycle's stock_unrealized_pl as "unavailable," not a crash.
 
-        Fetched in parallel, not one ticker at a time: each is an independent
-        network round trip (its own URL, its own cache file under
-        ``data/prices/``), so nothing about them requires serializing, and a
-        cold cache with a few dozen tickers turned a single-digit-second page
-        load into a multi-second one when fetched sequentially. ``pool.map``
-        keeps `tickers`' order, so building `prices`/`warnings` from the
-        zipped results needs no lock -- every dict/list write still happens
-        on this thread, only the network wait itself overlaps.
+        Two passes so the common case pays nothing for threads: first resolve
+        every ticker that a fresh cache or the in-process memo can answer
+        without network (``local_only=True``), then fan the genuine misses --
+        typically only the first page load after a trading session closes --
+        out across a thread pool, since each is an independent network round
+        trip (its own URL, its own cache file under ``data/prices/``). A cold
+        pull of a few dozen tickers one at a time turned a single-digit-second
+        page load into a multi-second one; spinning the pool up when there is
+        nothing to fetch was itself costing ~1.5s per Combined build.
         """
         if self._price_cache is not None:
             return self._price_cache
@@ -939,9 +940,19 @@ class Dashboard:
         )
         prices: dict[str, float | None] = {}
         warnings: list[str] = []
-        if tickers:
-            with ThreadPoolExecutor(max_workers=min(8, len(tickers))) as pool:
-                for ticker, (points, ticker_warnings) in zip(tickers, pool.map(marketdata.get_price_series, tickers)):
+        misses: list[str] = []
+        for ticker in tickers:
+            local = marketdata.get_price_series(ticker, local_only=True)
+            if local is None:
+                misses.append(ticker)
+                continue
+            points, ticker_warnings = local
+            warnings.extend(ticker_warnings)
+            prices[ticker] = points[-1].close if points else None
+
+        if misses:
+            with ThreadPoolExecutor(max_workers=min(8, len(misses))) as pool:
+                for ticker, (points, ticker_warnings) in zip(misses, pool.map(marketdata.get_price_series, misses)):
                     warnings.extend(ticker_warnings)
                     prices[ticker] = points[-1].close if points else None
 

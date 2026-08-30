@@ -15,10 +15,13 @@ from datetime import date, datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from datetime import timedelta  # noqa: E402
+
 from wheel.marketdata import (  # noqa: E402
     MarketDataError,
     PricePoint,
     _default_cache_path,
+    _sessions_elapsed,
     get_price_series,
     load_cache,
     parse_yahoo_chart,
@@ -185,6 +188,73 @@ class TestGetPriceSeries(unittest.TestCase):
             self.assertEqual(len(calls), 1)
             self.assertEqual(warnings, [])
             self.assertEqual(len(points), 3)
+
+    def test_cache_within_one_session_is_not_stale(self):
+        """The cache's last point is one weekday behind today: no refetch --
+        the same tolerance the old calendar-day rule gave, now session-aware
+        so a Friday->Sunday gap no longer counts as stale.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = self._cache_path(tmp)
+            today = date.today()
+            one_session_back = today - timedelta(days=1)
+            while one_session_back.weekday() >= 5:  # land on a weekday
+                one_session_back -= timedelta(days=1)
+            save_cache([PricePoint(day=one_session_back, close=100.0)], cache_path)
+
+            calls = []
+
+            def fetch():
+                calls.append(1)
+                return YAHOO_SAMPLE
+
+            points, warnings = get_price_series(fetch=fetch, cache_path=cache_path, max_age_days=1)
+            self.assertEqual(calls, [])
+            self.assertEqual(warnings, [])
+            self.assertEqual(points[-1].day, one_session_back)
+
+    def test_local_only_returns_none_when_a_fetch_would_be_needed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = self._cache_path(tmp)
+            save_cache([PricePoint(day=date(2020, 1, 1), close=100.0)], cache_path)
+
+            def fetch():
+                raise AssertionError("local_only must never fetch")
+
+            self.assertIsNone(
+                get_price_series(fetch=fetch, cache_path=cache_path, local_only=True)
+            )
+
+    def test_local_only_returns_the_series_when_cache_is_fresh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = self._cache_path(tmp)
+            save_cache([PricePoint(day=date.today(), close=100.0)], cache_path)
+
+            result = get_price_series(
+                fetch=lambda: YAHOO_SAMPLE, cache_path=cache_path, local_only=True
+            )
+            self.assertIsNotNone(result)
+            points, warnings = result
+            self.assertEqual(warnings, [])
+            self.assertEqual(points[-1].close, 100.0)
+
+
+class TestSessionsElapsed(unittest.TestCase):
+    def test_same_day_is_zero(self):
+        d = date(2026, 8, 26)
+        self.assertEqual(_sessions_elapsed(d, d), 0)
+
+    def test_future_cache_clamps_to_zero(self):
+        self.assertEqual(_sessions_elapsed(date(2026, 8, 27), date(2026, 8, 26)), 0)
+
+    def test_consecutive_weekdays_count_one(self):
+        self.assertEqual(_sessions_elapsed(date(2026, 8, 26), date(2026, 8, 27)), 1)
+
+    def test_friday_to_sunday_is_zero_sessions(self):
+        self.assertEqual(_sessions_elapsed(date(2026, 8, 28), date(2026, 8, 30)), 0)
+
+    def test_friday_to_tuesday_counts_only_monday_and_tuesday(self):
+        self.assertEqual(_sessions_elapsed(date(2026, 8, 28), date(2026, 9, 1)), 2)
 
 
 class TestPerTicker(unittest.TestCase):
