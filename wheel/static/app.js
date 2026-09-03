@@ -28,6 +28,9 @@ const state = {
   end: null,
   expanded: new Set(),
   cycleSort: { key: 'net_realized_pl', dir: -1 },
+  // Open option positions table: within each symbol group (symbols stay
+  // alphabetical), which column orders the rows and in which direction.
+  openPosSort: { key: 'expiration', dir: 1 },
   // How the capital chart expresses its bands: 'value' (dollars) or 'share' (%
   // of the day's total). A view of one chart, not a filter -- it changes no data.
   capitalMode: 'value',
@@ -5061,6 +5064,189 @@ function renderDashboardInsights() {
   renderInsights($('dashboard-insights'), state.data && state.data.insights, 'Portfolio insights');
 }
 
+/* -------------------------------------------------- open option positions
+ *
+ * One sortable row per open covered call / cash-secured put across every
+ * wheel -- `data.open_positions`, built by `_build_open_positions` in
+ * wheel/api.py. Filter-independent (an open contract needs watching whatever
+ * date window is on screen), so it is not redrawn on filter changes beyond
+ * the single render() pass. Symbols stay alphabetical and their rows stay
+ * contiguous; a column click re-orders the rows *within* each symbol group.
+ */
+const OPEN_POS_COLUMNS = [
+  { key: 'underlying', label: 'Symbol', left: true },
+  { key: 'cycle_id', label: 'Wheel', left: true },
+  { key: 'type', label: 'Type', left: true },
+  { key: 'breakeven', label: 'Breakeven' },
+  { key: 'wheel_breakeven', label: 'Wheel Breakeven' },
+  { key: 'moneyness_pct', label: 'ITM/OTM (%)' },
+  { key: 'strike', label: 'Strike' },
+  { key: 'last_close', label: 'Last Close' },
+  { key: 'last_close_pct', label: 'Last Close %' },
+  { key: 'expiration', label: 'Expiration' },
+  { key: 'signed_contracts', label: 'Qty' },
+  { key: 'net_premium', label: 'Net Premium' },
+  { key: 'annualized_yield_pct', label: 'Annualized Yield' },
+];
+
+function signedPct(value, digits = 2) {
+  if (value === null || value === undefined || Number.isNaN(value)) return '—';
+  return (value > 0 ? '+' : '') + value.toFixed(digits) + '%';
+}
+
+const toneOf = (value) =>
+  value === null || value === undefined || Number.isNaN(value) ? '' : value >= 0 ? 'pos' : 'neg';
+
+function openPositionRow(row, isGroupStart, groupSize) {
+  const tr = el('tr', {
+    class: 'op-row' + (isGroupStart ? ' op-group-start' : ''),
+  });
+
+  const symCell = el('td', { class: 'left ticker-cell' }, isGroupStart ? row.underlying : '');
+  if (isGroupStart) {
+    const bits = [row.name].filter(Boolean);
+    if (groupSize > 1) bits.push(`${groupSize} open positions`);
+    if (bits.length) symCell.title = bits.join(' · ');
+  }
+  tr.appendChild(symCell);
+
+  tr.appendChild(el('td', { class: 'left op-wheel' }, row.cycle_id));
+
+  const typeCell = el('td', { class: 'left' });
+  typeCell.appendChild(
+    el('span', { class: 'badge op-type op-type-' + row.type, title: row.type === 'CSP' ? 'Cash-secured put' : 'Covered call' }, row.type)
+  );
+  tr.appendChild(typeCell);
+
+  // Both break-even cells carry ONE signal: is the entire wheel in profit or
+  // underwater? That is the last close vs. the wheel break-even (for a
+  // share-less CSP wheel, which has no wheel break-even, its own position
+  // break-even stands in). No color without a reference and a price.
+  const wheelRef = row.wheel_breakeven === null || row.wheel_breakeven === undefined
+    ? row.breakeven
+    : row.wheel_breakeven;
+  const wheelUnderwater =
+    wheelRef === null || wheelRef === undefined || row.last_close === null || row.last_close === undefined
+      ? null
+      : row.last_close < wheelRef;
+  const breakEvenTone = wheelUnderwater === null ? '' : wheelUnderwater ? 'neg' : 'pos';
+  const wheelStatus =
+    wheelUnderwater === null
+      ? ''
+      : wheelUnderwater
+        ? ' — whole wheel underwater (last close below the wheel break-even)'
+        : ' — whole wheel in profit (last close above the wheel break-even)';
+
+  const beCell = el('td', { class: 'num ' + breakEvenTone }, money(row.breakeven, { cents: true }));
+  beCell.title =
+    (row.type === 'CSP'
+      ? 'This put alone: strike − premium/share.'
+      : 'This call alone: backing-share cost basis − premium/share.') + wheelStatus;
+  tr.appendChild(beCell);
+
+  const wheelBeCell = el('td', { class: 'num ' + breakEvenTone }, money(row.wheel_breakeven, { cents: true }));
+  wheelBeCell.title =
+    'The whole wheel: raw cost of shares still held, less every dollar the cycle has banked ' +
+    '(premium, realized P/L, dividends). A dash when the cycle holds no shares yet.' +
+    wheelStatus;
+  tr.appendChild(wheelBeCell);
+
+  const moneyness =
+    row.moneyness_pct === null || row.moneyness_pct === undefined
+      ? el('td', { class: 'num' }, '—')
+      : el(
+          'td',
+          { class: 'num ' + (row.moneyness_pct >= 0 ? 'pos' : 'neg') },
+          `${row.in_the_money ? 'ITM' : 'OTM'} ${Math.abs(row.moneyness_pct).toFixed(2)}%`
+        );
+  moneyness.title = 'Strike vs. last close. Positive = out-of-the-money cushion; negative = in-the-money (assignment risk).';
+  tr.appendChild(moneyness);
+
+  tr.appendChild(el('td', { class: 'num' }, money(row.strike, { cents: true })));
+  tr.appendChild(el('td', { class: 'num' }, money(row.last_close, { cents: true })));
+  tr.appendChild(el('td', { class: 'num ' + toneOf(row.last_close_pct) }, signedPct(row.last_close_pct)));
+
+  const expCell = el(
+    'td',
+    { class: 'num' },
+    row.expiration ? `${row.expiration} · ${row.days_to_expiry}d` : '—'
+  );
+  tr.appendChild(expCell);
+
+  tr.appendChild(el('td', { class: 'num' }, row.signed_contracts));
+  tr.appendChild(el('td', { class: 'num ' + toneOf(row.net_premium) }, money(row.net_premium, { cents: true, sign: true })));
+
+  const yieldCell = el('td', { class: 'num ' + toneOf(row.annualized_yield_pct) }, pct(row.annualized_yield_pct));
+  yieldCell.title =
+    'Net premium ÷ (strike × 100 × contracts), scaled to a year over the contract\'s open→expiry span.';
+  tr.appendChild(yieldCell);
+
+  return tr;
+}
+
+function renderOpenPositions() {
+  const table = $('open-positions-table');
+  if (!table) return;
+  const card = $('open-positions-card');
+  const rows = (state.data && state.data.open_positions) || [];
+  if (card) card.hidden = rows.length === 0;
+  clear(table);
+  if (!rows.length) return;
+
+  const { key, dir } = state.openPosSort;
+
+  const thead = el('thead');
+  const headRow = el('tr');
+  for (const column of OPEN_POS_COLUMNS) {
+    const th = el('th', { class: `sortable${column.left ? ' left' : ''}` }, column.label);
+    if (key === column.key) th.textContent = column.label + (dir === 1 ? ' ▲' : ' ▼');
+    th.addEventListener('click', () => {
+      if (state.openPosSort.key === column.key) state.openPosSort.dir *= -1;
+      else state.openPosSort = { key: column.key, dir: column.key === 'underlying' ? 1 : -1 };
+      renderOpenPositions();
+    });
+    headRow.appendChild(th);
+  }
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  // Sorting the Symbol column is a straight A-Z / Z-A of the groups, with each
+  // symbol's rows in expiry order. Sorting any other column sorts the rows
+  // inside every group by that column AND sorts the groups themselves by their
+  // now-leading (first) row -- so a header click visibly reorders the whole
+  // table, while a symbol's positions still sit together as one block.
+  const rowKey = key === 'underlying' ? 'expiration' : key;
+  const rowDir = key === 'underlying' ? 1 : dir;
+
+  // Null / NaN always sinks to the bottom, whichever direction is active.
+  const rowCmp = (a, b) => {
+    const av = a[rowKey];
+    const bv = b[rowKey];
+    const aNil = av === null || av === undefined || Number.isNaN(av);
+    const bNil = bv === null || bv === undefined || Number.isNaN(bv);
+    if (aNil || bNil) return (aNil ? 1 : 0) - (bNil ? 1 : 0);
+    const base = typeof av === 'string' ? av.localeCompare(bv) : av - bv;
+    return base * rowDir;
+  };
+
+  const groups = new Map();
+  for (const row of rows) {
+    if (!groups.has(row.underlying)) groups.set(row.underlying, []);
+    groups.get(row.underlying).push(row);
+  }
+  const ordered = [...groups.values()].map((group) => group.slice().sort(rowCmp));
+  ordered.sort((a, b) => {
+    if (key === 'underlying') return a[0].underlying.localeCompare(b[0].underlying) * dir;
+    return rowCmp(a[0], b[0]) || a[0].underlying.localeCompare(b[0].underlying);
+  });
+
+  const tbody = el('tbody');
+  for (const group of ordered) {
+    group.forEach((row, index) => tbody.appendChild(openPositionRow(row, index === 0, group.length)));
+  }
+  table.appendChild(tbody);
+}
+
 /**
  * A vertical waterfall: y is the running money value, x is each action, read
  * left to right -- the first action (Premium sold) is the leftmost column,
@@ -5230,6 +5416,205 @@ function drawTradeLogPpd(entry) {
     legendId: 'legend-tradelog-ppd',
     tableId: null,
   });
+}
+
+/**
+ * Break-even after every transaction, in ledger order -- the same
+ * `running_break_even` column from the table above, drawn as a line so the
+ * grind down (premium coming in) and the jumps (shares bought) read at a
+ * glance. A dashed rule marks the current stock price; the last point is the
+ * wheel's Break-even price. Hidden when the wheel never holds a whole share.
+ */
+function drawTradeLogBreakeven(entry) {
+  const host = $('tradelog-breakeven');
+  const svg = $('chart-tradelog-breakeven');
+  const rows = (entry.transactions || []).filter(
+    (r) => typeof r.running_break_even === 'number'
+  );
+  if (rows.length < 2) {
+    host.hidden = true;
+    clear(svg);
+    return;
+  }
+  host.hidden = false;
+
+  const be = rows.map((r) => r.running_break_even);
+  const cur = typeof entry.current_price === 'number' ? entry.current_price : null;
+
+  // A pathological opener (a token 1-share buy while big puts are sold) can
+  // throw break-even to a wild negative for a row or two. Scale the y-axis to
+  // the bulk of the series with a median/MAD clamp so those outliers sit at the
+  // edge instead of flattening everything meaningful; the line is clipped to
+  // the plot so it never spills, and off-scale dots are simply not drawn.
+  const sorted = [...be].sort((a, b) => a - b);
+  const med = sorted[sorted.length >> 1];
+  const devs = sorted.map((v) => Math.abs(v - med)).sort((a, b) => a - b);
+  const mad = devs[devs.length >> 1] || Math.abs(med) * 0.1 || 1;
+  const within = be.filter((v) => Math.abs(v - med) <= 6 * mad);
+  let lo = Math.min(...within, cur === null ? Infinity : cur);
+  let hi = Math.max(...within, cur === null ? -Infinity : cur);
+  if (!isFinite(lo) || !isFinite(hi)) {
+    lo = Math.min(...be);
+    hi = Math.max(...be);
+  }
+  const pad = (hi - lo) * 0.12 || 1;
+  lo -= pad;
+  hi += pad;
+
+  const margin = { top: 14, right: 58, bottom: 30, left: 62 };
+  const width = chartWidth(svg);
+  const height = 260;
+  const priceLabel = (v) => (v < 0 ? '-$' : '$') + Math.abs(v).toFixed(2);
+  const { group, plotWidth, plotHeight, y } = frame(svg, {
+    width,
+    height,
+    margin,
+    yMin: lo,
+    yMax: hi,
+    yFormat: priceLabel,
+  });
+
+  // Clip the line to the plot box so a far-off-scale segment can't draw over
+  // the axis labels.
+  const clipId = 'tlbe-clip';
+  const defs = svgEl('defs');
+  const clip = svgEl('clipPath', { id: clipId });
+  clip.appendChild(
+    svgEl('rect', { x: margin.left, y: margin.top, width: plotWidth, height: plotHeight })
+  );
+  defs.appendChild(clip);
+  svg.insertBefore(defs, svg.firstChild);
+
+  const slot = plotWidth / rows.length;
+  const centers = rows.map((_, i) => margin.left + slot * (i + 0.5));
+  const lineColor = cssVar('--series-1');
+  const clampY = (v) => y(Math.max(lo, Math.min(hi, v)));
+
+  // Current stock price -- the gap between this and the line is what is left to
+  // recover.
+  if (cur !== null && cur >= lo && cur <= hi) {
+    const cy = y(cur);
+    group.appendChild(
+      svgEl('line', {
+        x1: margin.left,
+        x2: margin.left + plotWidth,
+        y1: cy,
+        y2: cy,
+        stroke: cssVar('--text-muted'),
+        'stroke-width': 1,
+        'stroke-dasharray': '4 3',
+        'stroke-opacity': 0.7,
+      })
+    );
+    group.appendChild(
+      svgEl(
+        'text',
+        {
+          x: margin.left + plotWidth + 4,
+          y: cy + 3.5,
+          'text-anchor': 'start',
+          fill: 'var(--text-muted)',
+          'font-weight': 600,
+        },
+        'now ' + priceLabel(cur)
+      )
+    );
+  }
+
+  group.appendChild(
+    svgEl('path', {
+      d: 'M' + centers.map((cx, i) => `${cx},${y(be[i])}`).join('L'),
+      fill: 'none',
+      stroke: lineColor,
+      'stroke-width': 2.5,
+      'stroke-linejoin': 'round',
+      'stroke-linecap': 'round',
+      'clip-path': `url(#${clipId})`,
+    })
+  );
+
+  rows.forEach((r, i) => {
+    const cx = centers[i];
+    if (be[i] >= lo && be[i] <= hi) {
+      group.appendChild(svgEl('circle', { cx, cy: y(be[i]), r: 2.2, fill: lineColor }));
+    }
+    const hit = svgEl('circle', { cx, cy: clampY(be[i]), r: 7, fill: 'transparent' });
+    attachTip(
+      hit,
+      `${r.type} · ${r.date}`,
+      [
+        { label: 'Break-even after this fill', value: priceLabel(r.running_break_even) },
+        { label: 'Cumulative cash flow', value: money(r.running_cash_flow, { cents: true }) },
+      ],
+      formula([
+        'Break-even = minus Cumulative cash flow ÷ shares held',
+        `= ${money(-r.running_cash_flow, { cents: true })} ÷ shares held`,
+        `= ${priceLabel(r.running_break_even)}`,
+      ])
+    );
+    group.appendChild(hit);
+  });
+
+  // Endpoint = the summary's Break-even price.
+  const lastCx = centers[centers.length - 1];
+  const lastVal = be[be.length - 1];
+  const lastCy = clampY(lastVal);
+  group.appendChild(
+    svgEl('circle', {
+      cx: lastCx,
+      cy: lastCy,
+      r: 4.5,
+      fill: lineColor,
+      stroke: cssVar('--surface-1'),
+      'stroke-width': 2,
+    })
+  );
+  group.appendChild(
+    svgEl(
+      'text',
+      {
+        x: Math.min(lastCx + 8, margin.left + plotWidth + margin.right - 4),
+        y: lastCy - 8,
+        'text-anchor': lastCx + 8 > margin.left + plotWidth ? 'end' : 'start',
+        fill: 'var(--text-primary)',
+        'font-weight': 700,
+      },
+      priceLabel(lastVal)
+    )
+  );
+
+  group.appendChild(
+    svgEl('line', {
+      class: 'axis-line',
+      x1: margin.left,
+      x2: margin.left + plotWidth,
+      y1: margin.top + plotHeight,
+      y2: margin.top + plotHeight,
+    })
+  );
+  const maxLabels = Math.max(2, Math.floor(plotWidth / 74));
+  const step = Math.max(1, Math.ceil(rows.length / maxLabels));
+  rows.forEach((r, i) => {
+    if (i % step !== 0 && i !== rows.length - 1) return;
+    group.appendChild(
+      svgEl(
+        'text',
+        {
+          class: 'tick-label',
+          x: centers[i],
+          y: margin.top + plotHeight + 16,
+          'text-anchor': 'middle',
+        },
+        dayLabel(r.date)
+      )
+    );
+  });
+
+  svg.setAttribute(
+    'aria-label',
+    `Break-even after each of ${rows.length} transactions, ending at ${priceLabel(lastVal)}` +
+      (cur !== null ? `, with the stock now at ${priceLabel(cur)}.` : '.')
+  );
 }
 
 function renderTradeLogSummary(entry) {
@@ -5513,6 +5898,7 @@ function renderTradeLogTable(entry) {
     'Commissions',
     'Net cash flow',
     'Cumulative cash flow',
+    'Break-even',
   ];
   const HEAD_HELP = {
     Type: formula([
@@ -5561,6 +5947,13 @@ function renderTradeLogTable(entry) {
       'Running sum of Net cash flow down the rows.',
       'A cash ledger, not a P&L figure.',
     ]),
+    'Break-even': formula([
+      'Sell price that would zero the campaign here.',
+      'Negative Cumulative cash flow ÷ shares held.',
+      'Falls as premium and dividends come in.',
+      'Dash while under one share is on the book.',
+      'Last share-holding row = Break-even price above.',
+    ]),
   };
   const table = el('table');
   const thead = el('thead');
@@ -5576,6 +5969,10 @@ function renderTradeLogTable(entry) {
 
   const cents = (value) => (value === null || value === undefined ? '—' : money(value, { cents: true }));
   const bare = (value) => (value === null || value === undefined ? '—' : '$' + value);
+  // Per-share price, formatted like the summary's Break-even price so the two
+  // can be read against each other.
+  const perShare = (value) =>
+    value === null || value === undefined ? '—' : '$' + value.toFixed(2);
   // Long/bought positive with a leading +, short/sold negative with -.
   // No direction (a dividend) shows a dash.
   const signedQty = (value) =>
@@ -5618,6 +6015,7 @@ function renderTradeLogTable(entry) {
       row.commission === null || row.commission === undefined ? '—' : cents(row.commission),
       cents(row.net_cash_flow),
       cents(row.running_cash_flow),
+      perShare(row.running_break_even),
     ];
     cells.forEach((value, index) => {
       const td = el('td', { class: index === 0 ? 'left' : 'num' }, value);
@@ -5690,6 +6088,7 @@ function renderTradeLog() {
     $('tradelog-summary').hidden = true;
     $('tradelog-bridge').hidden = true;
     $('tradelog-ppd').hidden = true;
+    $('tradelog-breakeven').hidden = true;
     $('tradelog-insights').hidden = true;
     $('tradelog-hedge').hidden = true;
     $('tradelog-note').hidden = true;
@@ -5716,6 +6115,7 @@ function renderTradeLog() {
     $('tradelog-summary').hidden = true;
     $('tradelog-bridge').hidden = true;
     $('tradelog-ppd').hidden = true;
+    $('tradelog-breakeven').hidden = true;
     $('tradelog-insights').hidden = true;
     $('tradelog-hedge').hidden = true;
     $('tradelog-note').hidden = true;
@@ -5730,6 +6130,7 @@ function renderTradeLog() {
   drawTradeLogPpd(entry);
   renderTradeLogSummary(entry);
   renderTradeLogTable(entry);
+  drawTradeLogBreakeven(entry);
 }
 
 function render() {
@@ -5783,6 +6184,7 @@ function render() {
   renderTiles(portfolio, reconciliation);
   renderHedgeBanner();
   renderDashboardInsights();
+  renderOpenPositions();
   renderNetWorth(net_worth, benchmark, wheel_return);
 
   drawCapital(capital_series, net_worth);

@@ -714,6 +714,35 @@ th.sortable:hover {
   cursor: help;
 }
 
+/* ---------------- open option positions table ---------------- */
+
+/* First row of each symbol group gets a heavier rule, so a symbol's stacked
+   positions read as one block even when a column sort reorders them. */
+#open-positions-table tr.op-group-start > td {
+  border-top: 2px solid var(--border);
+}
+
+#open-positions-table td.op-wheel {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.badge.op-type {
+  font-size: 10px;
+  letter-spacing: 0.03em;
+}
+
+.badge.op-type-CSP {
+  color: var(--series-1);
+  border-color: var(--series-1);
+}
+
+.badge.op-type-CC {
+  color: var(--series-2);
+  border-color: var(--series-2);
+}
+
 /* ---------------- expandable cycle rows ---------------- */
 
 tr.cycle-row {
@@ -1129,6 +1158,14 @@ tr.detail > td {
   border-radius: var(--radius);
   padding: 10px 12px;
   margin-bottom: 14px;
+}
+
+#tradelog-breakeven {
+  margin-top: 14px;
+}
+
+#tradelog-breakeven svg {
+  font-size: 12px;
 }
 
 .tradelog-ppd .ti-head {

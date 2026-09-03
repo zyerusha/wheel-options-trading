@@ -155,6 +155,54 @@ scoped to the wheel on screen) directly under that wheel's Insights. Both are hi
 when there is nothing to show. The Trade Log also keeps the long leg's own transaction
 row highlighted for as long as it stays open (`is_open_long` on the row).
 
+### Open option positions table
+
+`Dashboard._build_open_positions` (`wheel/api.py`, filter-independent like the Trade Log
+and the hedge banner) emits one row per **open short option leg** — `leg.is_open and
+leg.side == SHORT and leg.strategy in (CSP, COVERED_CALL)` — across every cycle. Plain
+buy-and-hold share lots and long-only hedges are excluded (the hedge banner covers the
+latter). `_open_position_row` computes, per leg:
+
+- `type` — `CSP` for a short put, `CC` for a short call.
+- `net_premium` — `leg.open_premium`, the credit still standing on the un-closed portion
+  (fees already netted in). `premium/share` = that ÷ (contracts × 100).
+- `breakeven` — **this contract alone.** Short put: `strike − premium/share`; short call:
+  `cost_basis − premium/share`, where `cost_basis` is the known-basis mean of the cycle's
+  still-held lots (`None`, shown as `—`, when only pre-history unknown-basis shares back
+  the call).
+- `wheel_breakeven` — **the whole cycle's** campaign break-even price, looked up by
+  `cycle_id` from the already-built Trade Log's `wheels` (the Trade Log's own "Break-even
+  price": raw share cost less every dollar the cycle has banked — premium, realized P/L,
+  dividends). `None` for a cycle holding no shares yet. Passed in via `_build_open_positions(
+  …, wheels=self._trade_log["wheels"])`, so it costs no extra `cycle_metrics` call.
+
+Both break-even cells carry one shared color in the frontend: is the **entire wheel**
+in profit or underwater? That is `last_close` vs. `wheel_breakeven` (green at or above,
+red below) — for a share-less CSP wheel, which has no `wheel_breakeven`, its own
+`breakeven` stands in. Uncolored when the reference or the price is missing. The
+per-contract `breakeven` number is still shown; only its color follows the whole wheel.
+- `moneyness_pct` — signed, vs `last_close`: `+` = out-of-the-money cushion, `−` =
+  in-the-money (assignment risk). `in_the_money` is just `moneyness_pct < 0`.
+- `last_close` / `last_close_pct` — latest close and its day-over-day % change, from
+  `Dashboard._prev_closes` (the prior trading day's close, captured alongside
+  `_price_cache` in `_current_prices` — whose ticker set was widened to include every
+  cycle with an open leg, so a shares-free CSP wheel still gets a mark).
+- `annualized_yield_pct` — `net_premium ÷ (strike × 100 × contracts) × (365 ÷
+  contract_days)`, where `contract_days` is the leg's own open-to-expiry span.
+- `signed_contracts` — negative (short); **not** color-coded, unlike every other
+  numeric column.
+
+The dashboard renders `data.open_positions` as a sortable table (`#open-positions-table`,
+`renderOpenPositions` in `app.js`) inside the Performance card, directly under *Portfolio
+insights*; hidden when empty. A symbol's positions always render as one contiguous block.
+A column-heading click sets `state.openPosSort` and re-orders the **whole** table: rows
+within each symbol group sort by the chosen column, and the groups themselves sort by
+their now-leading row — so every row visibly moves, but a symbol never scatters. The
+Symbol header is a plain A→Z / Z→A of the groups (rows in expiry order); nulls always
+sink. Default is symbol A→Z, expiry ascending. The Combined view concatenates each
+account's rows via `_combine_open_positions` (`wheel/accounts.py`), `cycle_id`
+account-prefixed like the rest.
+
 ### Insights
 
 `wheel/insights.py` is plain-rules commentary — no model, no network — in one shape,
@@ -452,6 +500,18 @@ then subtracting fees back out via the formula's own term is algebraically
 identical to just using the already fee-net total directly. That identity is
 exactly what the implementation does -- no separate fee term, because there's
 nothing left for it to do once the gross reconstruction is skipped.
+
+A third view, the Trade Log ledger's **Break-even** column (`running_break_even`
+per row, `_trade_log_entry`): the same campaign-wide `break_even_price` the entry
+summary shows, but recomputed after every transaction so the progression is
+visible as premium comes in and shares move. It is just `-running_cash_flow /
+shares_held_so_far` -- open option premium in the cash total is cancelled by
+valuing those legs at expiry, and the raw share cost cancels the tax-lot basis
+term, so `cost_basis - non_stock_pl/shares_held` collapses to it. The last row
+that still holds a whole share is pinned to the summary's `break_even_price`
+exactly (the per-row figure sums already-rounded cash and can drift a cent or two
+over a long ledger); rows under one share, or a wheel that is flat now, show a
+dash, and so does the final row when the summary value is itself withheld.
 
 ### Dual-track returns: Net Option Yield and Total Position ROI
 

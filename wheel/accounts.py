@@ -828,6 +828,7 @@ class AccountRegistry:
         combined_portfolio = _combine_portfolio(payloads, capital_series)
         combined_trade_log = _combine_trade_log(payloads)
         combined_hedges = _combine_open_hedges(payloads)
+        combined_open_positions = _combine_open_positions(payloads)
         combined_wheel_state = _combine_wheel_state(payloads)
         combined_benchmark = _combine_benchmark(payloads)
         combined_wheel_return = _combine_wheel_return(payloads)
@@ -856,6 +857,7 @@ class AccountRegistry:
             "wheel_return": combined_wheel_return,
             "trade_log": combined_trade_log,
             "open_hedges": combined_hedges,
+            "open_positions": combined_open_positions,
         }
 
 
@@ -952,6 +954,21 @@ def _combine_open_hedges(payloads: dict[str, dict]) -> list[dict]:
             )
     hedges.sort(key=lambda hedge: hedge["days_to_expiry"])
     return hedges
+
+
+def _combine_open_positions(payloads: dict[str, dict]) -> list[dict]:
+    """Every account's open covered calls / cash-secured puts in one list,
+    ``cycle_id`` account-prefixed to match the combined timeline / Trade Log.
+    Grouped by underlying then expiry, the same order each account already uses.
+    """
+    positions: list[dict] = []
+    for account_id, payload in payloads.items():
+        for position in payload.get("open_positions") or []:
+            positions.append(
+                {**position, "account_id": account_id, "cycle_id": f"{account_id}:{position['cycle_id']}"}
+            )
+    positions.sort(key=lambda p: (p["underlying"], p["expiration"] or "", p["strike"] or 0.0))
+    return positions
 
 
 def _combine_tickers(payloads: dict[str, dict]) -> list[dict]:

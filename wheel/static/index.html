@@ -107,6 +107,24 @@
         <div id="dashboard-insights" class="insights-box" aria-label="Portfolio insights" hidden></div>
       </section>
 
+      <section class="card" id="open-positions-card" style="margin-bottom: var(--gap)" hidden>
+        <header><h2>Open option positions</h2></header>
+        <p class="hint">
+          Every open covered call (CC) and cash-secured put (CSP) across all wheels — plain
+          buy-and-hold stock is excluded. Default order is by symbol (A–Z); click any column
+          heading to re-sort the whole table by that column, with each symbol's positions kept
+          together. Green is a cushion or a credit, red is assignment risk or a debit.
+        </p>
+        <ul class="hint-list">
+          <li><strong>Breakeven</strong> — this contract alone. Short put: strike − premium/share; short call: backing-share cost basis − premium/share</li>
+          <li><strong>Wheel Breakeven</strong> — the whole cycle: raw cost of shares still held, less every dollar the cycle has banked. A dash when the cycle holds no shares yet</li>
+          <li>Both break-even cells are green / red by whether the <strong>entire wheel</strong> is in profit or underwater — the last close vs. the Wheel Breakeven (a share-less CSP wheel uses its own breakeven)</li>
+          <li><strong>ITM/OTM %</strong> — strike vs. last close; positive = out-of-the-money cushion, negative = in-the-money</li>
+          <li><strong>Annualized Yield</strong> — net premium ÷ (strike × 100 × contracts), scaled to a year over the contract's open→expiry span</li>
+        </ul>
+        <div style="overflow-x: auto"><table id="open-positions-table"></table></div>
+      </section>
+
       <section class="card" id="net-worth-card" style="margin-bottom: var(--gap)" hidden>
         <header>
           <h2>Net worth &amp; benchmark</h2>
@@ -352,6 +370,10 @@
           </div>
           <div id="tradelog-summary" class="tradelog-summary" hidden></div>
           <div style="overflow-x: auto"><div id="tradelog-table"></div></div>
+          <div id="tradelog-breakeven" class="tradelog-ppd" hidden>
+            <div class="ti-head">Break-even over time</div>
+            <div class="chart-scroll"><svg id="chart-tradelog-breakeven" role="img"></svg></div>
+          </div>
         </section>
       </div>
     </div>

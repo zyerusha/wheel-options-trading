@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.test_engine import tx  # noqa: E402
 from wheel.api import Dashboard, _trade_log_entry  # noqa: E402
 from wheel.engine import build_cycles  # noqa: E402
-from wheel.parser import ASSIGNED, BTC, BTO, EXPIRED, OTHER, STC, STO  # noqa: E402
+from wheel.parser import ASSIGNED, BTC, BTO, EXPIRED, OTHER, SELL_STOCK, STC, STO  # noqa: E402
 
 
 def _trade_log(transactions, names=None, prices=None) -> dict:
@@ -175,6 +175,59 @@ class TestTransactionRows(unittest.TestCase):
             wheel["mark_to_market_pl"], 100.0 * (92.0 - wheel["break_even_price"]), places=2
         )
 
+    def test_running_break_even_progression_and_final_row(self):
+        # STO put +$300 -> assigned 100 sh @ $100 -> STO covered call +$150,
+        # still open. Break-even should be a dash until shares land, step down
+        # $3/sh on assignment and another $1.50/sh on the call, and the last
+        # share-holding row must equal the summary's break_even_price.
+        rows = _trade_log(
+            [
+                tx("2025-01-02", STO, "-MU250117P100", -1, 3.0, 300.0, row_id=1),
+                tx("2025-01-17", ASSIGNED, "-MU250117P100", 1, None, 0.0, row_id=2, as_of="2025-01-17"),
+                tx("2025-01-20", STO, "-MU250221C105", -1, 1.5, 150.0, row_id=3),
+            ],
+            prices={"MU": 92.0},
+        )
+        (wheel,) = rows["wheels"]
+        txns = wheel["transactions"]
+        by_type = {r["type"]: r for r in txns}
+        # Put sold before any shares exist -> no break-even yet.
+        self.assertIsNone(by_type["Sell Put"]["running_break_even"])
+        # 100 sh assigned at $100, $300 premium already banked -> $97.00.
+        self.assertAlmostEqual(by_type["Shares Assigned"]["running_break_even"], 97.0, places=2)
+        # Covered call adds $150 / 100 sh -> $95.50.
+        self.assertAlmostEqual(by_type["Sell Call"]["running_break_even"], 95.5, places=2)
+        # Final populated row is exactly the summary figure.
+        last_with_shares = [r for r in txns if r["running_break_even"] is not None][-1]
+        self.assertAlmostEqual(
+            last_with_shares["running_break_even"], wheel["break_even_price"], places=2
+        )
+        # And it tracks -cumulative cash flow / shares held.
+        self.assertAlmostEqual(
+            by_type["Sell Call"]["running_break_even"],
+            -by_type["Sell Call"]["running_cash_flow"] / wheel["shares_held"],
+            places=2,
+        )
+
+    def test_running_break_even_is_none_after_shares_are_sold_off(self):
+        rows = _trade_log(
+            [
+                tx("2025-01-02", STO, "-MU250117P100", -1, 3.0, 300.0, row_id=1),
+                tx("2025-01-17", ASSIGNED, "-MU250117P100", 1, None, 0.0, row_id=2, as_of="2025-01-17"),
+                tx("2025-02-01", SELL_STOCK, "MU", -100, 101.0, 10100.0, row_id=3),
+            ],
+        )
+        (wheel,) = rows["wheels"]
+        txns = wheel["transactions"]
+        by_type = {r["type"]: r for r in txns}
+        self.assertEqual(wheel["shares_held"], 0.0)
+        # While the 100 sh were held the row still showed the break-even -- the
+        # historical progression is not erased just because the wheel is flat now.
+        self.assertAlmostEqual(by_type["Shares Assigned"]["running_break_even"], 97.0, places=2)
+        # Flat again -> the closing row has no break-even, matching the summary.
+        self.assertIsNone(txns[-1]["running_break_even"])
+        self.assertIsNone(wheel["break_even_price"])
+
     def test_pl_bridge_sums_to_mark_to_market(self):
         rows = _trade_log(
             [
@@ -263,6 +316,30 @@ class TestEngineExactPath(unittest.TestCase):
             self.assertIsNone(row["commission"])  # folded into fees on this path
         # open leg fee is commission + fees combined
         self.assertAlmostEqual(entry["transactions"][0]["fees"], 0.67)
+
+    def test_engine_exact_entry_still_carries_dividend_rows(self):
+        # Engine-exact derivation is legs/closes/assignments only; a dividend is
+        # not an engine structure, so it has to be pulled from the raw ledger or
+        # the cash column (and the running break-even) would drop it.
+        div = tx("2025-01-08", OTHER, "MU", 0, None, 12.34, row_id=9, action_raw="DIVIDEND RECEIVED MICRON")
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-06", STO, "-MU250117P100", -1, 2.00, 199.33, row_id=1),
+                tx("2025-01-10", BTC, "-MU250117P100", 1, 0.50, -50.67, row_id=2),
+            ]
+        )
+        entry = _trade_log_entry(
+            cycles[0],
+            [div],
+            date(2025, 1, 17),
+            name=None,
+            dividend_row_ids={9},
+            dividends=12.34,
+            engine_exact=True,
+        )
+        div_rows = [r for r in entry["transactions"] if r["type"] == "Dividend"]
+        self.assertEqual(len(div_rows), 1)
+        self.assertEqual(div_rows[0]["net_cash_flow"], 12.34)
 
 
 class TestBuildPayload(unittest.TestCase):
