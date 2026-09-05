@@ -196,12 +196,9 @@
           <li><strong>Covered Calls</strong> — shares backing a short call currently written against them, waiting to be called away</li>
           <li><strong>Holding Shares</strong> — shares held with no call currently written; capital not generating premium right now</li>
           <li><strong>Hedged / Other</strong> — protective puts, long calls, and netted credit-spread collateral — capital that isn't plain put or stock exposure</li>
+          <li><strong>Cash</strong> — account cash not already reserved as Cash-Secured Puts collateral (that collateral is a hold against this same cash, never counted twice)</li>
+          <li><strong>Unrealized</strong> — unrealized gains (market price vs. cost basis) plus any equity this history can't fully track. Cash and Unrealized both come from the broker's own Positions snapshot; only shown once one is loaded</li>
         </ul>
-        <p class="hint">
-          Weighted toward Covered Calls/Holding = most capital tied up in stock. Weighted toward Cash-Secured
-          Puts = mostly waiting on assignment decisions. Zero in a bucket is a real reading, not a gap — it
-          means nothing currently active is in that phase.
-        </p>
         <div class="chart-scroll"><svg id="chart-wheel-state" role="img"></svg></div>
         <div class="legend" id="legend-wheel-state"></div>
         <div class="table-twin" id="wheel-state-table" hidden></div>
@@ -223,6 +220,29 @@
         <div class="chart-scroll"><svg id="chart-cashflow" role="img"></svg></div>
         <div class="legend" id="legend-cashflow"></div>
         <div class="table-twin" id="cashflow-table" hidden></div>
+      </section>
+
+      <section class="card" style="margin-bottom: var(--gap)" id="period-pl-card" hidden>
+        <header>
+          <h2>Periodic P/L</h2>
+          <div class="card-actions">
+            <button class="toggle" id="period-pl-granularity" aria-pressed="false">Weekly</button>
+            <button class="toggle" data-twin="period-pl-table" aria-pressed="false">Table</button>
+          </div>
+        </header>
+        <p class="hint">
+          Three realized figures per period, dated to when a leg closes or a share lot is sold or
+          bought back — never to when premium was originally sold (see Monthly cash flow above for
+          that lens):
+        </p>
+        <ul class="hint-list">
+          <li><strong>Net Premium</strong> — realized option P/L (CSP + covered-call + hedge legs) that closed in that period</li>
+          <li><strong>Closed P/L</strong> — realized stock P/L from shares sold or called away in that period</li>
+          <li><strong>Net P/L</strong> — Net Premium + Closed P/L, realized only (matches Net Realized P/L elsewhere on the dashboard)</li>
+        </ul>
+        <div class="chart-scroll"><svg id="chart-period-pl" role="img"></svg></div>
+        <div class="legend" id="legend-period-pl"></div>
+        <div class="table-twin" id="period-pl-table" hidden></div>
       </section>
 
       <section class="card" style="margin-bottom: var(--gap)">
@@ -355,6 +375,16 @@
             <button id="tradelog-prev" type="button" aria-label="Previous wheel">◀</button>
             <select id="tradelog-pick" aria-label="Wheel"></select>
             <button id="tradelog-next" type="button" aria-label="Next wheel">▶</button>
+          </div>
+          <div id="tradelog-stage" class="wheel-stage" hidden tabindex="0">
+            <svg class="wheel-stage-ring" viewBox="0 0 40 40" aria-hidden="true">
+              <circle class="track" cx="20" cy="20" r="16" fill="none" stroke-width="4"></circle>
+              <circle class="arc" cx="20" cy="20" r="16" fill="none" stroke-width="4" stroke-linecap="round"></circle>
+            </svg>
+            <div class="wheel-stage-text">
+              <div class="wheel-stage-label" id="tradelog-stage-label"></div>
+              <div class="wheel-stage-sub" id="tradelog-stage-sub"></div>
+            </div>
           </div>
           <div id="tradelog-empty" class="hint">
             Pick a wheel above, or click one in the Dashboard's “Wheel timelines” chart.

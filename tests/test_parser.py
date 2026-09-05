@@ -291,6 +291,80 @@ class TestRobustness(unittest.TestCase):
         os.unlink(handle.name)
 
 
+class TestPendingRepostDedup(unittest.TestCase):
+    """Fidelity sometimes re-posts the identical trade a second time once its
+    running Cash Balance settles: the first copy reads the literal string
+    "Processing" in that column, the second is otherwise byte-for-byte
+    identical with a real number there. Left alone that is a double-posted
+    CSP/covered-call row -- the real-world case this covers is exactly two
+    HPE CSP rows, $52 strike, -2 contracts, $218.67 premium, one "Processing"
+    and one settled, that would otherwise show up as a duplicate open
+    position in the dashboard.
+    """
+
+    PENDING = (
+        '09/04/2025,"YOU SOLD OPENING TRANSACTION PUT (HPE) HEWLETT PACKARD SEP 11 25 $52 (100 SHS) (Cash)",'
+        '-HPE250911P52,"PUT (HPE) HEWLETT PACKARD SEP 11 25 $52 (100 SHS)",Cash,-2,1.1,1.3,0.03,,218.67,'
+        "Processing,09/08/2025"
+    )
+    SETTLED = (
+        '09/04/2025,"YOU SOLD OPENING TRANSACTION PUT (HPE) HEWLETT PACKARD SEP 11 25 $52 (100 SHS) (Cash)",'
+        '-HPE250911P52,"PUT (HPE) HEWLETT PACKARD SEP 11 25 $52 (100 SHS)",Cash,-2,1.1,1.3,0.03,,218.67,'
+        "10999.94,09/08/2025"
+    )
+
+    def test_settled_repost_of_a_pending_row_is_dropped(self):
+        path = write_csv([self.PENDING, self.SETTLED])
+        transactions, report = parse_fidelity_csv(path)
+        os.unlink(path)
+        self.assertEqual(len(transactions), 1)
+        self.assertAlmostEqual(transactions[0].amount, 218.67, places=2)
+        self.assertTrue(any("re-posted" in warning for warning in report.warnings))
+
+    def test_order_does_not_matter(self):
+        """The settled copy can just as easily come first in the file."""
+        path = write_csv([self.SETTLED, self.PENDING])
+        transactions, _ = parse_fidelity_csv(path)
+        os.unlink(path)
+        self.assertEqual(len(transactions), 1)
+
+    def test_pending_row_with_no_settled_twin_is_kept(self):
+        """The ordinary case: a trade from the file's own last day or two,
+        whose balance simply hasn't posted yet, has nothing to be a repost of
+        and must not be dropped.
+        """
+        path = write_csv([self.PENDING])
+        transactions, _ = parse_fidelity_csv(path)
+        os.unlink(path)
+        self.assertEqual(len(transactions), 1)
+
+    def test_two_settled_identical_rows_are_both_kept(self):
+        """A genuine repeated fill -- same price, same day, no "Processing"
+        involved anywhere -- is two real fills, not a repost, and both survive
+        (the same principle `merge_transactions` applies across files).
+        """
+        path = write_csv([self.SETTLED, self.SETTLED])
+        transactions, _ = parse_fidelity_csv(path)
+        os.unlink(path)
+        self.assertEqual(len(transactions), 2)
+
+    def test_modern_dialect_cash_balance_column_is_also_recognized(self):
+        pending = (
+            '09/04/2025,"YOU SOLD OPENING TRANSACTION PUT (HPE) HEWLETT PACKARD SEP 11 25 $52 (100 SHS) (Cash)",'
+            '-HPE250911P52,"PUT (HPE) HEWLETT PACKARD SEP 11 25 $52 (100 SHS)",Cash,0,,USD,1.1,-2,0,1.3,0.03,,'
+            "218.67,Processing,09/08/2025"
+        )
+        settled = (
+            '09/04/2025,"YOU SOLD OPENING TRANSACTION PUT (HPE) HEWLETT PACKARD SEP 11 25 $52 (100 SHS) (Cash)",'
+            '-HPE250911P52,"PUT (HPE) HEWLETT PACKARD SEP 11 25 $52 (100 SHS)",Cash,0,,USD,1.1,-2,0,1.3,0.03,,'
+            "218.67,10999.94,09/08/2025"
+        )
+        path = write_csv([pending, settled], header=MODERN_HEADER)
+        transactions, _ = parse_fidelity_csv(path)
+        os.unlink(path)
+        self.assertEqual(len(transactions), 1)
+
+
 class TestEventDate(unittest.TestCase):
     def test_as_of_date_overrides_run_date(self):
         """Assignments post next business day but state the real date inline."""

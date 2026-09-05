@@ -51,6 +51,20 @@ rather than the rule — see [Assignment share legs](#assignment-share-legs).
 but carry the real date inline as `as of Nov-20-2025`. `Transaction.event_date`
 prefers the as-of date, which is what puts them in the right cycle.
 
+**A pending trade is sometimes re-posted, byte-for-byte, once it settles.** One of
+those literal `"Processing"` `Cash Balance` strings above is not just an unposted
+balance — occasionally the *entire row* (date, action, symbol, quantity, price,
+commission, fees, amount) reappears a few lines later with a real number in that
+one column and nothing else different. Read naively, that is two identical CSP/
+covered-call legs instead of one — a duplicated row in the Open option positions
+table. `wheel.parser._drop_pending_reposts` drops the `"Processing"` copy, but only
+when a settled twin with an *identical* signature exists elsewhere in the same
+file; an ordinary `"Processing"` row from the file's own last day or two, with no
+such twin, is left alone (the balance just hasn't posted by download time — the
+common case, and the reason this isn't "drop every Processing row"). This mirrors
+`merge_transactions`'s own rule for genuine repeated fills across *different*
+files: only a row fully superseded by an identical settled copy is ever removed.
+
 ## Domain model
 
 ### Cycles
@@ -477,6 +491,43 @@ PPD by week* card -- bars for `weekly_ppd`, a bold line for `cum_ppd` with a das
 marker at its current level) and per wheel inside each Trade Log entry (empty for a
 non-wheel cycle). The Combined view sums each account's wheel-only daily P&L
 (`pnl_series_wheel`) before bucketing.
+
+### Periodic P/L histogram
+
+`metrics.periodic_pl_series(cycles, through, granularity)` buckets `net_premium`
+(realized option P/L) and `closed_pl` (realized stock P/L from shares sold or
+called away) into ISO weeks (Monday-anchored) or calendar months, zero-filled
+between the first active bucket and `through` like every other bucketed series
+here. Both are period *flows*, summed from `cycles`' `realized_pl_series` output
+(option legs dated to close, share lots dated to disposal) -- typically the
+caller's ticker/date/status-filtered cycles, matching `pnl_series` elsewhere.
+`net_pl` is their sum, deliberately realized-only to match `net_realized_pl`
+everywhere else on the dashboard.
+
+An earlier version also carried `open_pl`, a running mark-to-market snapshot of
+today's still-held shares (fixed share count, re-priced at each bucket's own
+closing date via a second, start-unfiltered cycle sequence and a price lookup).
+It was removed: a level dropped into a table of flows read as unclear ("did
+something happen this period, or is this just the same holding re-priced?"),
+and the figure it wanted already exists per-position elsewhere on the dashboard
+(the Trade Log's mark-to-market P&L, the Open Positions table's breakeven
+coloring) -- so it added confusion without adding information the reader
+couldn't already get, more clearly, somewhere else.
+
+The Dashboard computes both granularities on every `build()` call (`period_pl.weeks`
+/ `period_pl.months`) -- filter-dependent, unlike the Trade Log/hedges/positions
+tables, so it is never cached across calls the way those are. `since` (a `start`
+filter) is applied afterward as a pure display crop over the finished rows, safe
+because neither series carries anything cumulative across buckets. The dashboard
+renders it as the *Periodic P/L* card: one grouped-bar cluster per period (Net
+Premium, Closed P/L, Net P/L), each series a fixed identity color -- a bar's own
+height/direction off the zero line already shows profit vs. loss, so color
+answers "which metric," never "up or down" (the same discipline `drawCashFlow`'s
+fixed wheel-color bar already follows). A toggle button swaps between the two
+already-fetched series client-side, no refetch. The Combined view merges
+accounts via `_combine_period_pl`, summing by the shared `period` key -- safe
+because `period` is a deterministic function of the calendar (unlike a capital
+or P/L date series, nothing here is cumulative across periods).
 
 ### Cost basis: tax basis vs. net adjusted cost basis
 

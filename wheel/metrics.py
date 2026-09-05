@@ -1104,6 +1104,84 @@ def weekly_ppd_series(
     return rows
 
 
+def _month_start(day: date) -> date:
+    return date(day.year, day.month, 1)
+
+
+def _month_end(start: date) -> date:
+    return date(start.year, 12, 31) if start.month == 12 else date(start.year, start.month + 1, 1) - timedelta(days=1)
+
+
+def _next_month_start(start: date) -> date:
+    return date(start.year + 1, 1, 1) if start.month == 12 else date(start.year, start.month + 1, 1)
+
+
+def periodic_pl_series(cycles: Sequence[Cycle], through: date, granularity: str) -> list[dict]:
+    """Net Premium / Closed P/L / Net P/L, one row per ISO week (Monday-anchored)
+    or calendar month -- the Dashboard's "Periodic P/L" histogram, one bucket
+    size shared by both weekly and monthly rows so the frontend can toggle
+    without a refetch.
+
+    Every figure here is a period *flow*, summed from ``cycles`` (typically the
+    caller's ticker/date/status-filtered cycles, matching ``pnl_series``
+    elsewhere): whatever realized option/stock P/L landed in that bucket -- the
+    same event-dated figures :func:`realized_pl_series` reports day by day
+    (option legs dated to close, share lots dated to disposal). A quiet bucket
+    is a real $0, not a gap. ``net_premium`` and ``closed_pl`` are the two
+    sources; ``net_pl`` is their sum, deliberately realized-only -- it matches
+    ``net_realized_pl`` everywhere else on the dashboard (the Cycles table,
+    Realized P/L by ticker) rather than blending in an unrealized figure.
+
+    An earlier version of this also carried ``open_pl``, a running
+    mark-to-market snapshot of still-held shares -- withdrawn because it isn't
+    a period flow like the other three (a level dropped into a table of
+    flows), and the figure it wants already exists per-position elsewhere
+    (the Trade Log, the Open Positions table's breakeven coloring).
+
+    Buckets run from the first realized flow through ``through``'s own bucket,
+    zero-filled in between -- never fabricated before that start or after
+    ``through``.
+    """
+    if granularity not in ("week", "month"):
+        raise ValueError(f"unknown granularity: {granularity!r}")
+    bucket_start = _monday if granularity == "week" else _month_start
+    bucket_end = (lambda start: start + timedelta(days=6)) if granularity == "week" else _month_end
+    next_bucket = (lambda start: start + timedelta(days=7)) if granularity == "week" else _next_month_start
+
+    flows: dict[date, list[float]] = {}
+    for row in realized_pl_series(cycles):
+        day = row["date"] if isinstance(row["date"], date) else date.fromisoformat(row["date"])
+        slot = flows.setdefault(bucket_start(day), [0.0, 0.0])
+        slot[0] += row["option_pl"]
+        slot[1] += row["stock_pl"]
+
+    if not flows:
+        return []
+
+    start = min(flows)
+    last = bucket_start(through)
+    rows: list[dict] = []
+    while start <= last:
+        end = bucket_end(start)
+        option_pl, stock_pl = flows.get(start, (0.0, 0.0))
+
+        row = {
+            "period": start.isoformat() if granularity == "week" else f"{start.year:04d}-{start.month:02d}",
+            "net_premium": round(option_pl, 2),
+            "closed_pl": round(stock_pl, 2),
+            "net_pl": round(option_pl + stock_pl, 2),
+        }
+        if granularity == "week":
+            row["week_start"] = start.isoformat()
+            row["week_end"] = end.isoformat()
+        else:
+            row["year"] = start.year
+            row["month"] = start.month
+        rows.append(row)
+        start = next_bucket(start)
+    return rows
+
+
 def leg_rows(cycle: Cycle) -> list[dict]:
     """Flatten a cycle's legs for the detail table and timeline chart."""
     rows: list[dict] = []

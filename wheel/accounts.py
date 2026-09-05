@@ -850,6 +850,10 @@ class AccountRegistry:
             "pnl_series": _combine_pnl_series(payloads),
             "ppd_series": _combine_ppd_series(payloads, combined_portfolio),
             "cash_flow": _combine_cash_flow(payloads, capital_series),
+            "period_pl": {
+                "weeks": _combine_period_pl(payloads, "weeks"),
+                "months": _combine_period_pl(payloads, "months"),
+            },
             "wheel_state": combined_wheel_state,
             "reconciliation": _combine_reconciliation(payloads),
             "net_worth": net_worth,
@@ -1042,6 +1046,39 @@ def _combine_pnl_series(payloads: dict[str, dict]) -> list[dict]:
             }
         )
     return series
+
+
+def _combine_period_pl(payloads: dict[str, dict], key: str) -> list[dict]:
+    """Sum every account's Periodic P/L rows (``key`` is ``"weeks"`` or
+    ``"months"``) by their shared ``period`` key. Safe to merge by that key
+    alone, unlike a date series: ``period`` is a deterministic function of the
+    calendar (Monday-anchored ISO week, or ``YYYY-MM``), so two accounts'
+    rows for the same period always describe the exact same span. Every field
+    here is a plain per-period dollar figure, none of them running/cumulative,
+    so summing across accounts needs no recomputation pass the way
+    :func:`_combine_pnl_series` does.
+    """
+    buckets: dict[str, dict[str, Any]] = {}
+    for payload in payloads.values():
+        for row in (payload.get("period_pl") or {}).get(key, []):
+            bucket = buckets.setdefault(
+                row["period"],
+                {
+                    field_name: row[field_name]
+                    for field_name in row
+                    if field_name not in ("net_premium", "closed_pl", "net_pl")
+                },
+            )
+            for field_name in ("net_premium", "closed_pl", "net_pl"):
+                bucket[field_name] = bucket.get(field_name, 0.0) + (row.get(field_name) or 0.0)
+
+    rows = []
+    for period in sorted(buckets):
+        row = dict(buckets[period])
+        for field_name in ("net_premium", "closed_pl", "net_pl"):
+            row[field_name] = round(row.get(field_name, 0.0), 2)
+        rows.append(row)
+    return rows
 
 
 def _combine_wheel_pnl_series(payloads: dict[str, dict]) -> list[dict]:
@@ -1347,7 +1384,14 @@ def _combine_net_worth(payloads: dict[str, dict]) -> dict[str, Any]:
             "accounts": [],
         }
 
-    totals = {"total_value": 0.0, "cash_total": 0.0, "equity_value": 0.0, "option_value": 0.0, "wheel_capital_deployed": 0.0}
+    totals = {
+        "total_value": 0.0,
+        "cash_total": 0.0,
+        "equity_value": 0.0,
+        "option_value": 0.0,
+        "wheel_capital_deployed": 0.0,
+        "untracked_equity_value": 0.0,
+    }
     accounts_out = []
     for account_id, net_worth in available:
         accounts_out.append({**net_worth, "account_id": account_id})

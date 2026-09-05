@@ -12,7 +12,7 @@ import os
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Sequence
 
 from wheel import benchmark as bm
@@ -27,6 +27,7 @@ from wheel.metrics import (
     dividends_by_cycle,
     leg_rows,
     net_adjusted_cost_basis,
+    periodic_pl_series,
     portfolio_capital_series,
     portfolio_metrics,
     realized_pl_series,
@@ -54,7 +55,13 @@ from wheel.parser import (
     company_name_from_description,
     parse_exports,
 )
-from wheel.positions import discover_position_snapshots, latest_snapshot, latest_snapshot_per_account, load_snapshots
+from wheel.positions import (
+    EQUITY,
+    discover_position_snapshots,
+    latest_snapshot,
+    latest_snapshot_per_account,
+    load_snapshots,
+)
 
 EXPORT_DIRS = (".", "data")
 
@@ -1396,6 +1403,29 @@ class Dashboard:
                 f"activity on {capital_series[-1].day}, prior to the snapshot date {as_of_day}"
             )
 
+        # How much of the account's *equity* market value the transaction-
+        # history model has no real share lot for at all -- a position bought
+        # before every loaded export begins, with nothing since but maybe a
+        # stray dividend-reinvestment fraction of a share. The Positions
+        # snapshot still reports its full market value in `equity_value` (and
+        # therefore `total_value`), but with no real share count to attach a
+        # cost basis to, `wheel_capital_deployed` counts essentially none of
+        # it -- the single biggest reason "True capital deployed" can
+        # undercount `total_value` by a wide margin even for a fully-tracked
+        # wheel. Compared per ticker so a *partially* tracked position (e.g.
+        # 30 of 60 real shares visible) only contributes its untracked
+        # fraction, not the whole position.
+        tracked_shares: dict[str, float] = {}
+        for cycle in self.all_cycles:
+            for lot in cycle.share_lots:
+                tracked_shares[cycle.underlying] = tracked_shares.get(cycle.underlying, 0.0) + lot.remaining
+        untracked_equity_value = 0.0
+        for row in latest.rows:
+            if row.kind != EQUITY or not row.quantity or not row.current_value:
+                continue
+            untracked_shares = max(row.quantity - tracked_shares.get(row.symbol, 0.0), 0.0)
+            untracked_equity_value += row.current_value * (untracked_shares / row.quantity)
+
         account_history = sorted(
             (s for s in self.snapshots if s.account_number == latest.account_number),
             key=lambda snapshot: snapshot.as_of,
@@ -1418,6 +1448,7 @@ class Dashboard:
             "cost_basis_known_total": _money(latest.cost_basis_known_total),
             "cost_basis_unknown_rows": latest.cost_basis_unknown_rows,
             "wheel_capital_deployed": _money(wheel_capital_deployed),
+            "untracked_equity_value": _money(untracked_equity_value),
             "positions": [
                 {
                     "symbol": row.symbol,
@@ -1917,6 +1948,21 @@ class Dashboard:
             "trailing": cf.range_summary(cash_flow_rows, capital_points, through),
         }
 
+        # Periodic P/L histogram: realized-only flows (Net Premium / Closed P/L)
+        # from the display-filtered `cycles`, matching `pnl_series`. `since` is
+        # applied afterward as a pure display crop, since neither series carries
+        # anything cumulative across buckets that a cropped-off earlier bucket
+        # could be feeding.
+        period_weeks = periodic_pl_series(cycles, through, "week")
+        period_months = periodic_pl_series(cycles, through, "month")
+        if since is not None:
+            week_cutoff = since - timedelta(days=since.weekday())
+            period_weeks = [row for row in period_weeks if date.fromisoformat(row["week_start"]) >= week_cutoff]
+            period_months = [
+                row for row in period_months if (row["year"], row["month"]) >= (since.year, since.month)
+            ]
+        period_pl = {"weeks": period_weeks, "months": period_months}
+
         portfolio_payload = {
             **{
                 key: (_money(value) if isinstance(value, float) else value)
@@ -2012,6 +2058,7 @@ class Dashboard:
                 through,
             ),
             "cash_flow": cash_flow,
+            "period_pl": period_pl,
             "wheel_state": wheel_state,
             "reconciliation": _reconciliation(
                 transactions, built_cycles, self.reports, engine.unmatched_cash

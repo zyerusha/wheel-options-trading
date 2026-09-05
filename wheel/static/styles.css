@@ -1140,6 +1140,86 @@ tr.detail > td {
   min-width: 34px;
 }
 
+/* Wheel stage badge: a small ring that spins clockwise while a leg is
+   actually open (blue = cash-secured put, aqua = covered call), and sits still
+   in gray once the wheel is CLOSED or amber while it is merely dormant
+   (NO_ACTIVITY) -- see wheelStageOf() in app.js. */
+.wheel-stage {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin-bottom: 12px;
+  cursor: help;
+  width: fit-content;
+}
+
+.wheel-stage-ring {
+  width: 36px;
+  height: 36px;
+  flex: none;
+}
+
+.wheel-stage-ring .track {
+  stroke: var(--gridline);
+}
+
+.wheel-stage-ring .arc {
+  stroke: var(--text-muted);
+  stroke-dasharray: 70 31; /* ~70% of the r=16 circumference (~100.5), leaving a gap */
+  transform-origin: center;
+  transition: stroke 0.25s ease;
+}
+
+.wheel-stage.spin .arc {
+  animation: wheel-stage-spin 3s linear infinite;
+}
+
+/* Positive rotation = clockwise. */
+@keyframes wheel-stage-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wheel-stage.spin .arc {
+    animation: none;
+  }
+}
+
+.wheel-stage.csp .arc {
+  stroke: var(--series-1);
+}
+
+.wheel-stage.cc .arc {
+  stroke: var(--series-3);
+}
+
+.wheel-stage.dormant .arc {
+  stroke: var(--warning);
+}
+
+.wheel-stage.closed .arc,
+.wheel-stage.nonwheel .arc {
+  stroke: var(--text-muted);
+}
+
+.wheel-stage-label {
+  font-weight: 700;
+  font-size: 13.5px;
+}
+
+.wheel-stage-sub {
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
 .tradelog-bridge {
   border: 1px solid var(--border);
   border-radius: var(--radius);
