@@ -272,25 +272,24 @@
           </p>
 
           <div
-            class="tiles"
             id="csp-cash-tiles"
             aria-label="Cash available for cash-secured puts"
           ></div>
 
           <ul class="hint-list" id="csp-candidates-hint" hidden>
             <li>
-              Filtered to:
-              <ul>
-                <li>Stocks &amp; plain ETFs only</li>
-                <li>
-                  No leveraged/inverse ETFs, closed-end funds, mutual funds, or
-                  LPs
-                </li>
-                <li>Last close: $10–$350</li>
-                <li>Market cap ≥ $1B for stocks</li>
-                <li>10-day average volume &gt; 1M</li>
-              </ul>
+              <strong
+                >Potential stocks for Cash-Secured Puts that currently can be
+                afforded in the account</strong
+              >
             </li>
+            <li>
+              <strong>Filter Criteria</strong>: Stocks &amp; plain ETFs only; No
+              leveraged/inverse ETFs, closed-end funds, mutual funds, or LPs;
+              $10 &le; Stock Price &le; $350; Market cap &ge; $1B; 10-day avg
+              vol &gt; 1M
+            </li>
+          </ul>
 
           <div style="overflow: auto; max-height: 420px">
             <table id="csp-candidates-table"></table>

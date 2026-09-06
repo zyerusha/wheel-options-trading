@@ -4521,8 +4521,8 @@ function renderNetWorthTiles(netWorth, benchmark, wheelReturn, wheelState) {
     },
   ];
 
-  // "Cash for new CSPs" (liquid cash minus collateral already securing open
-  // puts) lives in its own card up near Covered-call candidates -- see
+  // "Available Cash" for new CSPs (liquid cash minus collateral already securing
+  // open puts) lives in its own card up near Covered-call candidates -- see
   // `renderCspCash` -- so "what we can do next" reads in one place. Not
   // repeated here.
 
@@ -5881,46 +5881,41 @@ function renderCspCash() {
   const available = Math.max(cashTotal - putCollateral, 0);
   const pct = totalValue ? (100 * available) / totalValue : null;
 
-  const tiles = [
-    {
-      label: 'Cash for new CSPs',
-      value: money(available, { cents: true }),
-      primary: true,
-      foot:
-        putCollateral > 1e-9
-          ? `${money(cashTotal)} liquid cash − ${money(putCollateral)} securing open puts`
-          : `${money(cashTotal)} liquid cash, none reserved against open puts`,
-      formula: formula([
-        'Cash for new CSPs =',
-        '  Liquid account cash − collateral already securing open cash-secured puts',
-        '  (never includes unrealized gains, equity value, or shares held)',
-        `= ${money(cashTotal, { cents: true })} − ${money(putCollateral, { cents: true })}`,
-        `= ${money(available, { cents: true })}`,
-      ]),
-    },
-    {
-      label: 'Share of account',
-      value: pct === null ? '—' : pct.toFixed(1) + '%',
-      foot: totalValue ? `of ${money(totalValue)} total account value` : 'total account value unknown',
-      formula:
-        pct === null
-          ? null
-          : formula([
-              'Share of account = Cash for new CSPs ÷ Total account value',
-              `= ${money(available, { cents: true })} ÷ ${money(totalValue, { cents: true })}`,
-              `= ${pct.toFixed(1)}%`,
-            ]),
-    },
-  ];
+  // These two are one short fact, not a dashboard-tile's worth of screen: render
+  // them as a single line -- label plain, only the figures bold, each carrying
+  // its own formula on hover.
+  const line = el('div', { class: 'csp-cash-line' });
 
-  for (const tile of tiles) {
-    const node = el('div', { class: 'tile' + (tile.primary ? ' primary' : '') });
-    node.appendChild(el('div', { class: 'label' }, tile.label));
-    node.appendChild(el('div', { class: 'value' }, tile.value));
-    node.appendChild(el('div', { class: 'foot' }, tile.foot));
-    setFormula(node, tile.formula);
-    host.appendChild(node);
+  line.appendChild(document.createTextNode('Available Cash: '));
+  const cashAmt = el('strong', {}, money(available, { cents: true }));
+  setFormula(
+    cashAmt,
+    formula([
+      'Available Cash =',
+      '  Liquid account cash - collateral already securing open cash-secured puts',
+      '  (never includes unrealized gains, equity value, or shares held)',
+      `= ${money(cashTotal, { cents: true })} - ${money(putCollateral, { cents: true })}`,
+      `= ${money(available, { cents: true })}`,
+    ])
+  );
+  line.appendChild(cashAmt);
+
+  if (pct !== null) {
+    line.appendChild(document.createTextNode('  ·  '));
+    const shareAmt = el('strong', {}, `${pct.toFixed(1)}%`);
+    setFormula(
+      shareAmt,
+      formula([
+        'Share of account = Available Cash ÷ Total account value',
+        `= ${money(available, { cents: true })} ÷ ${money(totalValue, { cents: true })}`,
+        `= ${pct.toFixed(1)}%`,
+      ])
+    );
+    line.appendChild(shareAmt);
+    line.appendChild(document.createTextNode(' of account'));
   }
+
+  host.appendChild(line);
 
   renderCspCandidates(available);
 }
@@ -6159,7 +6154,7 @@ function renderCspCandidates(available) {
 
     const qtyCell = el('td', { class: 'num' }, String(row.contracts));
     qtyCell.title = formula([
-      'Qty ≈ Cash for new CSPs ÷ (last close × 100)',
+      'Qty ≈ Available Cash ÷ (last close × 100)',
       `= ${money(available, { cents: true })} ÷ (${money(row.last_close, { cents: true })} × 100)`,
       `= ${row.contracts} contract${row.contracts === 1 ? '' : 's'}`,
       '',

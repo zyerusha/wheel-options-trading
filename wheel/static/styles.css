@@ -391,11 +391,18 @@ button.primary {
   border-width: 2px;
 }
 
-/* The "Cash for new CSPs" tile keeps the larger value type but not the blue
-   accent border. */
-#csp-cash-tiles .tile.primary {
-  border-color: var(--border);
-  border-width: 1px;
+/* "Available Cash" + share of account as one compact line, not two tiles:
+   label plain, only the figures bold. */
+.csp-cash-line {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin: 0 0 12px;
+}
+
+.csp-cash-line strong {
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  cursor: help;
 }
 
 /* CSP recommender: a 0-5 star rating, half-star aware. */
