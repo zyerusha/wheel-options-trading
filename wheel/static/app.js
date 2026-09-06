@@ -31,13 +31,17 @@ const state = {
   // Open option positions table: within each symbol group (symbols stay
   // alphabetical), which column orders the rows and in which direction.
   openPosSort: { key: 'expiration', dir: 1 },
+  // Covered-call candidates table: which column sorts it, and which direction.
+  ccCandSort: { key: 'underlying', dir: 1 },
+  // CSP-candidates table (inside the Cash for CSPs card): sort column + dir.
+  cspCandSort: { key: 'net_realized_pl', dir: -1 },
   // How the capital chart expresses its bands: 'value' (dollars) or 'share' (%
   // of the day's total). A view of one chart, not a filter -- it changes no data.
   capitalMode: 'value',
-  // Row order for the Wheel timelines chart: 'ticker' (A-Z, a ticker's cycles
-  // together -- the default, best for lookup) or 'time' (by start date -- the
-  // account's history top to bottom). View-only, changes no data.
-  timelineSort: 'ticker',
+  // Row order for the Wheel timelines chart: 'time' (by start date, newest wheel
+  // on top -- the default, the account's recent history first) or 'ticker' (A-Z,
+  // a ticker's cycles together, best for lookup). View-only, changes no data.
+  timelineSort: 'time',
   // Bucket size for the Periodic P/L histogram: 'month' or 'week'. Both are
   // already in the payload (data.period_pl.months / .weeks), so switching is
   // a redraw from already-fetched data, not a refetch.
@@ -159,6 +163,22 @@ const localIso = (time) => {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 };
 
+/**
+ * Centered rolling mean with a window that shrinks toward each end, so the
+ * first and last points come back exactly unchanged (radius 0 there) while the
+ * interior is smoothed over up to `2 * maxRadius + 1` samples. Used to draw a
+ * spiky running-total line as a clean trend without moving its endpoints or
+ * touching the underlying values (tooltips/tables stay exact).
+ */
+function smoothSeries(values, maxRadius = 4) {
+  return values.map((_, i) => {
+    const r = Math.min(maxRadius, i, values.length - 1 - i);
+    let sum = 0;
+    for (let j = i - r; j <= i + r; j += 1) sum += values[j];
+    return sum / (2 * r + 1);
+  });
+}
+
 function niceTicks(min, max, count = 5) {
   if (min === max) return [min];
   const span = max - min;
@@ -256,8 +276,11 @@ function attachTip(node, title, rows, formula) {
  * chart width -- a hidden card has clientWidth 0.
  */
 function toggleChartCard(svg, hasData) {
-  const card = svg && svg.closest ? svg.closest('section.card') : null;
-  if (card) card.hidden = !hasData;
+  // A chart nested in a `.card-subsection` (e.g. the four Cash Flow & P/L
+  // Analytics quadrants) hides just its own sub-section; a chart that is the
+  // whole card hides the card. Nearest wins.
+  const box = svg && svg.closest ? svg.closest('.card-subsection, section.card') : null;
+  if (box) box.hidden = !hasData;
 }
 
 function frame(svg, { width, height, margin, yMin, yMax, yFormat = compactMoney }) {
@@ -441,50 +464,100 @@ function crosshairLayer(svg, group, geom, rows, xOf, { onIndex, onLeave, label }
 // bands above it don't inherit its wobble. Colour is bound to `varName`, never to
 // position -- reordering this array or filtering a band away must never repaint a
 // survivor, or a reader who learned "shares are orange" is misled.
+// These labels are the single source of truth for how the committed-capital
+// components are named -- the chart legend, the table headers, the aria text
+// and every "Capital deployed" tooltip formula all read them from here, so a
+// rename lands everywhere at once. They also match the wheel-state donut's
+// wedges, so the two charts (side by side) read as one vocabulary: "shares
+// held" is split into idle (orange, no call written) and covered-call
+// backing (aqua), and the covered-call backing further into real cost basis
+// and the pre-export strike estimate -- exactly the donut's split.
+//
+// Every committed-capital component gets a band and a colour chip -- nothing is
+// "counted but invisible". Long-option debit and net spread collateral are
+// usually a sliver (long debit peaks near 0.4% of committed capital, about a
+// pixel), but a hairline yellow band plus a legend row still beats a blank
+// space the reader can't reconcile. Yellow (`--series-4`) sits ABOVE put
+// collateral so it never touches the orange idle-shares band -- the one weak
+// colour pair the palette was validated against (see docs/DESIGN.md). A band
+// that rounds to $0 draws nothing and is dropped from the legend too, so the
+// two always agree.
 const CAPITAL_BANDS = [
-  { key: 'stock', label: 'Shares held', varName: '--series-2' },
-  { key: 'put', label: 'Cash secured (puts)', varName: '--series-1' },
-  // Shares backing covered calls that were bought before this export begins, so
-  // their cost basis is not visible and the strike stands in for it.
-  { key: 'call', label: 'Covered-call shares (estimated)', varName: '--series-3' },
+  { key: 'idle_stock', label: 'Idle shares (cost basis)', varName: '--series-2' },
+  // Real cost basis of shares currently backing an open covered call. Sits
+  // next to Idle shares so the two "shares held at known cost" bands read
+  // together, then the estimate above them, then put collateral on top.
+  { key: 'call_stock', label: 'Covered-call shares (cost basis)', varName: '--series-3' },
+  // Same, but for shares bought before this export begins -- their real cost
+  // basis isn't visible so the strike stands in (strike x 100). `estimate`
+  // draws it a touch lighter with a dashed cap: "this slice is a guess, not a
+  // number off your statements."
+  { key: 'call', label: 'Covered-call shares (strike estimate)', varName: '--series-3', estimate: true },
+  { key: 'put', label: 'Put collateral', varName: '--series-1' },
+  { key: 'long', label: 'Long-option debit', varName: '--series-4' },
+  { key: 'spread', label: 'Net spread collateral', varName: '--series-4' },
 ];
 
-// Counted in the total and carried by the tooltip, table and legend note, but
-// never given a band. Long-option debit peaks at 0.4% of committed capital,
-// about one pixel, so a swatch for it would point at nothing findable; spread
-// collateral (netted credit-spread margin) is new and can be far larger, but
-// giving it its own band risks the same weak-color-pair problem the existing
-// three bands were validated all-pairs against (see docs/DESIGN.md) -- so it
-// gets the same "counted, not banded" treatment rather than a fifth color.
-const CAPITAL_EXCLUDED = [
-  { key: 'long', label: 'Long-option debit' },
-  { key: 'spread', label: 'Spread collateral' },
-];
+// The three neutral (no-hue) capital concepts, a grey ramp from lightest to
+// strongest ink: Cash, then Unrealized, then the Total lines (`--text-primary`,
+// applied inline where the two totals are drawn). Unlike the hued bands there
+// is no daily history for cash/unrealized -- both are known only on a Portfolio
+// Positions snapshot date, so neither is zero-filled; they show as isolated
+// markers above the total line, not folded into the stack (see notDeployedByDate).
+// The wheel-state donut uses these same two tokens for its Cash/Unrealized
+// wedges, so the two charts read as one shared vocabulary.
+const NOT_DEPLOYED_COLOR = '--text-muted'; // Cash
+const UNREALIZED_COLOR = '--text-secondary'; // Unrealized
 
-// A fourth, fundamentally different quantity: idle cash and non-wheel
-// holdings -- the rest of the account. Unlike the bands above, there is no
-// daily history for "total account value" the way there is for committed
-// capital: it is only known on the (usually one) day a Portfolio Positions
-// snapshot was taken. So it is never zero-filled between snapshots -- it
-// shows up as an isolated marker on the exact dates it's known, drawn above
-// the total line rather than folded into the stack, since it explicitly
-// isn't part of capital deployed (see notDeployedByDate below).
-const NOT_DEPLOYED_COLOR = '--text-muted';
-
+// Derived from CAPITAL_BANDS so the column headers, the tooltip formulas and
+// the aria text can never drift from the legend labels. Order matches the
+// stack, bottom -> top.
+const CAPITAL_COMPONENT_LABELS = CAPITAL_BANDS.map((c) => c.label);
+// The same sum, for every "Capital deployed" / "Initial cap" formula.
+const CAPITAL_FORMULA_SUM = CAPITAL_COMPONENT_LABELS.join(' + ');
 const CAPITAL_TABLE_HEAD = [
   'Date',
-  'Shares held',
-  'Put collateral',
-  'Short calls',
-  'Long debit',
-  'Spread collateral',
-  { text: 'Total', title: 'Total = Shares held + Put collateral + Short calls + Long debit + Spread collateral' },
+  ...CAPITAL_COMPONENT_LABELS,
+  { text: 'Total committed', title: `Total committed = ${CAPITAL_COMPONENT_LABELS.join(' + ')}` },
   {
-    text: 'Not deployed',
-    title: 'Idle cash and non-wheel holdings -- blank except on a Positions snapshot date.',
+    text: 'Cash',
+    title: 'Account cash not already reserved as put collateral, blank except on a Positions snapshot date.',
   },
-  { text: 'Total value', title: 'Total committed + Not deployed -- the whole account, cash and all.' },
+  {
+    text: 'Unrealized',
+    title: 'Unrealized gains plus equity this history can\'t track, blank except on a Positions snapshot date.',
+  },
+  { text: 'Total value', title: 'Total committed + Cash + Unrealized; the whole account, cash and all.' },
 ];
+
+/**
+ * One row of the wheel-state donut's `.legend-stack` breakdown — the one
+ * figured capital breakdown on the page (the Capital deployed chart above keeps
+ * only a plain colour key). `kind`: 'square' (default) a filled colour chip,
+ * 'line' a solid rule (a subtotal like Total committed), 'dashed' a dashed rule
+ * (a grand total like Total value), 'none' an invisible spacer. `color` is a
+ * resolved CSS value; `faded` dims a chip to ~45%; `indent` nests a component
+ * under its group header; `strong` bolds the label.
+ */
+function capitalBreakdownRow(legend, label, value, { color, kind = 'square', faded, indent, strong } = {}) {
+  const row = el('span');
+  if (indent) row.style.paddingLeft = '16px';
+  const swatch = el('i', kind === 'line' || kind === 'dashed' ? { class: 'line' } : {});
+  if (kind === 'dashed') {
+    swatch.style.background = 'none';
+    swatch.style.height = '0';
+    swatch.style.borderTop = `2px dashed ${color || 'currentColor'}`;
+  } else if (kind === 'none') {
+    swatch.style.visibility = 'hidden';
+  } else if (color) {
+    swatch.style.background = color;
+    if (faded) swatch.style.opacity = '0.45';
+  }
+  row.appendChild(swatch);
+  row.appendChild(strong ? el('strong', {}, label) : document.createTextNode(label));
+  row.appendChild(el('b', { class: 'legend-value' }, money(value)));
+  legend.appendChild(row);
+}
 
 /** The last entry in a `.timeline`-shaped (ascending, sorted) array whose
  * `as_of` is on or before `asOf`, or null if none is that early yet --
@@ -519,6 +592,15 @@ function lastSnapshotAtOrBefore(timeline, asOf) {
  * reflects every account's most recent real reading, not just whichever
  * accounts happened to snapshot that exact day.
  */
+/**
+ * `{ amount, cash, unrealized }` per date, ``amount`` being the combined
+ * figure described above and ``cash``/``unrealized`` its same split as the
+ * "Where the wheel is right now" donut's own Cash/Unrealized
+ * wedges (see `drawWheelState`): ``cash`` is that day's committed capital
+ * point's ``put`` collateral subtracted from the snapshot's own
+ * ``cash_total`` (never double-counted with the Cash Secured (puts) band),
+ * ``unrealized`` is whatever of ``amount`` that leaves.
+ */
 function notDeployedByDate(points, netWorth) {
   const map = new Map();
   if (!netWorth || !netWorth.available) return map;
@@ -534,17 +616,21 @@ function notDeployedByDate(points, netWorth) {
     const point = pointByDate.get(asOf);
     if (!point) continue;
     let totalValue = 0;
+    let cashTotal = 0;
     let anyKnown = false;
     for (const timeline of timelines) {
       const latest = lastSnapshotAtOrBefore(timeline, asOf);
       if (latest) {
         totalValue += latest.total_value;
+        cashTotal += latest.cash_total || 0;
         anyKnown = true;
       }
     }
     if (!anyKnown) continue;
     const amount = totalValue - point.total;
-    if (amount > 1e-9) map.set(asOf, amount);
+    if (amount <= 1e-9) continue;
+    const cash = Math.min(Math.max(cashTotal - point.put, 0), amount);
+    map.set(asOf, { amount, cash, unrealized: amount - cash });
   }
   return map;
 }
@@ -640,13 +726,39 @@ function drawCapital(points, netWorth) {
   // is no room in that scale for a quantity measured against total account
   // value instead, so the overlay is $-mode only (see the legend note below).
   const notDeployed = share ? new Map() : notDeployedByDate(points, netWorth);
+  // Positions snapshots are sparse -- often only a handful of dates. With two
+  // or more, connect them so Cash + Unrealized reads as one continuous shaded
+  // estimate across the snapshot range rather than isolated single-day
+  // slivers. Straight linear interpolation between consecutive snapshots,
+  // never extrapolated past the first or last (the account value there simply
+  // isn't known). One snapshot alone can't be connected -- it stays a dot.
+  const ndAnchors = [...notDeployed.keys()]
+    .sort()
+    .map((d) => ({ t: parseDay(d).getTime(), ...notDeployed.get(d) }));
+  const ndInterp =
+    ndAnchors.length >= 2
+      ? points.map((p) => {
+          const t = parseDay(p.date).getTime();
+          if (t < ndAnchors[0].t || t > ndAnchors[ndAnchors.length - 1].t) return { cash: 0, unrealized: 0 };
+          const hi = ndAnchors.findIndex((a) => a.t >= t);
+          const a = ndAnchors[hi - 1] || ndAnchors[0];
+          const b = ndAnchors[hi] || ndAnchors[0];
+          const f = b.t === a.t ? 0 : (t - a.t) / (b.t - a.t);
+          return {
+            cash: a.cash + (b.cash - a.cash) * f,
+            unrealized: a.unrealized + (b.unrealized - a.unrealized) * f,
+          };
+        })
+      : null;
+  const ndTopAt = (i) =>
+    ndInterp
+      ? ndInterp[i].cash + ndInterp[i].unrealized
+      : notDeployed.get(points[i].date)?.amount || 0;
   const last = points[points.length - 1];
   const margin = { top: 12, right: 64, bottom: 30, left: 62 };
   const width = chartWidth(svg);
   const height = 288;
-  const yMax = share
-    ? 100
-    : Math.max(...points.map((p) => p.total + (notDeployed.get(p.date) || 0))) * 1.06 || 1;
+  const yMax = share ? 100 : Math.max(...points.map((p, i) => p.total + ndTopAt(i))) * 1.06 || 1;
 
   const { group, plotWidth, plotHeight, y } = frame(svg, {
     width,
@@ -673,6 +785,7 @@ function drawCapital(points, netWorth) {
     // A band present on a single isolated day has no run to cap (a cap needs two
     // points), but it still has a fill, so the two are gated separately.
     if (!upper.some((value, i) => value - lower[i] > 1e-9)) return;
+    const estimate = CAPITAL_BANDS[index].estimate;
     const runs = bandRuns(lower, upper);
     const top = points.map((p, i) => `${x(p.date)},${y(upper[i])}`);
     const bottom = points.map((p, i) => `${x(p.date)},${y(lower[i])}`).reverse();
@@ -680,7 +793,10 @@ function drawCapital(points, netWorth) {
       svgEl('path', {
         d: `M${top.join('L')}L${bottom.join('L')}Z`,
         fill: colors[index],
-        'fill-opacity': BAND_WASH,
+        // The strike-estimate band draws only slightly lighter than the rest --
+        // enough to read as "this figure is a guess" alongside its dashed cap,
+        // but still clearly a shaded band, not a blank gap.
+        'fill-opacity': estimate ? BAND_WASH * 0.8 : BAND_WASH,
         stroke: 'none',
       })
     );
@@ -689,6 +805,7 @@ function drawCapital(points, netWorth) {
     //    Restricted to the runs where this band has height: drawn full width,
     //    every band's cap would land on the same line wherever the bands above
     //    are empty, and the last one painted would misreport what is on top.
+    //    The estimate band's cap is dashed, the second half of the "guess" flag.
     if (!runs.length) return;
     group.appendChild(
       svgEl('path', {
@@ -700,6 +817,7 @@ function drawCapital(points, netWorth) {
         'stroke-width': 2,
         'stroke-linejoin': 'round',
         'stroke-linecap': 'butt',
+        'stroke-dasharray': estimate ? '4,3' : 'none',
       })
     );
   });
@@ -726,9 +844,10 @@ function drawCapital(points, netWorth) {
     );
   }
 
-  // 4. The total. In dollars this is load-bearing, not decoration: the gap
-  //    between the top cap and this line is the excluded long-option debit, and
-  //    on a day whose capital is entirely long debit it is the only mark drawn.
+  // 4. The total. Every component is now banded, so this line normally rests
+  //    right on the top cap; it still earns its keep as the ink reference the
+  //    Cash / Unrealized fill builds up from, and on a day whose capital is a
+  //    single hairline band (all long debit, say) it is the only firm mark.
   //    In share mode it would be a flat line at ~100% carrying no level, so the
   //    axis does the job instead and the shortfall to 100% shows the same thing.
   if (!share) {
@@ -736,45 +855,83 @@ function drawCapital(points, netWorth) {
       svgEl('path', {
         d: 'M' + points.map((p) => `${x(p.date)},${y(p.total)}`).join('L'),
         fill: 'none',
-        stroke: cssVar('--text-muted'),
+        stroke: cssVar('--text-primary'),
         'stroke-width': 1.5,
         'stroke-linejoin': 'round',
       })
     );
   }
 
-  // 5. Not deployed, floating above the total line. Almost always an
-  //    isolated single day (one Positions snapshot), so -- like an isolated
-  //    band above -- it gets a fill but no top cap (a cap needs a run of at
-  //    least two points); a small ringed marker at the peak makes it
-  //    findable even when that fill is only a couple of pixels wide.
-  if (notDeployed.size) {
-    const ndColor = cssVar(NOT_DEPLOYED_COLOR);
-    const ndLower = points.map((p) => p.total);
-    const ndUpper = points.map((p) => p.total + (notDeployed.get(p.date) || 0));
-    const top = points.map((p, i) => `${x(p.date)},${y(ndUpper[i])}`);
-    const bottom = points.map((p, i) => `${x(p.date)},${y(ndLower[i])}`).reverse();
-    group.appendChild(
-      svgEl('path', {
-        d: `M${top.join('L')}L${bottom.join('L')}Z`,
-        fill: ndColor,
-        'fill-opacity': BAND_WASH,
-        stroke: 'none',
-      })
+  // 5. Cash + Unrealized -- the shaded area between committed capital and the
+  //    account's Total value, stacked Cash then Unrealized with the same two
+  //    colors the "Where the wheel is right now" donut uses
+  //    (see `notDeployedByDate` / `drawWheelState`). The Positions snapshots
+  //    (dots) are the only real readings; with two or more they are connected
+  //    by a dashed Total-value line so the fill spans the whole snapshot
+  //    range as one interpolated estimate, not isolated single-day slivers.
+  //    A lone snapshot can't be connected, so it stays just its dots.
+  if (ndInterp || notDeployed.size) {
+    const cash = points.map((p, i) => (ndInterp ? ndInterp[i].cash : notDeployed.get(p.date)?.cash || 0));
+    const unrealized = points.map((p, i) =>
+      ndInterp ? ndInterp[i].unrealized : notDeployed.get(p.date)?.unrealized || 0
     );
-    for (const [date, amount] of notDeployed) {
-      const point = points.find((p) => p.date === date);
-      if (!point) continue;
+    const cashLower = points.map((p) => p.total);
+    const cashUpper = points.map((p, i) => cashLower[i] + cash[i]);
+    const unrUpper = points.map((p, i) => cashUpper[i] + unrealized[i]);
+
+    const fillRun = (lower, upper, color) => {
+      for (const run of bandRuns(lower, upper)) {
+        const top = run.map((i) => `${x(points[i].date)},${y(upper[i])}`);
+        const bottom = run.map((i) => `${x(points[i].date)},${y(lower[i])}`).reverse();
+        group.appendChild(
+          svgEl('path', {
+            d: `M${top.join('L')}L${bottom.join('L')}Z`,
+            fill: color,
+            'fill-opacity': BAND_WASH,
+            stroke: 'none',
+          })
+        );
+      }
+    };
+    fillRun(cashLower, cashUpper, cssVar(NOT_DEPLOYED_COLOR));
+    fillRun(cashUpper, unrUpper, cssVar(UNREALIZED_COLOR));
+
+    // The connecting Total-value line, along the top of the area. `--text-primary`
+    // (the strong ink both "total" lines use), dashed to say the stretch between
+    // two real snapshot dots is interpolated.
+    for (const run of bandRuns(cashLower, unrUpper)) {
       group.appendChild(
-        svgEl('circle', {
-          cx: x(date),
-          cy: y(point.total + amount),
-          r: 4,
-          fill: ndColor,
-          stroke: surface,
-          'stroke-width': 2,
+        svgEl('path', {
+          d: 'M' + run.map((i) => `${x(points[i].date)},${y(unrUpper[i])}`).join('L'),
+          fill: 'none',
+          stroke: cssVar('--text-primary'),
+          'stroke-width': 1.5,
+          'stroke-dasharray': '4,3',
+          'stroke-linejoin': 'round',
         })
       );
+    }
+
+    // Dots: the real snapshot readings only, at each sub-band's true peak.
+    for (const [date, nd] of notDeployed) {
+      const point = points.find((p) => p.date === date);
+      if (!point) continue;
+      for (const stop of [
+        { v: nd.cash, top: point.total + nd.cash, color: cssVar(NOT_DEPLOYED_COLOR) },
+        { v: nd.unrealized, top: point.total + nd.cash + nd.unrealized, color: cssVar(UNREALIZED_COLOR) },
+      ]) {
+        if (!(stop.v > 1e-9)) continue;
+        group.appendChild(
+          svgEl('circle', {
+            cx: x(date),
+            cy: y(stop.top),
+            r: 4,
+            fill: stop.color,
+            stroke: surface,
+            'stroke-width': 2,
+          })
+        );
+      }
     }
   }
 
@@ -821,13 +978,13 @@ function drawCapital(points, netWorth) {
           value: readout(band.key),
           color: colors[i],
         })),
-        ...CAPITAL_EXCLUDED.map((excluded) => ({ label: excluded.label, value: readout(excluded.key) })),
         { label: 'Total committed', value: money(point.total) },
       ];
       if (nd !== undefined) {
         rows.push(
-          { label: 'Not deployed (cash & other holdings)', value: money(nd), color: cssVar(NOT_DEPLOYED_COLOR) },
-          { label: 'Total value', value: money(point.total + nd) }
+          { label: 'Cash', value: money(nd.cash), color: cssVar(NOT_DEPLOYED_COLOR) },
+          { label: 'Unrealized', value: money(nd.unrealized), color: cssVar(UNREALIZED_COLOR) },
+          { label: 'Total value', value: money(point.total + nd.amount) }
         );
       }
       showTooltip(
@@ -835,14 +992,14 @@ function drawCapital(points, netWorth) {
         longDate(point.date),
         rows,
         formula([
-          'Total committed = Σ of every band above + excluded (unbanded) figures',
-          `= ${money(point.stock)} + ${money(point.put)} + ${money(point.call)} + ${money(point.long)} + ${money(point.spread)}`,
+          'Total committed = Σ of every band above',
+          `= ${CAPITAL_BANDS.map((c) => money(point[c.key] || 0)).join(' + ')}`,
           `= ${money(point.total)}`,
           ...(nd !== undefined
             ? [
                 '',
-                'Total value (Positions snapshot only) = Total committed + Not deployed',
-                `= ${money(point.total)} + ${money(nd)} = ${money(point.total + nd)}`,
+                'Total value (Positions snapshot only) = Total committed + Cash + Unrealized',
+                `= ${money(point.total)} + ${money(nd.cash)} + ${money(nd.unrealized)} = ${money(point.total + nd.amount)}`,
               ]
             : []),
         ])
@@ -853,84 +1010,34 @@ function drawCapital(points, netWorth) {
   svg.setAttribute(
     'aria-label',
     `Committed capital by day, stacked: ${CAPITAL_BANDS.map((b) => b.label).join(', ')}. ` +
-      `Latest total ${money(last.total)} on ${longDate(last.date)}.`
+      `Latest total ${money(last.total)} on ${longDate(last.date)}.` +
+      (ndAnchors.length
+        ? ` Positions snapshots add Cash and Unrealized on top, up to a Total value of ` +
+          `${money(last.total + (notDeployed.get(last.date)?.amount || ndAnchors[ndAnchors.length - 1].amount))}` +
+          `${ndAnchors.length >= 2 ? ', interpolated between snapshot dates' : ''}.`
+        : '')
   );
 
-  // Legend carries the current value and share for every band -- it is the
-  // channel that stays complete when an end label has to be dropped.
-  legend.appendChild(el('span', { class: 'legend-caption' }, `as of ${longDate(last.date)}`));
+  // Legend: a plain colour key only -- swatch + band name, no figures. The one
+  // breakdown with numbers (Total committed / Cash / Unrealized / Total value)
+  // lives in the wheel-state donut's legend right below: its components are
+  // these same bands grouped by wheel phase, and reconcile to this chart's
+  // latest day to the cent. A band that is $0 on the latest day (and so draws
+  // nothing) is left out of the key too.
   CAPITAL_BANDS.forEach((band, i) => {
+    if (Math.round(last[band.key] || 0) === 0) return;
     const item = el('span');
     const swatch = el('i');
     swatch.style.background = colors[i];
+    if (band.estimate) swatch.style.opacity = '0.45';
     item.appendChild(swatch);
     item.appendChild(document.createTextNode(band.label));
-    item.appendChild(
-      el(
-        'b',
-        { class: 'legend-value' },
-        `${compactMoney(last[band.key])} · ${pct(shareOf(band.key), 0)}`
-      )
-    );
     legend.appendChild(item);
   });
-
-  const totalKey = el('span');
-  const totalSwatch = el('i', { class: 'line' });
-  totalSwatch.style.background = cssVar('--text-muted');
-  totalKey.appendChild(totalSwatch);
-  totalKey.appendChild(document.createTextNode('Total committed'));
-  totalKey.appendChild(el('b', { class: 'legend-value' }, compactMoney(last.total)));
-  legend.appendChild(totalKey);
-
-  // No swatch on these, deliberately: neither is a band.
-  CAPITAL_EXCLUDED.forEach((excluded) => {
-    legend.appendChild(
-      el(
-        'span',
-        { class: 'legend-note' },
-        `${excluded.label} is counted in the total but not banded ` +
-          `— ${money(last[excluded.key])} today. See the table.`
-      )
-    );
-  });
-
-  // Not deployed gets its own legend line, pinned to the most recent
-  // snapshot date in view (not necessarily `last.date` -- the chart can run
-  // a few days past the Positions export if the transaction history was
-  // refreshed more recently). Explicitly not folded into the bands above:
-  // it is the answer to "where's the rest of my total value," not a fourth
-  // kind of committed capital.
   if (share) {
-    legend.appendChild(
-      el('span', { class: 'legend-note' }, 'Switch to $ to see funds not deployed alongside committed capital.')
-    );
-  } else if (notDeployed.size) {
-    const latestDate = [...notDeployed.keys()].sort().pop();
-    const amount = notDeployed.get(latestDate);
-    const point = points.find((p) => p.date === latestDate);
-    const item = el('span');
-    const swatch = el('i');
-    swatch.style.background = cssVar(NOT_DEPLOYED_COLOR);
-    item.appendChild(swatch);
-    item.appendChild(document.createTextNode('Not deployed (cash & other holdings)'));
-    item.appendChild(el('b', { class: 'legend-value' }, compactMoney(amount)));
-    legend.appendChild(item);
-    legend.appendChild(
-      el(
-        'span',
-        { class: 'legend-note' },
-        `As of the ${longDate(latestDate)} snapshot only. + Total committed = Total value (${money(point.total + amount)}).`
-      )
-    );
-  } else if (netWorth && netWorth.available) {
-    legend.appendChild(
-      el(
-        'span',
-        { class: 'legend-note' },
-        "No Positions snapshot date falls inside the current view, so funds not deployed can't be shown here."
-      )
-    );
+    legend.appendChild(el('span', { class: 'legend-note' }, 'Switch to $ to add Cash and Unrealized.'));
+  } else if (ndAnchors.length >= 2) {
+    legend.appendChild(el('span', { class: 'legend-note' }, `Dots = ${ndAnchors.length} snapshots; band between is interpolated.`));
   }
 
   buildTable(
@@ -940,14 +1047,11 @@ function drawCapital(points, netWorth) {
       const nd = notDeployed.get(point.date);
       return [
         point.date,
-        money(point.stock),
-        money(point.put),
-        money(point.call),
-        money(point.long),
-        money(point.spread),
+        ...CAPITAL_BANDS.map((c) => money(point[c.key] || 0)),
         money(point.total),
-        nd === undefined ? '—' : money(nd),
-        nd === undefined ? '—' : money(point.total + nd),
+        nd === undefined ? '—' : money(nd.cash),
+        nd === undefined ? '—' : money(nd.unrealized),
+        nd === undefined ? '—' : money(point.total + nd.amount),
       ];
     })
   );
@@ -955,147 +1059,142 @@ function drawCapital(points, netWorth) {
 
 /* ----------------------------------------- chart: wheel-state snapshot donut */
 
-// Reuses this app's own already-validated categorical slots 1-3 (see
-// docs/DESIGN.md: "the only subset validated all-pairs in both modes") --
-// same palette, same fixed order, no new colors introduced. "Hedged / Other"
-// (slot 4) is protective puts, long calls, and netted credit-spread
-// collateral -- capital that isn't plain put or stock exposure. Ordering
-// keeps it non-adjacent to slot 2 in the ring, the one documented weak pair.
-const WHEEL_STATE_BUCKETS = [
-  { key: 'puts', label: 'Cash-Secured Puts', varName: '--series-1' },
-  { key: 'calls', label: 'Covered Calls', varName: '--series-2' },
-  { key: 'holding', label: 'Holding Shares', varName: '--series-3' },
-  { key: 'other', label: 'Hedged / Other', varName: '--series-4' },
+// One ring, one wedge per leaf capital component, in wheel-phase order. Colour
+// is bound to the phase (docs/DESIGN.md's shared vocabulary), so the two
+// "Covered-call shares" components read as one group by shared hue + adjacency
+// -- no second ring needed to bracket them. `estimate: true` means the dollar
+// figure is a strike-based stand-in, drawn faded. `synthetic` components (Cash,
+// Unrealized) come from the Positions snapshot, not `wheel_state`.
+const WHEEL_STATE_PHASE_META = {
+  puts: { label: 'Cash-Secured Puts', varName: '--series-1' },
+  holding: { label: 'Holding Shares', varName: '--series-2' },
+  calls: { label: 'Covered-call shares', varName: '--series-3' },
+  other: { label: 'Hedged / Other', varName: '--series-4' },
+  cash: { label: 'Cash', varName: NOT_DEPLOYED_COLOR },
+  unrealized: { label: 'Unrealized', varName: UNREALIZED_COLOR },
+};
+
+const WHEEL_STATE_COMPONENTS = [
+  { key: 'put_collateral', phase: 'puts', label: 'Put collateral' },
+  { key: 'holding_cost_basis', phase: 'holding', label: 'Idle shares (cost basis)' },
+  { key: 'calls_cost_basis', phase: 'calls', label: 'Covered-call shares (cost basis)' },
+  { key: 'calls_strike_estimate', phase: 'calls', label: 'Covered-call shares (strike estimate)', estimate: true },
+  { key: 'long_option_debit', phase: 'other', label: 'Long-option debit' },
+  { key: 'spread_collateral', phase: 'other', label: 'Net spread collateral' },
+  { key: 'cash', phase: 'cash', label: 'Cash', synthetic: true },
+  { key: 'unrealized', phase: 'unrealized', label: 'Unrealized', synthetic: true },
 ];
 
-// A fifth and sixth, optional wedge -- kept out of WHEEL_STATE_BUCKETS itself
-// since that array is the validated, fixed-order 4-hue wheel-strategy
-// palette (see the comment above it). Together they answer "if I liquidated
-// this account today, what would I have" without a single wedge overclaiming
-// to be cash: an earlier one-wedge version, "Cash & Other Holdings", read as
-// "mostly cash, plus a little else" when for a real account it can be the
-// opposite (see this function's own docstring). Splitting the real cash out
-// from everything else (unrealized gains, equity this history can't fully
-// track) makes both pieces honest on their own. Both get a neutral, no-hue
-// treatment rather than a 5th/6th wheel-strategy hue -- Cash reuses
-// `--text-muted`, the same color "Not deployed" already carries on the
-// Capital deployed chart (same meaning: this Cash wedge is the real-cash
-// slice of that same figure); Unrealized gets the visually distinct
-// `--text-secondary` so the two don't read as one blob. Appended after the
-// four wheel wedges so they never disturb that palette's fixed order.
-const CASH_BUCKET = { key: 'cash', label: 'Cash', varName: '--text-muted' };
-const UNREALIZED_BUCKET = { key: 'unrealized', label: 'Unrealized', varName: '--text-secondary' };
-
 /**
- * Donut: current capital, split by wheel phase, right now. Part-to-whole at
- * one moment in time -- the snapshot complement to "Capital deployed"'s time
- * series above.
+ * Donut: the whole account right now. This is the *one* capital breakdown with
+ * figures -- the Capital deployed chart above keeps only a colour key, because
+ * this donut's components ARE that chart's bands (same labels), just grouped by
+ * wheel phase instead of by instrument, and they reconcile to that chart's
+ * latest day to the cent. Wedges of a phase share a colour and sit together;
+ * there is no separate summary ring (for four of the six phases it would just
+ * repeat one wedge).
  *
- * Consumes ``data.wheel_state`` verbatim rather than computing it from the
- * `cycles` payload key: `cycles` is P&L-scoped (rebuilt from whatever date
- * window the filters select), so a position opened before the window but
- * still active today would be invisible to it -- the same "capital is a
- * state, not an event count" bug docs/DESIGN.md's "Filtering" section
- * already documents and solves for the Capital deployed chart via
- * `capital_cycles`. `wheel_state_breakdown()` (wheel/metrics.py) is computed
- * server-side from that same capital-scoped set, so this chart's total
- * always matches the portfolio tile's "Capital deployed" figure regardless
- * of the active date filter.
+ * The components (label = matching Capital deployed band):
+ *   Put collateral
+ *   Idle shares (cost basis)                 -- no call written
+ *   Covered-call shares (cost basis)         -- real basis
+ *   Covered-call shares (strike estimate)    -- pre-export proxy, faded
+ *   Long-option debit + Net spread collateral (phase "Hedged / Other")
+ *   Cash / Unrealized -- from `net_worth`; Total value minus deployed capital,
+ *     split so neither overclaims (Cash = account cash not already reserved as
+ *     put collateral; Unrealized = the market-value-vs-cost-basis remainder).
+ *     Only shown once a Positions snapshot is loaded, and dated to that
+ *     snapshot, which can trail the chart's latest transaction day by a few
+ *     days -- the committed components still match exactly.
  *
- * Splits by capital component within each cycle (see wheel_state_breakdown's
- * own docstring), so one cycle can contribute to more than one bucket --
- * e.g. shares held from an earlier assignment (Holding Shares) plus a
- * freshly-sold CSP on the same ticker (Cash-Secured Puts) are two real,
- * simultaneous commitments, not one or the other.
- *
- * Each phase's name, dollar amount and share are stated exactly once, in the
- * legend below -- the ring itself carries no per-wedge text. The previous
- * stacked-bar version printed "Label · pct%" directly under each segment
- * *and* the same label/amount/pct again in the legend right below it; a
- * wedge's own geometry already encodes its share, so that text only ever
- * repeated what the legend already said. The center callout (total capital
- * deployed) is the one number that ISN'T already any single wedge's value,
- * which is what earns it a second appearance -- the legend's own note is
- * trimmed to the active-cycle count so it doesn't restate that dollar figure
- * a third time.
- *
- * A fifth and sixth wedge, Cash and Unrealized, fill the ring out to the
- * answer of "if I liquidated this account today, what would I have" --
- * `net_worth`'s Total value (the broker's own Positions-snapshot
- * mark-to-market figure) minus this chart's own four cost-basis/collateral
- * wedges, split in two:
- *   Cash = account cash not already reserved as Cash-Secured Puts collateral
- *          (that collateral is a hold against this same cash, not separate
- *          money, so it's netted out here -- never double-counted with the
- *          Cash-Secured Puts wedge).
- *   Unrealized = whatever is left of the Total-value-minus-Deployed gap --
- *          unrealized gains on shares marked to cost basis in the other four
- *          wedges but to market price in Total value, equity this history
- *          can't fully track, and short options' own mark-to-market.
- * Combined, Cash + Unrealized is exactly `notDeployedByDate`'s figure on the
- * Capital deployed chart above (same meaning, same muted-gray family there
- * too), just taken at the latest snapshot instead of plotted day by day and
- * split so neither wedge overclaims to be the other. This is also why an
- * open put expiring worthless doesn't grow actual cash by its collateral:
- * that dollar was already real cash, just reserved: releasing the
- * reservation moves it from the Cash-Secured Puts wedge into Cash, it was
- * never double-counted or created anew. Both wedges only show once a
- * Positions snapshot is loaded; without one the ring stays exactly what it
- * always was, four wedges summing to capital deployed.
+ * `wheelState` is `wheel_state_breakdown()` (wheel/metrics.py), computed from
+ * the capital-scoped cycle set so the deployed total always matches the
+ * "Capital deployed" figure regardless of the active date filter.
  */
 function drawWheelState(wheelState, netWorth) {
   const svg = $('chart-wheel-state');
   const legend = $('legend-wheel-state');
   clear(legend);
+  legend.classList.add('legend-stack');
 
   const rawBuckets = (wheelState && wheelState.buckets) || {};
+  const rawParts = (wheelState && wheelState.parts) || {};
   const activeCycles = (wheelState && wheelState.active_cycles) || 0;
-  const totals = {};
-  const counts = {};
-  const tickersByBucket = {};
-  for (const bucket of WHEEL_STATE_BUCKETS) {
-    const entry = rawBuckets[bucket.key] || { amount: 0, cycles: 0, tickers: [] };
-    totals[bucket.key] = entry.amount || 0;
-    counts[bucket.key] = entry.cycles || 0;
-    tickersByBucket[bucket.key] = entry.tickers || [];
+
+  const phaseMeta = {};
+  for (const key of Object.keys(WHEEL_STATE_PHASE_META)) {
+    const b = rawBuckets[key] || {};
+    phaseMeta[key] = { cycles: b.cycles || 0, tickers: b.tickers || [], amount: b.amount || 0 };
   }
 
-  // Cash and Unrealized: see CASH_BUCKET/UNREALIZED_BUCKET and this
-  // function's own docstring. `netWorth.combined` nests a Combined view's
-  // summed totals, same split renderNetWorthTiles uses; a single account's
-  // payload already has these fields at the top level.
+  const deployed =
+    phaseMeta.puts.amount + phaseMeta.calls.amount + phaseMeta.holding.amount + phaseMeta.other.amount;
   const netWorthTotals = netWorth && netWorth.available ? netWorth.combined || netWorth : null;
   const totalValue = netWorthTotals && netWorthTotals.total_value != null ? netWorthTotals.total_value : null;
   const cashTotal = netWorthTotals && netWorthTotals.cash_total != null ? netWorthTotals.cash_total : null;
-  const deployed = totals.puts + totals.calls + totals.holding + totals.other;
-  const notDeployed = totalValue !== null ? Math.max(totalValue - deployed, 0) : 0;
-  // Cash never exceeds the total gap itself -- if Cash-Secured Puts is 0 (no
-  // open puts) `cashTotal` might slightly outrun `notDeployed` on a stale
-  // Positions snapshot; clamped so Unrealized never goes negative from it.
-  totals.cash = cashTotal !== null ? Math.min(Math.max(cashTotal - totals.puts, 0), notDeployed) : 0;
-  totals.unrealized = Math.max(notDeployed - totals.cash, 0);
-  counts.cash = counts.unrealized = 0; // not scoped to any cycle
-  tickersByBucket.cash = tickersByBucket.unrealized = [];
+  const gap = totalValue !== null ? Math.max(totalValue - deployed, 0) : 0;
+  const cash = cashTotal !== null ? Math.min(Math.max(cashTotal - phaseMeta.puts.amount, 0), gap) : 0;
+  const unrealized = Math.max(gap - cash, 0);
 
-  const grandTotal = deployed + totals.cash + totals.unrealized;
-  const tableHead = ['Phase', 'Capital', 'Share of total', 'Cycles with capital here', 'Tickers'];
+  const hasParts = Object.keys(rawParts).length > 0;
+  let components;
+  if (hasParts) {
+    const amt = { ...rawParts, cash, unrealized };
+    components = WHEEL_STATE_COMPONENTS.map((c) => ({
+      ...c,
+      amount: amt[c.key] || 0,
+      phaseLabel: WHEEL_STATE_PHASE_META[c.phase].label,
+      colorVar: WHEEL_STATE_PHASE_META[c.phase].varName,
+    })).filter((c) => c.amount > 1e-9);
+  } else {
+    // Older payload with no `parts`: one wedge per phase bucket + cash/unrealized.
+    components = ['puts', 'holding', 'calls', 'other', 'cash', 'unrealized']
+      .map((key) => {
+        const m = WHEEL_STATE_PHASE_META[key];
+        const amount = key === 'cash' ? cash : key === 'unrealized' ? unrealized : phaseMeta[key].amount;
+        return {
+          key,
+          phase: key,
+          label: m.label,
+          amount,
+          phaseLabel: m.label,
+          colorVar: m.varName,
+          synthetic: key === 'cash' || key === 'unrealized',
+        };
+      })
+      .filter((c) => c.amount > 1e-9);
+  }
 
+  const grandTotal = components.reduce((s, c) => s + c.amount, 0);
+  const tableHead = ['Phase', 'Component', 'Capital', 'Share of total'];
+
+  // This donut shares the Capital deployed card, so an empty state hides only
+  // its own subsection -- never the whole card and the history chart with it.
+  const block = $('wheel-state-block');
   if (!activeCycles || grandTotal <= 1e-9) {
     clear(svg);
     svg.removeAttribute('aria-label');
     buildTable('wheel-state-table', tableHead, []);
-    toggleChartCard(svg, false);
+    if (block) block.hidden = true;
     return;
   }
-  toggleChartCard(svg, true);
+  if (block) block.hidden = false;
 
-  const buckets = [...WHEEL_STATE_BUCKETS, CASH_BUCKET, UNREALIZED_BUCKET].filter(
-    (bucket) => totals[bucket.key] > 1e-9
-  );
+  // Every wedge/row is named by its component label -- the exact same label the
+  // Capital deployed colour key uses for the matching band, so the two read as
+  // one vocabulary. The phase name is kept only for the bold group header that
+  // sits above a phase with more than one visible component (Covered-call
+  // shares) and for the table's Phase column.
+  const phaseCount = {};
+  components.forEach((c) => (phaseCount[c.phase] = (phaseCount[c.phase] || 0) + 1));
+  const displayLabel = (c) => c.label;
 
-  const width = chartWidth(svg);
+  // Nested in the (full-width) Capital deployed card, but the donut is a
+  // fixed-radius mark -- its `.chart-scroll` is capped ~460px, so ask for a
+  // width that fits rather than the 520 chart minimum and a downscale.
+  const width = chartWidth(svg, 320);
   const rOuter = 100;
-  const rInner = 58;
+  const rInner = 56;
   const height = rOuter * 2 + 24;
   const cx = width / 2;
   const cy = height / 2;
@@ -1107,163 +1206,148 @@ function drawWheelState(wheelState, netWorth) {
   svg.appendChild(group);
 
   const surface = cssVar('--surface-1');
-  const arcPoint = (angle, r) => [cx + r * Math.cos(angle), cy + r * Math.sin(angle)];
+  const arcPoint = (a, r) => [cx + r * Math.cos(a), cy + r * Math.sin(a)];
   const wedgePath = (start, end) => {
+    if (end - start >= Math.PI * 2 - 1e-6) {
+      return (
+        `M${cx - rOuter},${cy} A${rOuter},${rOuter} 0 1 1 ${cx + rOuter},${cy} A${rOuter},${rOuter} 0 1 1 ${cx - rOuter},${cy} Z ` +
+        `M${cx - rInner},${cy} A${rInner},${rInner} 0 1 0 ${cx + rInner},${cy} A${rInner},${rInner} 0 1 0 ${cx - rInner},${cy} Z`
+      );
+    }
     const [x1, y1] = arcPoint(start, rOuter);
     const [x2, y2] = arcPoint(end, rOuter);
     const [x3, y3] = arcPoint(end, rInner);
     const [x4, y4] = arcPoint(start, rInner);
-    const largeArc = end - start > Math.PI ? 1 : 0;
-    return (
-      `M${x1},${y1} A${rOuter},${rOuter} 0 ${largeArc} 1 ${x2},${y2} ` +
-      `L${x3},${y3} A${rInner},${rInner} 0 ${largeArc} 0 ${x4},${y4} Z`
-    );
+    const large = end - start > Math.PI ? 1 : 0;
+    return `M${x1},${y1} A${rOuter},${rOuter} 0 ${large} 1 ${x2},${y2} L${x3},${y3} A${rInner},${rInner} 0 ${large} 0 ${x4},${y4} Z`;
   };
 
   const tableRows = [];
-  let angle = -Math.PI / 2; // 12 o'clock, sweeping clockwise
-  buckets.forEach((bucket) => {
-    const amount = totals[bucket.key];
-    const share = amount / grandTotal;
-    const color = cssVar(bucket.varName);
-
-    let path;
-    if (buckets.length === 1) {
-      // A full ring can't be described as a single arc -- SVG's arc command
-      // degenerates when the start and end point coincide. Two concentric
-      // circles with an even-odd fill draw the same annulus without that
-      // edge case, for the (rare) one-phase-only slice.
-      path = svgEl('path', {
-        class: 'mark',
-        'fill-rule': 'evenodd',
-        d:
-          `M${cx - rOuter},${cy} A${rOuter},${rOuter} 0 1 1 ${cx + rOuter},${cy} ` +
-          `A${rOuter},${rOuter} 0 1 1 ${cx - rOuter},${cy} Z ` +
-          `M${cx - rInner},${cy} A${rInner},${rInner} 0 1 0 ${cx + rInner},${cy} ` +
-          `A${rInner},${rInner} 0 1 0 ${cx - rInner},${cy} Z`,
-        fill: color,
-      });
-    } else {
-      const end = angle + share * Math.PI * 2;
-      path = svgEl('path', {
-        class: 'mark',
-        d: wedgePath(angle, end),
-        fill: color,
-        stroke: surface,
-        'stroke-width': 2,
-        'stroke-linejoin': 'round',
-      });
-      angle = end;
-    }
+  let angle = -Math.PI / 2; // 12 o'clock, clockwise
+  components.forEach((c) => {
+    const share = c.amount / grandTotal;
+    const end = angle + share * Math.PI * 2;
+    const color = cssVar(c.colorVar);
+    const path = svgEl('path', {
+      class: 'mark',
+      d: wedgePath(angle, end),
+      fill: color,
+      'fill-opacity': c.estimate ? 0.42 : 1,
+      stroke: surface,
+      'stroke-width': 2,
+      'stroke-linejoin': 'round',
+    });
     group.appendChild(path);
 
-    const isCash = bucket.key === 'cash';
-    const isUnrealized = bucket.key === 'unrealized';
-    const isMarketValue = isCash || isUnrealized;
+    const meta = phaseMeta[c.phase] || { cycles: 0, tickers: [] };
     attachTip(
       path,
-      bucket.label,
-      isMarketValue
-        ? [
-            { label: bucket.label, value: money(amount) },
-            { label: 'Share of total', value: pct(share * 100, 1) },
-          ]
-        : [
-            { label: 'Capital', value: money(amount) },
-            { label: 'Share of total', value: pct(share * 100, 1) },
-            { label: 'Cycles with capital here', value: String(counts[bucket.key]) },
-            { label: 'Tickers', value: [...tickersByBucket[bucket.key]].sort().join(', ') || '—' },
-          ],
-      isCash
+      displayLabel(c),
+      [
+        { label: c.label, value: money(c.amount) },
+        { label: 'Share of total', value: pct(share * 100, 1) },
+        ...(phaseCount[c.phase] > 1 ? [{ label: 'Part of', value: c.phaseLabel }] : []),
+        ...(c.synthetic
+          ? []
+          : [
+              { label: 'Cycles with capital here', value: String(meta.cycles) },
+              { label: 'Tickers', value: [...meta.tickers].sort().join(', ') || '—' },
+            ]),
+      ],
+      c.key === 'cash'
         ? formula([
-            'Cash = Cash − collateral already reserved for open cash-secured',
-            '  puts (a put\'s collateral is a hold against this same cash, not',
-            '  separate money, so it\'s netted out here, never double-counted',
-            '  with the Cash-Secured Puts wedge)',
-            `= ${money(cashTotal)} − ${money(totals.puts)} = ${money(amount)} of ${money(grandTotal)} total`,
+            'Cash = account cash - collateral already reserved for open',
+            '  cash-secured puts (a hold against this same cash, not separate',
+            "  money, so it's netted out here)",
+            `= ${money(cashTotal)} - ${money(phaseMeta.puts.amount)} = ${money(c.amount)}`,
           ])
-        : isUnrealized
+        : c.key === 'unrealized'
           ? formula([
-              'Unrealized = Total value (broker Positions snapshot)',
-              "  − Capital deployed (this ring's other 4 wedges, cost basis) − Cash",
-              `= ${money(totalValue)} − ${money(deployed)} − ${money(totals.cash)} = ${money(amount)}`,
+              'Unrealized = Total value (Positions snapshot) - Capital deployed - Cash',
+              `= ${money(totalValue)} - ${money(deployed)} - ${money(cash)} = ${money(c.amount)}`,
               '',
-              "Unrealized gains marked to market here vs. cost basis in the other",
-              "  wedges, plus equity this history can't fully track -- not cash.",
+              "Unrealized gains vs. cost basis, plus equity this history can't track.",
             ])
-          : formula([
-              `${bucket.label} = this capital component, summed across active cycles`,
-              '  (one cycle can count in more than one phase -- e.g. holding shares',
-              '  while also running a fresh cash-secured put)',
-              '',
-              `= ${money(amount)} of ${money(grandTotal)} total = ${pct(share * 100, 1)}`,
-            ])
+          : c.estimate
+            ? formula([
+                `${c.label} = strike × 100 × contracts, a stand-in for shares bought`,
+                "  before this export begins so their real cost basis isn't known.",
+                '  Drawn faded because it is an estimate.',
+                `= ${money(c.amount)} of ${money(grandTotal)} total = ${pct(share * 100, 1)}`,
+              ])
+            : formula([
+                `${c.label} = ${money(c.amount)} of ${money(grandTotal)} total = ${pct(share * 100, 1)}`,
+              ])
     );
 
-    tableRows.push([
-      bucket.label,
-      money(amount),
-      pct(share * 100, 1),
-      isMarketValue ? '—' : counts[bucket.key],
-      isMarketValue ? '—' : [...tickersByBucket[bucket.key]].sort().join(', ') || '—',
-    ]);
+    tableRows.push([c.phaseLabel, c.label, money(c.amount), pct(share * 100, 1)]);
+    angle = end;
   });
 
-  // Center callout: the only figure on the chart that isn't already one
-  // wedge's own value.
   group.appendChild(
     svgEl(
       'text',
-      {
-        x: cx,
-        y: cy - 6,
-        'text-anchor': 'middle',
-        style: 'fill: var(--text-primary); font-weight: 700; font-size: 18px;',
-      },
+      { x: cx, y: cy - 4, 'text-anchor': 'middle', style: 'fill: var(--text-primary); font-weight: 700; font-size: 16px;' },
       compactMoney(grandTotal)
     )
   );
   group.appendChild(
-    svgEl(
-      'text',
-      { x: cx, y: cy + 14, 'text-anchor': 'middle', class: 'tick-label' },
-      totalValue !== null ? 'if liquidated today' : 'deployed now'
-    )
+    svgEl('text', { x: cx, y: cy + 14, 'text-anchor': 'middle', class: 'tick-label' }, 'total')
   );
 
   svg.setAttribute(
     'aria-label',
-    `${totalValue !== null ? 'Account value if liquidated today' : 'Current wheel capital'}, by phase: ${buckets
-      .map((bucket) => `${bucket.label} ${pct((totals[bucket.key] / grandTotal) * 100, 0)}`)
-      .join(', ')}. Total ${money(grandTotal)} across ${activeCycles} active cycle(s).`
+    `${totalValue !== null ? 'Account value if liquidated today' : 'Current wheel capital'}: ${components
+      .map((c) => `${displayLabel(c)} ${pct((c.amount / grandTotal) * 100, 0)}`)
+      .join(', ')}. Total ${money(grandTotal)}, ${activeCycles} active cycle(s).`
   );
 
-  buckets.forEach((bucket) => {
-    const item = el('span');
-    const swatch = el('i');
-    swatch.style.background = cssVar(bucket.varName);
-    item.appendChild(swatch);
-    item.appendChild(document.createTextNode(bucket.label));
-    item.appendChild(
-      el(
-        'b',
-        { class: 'legend-value' },
-        `${money(totals[bucket.key])} · ${pct((totals[bucket.key] / grandTotal) * 100, 0)}`
-      )
-    );
-    legend.appendChild(item);
-  });
+  // The page's one figured capital breakdown: the deployed components (same
+  // labels as the Capital deployed bands), then a Total committed subtotal,
+  // then Cash / Unrealized, then Total value -- every figure rounded to whole
+  // dollars and summed from the rounded parts so the column always adds up.
+  const r = (v) => Math.round(v);
+  const row = (label, value, opts) => capitalBreakdownRow(legend, label, value, opts);
+
+  const asOfIso = netWorth && netWorth.as_of;
   legend.appendChild(
-    el('span', { class: 'legend-note' }, `Across ${activeCycles} active cycle(s); the ring's center shows the total.`)
+    el(
+      'span',
+      { class: 'legend-caption' },
+      `${activeCycles} active cycle(s)` + (asOfIso ? ` · as of ${longDate(String(asOfIso).slice(0, 10))}` : '')
+    )
   );
-  if (totals.cash > 1e-9 || totals.unrealized > 1e-9) {
-    legend.appendChild(
-      el(
-        'span',
-        { class: 'legend-note' },
-        "Cash and Unrealized bridge to Total value (broker Positions snapshot); the other wedges are dated to the latest transaction on file, so the two can be a few days apart. If an open put expires worthless, its collateral moves from Cash-Secured Puts into Cash -- actual cash in the account doesn't grow, since the premium was already banked when the put was sold."
-      )
-    );
+  const shownPhaseHeader = new Set();
+  let committed = 0;
+  components
+    .filter((c) => !c.synthetic)
+    .forEach((c) => {
+      committed += r(c.amount);
+      if (phaseCount[c.phase] > 1) {
+        if (!shownPhaseHeader.has(c.phase)) {
+          shownPhaseHeader.add(c.phase);
+          const subtotal = components
+            .filter((x) => x.phase === c.phase)
+            .reduce((s, x) => s + r(x.amount), 0);
+          row(c.phaseLabel, subtotal, { color: cssVar(c.colorVar), strong: true });
+        }
+        row(c.label, r(c.amount), { color: cssVar(c.colorVar), faded: c.estimate, indent: true });
+      } else {
+        row(displayLabel(c), r(c.amount), { color: cssVar(c.colorVar) });
+      }
+    });
+  row('Total committed', committed, { kind: 'line', color: cssVar('--text-primary'), strong: true });
+
+  const cashR = r(cash);
+  const unrealR = r(unrealized);
+  if (cashR > 0 || unrealR > 0) {
+    row('Cash', cashR, { color: cssVar(NOT_DEPLOYED_COLOR) });
+    row('Unrealized', unrealR, { color: cssVar(UNREALIZED_COLOR) });
+    row('Total value', committed + cashR + unrealR, {
+      kind: 'dashed',
+      color: cssVar('--text-primary'),
+      strong: true,
+    });
   }
 
   buildTable('wheel-state-table', tableHead, tableRows);
@@ -1429,8 +1513,8 @@ const CASHFLOW_TABLE_HEAD = [
     text: 'Net cash flow',
     title: formula([
       'Net cash flow = Gross credits - Gross debits - Fees',
-      'Dated to when cash actually settles -- premium sold, dividends',
-      '  received, a roll\'s debit -- not to when the underlying position',
+      'Dated to when cash actually settles; premium sold, dividends',
+      '  received, a roll\'s debit; not to when the underlying position',
       '  finally closes.',
     ]),
   },
@@ -1439,7 +1523,7 @@ const CASHFLOW_TABLE_HEAD = [
     title: formula([
       'This month\'s share of realized wheel P/L (profit/loss): option P/L',
       '  plus stock P/L, dated to when a leg actually closes or a share lot',
-      '  is sold -- never to when the premium was originally collected.',
+      '  is sold, never to when the premium was originally collected.',
     ]),
   },
   'Avg collateral',
@@ -1472,7 +1556,7 @@ const weekRangeLabel = (weekStart, weekEnd) => {
     day: 'numeric',
     year: 'numeric',
   });
-  return `${startText} – ${endText}`;
+  return `${startText}, ${endText}`;
 };
 
 // Re-derives an ISO week anchor on the client, to line `pnl_series` (daily,
@@ -1639,7 +1723,7 @@ function drawCashFlow(rows, trailing, pnlSeries) {
         '',
         'Monthly yield % = Net cash flow ÷ Avg allocated collateral × 100',
         `= ${money(row.net_cash_flow, { cents: true })} ÷ ${money(row.avg_collateral)} × 100`,
-        `= ${row.monthly_yield_pct === null ? 'N/A -- no collateral committed this month' : pct(row.monthly_yield_pct, 2)}`,
+        `= ${row.monthly_yield_pct === null ? 'N/A; no collateral committed this month' : pct(row.monthly_yield_pct, 2)}`,
       ])
     );
 
@@ -1659,7 +1743,7 @@ function drawCashFlow(rows, trailing, pnlSeries) {
 
     attachTip(
       wheelRect,
-      `${monthLabel(row.period)} — wheel realized P/L`,
+      `${monthLabel(row.period)}, wheel realized P/L`,
       [
         { label: 'Premium collected (net)', value: money(wp.option_pl, { cents: true }) },
         { label: 'Stock P/L', value: money(wp.stock_pl, { cents: true }) },
@@ -1668,8 +1752,8 @@ function drawCashFlow(rows, trailing, pnlSeries) {
       ],
       formula([
         'Wheel realized P/L = Premium collected (net) + Stock P/L',
-        '  Dated to when each leg closes or a share lot is sold --',
-        '  never to when premium was sold, unlike Net cash flow.',
+        '  Dated to when a leg closes or a share lot is sold,',
+        '  not to when premium was sold (unlike Net cash flow).',
         '',
         `= ${money(wp.option_pl, { cents: true })} + ${money(wp.stock_pl, { cents: true })}`,
         `= ${money(wp.total_pl, { cents: true })}`,
@@ -1811,39 +1895,24 @@ function drawCashFlow(rows, trailing, pnlSeries) {
   const cashSwatch = el('i');
   cashSwatch.style.background = `linear-gradient(90deg, ${positive} 50%, ${negative} 50%)`;
   cashSwatchItem.appendChild(cashSwatch);
-  cashSwatchItem.appendChild(document.createTextNode('Net cash flow (blue = credit, red = debit)'));
+  cashSwatchItem.appendChild(document.createTextNode('Net cash flow; blue credit, red debit'));
   legend.appendChild(cashSwatchItem);
 
   const wheelSwatchItem = el('span');
   const wheelSwatch = el('i');
   wheelSwatch.style.background = wheelColor;
   wheelSwatchItem.appendChild(wheelSwatch);
-  wheelSwatchItem.appendChild(document.createTextNode('Wheel realized P/L (dated to when a leg closes)'));
+  wheelSwatchItem.appendChild(document.createTextNode('Wheel realized P/L'));
   legend.appendChild(wheelSwatchItem);
 
-  legend.appendChild(
-    el(
-      'span',
-      { class: 'legend-note' },
-      'Cash flow books a credit the moment premium is sold; wheel P/L only once the position closes — hover either bar for its breakdown.'
-    )
-  );
   if (avgIncome !== null && avgIncome !== undefined) {
     legend.appendChild(
-      el(
-        'span',
-        { class: 'legend-note' },
-        `Dashed red line = avg monthly income over this range (${money(avgIncome, { cents: true })}). Hover it for the formula.`
-      )
+      el('span', { class: 'legend-note' }, `Dashed red = avg monthly income (${money(avgIncome, { cents: true })}).`)
     );
   }
   if (avgWheelPl !== null && avgWheelPl !== undefined) {
     legend.appendChild(
-      el(
-        'span',
-        { class: 'legend-note' },
-        `Dotted orange line = avg wheel realized P/L over this range (${money(avgWheelPl, { cents: true })}). Hover it for the formula.`
-      )
+      el('span', { class: 'legend-note' }, `Dotted orange = avg wheel realized P/L (${money(avgWheelPl, { cents: true })}).`)
     );
   }
 
@@ -1872,7 +1941,7 @@ const PERIOD_PL_TABLE_HEAD = [
     title: 'Realized option P/L (CSP + covered-call + hedge legs) that closed in this period.',
   },
   { text: 'Closed P/L', title: 'Realized stock P/L from shares sold or called away in this period.' },
-  { text: 'Net P/L', title: 'Net Premium + Closed P/L, realized only -- matches Net Realized P/L elsewhere.' },
+  { text: 'Net P/L', title: 'Net Premium + Closed P/L, realized only; matches Net Realized P/L elsewhere.' },
 ];
 
 // One fixed identity color per metric, regardless of sign -- a bar's own
@@ -2011,7 +2080,7 @@ function drawPeriodPl(periodPl) {
     el(
       'span',
       { class: 'legend-note' },
-      'Bar direction (above/below zero) shows profit vs. loss; color names the metric, not the sign.'
+      'Above zero = profit, below = loss. Color = metric, not sign.'
     )
   );
 
@@ -2044,10 +2113,13 @@ const GAP_TABLE_HEAD = ['Week', 'Net cash flow', 'Wheel realized P/L', 'Weekly g
  * see that chart's own hint for why the two diverge. Bucketed by ISO week,
  * not month, for finer x-axis resolution: bars are the weekly gap
  * (diverging, one categorical slot per week); the line overlaid on the same
- * x positions is its running total, the headline: a sustained rise means
- * collected premium is piling up in still-open positions faster than it's
- * being realized -- not necessarily a problem, but the thing worth watching
- * for. Weekly cash-flow rows come from `wheel.cashflow.weekly_cashflow_series`
+ * x positions is its running total, drawn as a rolling-mean trend so the
+ * sawtooth from lumpy weekly realizations doesn't drown the signal -- a
+ * sustained rise means collected premium is piling up in still-open positions
+ * faster than it's being realized, not necessarily a problem but the thing
+ * worth watching for. The dot, its label, every tooltip and the table keep
+ * the exact running total; only the line is smoothed. Weekly cash-flow rows
+ * come from `wheel.cashflow.weekly_cashflow_series`
  * (via `cash_flow.weeks`); weekly wheel P/L is `pnl_series` rebucketed by
  * `weeklyWheelPl`.
  */
@@ -2131,7 +2203,12 @@ function drawCashFlowGap(rows, pnlSeries) {
     );
   });
 
-  const linePath = centers.map((cx, index) => `${cx},${y(cumGaps[index])}`).join('L');
+  // The running total is a sawtooth -- the weekly gaps it sums land in lumps.
+  // Draw it as a shrinking-window centered mean so it reads as a clean trend;
+  // endpoints stay exact, and the dot/label/tooltips/table all keep the true
+  // running total.
+  const smoothGaps = smoothSeries(cumGaps, 4);
+  const linePath = centers.map((cx, index) => `${cx},${y(smoothGaps[index])}`).join('L');
   group.appendChild(
     svgEl('path', {
       d: 'M' + linePath,
@@ -2193,7 +2270,7 @@ function drawCashFlowGap(rows, pnlSeries) {
   barSwatch.style.background = `linear-gradient(90deg, ${positive} 50%, ${negative} 50%)`;
   barSwatchItem.appendChild(barSwatch);
   barSwatchItem.appendChild(
-    document.createTextNode('Weekly gap (blue = cash flow ahead that week, red = wheel P/L ahead)')
+    document.createTextNode('Weekly gap; blue: cash flow ahead, red: P/L ahead')
   );
   legend.appendChild(barSwatchItem);
 
@@ -2201,9 +2278,12 @@ function drawCashFlowGap(rows, pnlSeries) {
   const lineSwatch = el('i', { class: 'line' });
   lineSwatch.style.background = lineColor;
   lineSwatchItem.appendChild(lineSwatch);
-  lineSwatchItem.appendChild(document.createTextNode('Cumulative gap (running total)'));
+  lineSwatchItem.appendChild(document.createTextNode('Cumulative gap (smoothed)'));
   lineSwatchItem.appendChild(el('b', { class: 'legend-value' }, money(cumGaps[lastIndex], { cents: true })));
   legend.appendChild(lineSwatchItem);
+  legend.appendChild(
+    el('span', { class: 'legend-note' }, 'Line is a rolling-mean trend; hover a bar or open the table for each week’s exact running total.')
+  );
 
   buildTable(
     'gap-table',
@@ -2397,7 +2477,7 @@ function drawPpd(rows, { svgId = 'chart-ppd', legendId = 'legend-ppd', tableId =
     const lineSwatch = el('i', { class: 'line' });
     lineSwatch.style.background = lineColor;
     lineItem.appendChild(lineSwatch);
-    lineItem.appendChild(document.createTextNode('PPD to date (option P/L ÷ days)'));
+    lineItem.appendChild(document.createTextNode('PPD to date'));
     lineItem.appendChild(el('b', { class: 'legend-value' }, perDay(currentPpd)));
     legend.appendChild(lineItem);
 
@@ -2406,7 +2486,7 @@ function drawPpd(rows, { svgId = 'chart-ppd', legendId = 'legend-ppd', tableId =
     barSwatch.style.background = `linear-gradient(90deg, ${positive} 50%, ${negative} 50%)`;
     barSwatch.style.opacity = '0.55';
     barItem.appendChild(barSwatch);
-    barItem.appendChild(document.createTextNode("This week's PPD (realized P/L ÷ 7)"));
+    barItem.appendChild(document.createTextNode("This week's PPD"));
     legend.appendChild(barItem);
   }
 
@@ -2460,7 +2540,7 @@ function renderCashFlowTiles(trailing, rows, pnlSeries) {
               'Annualized cash-on-cash return =',
               '  (Avg monthly income × 12) ÷ Avg collateral × 100',
               '',
-              'N/A -- no collateral committed in the selected range.',
+              'N/A, no collateral committed in the selected range.',
             ])
           : formula([
               'Annualized cash-on-cash return =',
@@ -2470,8 +2550,8 @@ function renderCashFlowTiles(trailing, rows, pnlSeries) {
               `= (${money(trailing.avg_monthly_income, { cents: true })} × 12) ÷ ${money(trailing.avg_collateral)} × 100`,
               `= ${pct(trailing.annualized_cash_on_cash_return_pct, 2)}`,
               '',
-              'Counts all cash actually collected -- including premium on still-open',
-              '  legs, and dividends -- not just profit/loss on legs already closed.',
+              'Counts all cash actually collected, including premium on still-open',
+              '  legs, and dividends; not just profit/loss on legs already closed.',
             ]),
     },
     {
@@ -2487,7 +2567,7 @@ function renderCashFlowTiles(trailing, rows, pnlSeries) {
         `= ${money(trailing.cash_flow, { cents: true })} - ${money(rangeWheelPl, { cents: true })}`,
         `= ${money(gap, { cents: true })}`,
         '',
-        'Positive: premium collected is running ahead of what has been realized --',
+        'Positive: premium collected is running ahead of what has been realized,',
         '  usually open positions not yet closed, or dividends (never in wheel P/L).',
         'Negative: realized wheel P/L is running ahead of newly collected premium.',
       ]),
@@ -2656,8 +2736,8 @@ function drawSignedBars(
     item.appendChild(swatch);
     item.appendChild(document.createTextNode('Blue = positive, red = negative'));
     legend.appendChild(item);
-    if (legendNote) {
-      legend.appendChild(el('span', { class: 'legend-note' }, legendNote));
+    for (const note of [].concat(legendNote || [])) {
+      legend.appendChild(el('span', { class: 'legend-note' }, note));
     }
   }
 }
@@ -2817,7 +2897,7 @@ function drawTickerScatter(rows) {
             'Annualized Wheel ROC (return on capital) =',
             '  (Option premium P/L ÷ Avg capital) × (365 ÷ Days)',
             '',
-            'N/A -- no capital committed.',
+            'N/A, no capital committed.',
           ])
         : formula([
             'Bubble position: x = Annualized Wheel ROC (return on capital),',
@@ -2862,8 +2942,6 @@ function drawTickerScatter(rows) {
     el(
       'span',
       { class: 'legend-note' },
-      'Bubble size = avg capital deployed. Blue = net gain, red = net loss. Right of the vertical ' +
-        'line = positive ROC; above the horizontal line = net profit.'
     )
   );
 
@@ -2882,21 +2960,25 @@ function drawTickerScatter(rows) {
 
 /* ----------------------------------------------------- chart: wheel timeline */
 
+// Same capital vocabulary as the Capital-deployed chart and the wheel-state
+// donut: put collateral = slot 1, covered-call shares = slot 3, long-option
+// debit = slot 4. Held shares get slot 2 (see drawTimelineStock).
 const LEG_STYLES = {
   CSP: { label: 'Cash-secured put', varName: '--series-1' },
-  COVERED_CALL: { label: 'Covered call', varName: '--series-2' },
+  COVERED_CALL: { label: 'Covered call', varName: '--series-3' },
   LONG_PUT: { label: 'Long put', varName: '--series-4' },
   LONG_CALL: { label: 'Long call', varName: '--series-4' },
 };
 
 /**
  * One share lot on the Wheel-timelines chart: a bar over the days it was held
- * (--series-3, the same colour "Shares held" uses elsewhere), a filled square
- * at the buy, and an outlined square at each sale / call-away. This is the only
- * mark a plain buy-and-hold cycle has.
+ * (--series-2, the orange the "Capital deployed" chart and the "Holding Shares"
+ * donut wedge both use for shares held at cost basis), a filled square at the
+ * buy, and an outlined square at each sale / call-away. This is the only mark a
+ * plain buy-and-hold cycle has.
  */
 function drawTimelineStock(group, cycle, lot, y, laneHeight, x, through, surface, onClick) {
-  const color = cssVar('--series-3');
+  const color = cssVar('--series-2');
   const sells = (lot.disposals || []).slice().sort((a, b) => (a.date < b.date ? -1 : 1));
   const held = lot.remaining > 1e-9 || !sells.length;
   const endIso = held ? through : sells[sells.length - 1].date;
@@ -2997,6 +3079,8 @@ function drawTimeline(cycles, through) {
   // has renumbered or clipped the cycles here -- a wheel still open in full
   // history must not read "closed" just because the window cuts off its tail.
   const byStart = (a, b) => parseDay(a.start_date) - parseDay(b.start_date) || a.cycle_id.localeCompare(b.cycle_id);
+  // 'time' order puts the newest wheel on top, so recent activity reads first.
+  const byStartDesc = (a, b) => -byStart(a, b);
   const byTicker = (a, b) => a.underlying.localeCompare(b.underlying) || byStart(a, b);
   const ordered = cycles
     .slice()
@@ -3012,7 +3096,7 @@ function drawTimeline(cycles, through) {
           }
         : cycle;
     })
-    .sort(state.timelineSort === 'time' ? byStart : byTicker);
+    .sort(state.timelineSort === 'time' ? byStartDesc : byTicker);
 
   const endOf = (leg) => leg.close_date || through;
   const laneHeight = 11;
@@ -3290,12 +3374,12 @@ function drawTimeline(cycles, through) {
   }
   const stockItem = el('span');
   const stockSwatch = el('i');
-  stockSwatch.style.background = cssVar('--series-3');
+  stockSwatch.style.background = cssVar('--series-2');
   stockItem.appendChild(stockSwatch);
   stockItem.appendChild(document.createTextNode('Shares held'));
   legend.appendChild(stockItem);
-  legend.appendChild(el('span', {}, '▲ sold to open   ▼ bought to close   ◆ assigned   ■ bought shares   □ sold shares'));
-  legend.appendChild(el('span', {}, 'Faded bar = still open'));
+  legend.appendChild(el('span', {}, '▲ sell-open  ▼ buy-close  ◆ assign  ■ buy  □ sell'));
+  legend.appendChild(el('span', {}, 'Faded = still open'));
 
   const statusItem = el('span');
   const naDot = el('i');
@@ -3398,8 +3482,8 @@ function cycleFormulas(cycle) {
   const initial = day1
     ? formula([
         "Initial cap = day one's total committed capital",
-        '  Put collateral + Stock basis + Call proxy + Long debit + Spread collateral',
-        `= ${money(day1.put)} + ${money(day1.stock)} + ${money(day1.call)} + ${money(day1.long)} + ${money(day1.spread)}`,
+        `  ${CAPITAL_FORMULA_SUM}`,
+        `= ${CAPITAL_BANDS.map((c) => money(day1[c.key] || 0)).join(' + ')}`,
         `= ${money(cycle.initial_collateral)}`,
       ])
     : formula(["Initial cap = day one's total committed capital"]);
@@ -3427,7 +3511,7 @@ function cycleFormulas(cycle) {
           'Annualized Wheel ROC (return on capital) =',
           '  (Wheel option P/L ÷ Avg collateral) × (365 ÷ Days active)',
           '',
-          'N/A -- no capital committed in this cycle.',
+          'N/A, no capital committed in this cycle.',
         ])
       : formula([
           ...wheelOptionPlFormula(cycle, 'Wheel option P/L').split('\n'),
@@ -3447,14 +3531,11 @@ function cycleFormulas(cycle) {
           'Annualized Net Option Yield =',
           '  (Net premium income - Debit adjustments - Fees) ÷ Initial collateral × (365 ÷ Days active)',
           '',
-          'N/A -- no initial collateral committed in this cycle.',
+          'N/A, no initial collateral committed in this cycle.',
         ])
       : formula([
-          'Net Option Yield %: premium income only, measured against the capital',
-          '  committed on day one (not a time-weighted average over the cycle).',
-          '  Fees are already netted into every cash figure here.',
-          '',
           'Net Option Yield = Option P/L ÷ Initial collateral',
+          '  Premium only, vs. day-one capital (not a time-weighted average).',
           `= ${money(cycle.option_realized_pl, { cents: true })} ÷ ${money(cycle.initial_collateral)}`,
           `= ${pct(cycle.net_option_yield_pct, 2)}`,
           '',
@@ -3469,16 +3550,12 @@ function cycleFormulas(cycle) {
           'Annualized Total Position ROI (return on investment) =',
           '  (Option P/L + Stock realized/unrealized P&L + Dividends) ÷ Initial collateral × (365 ÷ Days active)',
           '',
-          'N/A -- no initial collateral committed in this cycle.',
+          'N/A, no initial collateral committed in this cycle.',
         ])
       : formula([
-          'Total Position ROI %: everything this position has produced --',
-          '  option P/L, realized AND unrealized stock P/L, and dividends --',
-          '  against day-one capital. Unrealized P/L on an open long-option',
-          '  hedge is not included: no options-quote feed exists to mark it.',
-          '',
-          'Total Position ROI (return on investment) = (Option P/L + Stock realized P/L +',
+          'Total Position ROI = (Option P/L + Stock realized P/L +',
           '  Stock unrealized P/L + Dividends) ÷ Initial collateral',
+          '  Open long-option (hedge) P/L is not marked; no quote feed.',
           `= (${money(cycle.option_realized_pl, { cents: true })} + ${money(cycle.stock_realized_pl, { cents: true })} + ${
             cycle.stock_unrealized_pl === null ? 'N/A' : money(cycle.stock_unrealized_pl, { cents: true })
           } + ${money(cycle.dividends_received, { cents: true })}) ÷ ${money(cycle.initial_collateral)}`,
@@ -3494,7 +3571,7 @@ function cycleFormulas(cycle) {
     .filter((d) => d !== null && d !== undefined);
   const avgDays =
     cycle.avg_days_in_trade === null
-      ? formula(['Avg days in trade = mean(days held), over closed legs', '', 'N/A -- no closed legs yet.'])
+      ? formula(['Avg days in trade = mean(days held), over closed legs', '', 'N/A, no closed legs yet.'])
       : formula([
           'Avg days in trade = mean(days held), over closed legs',
           `  (${held.length} closed leg(s) in this cycle)`,
@@ -3507,7 +3584,7 @@ function cycleFormulas(cycle) {
   const ppd = formula([
     'Profit Per Day (PPD) =',
     '  (Realized premium collected - Closeout cost) ÷ Days active',
-    '  Option premium only -- never includes stock profit/loss.',
+    '  Option premium only, never includes stock profit/loss.',
     '',
     `= ${money(cycle.option_realized_pl, { cents: true })} ÷ ${cycle.days_active}`,
     `= ${money(cycle.profit_per_day, { cents: true })}/day`,
@@ -3530,8 +3607,8 @@ function cycleFormulas(cycle) {
 }
 
 const CYCLE_STATUS_MEANING = {
-  ACTIVE: 'ACTIVE: something is still open -- a short leg, a long hedge, or shares held.',
-  NO_ACTIVITY: 'NO ACTIVITY: flat right now, but still within the same calendar year as the latest trade in the book -- another put or call on this ticker would resume this wheel.',
+  ACTIVE: 'ACTIVE: something is still open; a short leg, a long hedge, or shares held.',
+  NO_ACTIVITY: 'NO ACTIVITY: flat right now, but still within the same calendar year as the latest trade in the book; another put or call on this ticker would resume this wheel.',
   CLOSED: 'CLOSED: terminal. The year has turned since the last trade, or the stock was called away.',
 };
 
@@ -3625,8 +3702,8 @@ function renderCycles(cycles) {
       setFormula(
         tag,
         (isHold
-          ? 'Shares only -- no option has ever been written against them. Selling a covered call makes it a wheel. '
-          : 'Long options only -- no cash-secured put, covered call, shares or assignment. ') +
+          ? 'Shares only, no option has ever been written against them. Selling a covered call makes it a wheel. '
+          : 'Long options only; no cash-secured put, covered call, shares or assignment. ') +
           'P&L counts toward every total, but the wheel-return ratios (Wheel ROC, PPD, ' +
           'Net Option Yield) are withheld and show as a dash.'
       );
@@ -3721,7 +3798,7 @@ function legCollateralFormula(leg) {
     leg.paired_contracts > 0
       ? [
           `${leg.paired_contracts} of ${leg.contracts} contract(s) are paired into a spread`,
-          '  -- a matched same-day short + long position whose collateral is',
+          ' , a matched same-day short + long position whose collateral is',
           '  netted as one |short strike - long strike| figure, not priced here.',
           `  Only the remaining ${contracts} naked contract(s) are priced below.`,
           '',
@@ -3740,7 +3817,7 @@ function legCollateralFormula(leg) {
       return formula([
         'Collateral = $0',
         '  The shares backing this call are already counted as capital',
-        '  on their own -- a covered call adds nothing on top of shares',
+        '  on their own, a covered call adds nothing on top of shares',
         '  already held.',
       ]);
     }
@@ -3748,7 +3825,7 @@ function legCollateralFormula(leg) {
       ...pairedNote,
       'Collateral = Strike × 100 × Naked contracts',
       '  (proxy: these shares pre-date the export, so their real cost',
-      '  basis is not visible -- the strike stands in for it)',
+      '  basis is not visible, the strike stands in for it)',
       `= $${leg.strike} × 100 × ${contracts}`,
       `= ${money(leg.collateral)}`,
     ]);
@@ -3761,11 +3838,11 @@ function legCollateralFormula(leg) {
       `= ${money(leg.collateral)}`,
     ]);
   }
-  return formula(['Collateral = $0 -- this leg commits no capital.']);
+  return formula(['Collateral = $0, this leg commits no capital.']);
 }
 
 /**
- * Right side of a Spread's netted collateral figure -- mirrors
+ * Right side of a Spread's netted collateral figure — mirrors
  * `Spread.collateral_per_contract` in wheel/engine.py.
  */
 function spreadCollateralFormula(spread) {
@@ -3811,7 +3888,7 @@ function cycleDetail(cycle) {
         'p',
         { class: 'hint' },
         'A short and a long leg of the same underlying, right and expiry, opened the same day, pair ' +
-          'automatically -- collateral nets to the strike distance instead of the short leg\'s full ' +
+          'automatically, collateral nets to the strike distance instead of the short leg\'s full ' +
           'cash-secured-put/covered-call figure. Legs that don\'t pair this way appear in the Legs table, priced normally.'
       )
     );
@@ -3847,7 +3924,7 @@ function cycleDetail(cycle) {
         {
           text: 'Tax basis',
           title: formula([
-            'The raw assignment/purchase price -- what a 1099-B would show.',
+            'The raw assignment/purchase price, what a 1099-B would show.',
             '"Unknown" means these shares were acquired before this export',
             'begins: the real cost basis was never seen, so it is reported',
             'as unknown rather than invented.',
@@ -3871,9 +3948,9 @@ function cycleDetail(cycle) {
             '',
             lot.basis_known
               ? `Tax basis = ${money(lot.basis_per_share)}`
-              : 'Tax basis unknown -- shares pre-date this export.',
+              : 'Tax basis unknown, shares pre-date this export.',
             lot.net_adjusted_cost_basis === null
-              ? 'N/A -- no strike to net against.'
+              ? 'N/A, no strike to net against.'
               : `= ${money(lot.net_adjusted_cost_basis)}`,
           ]),
         },
@@ -3888,7 +3965,7 @@ function cycleDetail(cycle) {
         'p',
         { class: 'hint' },
         'A same-day close-and-reopen on the same underlying and option right, where the new expiry is ' +
-          'no earlier than the one closed -- re-entering the identical contract just closed is a round ' +
+          'no earlier than the one closed, re-entering the identical contract just closed is a round ' +
           'trip, not a roll. Quantities are not required to match: a real roll can close 4 contracts and ' +
           'open 2.'
       )
@@ -3903,7 +3980,7 @@ function cycleDetail(cycle) {
           text: 'Direction',
           title: formula([
             'OUT: same strike, later expiry.  UP/DOWN: same expiry, strike moved.',
-            'OUT_AND_UP / OUT_AND_DOWN: both -- later expiry and a moved strike.',
+            'OUT_AND_UP / OUT_AND_DOWN: both, later expiry and a moved strike.',
           ]),
         },
         'Closed',
@@ -3928,7 +4005,7 @@ function cycleDetail(cycle) {
 
   if (cycle.assignment_events.length) {
     inner.appendChild(
-      el('h3', {}, `Assignments (${cycle.assignment_events.length}) — share legs synthesized at strike`)
+      el('h3', {}, `Assignments (${cycle.assignment_events.length}), share legs synthesized at strike`)
     );
     inner.appendChild(
       el(
@@ -4059,7 +4136,7 @@ function renderTiles(portfolio, reconciliation) {
               'Annualized Wheel ROC (return on capital) =',
               '  (Wheel option P/L ÷ Time-weighted avg capital) × (365 ÷ Days)',
               '',
-              'N/A -- no capital has been committed in this window yet.',
+              'N/A, no capital has been committed in this window yet.',
             ])
           : formula([
               ...wheelOptionPlFormula(portfolio, 'Wheel option P/L').split('\n'),
@@ -4084,7 +4161,7 @@ function renderTiles(portfolio, reconciliation) {
               'Annualized Active Wheel ROC (return on capital) =',
               '  (Wheel option P/L ÷ Time-weighted avg active capital) × (365 ÷ Days)',
               '',
-              'N/A -- no capital was actively backing an open put or covered call',
+              'N/A, no capital was actively backing an open put or covered call',
               '  in this window yet.',
             ])
           : formula([
@@ -4108,14 +4185,12 @@ function renderTiles(portfolio, reconciliation) {
               'Annualized Net Option Yield =',
               '  (Option P/L ÷ Total initial collateral) × (365 ÷ Days)',
               '',
-              'N/A -- no initial collateral committed in this window.',
+              'N/A, no initial collateral committed in this window.',
             ])
           : formula([
-              'Denominator is the sum of every cycle\'s own day-one capital,',
-              '  added across every cycle -- not a time-weighted average.',
-              '',
               'Annualized Net Option Yield =',
               '  (Option P/L ÷ Total initial collateral) × (365 ÷ Days)',
+              '  Denominator sums every cycle\'s day-one capital, not a time-weighted avg.',
               `= (${money(portfolio.option_realized_pl, { cents: true })} ÷ ${money(portfolio.total_initial_collateral)}) × (365 ÷ ${days})`,
               `= ${pct(portfolio.net_option_yield_pct, 2)} × ${scale.toFixed(2)}`,
               `= ${pct(portfolio.annualized_net_option_yield_pct)}`,
@@ -4132,16 +4207,13 @@ function renderTiles(portfolio, reconciliation) {
               'Annualized Total Position ROI (return on investment) =',
               '  (Option P/L + Stock realized/unrealized P&L + Dividends) ÷ Total initial collateral × (365 ÷ Days)',
               '',
-              'N/A -- no initial collateral committed in this window.',
+              'N/A, no initial collateral committed in this window.',
             ])
           : formula([
-              'Everything this portfolio has produced -- option P/L, realized AND',
-              '  unrealized stock P/L, dividends -- against total day-one capital.',
-              '  Open long-option (hedge) unrealized P/L is not included: no',
-              '  options-quote feed exists to mark it.',
-              '',
-              'Annualized Total Position ROI (return on investment) =',
-              '  (Option P/L + Stock realized P/L + Stock unrealized P/L + Dividends) ÷ Total initial collateral × (365 ÷ Days)',
+              'Annualized Total Position ROI =',
+              '  (Option P/L + Stock realized P/L + Stock unrealized P/L + Dividends)',
+              '  ÷ Total initial collateral × (365 ÷ Days)',
+              '  Open long-option (hedge) P/L is not marked; no quote feed.',
               `= (${money(portfolio.option_realized_pl, { cents: true })} + ${money(portfolio.stock_realized_pl, { cents: true })} + ${money(portfolio.stock_unrealized_pl, { cents: true })} + ${money(portfolio.dividends_received, { cents: true })}) ÷ ${money(portfolio.total_initial_collateral)} × (365 ÷ ${days})`,
               `= ${pct(portfolio.total_position_roi_pct, 2)} × ${scale.toFixed(2)}`,
               `= ${pct(portfolio.annualized_total_position_roi_pct)}`,
@@ -4153,7 +4225,7 @@ function renderTiles(portfolio, reconciliation) {
       foot: `${money(portfolio.avg_capital)} avg · ${money(portfolio.peak_capital)} peak`,
       formula: formula([
         'Today =',
-        '  Put collateral + Stock cost basis + Call proxy + Long-option debit + Spread collateral',
+        `  ${CAPITAL_FORMULA_SUM}`,
         `= ${money(portfolio.capital_deployed_now)}`,
         '',
         'Avg = time-weighted mean of the daily total, over the days capital',
@@ -4185,7 +4257,7 @@ function renderTiles(portfolio, reconciliation) {
           : formula([
               'Win rate = Winning legs ÷ (Winning legs + Losing legs)',
               '',
-              'N/A -- no closed leg has a decided (non-zero) P/L yet.',
+              'N/A, no closed leg has a decided (non-zero) P/L yet.',
               'Not shown as 0%, which would wrongly imply losses occurred.',
             ]),
     },
@@ -4197,8 +4269,9 @@ function renderTiles(portfolio, reconciliation) {
         'Avg days in trade =',
         "  Σ (cycle's avg days-held × that cycle's decided legs)",
         '  ÷ Σ (decided legs), across every cycle',
-        '  "Decided" = closed legs with a win or a loss; open and',
-        '  exact break-even legs do not contribute a days-held value.',
+        '  Decided = a closed leg with a win or a loss (not open, not exact break-even).',
+        '',
+        `= ${portfolio.avg_days_in_trade === null ? 'N/A, no decided legs yet' : portfolio.avg_days_in_trade.toFixed(1) + ' days'}`,
       ]),
     },
     {
@@ -4274,7 +4347,7 @@ function renderNotices(meta, reconciliation) {
         {},
         `Combined ${meta.sources.length} exports: ${meta.rows_parsed} rows in, ` +
           `${meta.rows_kept} after merging ${meta.duplicates_removed} trades that appear in more ` +
-          `than one file — ${detail}.`
+          `than one file, ${detail}.`
       )
     );
   }
@@ -4351,12 +4424,11 @@ function buildHedgeRow(h, { showAccount = true } = {}) {
     const detail = el(
       'div',
       { class: 'hedge-detail' },
-      `Short-put premium booked since ${h.opened}: ${money(h.premium_written_since, { sign: true })} ` +
-        `(context only — see wheel P&L for where the position actually stands)`
+      `Short-put premium since ${h.opened}: ${money(h.premium_written_since, { sign: true })} (context only)`
     );
     row.appendChild(detail);
   } else if (!h.is_wheel) {
-    row.appendChild(el('div', { class: 'hedge-detail' }, 'Directional — no wheel premium is offsetting its cost.'));
+    row.appendChild(el('div', { class: 'hedge-detail' }, 'Directional, no wheel premium is offsetting its cost.'));
   }
 
   row.appendChild(el('div', { class: 'hedge-msg' }, h.message));
@@ -4415,8 +4487,8 @@ function renderNetWorthTiles(netWorth, benchmark, wheelReturn, wheelState) {
   const untracked = totals.untracked_equity_value || 0;
   const deployedFoot =
     untracked > 1
-      ? `of ${money(totals.total_value)} total value — ${money(untracked)} is equity with no tracked cost basis; the rest is idle cash and unrealized gains`
-      : `of ${money(totals.total_value)} total value — the rest is idle cash and unrealized gains, not a different kind of "not deployed"`;
+      ? `of ${money(totals.total_value)} total value; ${money(untracked)} untracked equity, rest is cash + unrealized gains`
+      : `of ${money(totals.total_value)} total value, rest is cash + unrealized gains`;
 
   // Total value and Cash are read verbatim off the broker's Positions
   // snapshot -- nothing computed to show a formula for, but four similarly-
@@ -4427,12 +4499,12 @@ function renderNetWorthTiles(netWorth, benchmark, wheelReturn, wheelState) {
     {
       label: 'Total value',
       value: money(totals.total_value, { cents: true }),
-      foot: 'Whole account, from the broker\'s own Positions snapshot -- cash + every holding, wheeled or not.',
+      foot: 'Broker Positions snapshot, cash + every holding.',
     },
     {
       label: 'Cash',
       value: money(totals.cash_total, { cents: true }),
-      foot: 'Uninvested cash sitting in the account right now -- part of Total value, not deployed anywhere.',
+      foot: 'Uninvested cash; part of Total value.',
     },
     {
       label: 'True capital deployed',
@@ -4440,7 +4512,7 @@ function renderNetWorthTiles(netWorth, benchmark, wheelReturn, wheelState) {
       foot: deployedFoot,
       formula: formula([
         "Today's committed wheel capital =",
-        '  Put collateral + Stock cost basis + Call proxy + Long-option debit + Spread collateral',
+        `  ${CAPITAL_FORMULA_SUM}`,
         `= ${money(totals.wheel_capital_deployed)}`,
         '',
         "Dated to the broker's Positions export (the as-of date), which can",
@@ -4449,31 +4521,10 @@ function renderNetWorthTiles(netWorth, benchmark, wheelReturn, wheelState) {
     },
   ];
 
-  // How much of that Cash tile is actually free -- not already reserved as
-  // collateral securing an open cash-secured put. The put's own collateral
-  // isn't a separate pot of money Fidelity pulls out of the account; it's a
-  // hold against this same cash balance, so naively adding the two would
-  // double-count it. Only rendered once there is at least one open put to
-  // net out, so an account with none isn't shown a tile that just repeats
-  // the Cash figure above.
-  const putCollateral =
-    (wheelState && wheelState.buckets && wheelState.buckets.puts && wheelState.buckets.puts.amount) || 0;
-  if (putCollateral > 1e-9 && totals.cash_total !== null && totals.cash_total !== undefined) {
-    const free = Math.max(totals.cash_total - putCollateral, 0);
-    tiles.push({
-      label: 'Cash free for new CSPs',
-      value: money(free, { cents: true }),
-      foot: `${money(totals.cash_total)} cash − ${money(putCollateral)} already reserved for open puts`,
-      formula: formula([
-        'Cash free for new CSPs =',
-        '  Cash − collateral already reserved for open cash-secured puts (CSPs)',
-        `= ${money(totals.cash_total, { cents: true })} − ${money(putCollateral, { cents: true })}`,
-        `= ${money(free, { cents: true })}`,
-        '',
-        'Rough, not a trading limit -- ignores margin buying power and broker reserves.',
-      ]),
-    });
-  }
+  // "Cash for new CSPs" (liquid cash minus collateral already securing open
+  // puts) lives in its own card up near Covered-call candidates -- see
+  // `renderCspCash` -- so "what we can do next" reads in one place. Not
+  // repeated here.
 
   // Independent of the SPY replay below -- no Positions/Yahoo price data
   // needed, just the wheel's own transaction history -- so it renders
@@ -4492,11 +4543,11 @@ function renderNetWorthTiles(netWorth, benchmark, wheelReturn, wheelState) {
       tiles.push({
         label: 'Wheel vs. S&P 500 (XIRR)',
         value: `${pct(wheelReturn.xirr_pct, 0)} ${beat ? '›' : '‹'} ${pct(wb.xirr_pct, 0)}`,
-        foot: `Wheel vs. the same dated flows in SPY -- value added ${money(wheelReturn.value_added, { cents: true, sign: true })}.`,
+        foot: `Wheel vs. the same dated flows in SPY; value added ${money(wheelReturn.value_added, { cents: true, sign: true })}.`,
         tone: beat ? 'pos' : 'neg',
         formula: formula([
-          "The wheel's own cash flows -- every option-leg open/close and every",
-          '  wheel-active share buy/sell, on their real dates -- measured two ways:',
+          "The wheel's own cash flows, every option-leg open/close and every",
+          '  wheel-active share buy/sell, on their real dates; measured two ways:',
           '',
           `Wheel-only return (XIRR)       ${pct(wheelReturn.xirr_pct, 1)}`,
           `  actual money-weighted return on those ${events.length} flows (${span}),`,
@@ -4520,8 +4571,8 @@ function renderNetWorthTiles(netWorth, benchmark, wheelReturn, wheelState) {
         tone: (wheelReturn.xirr_pct ?? 0) >= 0 ? 'pos' : 'neg',
         formula: formula([
           'XIRR (money-weighted annualized return): the single rate that makes',
-          '  every dated cash flow -- each option-leg open/close, each wheel-',
-          '  active share purchase/sale -- discount to zero against the',
+          '  every dated cash flow; each option-leg open/close, each wheel-',
+          '  active share purchase/sale, discount to zero against the',
           '  capital still committed today.',
           `${events.length} events, ${span} = ${pct(wheelReturn.xirr_pct, 1)}`,
           '',
@@ -4544,18 +4595,18 @@ function renderNetWorthTiles(netWorth, benchmark, wheelReturn, wheelState) {
     tiles.push({
       label: 'Whole-account return (XIRR)',
       value: pct(benchmark.actual.xirr_pct, 1),
-      foot: 'Every dollar in the account -- cash, buy-and-hold, wheel -- since the configured opening balance. Not a wheel figure.',
+      foot: 'Entire account since the opening balance. Not a wheel figure.',
       tone: (benchmark.actual.xirr_pct ?? 0) >= 0 ? 'pos' : 'neg',
       formula: formula([
         'Money-weighted return (XIRR): the annualized rate r solving',
         '  Σ amount_i ÷ (1 + r)^((date_i - date_0) / 365) = 0',
-        `  over ${events.length} cash-flow event(s) -- the opening balance`,
+        `  over ${events.length} cash-flow event(s), the opening balance`,
         '  plus every external deposit/withdrawal found in the transaction',
-        `  history, ${span} -- valued against the account's`,
+        `  history, ${span}; valued against the account's`,
         `  terminal value of ${money(benchmark.actual.terminal_value)} on ${benchmark.as_of}.`,
         '',
         'Covers the ENTIRE account, and starts at the opening balance in',
-        '  data/accounts.json -- which can pre-date the wheel. For the',
+        '  data/accounts.json, which can pre-date the wheel. For the',
         '  wheel-vs-SPY question use the two tiles above instead.',
       ]),
     });
@@ -4783,7 +4834,7 @@ function renderDatasets(listing) {
   for (const dataset of unsupported) {
     const name = (dataset.folder === '.' ? '' : dataset.folder + '/') + dataset.name;
     host.appendChild(
-      el('div', { class: 'dataset-unsupported' }, `${name} (${dataset.size_kb} KB) — ${dataset.reason}`)
+      el('div', { class: 'dataset-unsupported' }, `${name} (${dataset.size_kb} KB), ${dataset.reason}`)
     );
   }
 }
@@ -5053,7 +5104,7 @@ function wireFilters() {
       sourceStatus('');
     } else {
       const names = files.map((file) => file.name).join(', ');
-      sourceStatus(`${files.length} file(s) ready — press Load to evaluate: ${names}`);
+      sourceStatus(`${files.length} file(s) ready, press Load to evaluate: ${names}`);
     }
   });
 
@@ -5421,9 +5472,17 @@ function signedPct(value, digits = 2) {
 const toneOf = (value) =>
   value === null || value === undefined || Number.isNaN(value) ? '' : value >= 0 ? 'pos' : 'neg';
 
+const OP_TYPE_LABEL = {
+  CSP: 'Cash-secured put (premium received)',
+  CC: 'Covered call (premium received)',
+  LP: 'Long put, protective hedge or directional (premium paid)',
+  LC: 'Long call, protective hedge or directional (premium paid)',
+};
+
 function openPositionRow(row, isGroupStart, groupSize) {
+  const isLong = row.side === 'LONG';
   const tr = el('tr', {
-    class: 'op-row' + (isGroupStart ? ' op-group-start' : ''),
+    class: 'op-row' + (isGroupStart ? ' op-group-start' : '') + (isLong ? ' op-long' : ''),
   });
 
   const symCell = el('td', { class: 'left ticker-cell' }, isGroupStart ? row.underlying : '');
@@ -5438,18 +5497,23 @@ function openPositionRow(row, isGroupStart, groupSize) {
 
   const typeCell = el('td', { class: 'left' });
   typeCell.appendChild(
-    el('span', { class: 'badge op-type op-type-' + row.type, title: row.type === 'CSP' ? 'Cash-secured put' : 'Covered call' }, row.type)
+    el('span', { class: 'badge op-type op-type-' + row.type, title: OP_TYPE_LABEL[row.type] || row.type }, row.type)
   );
   tr.appendChild(typeCell);
 
   // Both break-even cells carry ONE signal: is the entire wheel in profit or
   // underwater? That is the last close vs. the wheel break-even (for a
   // share-less CSP wheel, which has no wheel break-even, its own position
-  // break-even stands in). No color without a reference and a price.
+  // break-even stands in). No color without a reference and a price -- and a
+  // standalone directional long (no wheel behind it) stays uncolored: its
+  // break-even isn't a wheel-profit signal, and a long put/call flips which
+  // side of it is "good."
   const wheelRef = row.wheel_breakeven === null || row.wheel_breakeven === undefined
     ? row.breakeven
     : row.wheel_breakeven;
+  const standaloneLong = isLong && (row.wheel_breakeven === null || row.wheel_breakeven === undefined);
   const wheelUnderwater =
+    standaloneLong ||
     wheelRef === null || wheelRef === undefined || row.last_close === null || row.last_close === undefined
       ? null
       : row.last_close < wheelRef;
@@ -5458,14 +5522,17 @@ function openPositionRow(row, isGroupStart, groupSize) {
     wheelUnderwater === null
       ? ''
       : wheelUnderwater
-        ? ' — whole wheel underwater (last close below the wheel break-even)'
-        : ' — whole wheel in profit (last close above the wheel break-even)';
+        ? ', whole wheel underwater (last close below the wheel break-even)'
+        : ', whole wheel in profit (last close above the wheel break-even)';
 
+  const bePositionNote = {
+    CSP: 'This put alone: strike - premium/share.',
+    CC: 'This call alone: backing-share cost basis - premium/share.',
+    LP: 'This long put alone: strike - cost/share (you profit below it).',
+    LC: 'This long call alone: strike + cost/share (you profit above it).',
+  };
   const beCell = el('td', { class: 'num ' + breakEvenTone }, money(row.breakeven, { cents: true }));
-  beCell.title =
-    (row.type === 'CSP'
-      ? 'This put alone: strike − premium/share.'
-      : 'This call alone: backing-share cost basis − premium/share.') + wheelStatus;
+  beCell.title = (bePositionNote[row.type] || '') + wheelStatus;
   tr.appendChild(beCell);
 
   const wheelBeCell = el('td', { class: 'num ' + breakEvenTone }, money(row.wheel_breakeven, { cents: true }));
@@ -5475,15 +5542,24 @@ function openPositionRow(row, isGroupStart, groupSize) {
     wheelStatus;
   tr.appendChild(wheelBeCell);
 
+  // OTM is favorable for a short (it expires worthless, you keep the premium);
+  // ITM is favorable for a long (it has intrinsic value). Same number, opposite
+  // "good" side -- so the tone is keyed to side, not to the raw sign.
+  const moneynessFavorable =
+    row.moneyness_pct === null || row.moneyness_pct === undefined
+      ? null
+      : (row.moneyness_pct >= 0) !== isLong;
   const moneyness =
     row.moneyness_pct === null || row.moneyness_pct === undefined
       ? el('td', { class: 'num' }, '—')
       : el(
           'td',
-          { class: 'num ' + (row.moneyness_pct >= 0 ? 'pos' : 'neg') },
+          { class: 'num ' + (moneynessFavorable ? 'pos' : 'neg') },
           `${row.in_the_money ? 'ITM' : 'OTM'} ${Math.abs(row.moneyness_pct).toFixed(2)}%`
         );
-  moneyness.title = 'Strike vs. last close. Positive = out-of-the-money cushion; negative = in-the-money (assignment risk).';
+  moneyness.title = isLong
+    ? 'Strike vs. last close. In-the-money (green) is where a long put/call has intrinsic value.'
+    : 'Strike vs. last close. Positive = out-of-the-money cushion; negative = in-the-money (assignment risk).';
   tr.appendChild(moneyness);
 
   tr.appendChild(el('td', { class: 'num' }, money(row.strike, { cents: true })));
@@ -5567,6 +5643,411 @@ function renderOpenPositions() {
   const tbody = el('tbody');
   for (const group of ordered) {
     group.forEach((row, index) => tbody.appendChild(openPositionRow(row, index === 0, group.length)));
+  }
+  table.appendChild(tbody);
+}
+
+/* -------------------------------------------- table: covered-call candidates */
+
+const CC_CAND_COLUMNS = [
+  { key: 'underlying', label: 'Symbol', left: true },
+  { key: 'target_cc_strike', label: 'Target price for CC' },
+  { key: 'contracts_available', label: 'Qty' },
+  { key: 'breakeven', label: 'Breakeven' },
+  { key: 'wheel_breakeven', label: 'Wheel Breakeven' },
+  { key: 'last_close', label: 'Last Close' },
+  { key: 'cost_basis_per_share', label: 'Avg Cost Basis' },
+  { key: 'unrealized_pl', label: 'Gain / Loss' },
+  { key: 'shares_held', label: 'Shares' },
+  { key: 'wheel', label: 'Current Wheel', left: true },
+  { key: 'days_to_earnings', label: 'Earnings' },
+  { key: 'sector', label: 'Sector', left: true },
+];
+
+/**
+ * A ticker's wheel id rendered as a jump-to-Trade-Log control. Click or
+ * Enter/Space switches to the Trade Log tab with that exact wheel selected.
+ */
+function wheelLink(cycleId, underlying) {
+  const link = el(
+    'span',
+    { class: 'wheel-link', role: 'button', tabindex: '0', title: 'Open this wheel in the Trade Log' },
+    cycleId
+  );
+  const go = () => {
+    state.tradeLogCycleId = cycleId;
+    state.tradeLogTicker = underlying || null;
+    switchTab('tradelog');
+  };
+  link.addEventListener('click', go);
+  link.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      go();
+    }
+  });
+  return link;
+}
+
+const shares = (value) =>
+  value === null || value === undefined || Number.isNaN(value)
+    ? '—'
+    : Number(value).toLocaleString('en-US', { maximumFractionDigits: 3 });
+
+/**
+ * Positions holding shares with no covered call written against them, from
+ * `data.cc_candidates` (see `_build_cc_candidates` in wheel/api.py). Positions
+ * with 100+ shares lead the table and carry a "Target price for CC" (the
+ * greatest of cost basis, both break-evens and the last close, rounded up to
+ * the next $0.50) and a negative "Qty" (the covered-call position that could
+ * be opened). Sub-100 lots are listed after them for visibility, with those
+ * two cells blank. Sortable.
+ */
+function renderCcCandidates() {
+  const table = $('cc-candidates-table');
+  if (!table) return;
+  const card = $('cc-candidates-card');
+  const rows = (state.data && state.data.cc_candidates) || [];
+  if (card) card.hidden = rows.length === 0;
+  clear(table);
+  if (!rows.length) return;
+
+  const { key, dir } = state.ccCandSort;
+
+  const thead = el('thead');
+  const headRow = el('tr');
+  for (const column of CC_CAND_COLUMNS) {
+    const th = el('th', { class: `sortable${column.left ? ' left' : ''}` }, column.label);
+    if (key === column.key) th.textContent = column.label + (dir === 1 ? ' ▲' : ' ▼');
+    th.addEventListener('click', () => {
+      if (state.ccCandSort.key === column.key) state.ccCandSort.dir *= -1;
+      else state.ccCandSort = { key: column.key, dir: column.key === 'underlying' ? 1 : -1 };
+      renderCcCandidates();
+    });
+    headRow.appendChild(th);
+  }
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const sorted = rows.slice().sort((a, b) => {
+    // The Symbol column keeps actionable (100+ share) rows above the rest.
+    if (key === 'underlying') {
+      if (a.meets_threshold !== b.meets_threshold) return a.meets_threshold ? -1 : 1;
+      return a.underlying.localeCompare(b.underlying) * dir;
+    }
+    const av = a[key];
+    const bv = b[key];
+    const aNil = av === null || av === undefined || Number.isNaN(av);
+    const bNil = bv === null || bv === undefined || Number.isNaN(bv);
+    if (aNil || bNil) return (aNil ? 1 : 0) - (bNil ? 1 : 0);
+    const base = typeof av === 'string' ? av.localeCompare(bv) : av - bv;
+    return base * dir || a.underlying.localeCompare(b.underlying);
+  });
+
+  const tbody = el('tbody');
+  for (const row of sorted) {
+    const { cell: earnCell, soon: earningsSoon } = earningsCell(row);
+    const tr = el('tr', {
+      class: 'op-row' + (row.meets_threshold ? '' : ' cc-below-100') + (earningsSoon ? ' earnings-warn' : ''),
+    });
+    const symCell = el('td', { class: 'left ticker-cell' }, row.underlying);
+    if (row.name) symCell.title = row.name;
+    tr.appendChild(symCell);
+
+    const targetCell = el('td', { class: 'num cc-target' }, money(row.target_cc_strike, { cents: true }));
+    targetCell.title = formula([
+      'Target price for CC = greatest of:',
+      `  cost basis      ${money(row.cost_basis_per_share, { cents: true })}`,
+      `  breakeven       ${money(row.breakeven, { cents: true })}`,
+      `  wheel breakeven ${money(row.wheel_breakeven, { cents: true })}`,
+      `  last close      ${money(row.last_close, { cents: true })}`,
+      '  ...then rounded up to the next $0.50',
+      `= ${money(row.target_cc_strike, { cents: true })}`,
+      '',
+      'The lowest strike worth writing a call at: an assignment sells',
+      'the shares for at least their cost (keeping every premium already',
+      'collected) and never below the current market.',
+    ]);
+    tr.appendChild(targetCell);
+
+    const qtyCell = el(
+      'td',
+      { class: 'num' },
+      row.contracts_available === null || row.contracts_available === undefined
+        ? '—'
+        : String(row.contracts_available)
+    );
+    if (row.contracts_available) {
+      const n = Math.abs(row.contracts_available);
+      qtyCell.title = `${n} covered call${n === 1 ? '' : 's'} writable (${n * 100} of ${shares(row.shares_held)} shares)`;
+    }
+    tr.appendChild(qtyCell);
+
+    tr.appendChild(el('td', { class: 'num' }, money(row.breakeven, { cents: true })));
+    tr.appendChild(el('td', { class: 'num' }, money(row.wheel_breakeven, { cents: true })));
+    tr.appendChild(el('td', { class: 'num' }, money(row.last_close, { cents: true })));
+    tr.appendChild(el('td', { class: 'num' }, money(row.cost_basis_per_share, { cents: true })));
+
+    // Total gain/loss on the shares vs. raw cost basis, marked to the last
+    // close: dollars and percent in one cell, green up / red down.
+    const gl = row.unrealized_pl;
+    const glText =
+      gl === null || gl === undefined
+        ? '—'
+        : money(gl, { cents: true, sign: true }) +
+          (row.unrealized_pl_pct === null || row.unrealized_pl_pct === undefined
+            ? ''
+            : ` · ${signedPct(row.unrealized_pl_pct, 1)}`);
+    const glCell = el('td', { class: 'num ' + toneOf(gl) }, glText);
+    if (gl !== null && gl !== undefined) {
+      glCell.title = formula([
+        'Gain / Loss = Shares × (Last close − Cost basis)',
+        `= ${shares(row.shares_held)} × (${money(row.last_close, { cents: true })} − ${money(row.cost_basis_per_share, { cents: true })})`,
+        `= ${money(gl, { cents: true, sign: true })}`,
+        'Against the raw average cost basis — premium already collected is not netted in.',
+      ]);
+    }
+    tr.appendChild(glCell);
+
+    // Whole-share count for the eye; the exact (sometimes fractional) figure
+    // sits in the tooltip -- fractional-share buys and DRIP dust leave odd
+    // remainders that don't matter for a 100-lot covered call.
+    const rounded = Math.round(row.shares_held);
+    const sharesCell = el('td', { class: 'num' }, rounded.toLocaleString('en-US'));
+    if (Math.abs(row.shares_held - rounded) > 1e-6) {
+      sharesCell.title = `${shares(row.shares_held)} exact`;
+    }
+    tr.appendChild(sharesCell);
+
+    const wheelCell = el('td', { class: 'left op-wheel' });
+    wheelCell.appendChild(row.wheel ? wheelLink(row.wheel, row.underlying) : document.createTextNode('—'));
+    tr.appendChild(wheelCell);
+
+    tr.appendChild(earnCell);
+    tr.appendChild(el('td', { class: 'left' }, row.sector || '—'));
+
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+}
+
+/**
+ * "Dry powder" for writing a new cash-secured put: liquid account cash only,
+ * minus the collateral already securing open puts. Reads the broker Positions
+ * snapshot's `cash_total` (pure cash -- never unrealized gains or equity
+ * value) and nets out `wheel_state.buckets.puts.amount` (current CSP
+ * collateral, a hold against that same cash, not a separate pot). Shown as a
+ * card right under Covered-call candidates so "what we can do next" is one
+ * glance: CC candidates + this.
+ */
+function renderCspCash() {
+  const card = $('csp-cash-card');
+  const host = $('csp-cash-tiles');
+  if (!host) return;
+  const data = state.data;
+  const netWorth = data && data.net_worth;
+  const totals = netWorth && netWorth.available ? netWorth.combined || netWorth : null;
+  const cashTotal = totals && totals.cash_total !== null && totals.cash_total !== undefined ? totals.cash_total : null;
+  const totalValue = totals && totals.total_value !== null && totals.total_value !== undefined ? totals.total_value : null;
+
+  clear(host);
+  if (cashTotal === null) {
+    if (card) card.hidden = true;
+    return;
+  }
+  if (card) card.hidden = false;
+
+  const ws = data && data.wheel_state;
+  const putCollateral = (ws && ws.buckets && ws.buckets.puts && ws.buckets.puts.amount) || 0;
+  const available = Math.max(cashTotal - putCollateral, 0);
+  const pct = totalValue ? (100 * available) / totalValue : null;
+
+  const tiles = [
+    {
+      label: 'Cash for new CSPs',
+      value: money(available, { cents: true }),
+      primary: true,
+      foot:
+        putCollateral > 1e-9
+          ? `${money(cashTotal)} liquid cash − ${money(putCollateral)} securing open puts`
+          : `${money(cashTotal)} liquid cash, none reserved against open puts`,
+      formula: formula([
+        'Cash for new CSPs =',
+        '  Liquid account cash − collateral already securing open cash-secured puts',
+        '  (never includes unrealized gains, equity value, or shares held)',
+        `= ${money(cashTotal, { cents: true })} − ${money(putCollateral, { cents: true })}`,
+        `= ${money(available, { cents: true })}`,
+      ]),
+    },
+    {
+      label: 'Share of account',
+      value: pct === null ? '—' : pct.toFixed(1) + '%',
+      foot: totalValue ? `of ${money(totalValue)} total account value` : 'total account value unknown',
+      formula:
+        pct === null
+          ? null
+          : formula([
+              'Share of account = Cash for new CSPs ÷ Total account value',
+              `= ${money(available, { cents: true })} ÷ ${money(totalValue, { cents: true })}`,
+              `= ${pct.toFixed(1)}%`,
+            ]),
+    },
+  ];
+
+  for (const tile of tiles) {
+    const node = el('div', { class: 'tile' + (tile.primary ? ' primary' : '') });
+    node.appendChild(el('div', { class: 'label' }, tile.label));
+    node.appendChild(el('div', { class: 'value' }, tile.value));
+    node.appendChild(el('div', { class: 'foot' }, tile.foot));
+    setFormula(node, tile.formula);
+    host.appendChild(node);
+  }
+
+  renderCspCandidates(available);
+}
+
+const CSP_CAND_COLUMNS = [
+  { key: 'underlying', label: 'Symbol', left: true },
+  { key: 'strong', label: 'Signal' },
+  { key: 'contracts', label: 'Qty' },
+  { key: 'avg_annualized_roc_pct', label: 'Avg Ann. ROC' },
+  { key: 'monthly_premium_pct', label: 'Mo. Prem %' },
+  { key: 'ppd', label: 'PPD' },
+  { key: 'last_close', label: 'Last Close' },
+  { key: 'wheels', label: 'Past Wheels' },
+  { key: 'net_realized_pl', label: 'Realized P/L' },
+  { key: 'days_to_earnings', label: 'Earnings' },
+  { key: 'sector', label: 'Sector', left: true },
+];
+
+const EARNINGS_WARN_DAYS = 14;
+
+/**
+ * `<td>` for a "next earnings" date plus whether it's within the warning
+ * window (0..14 days out). Shared by the CSP- and CC-candidate tables; the
+ * caller adds the `earnings-warn` class to the row when `.soon`.
+ */
+function earningsCell(row) {
+  const dte = row.days_to_earnings;
+  const soon = dte !== null && dte !== undefined && dte >= 0 && dte <= EARNINGS_WARN_DAYS;
+  const cell = el('td', { class: 'num' }, row.earnings_date ? longDate(row.earnings_date) : '—');
+  if (row.earnings_date) {
+    cell.title =
+      dte >= 0
+        ? `${row.earnings_date} · ${dte}d away` +
+          (soon ? ' — within 14 days, hold off on writing here' : '')
+        : `${row.earnings_date} · reported ${-dte}d ago (earnings.json is stale)`;
+  }
+  return { cell, soon };
+}
+
+/**
+ * Inside the Cash for CSPs card: tickers wheeled at a net profit before, each
+ * priced at its last close and shown only when `available` cash could secure
+ * at least one 100-share put at that price. "Qty" is how many such contracts
+ * the cash could cover. "Signal" flags a ticker whose past wheels paid well
+ * for the capital; a row whose earnings land within 14 days is amber. Data:
+ * `data.csp_candidates` (`_build_csp_candidates`).
+ */
+function renderCspCandidates(available) {
+  const table = $('csp-candidates-table');
+  const hint = $('csp-candidates-hint');
+  if (!table) return;
+  clear(table);
+
+  const base = (state.data && state.data.csp_candidates) || [];
+  const rows = base
+    .map((row) => ({
+      ...row,
+      contracts:
+        row.last_close && row.last_close > 0 ? Math.floor(available / (row.last_close * 100)) : 0,
+    }))
+    .filter((row) => row.contracts >= 1);
+
+  if (hint) hint.hidden = rows.length === 0;
+  if (!rows.length) return;
+
+  const { key, dir } = state.cspCandSort;
+
+  const thead = el('thead');
+  const headRow = el('tr');
+  for (const column of CSP_CAND_COLUMNS) {
+    const th = el('th', { class: `sortable${column.left ? ' left' : ''}` }, column.label);
+    if (key === column.key) th.textContent = column.label + (dir === 1 ? ' ▲' : ' ▼');
+    th.addEventListener('click', () => {
+      if (state.cspCandSort.key === column.key) state.cspCandSort.dir *= -1;
+      else state.cspCandSort = { key: column.key, dir: column.key === 'underlying' ? 1 : -1 };
+      renderCspCash();
+    });
+    headRow.appendChild(th);
+  }
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const sorted = rows.slice().sort((a, b) => {
+    const av = a[key];
+    const bv = b[key];
+    const aNil = av === null || av === undefined || Number.isNaN(av);
+    const bNil = bv === null || bv === undefined || Number.isNaN(bv);
+    if (aNil || bNil) return (aNil ? 1 : 0) - (bNil ? 1 : 0);
+    const cmp = typeof av === 'string' ? av.localeCompare(bv) : av - bv;
+    return cmp * dir || a.underlying.localeCompare(b.underlying);
+  });
+
+  const tbody = el('tbody');
+  for (const row of sorted) {
+    const { cell: earnCell, soon: earningsSoon } = earningsCell(row);
+    const tr = el('tr', { class: 'op-row' + (earningsSoon ? ' earnings-warn' : '') });
+
+    const symCell = el('td', { class: 'left ticker-cell' }, row.underlying);
+    if (row.name) symCell.title = row.name;
+    tr.appendChild(symCell);
+
+    const sigCell = el('td', { class: 'num csp-star' }, row.strong ? '★' : '');
+    sigCell.title = formula([
+      row.strong ? 'Strong CSP signal — at least one of:' : 'No strong signal — none of:',
+      `  Monthly premium yield  ${pct(row.monthly_premium_pct)}   (≥ 1.0%)`,
+      `  Blended PPD            ${money(row.ppd, { cents: true })}/day   (≥ $20/day)`,
+      `  Avg annualized ROC     ${pct(row.avg_annualized_roc_pct)}   (≥ 30%)`,
+      '',
+      'From this ticker\'s past wheels — how well they paid for the capital tied up.',
+    ]);
+    tr.appendChild(sigCell);
+
+    const qtyCell = el('td', { class: 'num' }, String(row.contracts));
+    qtyCell.title = formula([
+      'Qty ≈ Cash for new CSPs ÷ (last close × 100)',
+      `= ${money(available, { cents: true })} ÷ (${money(row.last_close, { cents: true })} × 100)`,
+      `= ${row.contracts} contract${row.contracts === 1 ? '' : 's'}`,
+      '',
+      'A rough at-the-money sizing; a real strike / collateral differs.',
+    ]);
+    tr.appendChild(qtyCell);
+
+    tr.appendChild(
+      el('td', { class: 'num ' + toneOf(row.avg_annualized_roc_pct) }, pct(row.avg_annualized_roc_pct))
+    );
+
+    const moCell = el('td', { class: 'num' }, pct(row.monthly_premium_pct, 2));
+    moCell.title = 'Gross premium ÷ avg collateral, per 30 days, over this ticker\'s past wheels.';
+    tr.appendChild(moCell);
+
+    const ppdCell = el('td', { class: 'num' }, row.ppd === null || row.ppd === undefined ? '—' : money(row.ppd, { cents: true }) + '/day');
+    ppdCell.title = 'Blended profit-per-day: total option P/L ÷ total days active, past wheels.';
+    tr.appendChild(ppdCell);
+
+    tr.appendChild(el('td', { class: 'num' }, money(row.last_close, { cents: true })));
+
+    tr.appendChild(el('td', { class: 'num' }, row.wheels));
+
+    const plCell = el('td', { class: 'num ' + toneOf(row.net_realized_pl) }, money(row.net_realized_pl, { cents: true, sign: true }));
+    plCell.title = 'Net realized P/L across every past wheel on this ticker.';
+    tr.appendChild(plCell);
+
+    tr.appendChild(earnCell);
+    tr.appendChild(el('td', { class: 'left' }, row.sector || '—'));
+
+    tbody.appendChild(tr);
   }
   table.appendChild(tbody);
 }
@@ -5956,7 +6437,7 @@ function wheelStageOf(entry) {
       cls: 'nonwheel',
       spin: false,
       label: entry.kind === 'hold' ? 'Buy-and-hold' : 'Directional',
-      sub: 'Not a wheel -- no cash-secured put / covered call phase applies.',
+      sub: 'Not a wheel, no cash-secured put / covered call phase applies.',
     };
   }
   if (entry.status === 'CLOSED') {
@@ -5967,7 +6448,7 @@ function wheelStageOf(entry) {
       cls: 'dormant',
       spin: false,
       label: 'Dormant',
-      sub: 'Flat for now -- a new put on this ticker resumes it.',
+      sub: 'Flat for now, a new put on this ticker resumes it.',
     };
   }
   if (entry.shares_held > 1e-9) {
@@ -6006,7 +6487,7 @@ function renderTradeLogStage(entry) {
       '  while waiting for assignment or expiry.',
       'Covered Call: shares are held, a call is selling',
       '  against them while waiting to be called away.',
-      'Dormant: flat with nothing open -- a new put resumes it.',
+      'Dormant: flat with nothing open, a new put resumes it.',
       'Closed: terminal, this wheel is done.',
     ])
   );
@@ -6065,13 +6546,13 @@ function renderTradeLogSummary(entry) {
         entry.kind === 'hold'
           ? [
               'Plain buy-and-hold: shares were bought but no option has ever',
-              'been written against them -- no cash-secured put, no covered call.',
+              'been written against them; no cash-secured put, no covered call.',
               'Not a wheel. Its P&L counts toward every total, but the wheel-return',
               'ratios are withheld. Selling a covered call turns it into a wheel.',
             ]
           : entry.kind === 'directional'
           ? [
-              'Directional: only long options were bought -- no cash-secured put,',
+              'Directional: only long options were bought, no cash-secured put,',
               'no covered call, no shares. Not a wheel; its P&L counts but the',
               'wheel-return ratios are withheld (they would annualize a short-dated',
               'premium bet into nonsense).',
@@ -6243,7 +6724,10 @@ function renderTradeLogSummary(entry) {
   );
   host.appendChild(
     tradeLogCell('Avg days in trade', days1(entry.avg_days_in_trade), {
-      help: formula(['Mean calendar days each closed leg of this wheel was held.']),
+      help: formula([
+        'Mean calendar days a closed leg of this wheel was held.',
+        `= ${entry.avg_days_in_trade === null ? 'N/A, no closed legs yet' : entry.avg_days_in_trade.toFixed(1) + ' days'}`,
+      ]),
     })
   );
   host.appendChild(
@@ -6391,7 +6875,7 @@ function renderTradeLogTable(entry) {
     if (row.is_settled) tr.classList.add('settled');
     if (row.is_open_long) {
       tr.classList.add('open-hedge');
-      tr.title = 'Open long option with no matching close yet -- a live protective/directional leg.';
+      tr.title = 'Open long option with no matching close yet, a live protective/directional leg.';
     }
     if (row.synthetic) {
       tr.classList.add('synthetic');
@@ -6584,6 +7068,8 @@ function render() {
   renderHedgeBanner();
   renderDashboardInsights();
   renderOpenPositions();
+  renderCcCandidates();
+  renderCspCash();
   renderNetWorth(net_worth, benchmark, wheel_return, wheel_state);
 
   drawCapital(capital_series, net_worth);
@@ -6618,8 +7104,9 @@ function render() {
     valueOf: (row) => row.net_realized_pl,
     format: (value) => compactMoney(value),
     legendId: 'legend-ticker-pl',
-    legendNote:
-      'Net of option cash and realized stock P/L, one bar per ticker. Tickers with nothing realized in range are omitted. Hover a bar for its breakdown, or click it to open that ticker in the Trade Log.',
+    legendNote: [
+
+    ],
     onRowClick: openTradeLogForTicker,
     tipRows: (row) => [
       { label: 'Net realized P/L', value: money(row.net_realized_pl, { cents: true }) },
@@ -6645,7 +7132,7 @@ function render() {
             title: formula([
               'Profit Per Day (PPD) = wheel option P/L ÷ Days',
               '',
-              'N/A -- this ticker never sold a put or call, so it has no',
+              'N/A; this ticker never sold a put or call, so it has no',
               '  wheel premium to spread over the days held (buy-and-hold).',
             ]),
           }
@@ -6671,7 +7158,7 @@ function render() {
           'Annualized Wheel ROC (return on capital) =',
           '  (Wheel option P/L ÷ Avg capital) × (365 ÷ Days)',
           '',
-          'N/A -- this ticker never sold a put or call (buy-and-hold), so it',
+          'N/A; this ticker never sold a put or call (buy-and-hold), so it',
           '  has no wheel option return, or no wheel capital was committed.',
         ])
       : formula([
@@ -6691,12 +7178,12 @@ function render() {
       ? formula([
           'Annualized Net Option Yield = (Option P/L ÷ Total initial collateral) × (365 ÷ Days)',
           '',
-          'N/A -- this ticker never sold a put or call (buy-and-hold), or no',
+          'N/A; this ticker never sold a put or call (buy-and-hold), or no',
           '  initial collateral was committed.',
         ])
       : formula([
           'Denominator is total initial (day-one) collateral, summed across',
-          '  every cycle -- not a time-weighted average.',
+          '  every cycle, not a time-weighted average.',
           '',
           'Annualized Net Option Yield =',
           '  (Option P/L ÷ Total initial collateral) × (365 ÷ Days)',
@@ -6711,11 +7198,11 @@ function render() {
           'Annualized Total Position ROI (return on investment) =',
           '  (Option P/L + Stock realized/unrealized P&L + Dividends) ÷ Total initial collateral × (365 ÷ Days)',
           '',
-          'N/A -- no initial collateral committed.',
+          'N/A, no initial collateral committed.',
         ])
       : formula([
-          'Everything this ticker has produced -- option P/L, realized AND',
-          '  unrealized stock P/L, dividends -- against total day-one capital.',
+          'Everything this ticker has produced; option P/L, realized AND',
+          '  unrealized stock P/L, dividends; against total day-one capital.',
           '  Open long-option (hedge) unrealized P/L is not included.',
           '',
           'Annualized Total Position ROI (return on investment) =',
@@ -6729,8 +7216,9 @@ function render() {
     valueOf: (row) => row.annualized_wheel_roc_pct,
     format: (value) => pct(value, 0),
     legendId: 'legend-roc',
-    legendNote:
-      'Buy-and-hold tickers (shares only, no puts or calls ever sold) are excluded — a wheel-premium return is undefined for them. Tickers marked ~ include a strike-based proxy for stock held before this export. Click a bar to open that ticker in the Trade Log.',
+    legendNote: [
+
+    ],
     onRowClick: openTradeLogForTicker,
     tipRows: (row) => [
       { label: 'Annualized Wheel ROC', value: pct(row.annualized_wheel_roc_pct) },
@@ -6761,7 +7249,7 @@ function render() {
         text: 'Proxy',
         title: formula([
           '"yes": this ticker has a covered call backed by shares bought',
-          'before this export begins -- the shares are real and the call is',
+          'before this export begins, the shares are real and the call is',
           'genuinely covered, but since the purchase itself is outside the',
           'export, its capital is estimated as strike × 100 rather than the',
           'real cost basis. Marked ~ next to the ticker name on the chart.',

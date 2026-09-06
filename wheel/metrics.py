@@ -155,10 +155,10 @@ class CapitalPoint:
     def working_capital(self) -> float:
         """`total`, minus shares held with no covered call currently open.
 
-        Puts, call-backed shares, the call proxy, long premium and spread
-        collateral are all, by construction, tied to an actually-open option
-        contract -- only idle holding-shares capital needs to be subtracted
-        out here.
+        Put collateral, real covered-call-backed shares, the estimated
+        covered-call proxy, long-option debit and net spread collateral are
+        all, by construction, tied to an actually-open option contract -- only
+        idle holding-shares capital needs to be subtracted out here.
         """
         return self.total - self.idle_stock_basis
 
@@ -1245,6 +1245,24 @@ def leg_rows(cycle: Cycle) -> list[dict]:
 
 _WHEEL_STATE_KEYS = ("puts", "calls", "holding", "other")
 
+# The finest-grained split, one level below the four phase buckets, so the
+# dashboard's nested donut can show every dollar and let a reader reconcile
+# it against the "Capital deployed" chart. `parts[k]` reconciles to `buckets`:
+#   put_collateral            -> puts
+#   calls_cost_basis          -\
+#   calls_strike_estimate     -/ calls   (real basis + the pre-export proxy)
+#   holding_cost_basis        -> holding
+#   long_option_debit         -\
+#   spread_collateral         -/ other
+_WHEEL_STATE_PART_KEYS = (
+    "put_collateral",
+    "calls_cost_basis",
+    "calls_strike_estimate",
+    "holding_cost_basis",
+    "long_option_debit",
+    "spread_collateral",
+)
+
 
 def wheel_state_breakdown(cycles: Sequence[Cycle], through: date) -> dict:
     """Current wheel capital, split by phase, across every ACTIVE cycle.
@@ -1275,6 +1293,7 @@ def wheel_state_breakdown(cycles: Sequence[Cycle], through: date) -> dict:
     buckets: dict[str, dict] = {
         key: {"amount": 0.0, "cycle_ids": set(), "tickers": set()} for key in _WHEEL_STATE_KEYS
     }
+    parts: dict[str, float] = {key: 0.0 for key in _WHEEL_STATE_PART_KEYS}
     active_cycle_ids: set[str] = set()
 
     for cycle in cycles:
@@ -1285,13 +1304,30 @@ def wheel_state_breakdown(cycles: Sequence[Cycle], through: date) -> dict:
             continue
         active_cycle_ids.add(cycle.cycle_id)
         latest = points[-1]
-        has_open_covered_call = any(leg.strategy == COVERED_CALL and leg.is_open for leg in cycle.legs)
+
+        # Take the idle-vs-call-backing split straight from `capital_timeline`'s
+        # own `idle_stock_basis` rather than re-deciding it here -- that is the
+        # authoritative figure the "Capital deployed" chart bands, so deriving
+        # it a second way (a `has_open_covered_call` check that differs subtly
+        # on a cycle with an untracked-shares call plus separate idle tracked
+        # shares) is exactly how the two charts drifted apart.
+        call_backed_basis = latest.stock_basis - latest.idle_stock_basis
+        part_split = {
+            "put_collateral": latest.put_collateral,
+            "calls_cost_basis": call_backed_basis,
+            "calls_strike_estimate": latest.call_collateral,
+            "holding_cost_basis": latest.idle_stock_basis,
+            "long_option_debit": latest.long_premium,
+            "spread_collateral": latest.spread_collateral,
+        }
+        for key, amount in part_split.items():
+            parts[key] += amount
 
         split = {
-            "puts": latest.put_collateral,
-            "calls": latest.call_collateral + (latest.stock_basis if has_open_covered_call else 0.0),
-            "holding": 0.0 if has_open_covered_call else latest.stock_basis,
-            "other": latest.spread_collateral + latest.long_premium,
+            "puts": part_split["put_collateral"],
+            "calls": part_split["calls_cost_basis"] + part_split["calls_strike_estimate"],
+            "holding": part_split["holding_cost_basis"],
+            "other": part_split["long_option_debit"] + part_split["spread_collateral"],
         }
         for key, amount in split.items():
             if amount <= 1e-9:
@@ -1310,6 +1346,7 @@ def wheel_state_breakdown(cycles: Sequence[Cycle], through: date) -> dict:
             }
             for key, bucket in buckets.items()
         },
+        "parts": {key: round(amount, 2) for key, amount in parts.items()},
         "active_cycles": len(active_cycle_ids),
     }
 

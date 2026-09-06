@@ -1700,6 +1700,43 @@ class TestWheelStateBreakdown(unittest.TestCase):
         self.assertAlmostEqual(result["buckets"]["holding"]["amount"], 23000.0, places=2)
         self.assertAlmostEqual(result["buckets"]["calls"]["amount"], 0.0)
 
+    def test_parts_reconcile_to_buckets_and_split_real_basis_from_the_proxy(self):
+        """`parts` is the finest split, one level below the four buckets -- the
+        nested-donut / reconciliation layer. Here: real assigned MU shares
+        backing a covered call (their $23,000 basis -> calls_cost_basis) and,
+        on a second ticker, a covered call whose backing shares predate the
+        export (its strike proxy -> calls_strike_estimate). Both roll up into
+        the single `calls` bucket.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-11-17", STO, "-MU251121P230", -1, 4.00, 399.33, row_id=1),
+                tx("2025-11-21", ASSIGNED, "-MU251121P230", 1, None, 0.0, row_id=2, as_of="2025-11-20"),
+                tx("2025-11-24", STO, "-MU251128C235", -1, 2.00, 199.33, row_id=3),
+                tx("2025-11-24", STO, "-QQQ251219C588", -1, 3.32, 331.33, row_id=4),
+            ]
+        )
+        result = wheel_state_breakdown(cycles, date(2025, 11, 25))
+        parts = result["parts"]
+        buckets = result["buckets"]
+
+        self.assertAlmostEqual(parts["calls_cost_basis"], 23000.0, places=2)  # real MU basis
+        self.assertAlmostEqual(parts["calls_strike_estimate"], 58800.0, places=2)  # QQQ 588 x 100
+        self.assertAlmostEqual(parts["holding_cost_basis"], 0.0)
+        # parts roll up exactly into the four buckets
+        self.assertAlmostEqual(
+            parts["calls_cost_basis"] + parts["calls_strike_estimate"],
+            buckets["calls"]["amount"],
+            places=2,
+        )
+        self.assertAlmostEqual(parts["put_collateral"], buckets["puts"]["amount"], places=2)
+        self.assertAlmostEqual(parts["holding_cost_basis"], buckets["holding"]["amount"], places=2)
+        self.assertAlmostEqual(
+            parts["long_option_debit"] + parts["spread_collateral"],
+            buckets["other"]["amount"],
+            places=2,
+        )
+
     def test_covered_call_on_untracked_shares_uses_strike_proxy(self):
         cycles, _ = build_cycles([tx("2025-09-15", STO, "-QQQ251017C588", -1, 3.32, 331.33)])
         result = wheel_state_breakdown(cycles, date(2025, 9, 16))

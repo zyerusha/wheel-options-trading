@@ -13,7 +13,7 @@ from tests.test_engine import tx  # noqa: E402
 from wheel.accounts import _combine_open_positions  # noqa: E402
 from wheel.api import Dashboard  # noqa: E402
 from wheel.engine import build_cycles  # noqa: E402
-from wheel.parser import ASSIGNED, BTC, BTO, STO  # noqa: E402
+from wheel.parser import ASSIGNED, BTC, BTO, STC, STO  # noqa: E402
 
 
 def _positions(transactions, names=None, prices=None, prev=None, wheels=()) -> list[dict]:
@@ -109,14 +109,51 @@ class TestDetection(unittest.TestCase):
         )
         self.assertEqual(rows, [])
 
-    def test_long_hedge_is_excluded(self):
+    def test_open_long_put_is_an_lp_row_with_paid_premium(self):
         rows = _positions(
             [
                 tx("2025-06-01", STO, "-MU250801P90", -1, 1.50, 150.0, row_id=1),
                 tx("2025-06-02", BTO, "-MU251121P80", 1, 5.0, -500.0, row_id=2),
+            ],
+            prices={"MU": 95.0},
+        )
+        self.assertEqual({r["type"] for r in rows}, {"CSP", "LP"})
+        lp = next(r for r in rows if r["type"] == "LP")
+        self.assertEqual(lp["side"], "LONG")
+        self.assertEqual(lp["strike"], 80.0)
+        # premium was paid: a debit, so a negative number
+        self.assertEqual(lp["net_premium"], -500.0)
+        # long put break-even = strike - cost/share
+        self.assertAlmostEqual(lp["breakeven"], 75.0, places=2)
+        # long: reads positive, unlike a short leg's negative count
+        self.assertEqual(lp["signed_contracts"], 1.0)
+        # premium paid is a cost, not a yield on committed collateral
+        self.assertIsNone(lp["annualized_yield_pct"])
+        self.assertIsNone(lp["collateral"])
+
+    def test_long_call_break_even_is_strike_plus_cost(self):
+        rows = _positions(
+            [tx("2025-06-02", BTO, "-MU251121C120", 2, 3.0, -600.0, row_id=1)],
+            prices={"MU": 130.0},
+        )
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["type"], "LC")
+        self.assertEqual(row["side"], "LONG")
+        # cost/share = 600 / (2 * 100) = 3.0  ->  120 + 3
+        self.assertAlmostEqual(row["breakeven"], 123.0, places=2)
+        self.assertEqual(row["signed_contracts"], 2.0)
+        # 130 > 120 -> the call has intrinsic value (in the money)
+        self.assertTrue(row["in_the_money"])
+
+    def test_closed_long_leg_is_excluded(self):
+        rows = _positions(
+            [
+                tx("2025-06-02", BTO, "-MU251121P80", 1, 5.0, -500.0, row_id=1),
+                tx("2025-06-20", STC, "-MU251121P80", -1, 4.0, 400.0, row_id=2),
             ]
         )
-        self.assertEqual([r["type"] for r in rows], ["CSP"])
+        self.assertEqual(rows, [])
 
     def test_rows_group_by_symbol_then_expiry(self):
         rows = _positions(

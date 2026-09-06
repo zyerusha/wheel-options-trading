@@ -8,6 +8,7 @@ derived from the same slice, so the numbers always agree with each other.
 
 from __future__ import annotations
 
+import math
 import os
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -18,7 +19,17 @@ from typing import Any, Sequence
 from wheel import benchmark as bm
 from wheel import cashflow as cf
 from wheel import marketdata
-from wheel.engine import COVERED_CALL, CSP, LONG, SHORT, Cycle, WheelEngine, build_cycles
+from wheel.engine import (
+    COVERED_CALL,
+    CSP,
+    FROM_PURCHASE,
+    FROM_PUT_ASSIGNMENT,
+    LONG,
+    SHORT,
+    Cycle,
+    WheelEngine,
+    build_cycles,
+)
 from wheel.fileio import peek_text
 from wheel.insights import portfolio_insights, wheel_insights
 from wheel.metrics import (
@@ -62,6 +73,13 @@ from wheel.positions import (
     latest_snapshot_per_account,
     load_snapshots,
 )
+from wheel.reference import load_earnings, sector_of
+
+# "Strong CSP" thresholds -- any one flags a ticker whose past wheels paid well
+# for the capital they tied up. Tuned by eye; easy to move.
+CSP_MONTHLY_PREMIUM_STRONG = 1.0  # gross premium / avg collateral, per 30 days, %
+CSP_PPD_STRONG = 20.0  # blended option P/L per day, $
+CSP_ROC_STRONG = 30.0  # annualized wheel ROC, %
 
 EXPORT_DIRS = (".", "data")
 
@@ -226,10 +244,14 @@ def _capital_point(point) -> dict[str, Any]:
         "long": long_premium,
         "spread": spread,
         "total": round(put + stock + call + long_premium + spread, 2),
-        # Slice of `stock` with no covered call currently written against it
-        # -- see CapitalPoint.working_capital. `total - idle_stock` is the
-        # capital actually backing an open put or covered call that day.
+        # `stock` split by whether a covered call is currently written against
+        # the shares (see CapitalPoint.idle_stock_basis / .working_capital):
+        #   idle_stock = shares held with no call -- capital not earning premium
+        #   call_stock = shares held whose real cost basis backs an open call
+        # These two + `call` (the strike proxy for pre-export call-backed shares)
+        # are the full "shares held" story the Capital deployed chart bands.
         "idle_stock": idle_stock,
+        "call_stock": round((stock or 0.0) - (idle_stock or 0.0), 2),
     }
 
 
@@ -540,12 +562,34 @@ def _trade_log_entry(
 ) -> dict[str, Any]:
     metrics = cycle_metrics(cycle, through, current_price=current_price, dividends=dividends)
 
-    # A cycle holding no shares right now: any acquire-then-flat share row and
-    # any bare stock purchase are settled positions.
+    # A cycle holding no shares right now -- the fallback when a share-acquiring
+    # row can't be matched to its own lot below.
     share_flat = sum(lot.remaining for lot in cycle.share_lots) <= 1e-9
 
+    # Per-lot "is this row's stock gone?" -- a share-acquiring row (Buy Shares,
+    # Shares Assigned) is greyed once *its own* lot is fully disposed, not only
+    # once the whole cycle goes flat. A cycle that bought, sold, then bought
+    # again still holds shares (share_flat is False), but the first purchase's
+    # row should still read as settled. Keyed by (acquired date, lot size); when
+    # two lots share a key the row greys only once *all* of them are gone (a
+    # rare same-day, same-size pair the raw ledger can't tell apart anyway).
+    def _disposed_index(source: str) -> dict[tuple[date, float], bool]:
+        by_key: dict[tuple[date, float], list[float]] = {}
+        for lot in cycle.share_lots:
+            if lot.source == source:
+                by_key.setdefault((lot.acquired, round(lot.shares, 4)), []).append(lot.remaining)
+        return {key: all(r <= 1e-9 for r in remaining) for key, remaining in by_key.items()}
+
+    _purchase_disposed = _disposed_index(FROM_PURCHASE)
+    _assignment_disposed = _disposed_index(FROM_PUT_ASSIGNMENT)
+
+    def _acquire_row_settled(disposed: dict[tuple[date, float], bool], when: date, shares: float) -> bool:
+        return disposed.get((when, round(abs(shares), 4)), share_flat)
+
     def _assignment_settled(assignment) -> bool:
-        return assignment.direction == "DISPOSE" or share_flat
+        if assignment.direction == "DISPOSE":
+            return True  # a call-away / sale is complete on arrival
+        return _acquire_row_settled(_assignment_disposed, assignment.date, assignment.shares)
 
     if engine_exact:
         rows = _trade_log_engine_rows(cycle)
@@ -612,7 +656,7 @@ def _trade_log_entry(
             if t.action == SELL_STOCK:
                 return True
             if t.action == BUY_STOCK:
-                return share_flat
+                return _acquire_row_settled(_purchase_disposed, t.event_date, t.contracts)
             return False
 
         rows = [
@@ -922,8 +966,6 @@ def _open_hedge_entry(
             and other.close_date >= leg.open_date
         )
 
-    months = days_to_expiry / 30.4
-    span = f"{months:.1f} months" if days_to_expiry >= 45 else f"{days_to_expiry} days"
     label = f"long ${leg.strike:g} {kind}"
     pl_phrase = _hedge_pl_phrase(wheel_pl_now)
     losing = wheel_pl_now is not None and wheel_pl_now < -1
@@ -933,48 +975,39 @@ def _open_hedge_entry(
         headline = f"DIRECTIONAL · {days_to_expiry}d"
         if phase == "runway":
             message = (
-                f"Directional {kind} with {span} to run and no wheel selling premium behind "
-                f"it -- theta is working against its ${cost:,.0f} cost every day. Decide whether "
-                f"you still want the exposure or should cut it."
+                f"Directional {kind}, no wheel premium behind it. Theta eats its cost daily; "
+                f"cut it or keep the exposure on purpose."
             )
         else:
             message = (
-                f"Directional {kind}, {days_to_expiry} days left. Close it for whatever time "
-                f"value remains, or hold it for the move -- it finances nothing."
+                f"Directional {kind}, {days_to_expiry}d left. Close for time value or hold "
+                f"for the move, it finances nothing."
             )
     elif phase == "runway":
         headline = f"RUNWAY · {days_to_expiry}d"
         if losing:
             message = (
-                f"{span} of downside protection left, and the wheel is {pl_phrase} right now"
-                f"{' with shares below cost' if shares_held > 1e-9 else ''}. This "
-                f"${leg.strike:g} {kind} is the leg that pays if {cycle.underlying} keeps "
-                f"falling -- hold it, and keep writing puts to carry its ${cost:,.0f} cost. "
-                f"Do not close it while the wheel is underwater."
+                f"Wheel is {pl_phrase}"
+                f"{' with shares below cost' if shares_held > 1e-9 else ''}. Keep this hedge "
+                f"and keep selling puts to carry its cost. Do not close it while the wheel "
+                f"is underwater."
             )
         else:
             message = (
-                f"{span} of protection left; the wheel is {pl_phrase}. There is still runway "
-                f"to write puts against this hedge -- plan to sell it around two months out to "
-                f"salvage its time value rather than letting it decay."
+                f"Runway left to sell puts against this hedge, plan to sell it around two "
+                f"months out to salvage its time value."
             )
     elif phase == "wind_down":
         headline = f"WIND DOWN · {days_to_expiry}d"
         message = (
-            f"{days_to_expiry} days left -- inside two months. Sell the hedge now to recover its "
-            f"remaining time value{intrinsic_phrase}, then stop adding puts against it."
+            f"{days_to_expiry}d left, inside two months. Sell the hedge now to recover its "
+            f"time value{intrinsic_phrase}, then stop adding puts against it."
         )
         if losing:
-            message += (
-                f" The wheel is {pl_phrase}; if you still want protection, roll to a later "
-                f"expiry instead of holding this one into its decay."
-            )
+            message += f" Wheel is {pl_phrase}; roll to a later expiry if you still want protection."
     else:  # expiring
         headline = f"EXPIRING · {days_to_expiry}d"
-        message = (
-            f"{days_to_expiry} days left -- time value is nearly gone{intrinsic_phrase}. Close "
-            f"it or let it lapse; it will not finance more premium."
-        )
+        message = f"{days_to_expiry}d left, time value nearly gone{intrinsic_phrase}. Close it or let it lapse."
 
     return {
         "cycle_id": cycle.cycle_id,
@@ -1012,30 +1045,45 @@ def _open_position_row(
     cost_basis: float | None,
     wheel_breakeven: float | None,
 ) -> dict[str, Any]:
-    """One open covered call / cash-secured put, framed the way the Open option
-    positions table wants it -- raw numbers only; the frontend formats and colors.
+    """One open option leg -- a short covered call / cash-secured put, or a long
+    put / call (a protective hedge or a directional punt) -- framed the way the
+    Open option positions table wants it. Raw numbers only; the frontend formats
+    and colors.
 
-    ``breakeven`` is per position: a short put's is ``strike - premium/share``;
-    a short call's is the backing shares' break-even (``cost_basis - premium/share``),
-    or ``None`` when the pre-history shares carry no known basis. ``wheel_breakeven``
-    is the whole cycle's campaign break-even price (the Trade Log's "Break-even
-    price": raw share cost less every dollar the cycle has banked), passed in from
-    the already-built Trade Log and ``None`` for a cycle holding no shares yet.
-    ``moneyness_pct`` is signed so positive means out-of-the-money (a cushion) and
-    negative means in-the-money (assignment risk), measured against ``last_close``.
-    ``annualized_yield_pct`` scales the net credit over ``strike x 100 x contracts``
-    of cash-equivalent collateral to a full year using the contract's own
-    open->expiry span.
+    ``net_premium`` is the cash still standing on the un-closed portion: a credit
+    (positive) for a short leg, a debit (negative) for a long one -- the sign is
+    the table's "premium paid" cue, reinforced by the row background.
+
+    ``breakeven`` is per position. Short put: ``strike - premium/share``. Short
+    call: the backing shares' break-even (``cost_basis - premium/share``), or
+    ``None`` when the pre-history shares carry no known basis. Long put:
+    ``strike - cost/share``; long call: ``strike + cost/share`` -- the buyer's
+    at-expiry break-even. ``wheel_breakeven`` is the whole cycle's campaign
+    break-even price (the Trade Log's "Break-even price"), passed in from the
+    already-built Trade Log and ``None`` for a cycle holding no shares yet.
+
+    ``moneyness_pct`` is signed so positive means the strike is out-of-the-money
+    and negative means in-the-money, measured against ``last_close`` -- a raw
+    geometric reading, side-agnostic; the frontend decides which sign is
+    "favorable" per side. ``annualized_yield_pct`` scales the net credit over
+    ``strike x 100 x contracts`` to a year over the contract's open->expiry span,
+    and is ``None`` for a long leg (premium paid is a cost, not a yield on
+    committed collateral).
     """
     contracts = leg.remaining_contracts
     is_put = leg.right == "P"
-    # Net credit still standing on the un-closed portion (fees already netted into
-    # every cash figure the parser produces).
+    is_long = leg.side == LONG
+    # Cash still standing on the un-closed portion (fees already netted into every
+    # cash figure the parser produces): a credit for a short leg, a debit (so a
+    # negative number here) for a long one.
     net_premium = leg.open_premium
     shares = contracts * OPTION_MULTIPLIER
     premium_per_share = net_premium / shares if shares else None
 
-    if is_put:
+    if is_long:
+        cost_per_share = abs(premium_per_share or 0.0)
+        breakeven = (leg.strike - cost_per_share) if is_put else (leg.strike + cost_per_share)
+    elif is_put:
         breakeven = leg.strike - (premium_per_share or 0.0)
     elif cost_basis is not None:
         breakeven = cost_basis - (premium_per_share or 0.0)
@@ -1058,25 +1106,31 @@ def _open_position_row(
     contract_days = (leg.expiry - leg.open_date).days
     denom = leg.strike * OPTION_MULTIPLIER * contracts
     annualized_yield_pct = (
-        100.0 * (net_premium / denom) * (365.0 / contract_days)
-        if denom and contract_days > 0
-        else None
+        None
+        if is_long or not denom or contract_days <= 0
+        else 100.0 * (net_premium / denom) * (365.0 / contract_days)
     )
+
+    if is_long:
+        type_ = "LP" if is_put else "LC"
+    else:
+        type_ = "CSP" if is_put else "CC"
 
     return {
         "cycle_id": cycle.cycle_id,
         "underlying": cycle.underlying,
         "name": name,
-        "type": "CSP" if is_put else "CC",
+        "type": type_,
+        "side": "LONG" if is_long else "SHORT",
         "right": leg.right,
         "strike": leg.strike,
         "expiration": _iso(leg.expiry),
         "days_to_expiry": (leg.expiry - through).days,
         "open_date": _iso(leg.open_date),
         "contracts": round(contracts, 4),
-        # Short, so the position count reads negative -- matches the Trade Log's
-        # signed_quantity convention. Not color-coded on the frontend.
-        "signed_contracts": round(-contracts, 4),
+        # Signed like the Trade Log's signed_quantity: a long leg reads positive,
+        # a short leg negative. Not color-coded on the frontend.
+        "signed_contracts": round(contracts if is_long else -contracts, 4),
         "open_price": leg.open_price,
         "net_premium": _money(net_premium),
         "breakeven": _money(breakeven),
@@ -1088,7 +1142,7 @@ def _open_position_row(
         "annualized_yield_pct": (
             round(annualized_yield_pct, 2) if annualized_yield_pct is not None else None
         ),
-        "collateral": _money(denom),
+        "collateral": None if is_long else _money(denom),
         "cost_basis": _money(cost_basis),
         "shares_tracked": leg.shares_tracked,
     }
@@ -1239,7 +1293,7 @@ class Dashboard:
                 self.position_warnings = self.position_warnings + [
                     "ignored Positions rows for account(s) "
                     + ", ".join(other_numbers)
-                    + f" -- this dashboard is scoped to account {account_number}"
+                    + f", this dashboard is scoped to account {account_number}"
                 ]
         self._net_worth = self._build_net_worth()
         self._benchmark = self._build_benchmark()
@@ -1275,6 +1329,8 @@ class Dashboard:
         self._trade_log: dict[str, Any] | None = None
         self._open_hedges: list[dict[str, Any]] | None = None
         self._open_positions: list[dict[str, Any]] | None = None
+        self._cc_candidates: list[dict[str, Any]] | None = None
+        self._csp_candidates: list[dict[str, Any]] | None = None
 
     # ---- market data ----
 
@@ -1339,6 +1395,31 @@ class Dashboard:
         self._price_warnings = warnings
         return prices
 
+    def _last_closes(self, tickers: Sequence[str]) -> dict[str, float | None]:
+        """Latest close for each of ``tickers`` -- the same two-pass strategy
+        ``_current_prices`` documents (cache/memo first, then a thread pool for
+        genuine misses), but for an arbitrary list: the CSP-candidates table
+        wants closes for tickers this account is no longer holding anything in,
+        so they aren't in ``_current_prices``'s set. Fetch warnings append to
+        ``self._price_warnings``.
+        """
+        out: dict[str, float | None] = {}
+        misses: list[str] = []
+        for ticker in tickers:
+            local = marketdata.get_price_series(ticker, local_only=True)
+            if local is None:
+                misses.append(ticker)
+                continue
+            points, warns = local
+            self._price_warnings.extend(warns)
+            out[ticker] = points[-1].close if points else None
+        if misses:
+            with ThreadPoolExecutor(max_workers=min(8, len(misses))) as pool:
+                for ticker, (points, warns) in zip(misses, pool.map(marketdata.get_price_series, misses)):
+                    self._price_warnings.extend(warns)
+                    out[ticker] = points[-1].close if points else None
+        return out
+
     # ---- metadata ----
 
     @property
@@ -1386,7 +1467,7 @@ class Dashboard:
             warnings.append(
                 "multiple account numbers found in one dataset ("
                 + ", ".join(sorted(latest_by_account))
-                + "); showing the most recently seen -- put each account in its own "
+                + "); showing the most recently seen, put each account in its own "
                 "folder under data/ to keep them separate"
             )
         latest = max(latest_by_account.values(), key=lambda snapshot: snapshot.as_of)
@@ -1508,7 +1589,7 @@ class Dashboard:
                 "available": False,
                 "warnings": [
                     "at least two Portfolio Positions snapshots, taken on different dates, are "
-                    "needed to compute a return -- only one is available so far (or add an "
+                    "needed to compute a return, only one is available so far (or add an "
                     "'opening_balances' entry for this account to data/accounts.json to supply "
                     "an earlier starting point manually)"
                 ],
@@ -1621,7 +1702,7 @@ class Dashboard:
             return {
                 "available": False,
                 "warnings": [
-                    "not enough wheel activity yet to compute a return -- need at least one "
+                    "not enough wheel activity yet to compute a return, need at least one "
                     "full open/close (or assignment) on record"
                 ],
             }
@@ -1646,7 +1727,7 @@ class Dashboard:
                 "available": False,
                 "warnings": [
                     "wheel cash flows don't yet have enough sign variation (money in AND "
-                    "money out) to solve for a rate -- typically means every tracked "
+                    "money out) to solve for a rate, typically means every tracked "
                     "position is still open"
                 ],
             }
@@ -1709,7 +1790,7 @@ class Dashboard:
                     if prev.end_date is not None and nxt.start_date < prev.end_date:
                         warnings.append(
                             f"{prev.underlying}: cycles {prev.cycle_id} and {nxt.cycle_id} "
-                            "overlap in time -- Trade Log attributed them via the engine"
+                            "overlap in time, Trade Log attributed them via the engine"
                         )
 
         wheels = [
@@ -1784,10 +1865,12 @@ class Dashboard:
         prev_closes: dict[str, float | None],
         wheels: Sequence[dict[str, Any]] = (),
     ) -> list[dict[str, Any]]:
-        """One row per open short option leg across ``all_cycles`` -- every
-        covered call and cash-secured put still on the books, the option content
-        of every live wheel. Buy-and-hold share lots and long-only hedges are
-        deliberately left out (the hedge banner already covers the latter).
+        """One row per open option leg across ``all_cycles`` -- every covered
+        call and cash-secured put still on the books, plus every open long put /
+        call (a protective hedge or a directional punt). Buy-and-hold share lots
+        are left out; the long legs are the same ones the hedge banner reasons
+        about, shown here as compact data rows with an amber row background
+        marking that their premium was *paid*, not received.
 
         ``wheels`` is the already-built Trade Log's ``wheels`` list; each row picks
         its cycle's campaign break-even price out of it rather than recomputing.
@@ -1813,9 +1896,10 @@ class Dashboard:
                 else None
             )
             for leg in cycle.legs:
-                if not leg.is_open or leg.side != SHORT or leg.expiry is None:
+                if not leg.is_open or leg.expiry is None:
                     continue
-                if leg.strategy not in (CSP, COVERED_CALL):
+                short_wheel_leg = leg.side == SHORT and leg.strategy in (CSP, COVERED_CALL)
+                if not (short_wheel_leg or leg.side == LONG):
                     continue
                 rows.append(
                     _open_position_row(
@@ -1830,6 +1914,187 @@ class Dashboard:
                     )
                 )
         rows.sort(key=lambda r: (r["underlying"], r["expiration"] or "", r["strike"] or 0.0))
+        return rows
+
+    def _build_cc_candidates(
+        self,
+        wheels: Sequence[dict[str, Any]],
+        open_positions: Sequence[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Every position holding shares with no covered call currently written
+        against it. Positions with >= 100 shares are the actionable ones -- a
+        covered call could be written -- and carry a ``target_cc_strike`` and a
+        (negative) ``contracts_available``. Positions under 100 shares are still
+        listed for visibility, with those two fields ``None``. Built from the
+        already-assembled Trade Log ``wheels`` (share count, cost basis, both
+        break-evens, last close) and ``open_positions`` (which cycles already
+        have a live CC leg); filter-independent like both.
+
+        ``target_cc_strike`` is the lowest strike worth writing a call at: the
+        greatest of the share cost basis, the position break-even (cost basis
+        net of premium already banked on these lots), the whole-wheel
+        break-even, and the last close, then rounded **up** to the next $0.50
+        (real strikes sit on 0.50-or-wider increments, and rounding up keeps it
+        a valid floor). At or above it an assignment sells the stock for at
+        least what it cost, on top of every premium already collected, and
+        never below the current market. It is a floor, not a recommendation --
+        it says nothing about where the premium is richest.
+
+        ``unrealized_pl`` / ``unrealized_pl_pct`` are the shares' total gain or
+        loss against their raw average cost basis (premium already banked is
+        deliberately *not* netted in), marked to the last close. ``sector`` and
+        ``earnings_date`` / ``days_to_earnings`` come from ``wheel.reference``.
+        """
+        cc_cycle_ids = {p["cycle_id"] for p in open_positions if p.get("type") == "CC"}
+        earnings = load_earnings()
+        today = date.today()
+        rows: list[dict[str, Any]] = []
+        for wheel in wheels:
+            shares = wheel.get("shares_held") or 0.0
+            if shares <= 1e-9 or wheel["cycle_id"] in cc_cycle_ids:
+                continue
+            meets_threshold = shares >= 100 - 1e-9
+            cost_basis = wheel.get("cost_basis_per_share")
+            last_close = wheel.get("current_price")
+            floors = [
+                value
+                for value in (
+                    cost_basis,
+                    wheel.get("break_even_per_share"),
+                    wheel.get("break_even_price"),
+                    last_close,
+                )
+                if value is not None
+            ]
+            if meets_threshold and floors:
+                # ceil to the next $0.50; round first to shake off float noise.
+                target = _money(math.ceil(round(max(floors) / 0.5, 4)) * 0.5)
+            else:
+                target = None
+            # Total unrealized gain/loss on the shares vs. their raw average
+            # cost basis (not a break-even -- premium already banked is not
+            # netted in here), marked to the last close.
+            has_marks = cost_basis is not None and last_close is not None
+            gain = round(shares * (last_close - cost_basis), 2) if has_marks else None
+            gain_pct = (
+                round(100.0 * (last_close - cost_basis) / cost_basis, 2)
+                if has_marks and cost_basis
+                else None
+            )
+            rows.append(
+                {
+                    "cycle_id": wheel["cycle_id"],
+                    "underlying": wheel["underlying"],
+                    "name": wheel.get("name"),
+                    "is_wheel": bool(wheel.get("is_wheel")),
+                    # Shown in the "Wheel" column; a plain buy-and-hold lot has none.
+                    "wheel": wheel["cycle_id"] if wheel.get("is_wheel") else None,
+                    "shares_held": round(shares, 4),
+                    "meets_threshold": meets_threshold,
+                    # The covered-call position that could be opened, so it reads
+                    # negative (a short call), e.g. 175 shares -> -1. None when
+                    # there aren't 100 shares to cover a contract.
+                    "contracts_available": -(int(shares // 100)) if meets_threshold else None,
+                    "cost_basis_per_share": cost_basis,
+                    "breakeven": wheel.get("break_even_per_share"),
+                    "wheel_breakeven": wheel.get("break_even_price"),
+                    "last_close": last_close,
+                    "target_cc_strike": target,
+                    "unrealized_pl": gain,
+                    "unrealized_pl_pct": gain_pct,
+                    "sector": sector_of(wheel["underlying"]),
+                    "earnings_date": (
+                        earnings[wheel["underlying"]].isoformat() if wheel["underlying"] in earnings else None
+                    ),
+                    "days_to_earnings": (
+                        (earnings[wheel["underlying"]] - today).days if wheel["underlying"] in earnings else None
+                    ),
+                }
+            )
+        # Actionable positions first, then the sub-100 lots, each alphabetical.
+        rows.sort(key=lambda r: (not r["meets_threshold"], r["underlying"]))
+        return rows
+
+    def _build_csp_candidates(self, wheels: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Tickers this account has wheeled **profitably** in the past -- names
+        worth a fresh cash-secured put -- one row per underlying, summed over
+        every wheel on it, keeping only the net-positive ones. Each carries its
+        latest close so the frontend can size it against whatever cash is free
+        (how many 100-share puts that cash could secure at roughly that price).
+
+        ``avg_annualized_roc_pct`` is a rough wheel-count-weighted mean of each
+        wheel's own annualized ROC. ``strong`` flags a ticker whose past wheels
+        paid well for the capital they tied up -- any of: monthly premium yield
+        (gross premium / avg collateral, per 30 days) >= 1%, blended PPD
+        (option P/L / days) >= $20, or annualized wheel ROC >= 30%. ``sector``
+        and ``earnings_date`` / ``days_to_earnings`` come from
+        ``wheel.reference`` (a static map and an optional ``earnings.json``).
+        """
+        by_ticker: dict[str, dict[str, Any]] = {}
+        for wheel in wheels:
+            if not wheel.get("is_wheel"):
+                continue
+            agg = by_ticker.setdefault(
+                wheel["underlying"],
+                {
+                    "net_realized_pl": 0.0,
+                    "wheels": 0,
+                    "roc_sum": 0.0,
+                    "roc_n": 0,
+                    "gross_premium": 0.0,
+                    "option_pl": 0.0,
+                    "avg_collateral": 0.0,
+                    "days": 0,
+                },
+            )
+            agg["net_realized_pl"] += wheel.get("net_realized_pl") or 0.0
+            agg["wheels"] += 1
+            roc = wheel.get("annualized_wheel_roc_pct")
+            if roc is not None:
+                agg["roc_sum"] += roc
+                agg["roc_n"] += 1
+            agg["gross_premium"] += wheel.get("gross_premium_received") or 0.0
+            agg["option_pl"] += wheel.get("option_realized_pl") or 0.0
+            agg["avg_collateral"] += wheel.get("avg_collateral") or 0.0
+            agg["days"] += wheel.get("days_active") or 0
+
+        winners = {t: a for t, a in by_ticker.items() if a["net_realized_pl"] > 0}
+        closes = self._last_closes(sorted(winners))
+        earnings = load_earnings()
+        today = date.today()
+
+        rows: list[dict[str, Any]] = []
+        for ticker, agg in winners.items():
+            avg_roc = round(agg["roc_sum"] / agg["roc_n"], 2) if agg["roc_n"] else None
+            monthly_premium_pct = (
+                100.0 * agg["gross_premium"] / agg["avg_collateral"] * (30.0 / max(agg["days"], 1))
+                if agg["avg_collateral"] > 1e-9
+                else None
+            )
+            ppd = agg["option_pl"] / agg["days"] if agg["days"] else None
+            strong = (
+                (monthly_premium_pct is not None and monthly_premium_pct >= CSP_MONTHLY_PREMIUM_STRONG)
+                or (ppd is not None and ppd >= CSP_PPD_STRONG)
+                or (avg_roc is not None and avg_roc >= CSP_ROC_STRONG)
+            )
+            earn = earnings.get(ticker)
+            rows.append(
+                {
+                    "underlying": ticker,
+                    "name": self._company_names.get(ticker),
+                    "wheels": agg["wheels"],
+                    "net_realized_pl": _money(agg["net_realized_pl"]),
+                    "avg_annualized_roc_pct": avg_roc,
+                    "monthly_premium_pct": round(monthly_premium_pct, 2) if monthly_premium_pct is not None else None,
+                    "ppd": _money(ppd),
+                    "strong": strong,
+                    "last_close": _money(closes.get(ticker)),
+                    "sector": sector_of(ticker),
+                    "earnings_date": earn.isoformat() if earn else None,
+                    "days_to_earnings": (earn - today).days if earn else None,
+                }
+            )
+        rows.sort(key=lambda r: -(r["net_realized_pl"] or 0.0))
         return rows
 
     # ---- query ----
@@ -1917,6 +2182,12 @@ class Dashboard:
             self._open_positions = self._build_open_positions(
                 current_prices, self._prev_closes, (self._trade_log or {}).get("wheels", [])
             )
+        if self._cc_candidates is None:
+            self._cc_candidates = self._build_cc_candidates(
+                (self._trade_log or {}).get("wheels", []), self._open_positions or []
+            )
+        if self._csp_candidates is None:
+            self._csp_candidates = self._build_csp_candidates((self._trade_log or {}).get("wheels", []))
 
         portfolio = portfolio_metrics(
             cycles,
@@ -2069,4 +2340,6 @@ class Dashboard:
             "trade_log": self._trade_log,
             "open_hedges": self._open_hedges,
             "open_positions": self._open_positions,
+            "cc_candidates": self._cc_candidates,
+            "csp_candidates": self._csp_candidates,
         }

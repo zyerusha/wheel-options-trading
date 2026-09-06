@@ -127,7 +127,15 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 from wheel import benchmark as bm
 from wheel import cashflow as cf
-from wheel.api import Dashboard, Filters, discover_exports, discover_multi_account_exports
+from wheel.api import (
+    CSP_MONTHLY_PREMIUM_STRONG,
+    CSP_PPD_STRONG,
+    CSP_ROC_STRONG,
+    Dashboard,
+    Filters,
+    discover_exports,
+    discover_multi_account_exports,
+)
 from wheel.insights import portfolio_insights
 from wheel.metrics import roi_and_annualized, time_weighted_average, weekly_ppd_series
 from wheel.positions import discover_position_snapshots, latest_snapshot, latest_snapshot_per_account, load_snapshots
@@ -829,6 +837,8 @@ class AccountRegistry:
         combined_trade_log = _combine_trade_log(payloads)
         combined_hedges = _combine_open_hedges(payloads)
         combined_open_positions = _combine_open_positions(payloads)
+        combined_cc_candidates = _combine_cc_candidates(payloads)
+        combined_csp_candidates = _combine_csp_candidates(payloads)
         combined_wheel_state = _combine_wheel_state(payloads)
         combined_benchmark = _combine_benchmark(payloads)
         combined_wheel_return = _combine_wheel_return(payloads)
@@ -862,6 +872,8 @@ class AccountRegistry:
             "trade_log": combined_trade_log,
             "open_hedges": combined_hedges,
             "open_positions": combined_open_positions,
+            "cc_candidates": combined_cc_candidates,
+            "csp_candidates": combined_csp_candidates,
         }
 
 
@@ -975,6 +987,104 @@ def _combine_open_positions(payloads: dict[str, dict]) -> list[dict]:
     return positions
 
 
+def _combine_cc_candidates(payloads: dict[str, dict]) -> list[dict]:
+    """Every account's covered-call candidates in one list, ``cycle_id`` /
+    ``wheel`` account-prefixed to match the combined Trade Log; sorted by
+    underlying like each account's own table.
+    """
+    rows: list[dict] = []
+    for account_id, payload in payloads.items():
+        for row in payload.get("cc_candidates") or []:
+            rows.append(
+                {
+                    **row,
+                    "account_id": account_id,
+                    "cycle_id": f"{account_id}:{row['cycle_id']}",
+                    "wheel": f"{account_id}:{row['wheel']}" if row.get("wheel") else None,
+                }
+            )
+    # Actionable (100+ share) rows first, then the sub-100 lots -- same order
+    # each account's own table already uses.
+    rows.sort(key=lambda r: (not r.get("meets_threshold", True), r["underlying"]))
+    return rows
+
+
+def _combine_csp_candidates(payloads: dict[str, dict]) -> list[dict]:
+    """One row per underlying across every account -- a ticker wheeled in more
+    than one account is merged, its realized P/L and wheel count summed, and
+    kept only if the *combined* result is still net-positive. ``last_close`` is
+    the same everywhere, so any account's value stands.
+    """
+    def _keep_max(current, candidate):
+        if candidate is None:
+            return current
+        return candidate if current is None else max(current, candidate)
+
+    by_ticker: dict[str, dict] = {}
+    for payload in payloads.values():
+        for row in payload.get("csp_candidates") or []:
+            agg = by_ticker.setdefault(
+                row["underlying"],
+                {
+                    "net_realized_pl": 0.0,
+                    "wheels": 0,
+                    "roc_sum": 0.0,
+                    "roc_n": 0,
+                    "last_close": None,
+                    "name": None,
+                    "monthly_premium_pct": None,
+                    "ppd": None,
+                    "sector": None,
+                    "earnings_date": None,
+                    "days_to_earnings": None,
+                },
+            )
+            agg["net_realized_pl"] += row.get("net_realized_pl") or 0.0
+            wheels = row.get("wheels") or 0
+            agg["wheels"] += wheels
+            if row.get("avg_annualized_roc_pct") is not None:
+                agg["roc_sum"] += row["avg_annualized_roc_pct"] * max(wheels, 1)
+                agg["roc_n"] += max(wheels, 1)
+            if row.get("last_close") is not None:
+                agg["last_close"] = row["last_close"]
+            agg["name"] = agg["name"] or row.get("name")
+            agg["monthly_premium_pct"] = _keep_max(agg["monthly_premium_pct"], row.get("monthly_premium_pct"))
+            agg["ppd"] = _keep_max(agg["ppd"], row.get("ppd"))
+            # Sector and earnings are ticker facts, identical across accounts.
+            agg["sector"] = agg["sector"] or row.get("sector")
+            if row.get("earnings_date") is not None:
+                agg["earnings_date"] = row["earnings_date"]
+                agg["days_to_earnings"] = row.get("days_to_earnings")
+
+    rows = []
+    for ticker, agg in by_ticker.items():
+        if agg["net_realized_pl"] <= 0:
+            continue
+        roc = round(agg["roc_sum"] / agg["roc_n"], 2) if agg["roc_n"] else None
+        rows.append(
+            {
+                "underlying": ticker,
+                "name": agg["name"],
+                "wheels": agg["wheels"],
+                "net_realized_pl": round(agg["net_realized_pl"], 2),
+                "avg_annualized_roc_pct": roc,
+                "monthly_premium_pct": agg["monthly_premium_pct"],
+                "ppd": agg["ppd"],
+                "strong": bool(
+                    (agg["monthly_premium_pct"] is not None and agg["monthly_premium_pct"] >= CSP_MONTHLY_PREMIUM_STRONG)
+                    or (agg["ppd"] is not None and agg["ppd"] >= CSP_PPD_STRONG)
+                    or (roc is not None and roc >= CSP_ROC_STRONG)
+                ),
+                "last_close": agg["last_close"],
+                "sector": agg["sector"],
+                "earnings_date": agg["earnings_date"],
+                "days_to_earnings": agg["days_to_earnings"],
+            }
+        )
+    rows.sort(key=lambda r: -r["net_realized_pl"])
+    return rows
+
+
 def _combine_tickers(payloads: dict[str, dict]) -> list[dict]:
     combined = [
         {**row, "account_id": account_id} for account_id, payload in payloads.items() for row in payload["tickers"]
@@ -989,9 +1099,9 @@ def _combine_capital_series(payloads: dict[str, dict]) -> list[dict]:
         for point in payload["capital_series"]:
             bucket = buckets.setdefault(
                 point["date"],
-                {"put": 0.0, "stock": 0.0, "call": 0.0, "long": 0.0, "spread": 0.0, "idle_stock": 0.0},
+                {"put": 0.0, "stock": 0.0, "call": 0.0, "long": 0.0, "spread": 0.0, "idle_stock": 0.0, "call_stock": 0.0},
             )
-            for field_name in ("put", "stock", "call", "long", "spread", "idle_stock"):
+            for field_name in ("put", "stock", "call", "long", "spread", "idle_stock", "call_stock"):
                 bucket[field_name] += point.get(field_name) or 0.0
 
     series: list[dict] = []
@@ -1010,6 +1120,7 @@ def _combine_capital_series(payloads: dict[str, dict]) -> list[dict]:
                 "spread": round(values["spread"], 2),
                 "total": total,
                 "idle_stock": round(values["idle_stock"], 2),
+                "call_stock": round(values["call_stock"], 2),
             }
         )
     return series
@@ -1196,9 +1307,18 @@ def _combine_wheel_state(payloads: dict[str, dict]) -> dict[str, Any]:
     cycles.
     """
     keys = ("puts", "calls", "holding", "other")
+    part_keys = (
+        "put_collateral",
+        "calls_cost_basis",
+        "calls_strike_estimate",
+        "holding_cost_basis",
+        "long_option_debit",
+        "spread_collateral",
+    )
     buckets: dict[str, dict[str, Any]] = {
         key: {"amount": 0.0, "cycles": 0, "tickers": set()} for key in keys
     }
+    parts: dict[str, float] = {key: 0.0 for key in part_keys}
     active_cycles = 0
     for payload in payloads.values():
         state = payload.get("wheel_state") or {}
@@ -1207,6 +1327,8 @@ def _combine_wheel_state(payloads: dict[str, dict]) -> dict[str, Any]:
             buckets[key]["amount"] += bucket.get("amount", 0.0)
             buckets[key]["cycles"] += bucket.get("cycles", 0)
             buckets[key]["tickers"].update(bucket.get("tickers", []))
+        for key in part_keys:
+            parts[key] += (state.get("parts") or {}).get(key, 0.0)
         active_cycles += state.get("active_cycles", 0)
 
     return {
@@ -1218,6 +1340,7 @@ def _combine_wheel_state(payloads: dict[str, dict]) -> dict[str, Any]:
             }
             for key, bucket in buckets.items()
         },
+        "parts": {key: round(amount, 2) for key, amount in parts.items()},
         "active_cycles": active_cycles,
     }
 

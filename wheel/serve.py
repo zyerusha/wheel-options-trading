@@ -170,7 +170,7 @@ def _write_uploads(target_dir: str, files: list[tuple[str, bytes]], written: lis
         names = ", ".join(os.path.basename(path) for path in multi_account)
         raise DatasetError(
             f"{names}: this looks like Fidelity's multi-account transaction history export "
-            "(separate 'Account'/'Account Number' columns) -- not supported yet. "
+            "(separate 'Account'/'Account Number' columns); not supported yet. "
             "Download a per-account History_for_Account_*.csv export instead."
         )
 
@@ -292,7 +292,7 @@ class DashboardState:
                     "name": os.path.basename(path),
                     "folder": "data" if os.path.dirname(path) == UPLOAD_DIR else ".",
                     "size_kb": round(stat.st_size / 1024, 1),
-                    "reason": "multi-account transaction history export -- not supported yet",
+                    "reason": "multi-account transaction history export; not supported yet",
                 }
             )
         return rows

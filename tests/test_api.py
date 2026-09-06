@@ -292,5 +292,46 @@ class TestUntrackedEquityValue(unittest.TestCase):
             self.assertAlmostEqual(data["net_worth"]["untracked_equity_value"], 0.0, places=2)
 
 
+class TestCapitalPointSharesSplit(unittest.TestCase):
+    """`_capital_point` splits `stock` (all held-share cost basis) into
+    `idle_stock` (no call written) + `call_stock` (backing an open covered
+    call), so the Capital deployed chart can draw the two as separate bands.
+    """
+
+    def test_idle_hold_is_all_idle_stock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "History.csv")
+            _write_history_csv(
+                path,
+                [
+                    '11/17/2025,"YOU SOLD OPENING TRANSACTION PUT (MU) ...",-MU251121P230,'
+                    '"PUT ...",Cash,-1,4.00,0,0,,399.33,10000.00,11/17/2025',
+                    '11/21/2025,"ASSIGNED PUT as of Nov-20-2025",-MU251121P230,"PUT ...",Cash,1,,0,0,,0.00,9700.00,11/21/2025',
+                ],
+            )
+            last = Dashboard(path, position_paths=[]).build()["capital_series"][-1]
+            self.assertAlmostEqual(last["stock"], 23000.0, places=2)
+            self.assertAlmostEqual(last["idle_stock"], 23000.0, places=2)
+            self.assertAlmostEqual(last["call_stock"], 0.0, places=2)
+
+    def test_covered_call_moves_the_basis_to_call_stock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "History.csv")
+            _write_history_csv(
+                path,
+                [
+                    '11/17/2025,"YOU SOLD OPENING TRANSACTION PUT (MU) ...",-MU251121P230,'
+                    '"PUT ...",Cash,-1,4.00,0,0,,399.33,10000.00,11/17/2025',
+                    '11/21/2025,"ASSIGNED PUT as of Nov-20-2025",-MU251121P230,"PUT ...",Cash,1,,0,0,,0.00,9700.00,11/21/2025',
+                    '11/24/2025,"YOU SOLD OPENING TRANSACTION CALL (MU) ...",-MU251219C235,'
+                    '"CALL ...",Cash,-1,2.00,0,0,,199.33,9900.00,11/24/2025',
+                ],
+            )
+            last = Dashboard(path, position_paths=[]).build()["capital_series"][-1]
+            self.assertAlmostEqual(last["idle_stock"] + last["call_stock"], last["stock"], places=2)
+            self.assertAlmostEqual(last["idle_stock"], 0.0, places=2)
+            self.assertAlmostEqual(last["call_stock"], 23000.0, places=2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

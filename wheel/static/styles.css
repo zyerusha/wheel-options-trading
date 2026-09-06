@@ -15,22 +15,23 @@
   --border: rgba(11, 11, 11, 0.1);
   --ghost: rgba(11, 11, 11, 0.04);
 
-  --series-1: #2a78d6; /* blue    - CSP collateral / premium */
-  --series-2: #eb6834; /* orange  - stock basis / realised P/L */
-  --series-3: #1baf7a; /* aqua    - short-call proxy capital */
-  --series-4: #eda100; /* yellow  - long-option debit */
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
 
-  --pos: #2a78d6; /* diverging pole: gain */
-  --neg: #e34948; /* diverging pole: loss */
-  --mid: #f0efec; /* diverging midpoint - neutral, never a hue */
+  --pos: #2a78d6;
+  --neg: #e34948;
+  --mid: #f0efec;
 
   --good: #0ca30c;
   --warning: #fab219;
   --critical: #d03b3b;
   --success-text: #006300;
 
-  --closed-bg: #ffe6df; /* salmon - a closed wheel in the Trade Log */
-  --noactivity-bg: #fff4d6; /* pale amber - a NO_ACTIVITY (dormant) wheel */
+  --closed-bg: #ffe6df;
+  --noactivity-bg: #fff4d6;
+  --long-bg: #fdf1de;
 
   --radius: 10px;
   --gap: 18px;
@@ -58,6 +59,7 @@
     --success-text: #0ca30c;
     --closed-bg: #4a2b25;
     --noactivity-bg: #4a4325;
+    --long-bg: #3a3320;
   }
 }
 
@@ -82,6 +84,7 @@
   --success-text: #0ca30c;
   --closed-bg: #4a2b25;
   --noactivity-bg: #4a4325;
+  --long-bg: #3a3320;
 }
 
 * {
@@ -335,8 +338,6 @@ button.primary {
   max-width: 620px;
 }
 
-/* A combined view can list 40+ tickers; scroll them rather than letting the
-   filter bar grow tall enough to strand the date controls at its foot. */
 #ticker-chips {
   max-height: 74px;
   overflow-y: auto;
@@ -390,6 +391,31 @@ button.primary {
   border-width: 2px;
 }
 
+/* The "Cash for new CSPs" tile keeps the larger value type but not the blue
+   accent border. */
+#csp-cash-tiles .tile.primary {
+  border-color: var(--border);
+  border-width: 1px;
+}
+
+/* "Strong CSP" marker -- a warm yellow star. */
+#csp-candidates-table td.csp-star {
+  color: var(--warning);
+  font-size: 15px;
+  line-height: 1;
+}
+
+/* A candidate whose earnings land within 14 days -- don't write into an
+   earnings print. Amber the whole row (td-level, so it holds on hover). */
+#csp-candidates-table tr.earnings-warn > td,
+#cc-candidates-table tr.earnings-warn > td {
+  background: var(--noactivity-bg);
+}
+#csp-candidates-table tr.earnings-warn > td:first-child,
+#cc-candidates-table tr.earnings-warn > td:first-child {
+  box-shadow: inset 3px 0 0 var(--warning);
+}
+
 .tile.primary .value {
   font-size: 30px;
 }
@@ -436,6 +462,34 @@ button.primary {
   grid-template-columns: repeat(auto-fit, minmax(440px, 1fr));
 }
 
+/*
+ * The four Cash Flow & P/L Analytics sub-sections must always form an explicit
+ * 2x2 grid -- used as `class="grid analytics-grid"` (no `two`), so this column
+ * rule wins by cascade order rather than fighting `.grid.two`'s auto-fit, which
+ * can spill to 3-4 columns at wide widths.
+ */
+.analytics-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+/* Grid-nested sub-sections drop the stacked-in-a-card top margin; row 1 has no
+   rule, rows 2+ get a horizontal divider so the quadrants read as a 2x2. */
+.card > .grid {
+  margin-bottom: 0;
+}
+
+.analytics-grid > .card-subsection {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+  min-width: 0;
+}
+
+.analytics-grid > .card-subsection:nth-child(n + 3) {
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
 .card {
   background: var(--surface-1);
   border: 1px solid var(--border);
@@ -444,8 +498,6 @@ button.primary {
   min-width: 0;
 }
 
-/* A chart card with nothing to plot for the current filter is hidden by JS
-   (see toggleChartCard) rather than left blank. */
 .card[hidden] {
   display: none;
 }
@@ -487,6 +539,40 @@ button.primary {
   margin-top: 3px;
 }
 
+/* A second chart living in the same card. */
+.card-subsection {
+  margin-top: 20px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.card-subsection[hidden] {
+  display: none;
+}
+
+.card-subsection > header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+
+.card-subsection h3 {
+  font-size: 14px;
+  font-weight: 640;
+  margin: 0;
+}
+
+#wheel-state-block .chart-scroll {
+  max-width: 460px;
+  margin-inline: auto;
+}
+
+#wheel-state-block .legend-stack {
+  margin-inline: auto;
+}
+
 .legend {
   display: flex;
   flex-wrap: wrap;
@@ -496,8 +582,6 @@ button.primary {
   color: var(--text-secondary);
 }
 
-/* Direct children only: legend items now nest a value, and an unscoped rule
-   would turn every descendant into its own inline-flex row. */
 .legend > span {
   display: inline-flex;
   align-items: center;
@@ -530,6 +614,21 @@ button.primary {
   height: 2px;
   border-radius: 2px;
   width: 16px;
+}
+
+.legend.legend-stack {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  max-width: 320px;
+}
+
+.legend.legend-stack > span {
+  align-self: stretch;
+}
+
+.legend.legend-stack .legend-value {
+  margin-left: auto;
 }
 
 .chart-scroll {
@@ -566,15 +665,11 @@ svg .hit {
   cursor: pointer;
 }
 
-/* Full-row click target behind the per-leg hits in the wheel timeline -- opens
-   that wheel in the Trade Log tab. Painted first, so leg tooltips still win. */
 svg .row-hit {
   fill: transparent;
   cursor: pointer;
 }
 
-/* The overlay is transparent, so ring the plot area rather than relying on an
-   outline, which SVG renders inconsistently. */
 svg .hit:focus {
   outline: none;
 }
@@ -716,8 +811,6 @@ th.sortable:hover {
 
 /* ---------------- open option positions table ---------------- */
 
-/* First row of each symbol group gets a heavier rule, so a symbol's stacked
-   positions read as one block even when a column sort reorders them. */
 #open-positions-table tr.op-group-start > td {
   border-top: 2px solid var(--border);
 }
@@ -726,6 +819,56 @@ th.sortable:hover {
   color: var(--text-secondary);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
+}
+
+#cc-candidates-table td.op-wheel {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Wheel id that jumps to the Trade Log when clicked. */
+.wheel-link {
+  color: var(--series-1);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.wheel-link:hover,
+.wheel-link:focus-visible {
+  color: var(--text-primary);
+  outline: none;
+}
+
+/* The one actionable figure in the covered-call candidates table. */
+#cc-candidates-table td.cc-target {
+  font-weight: 700;
+  color: #7c3aed; /* violet */
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) #cc-candidates-table td.cc-target {
+    color: #a78bfa; /* lighter violet for dark backgrounds */
+  }
+}
+
+:root[data-theme='dark'] #cc-candidates-table td.cc-target {
+  color: #a78bfa;
+}
+
+/* Sub-100-share rows carry no CC target -- the "—" shouldn't read as an
+   actionable violet figure. */
+#cc-candidates-table tr.cc-below-100 > td.cc-target {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+#open-positions-table tr.op-long > td {
+  background: var(--long-bg);
+}
+
+#open-positions-table tr.op-long:hover > td {
+  filter: brightness(0.96);
 }
 
 .badge.op-type {
@@ -739,8 +882,14 @@ th.sortable:hover {
 }
 
 .badge.op-type-CC {
-  color: var(--series-2);
-  border-color: var(--series-2);
+  color: var(--series-3);
+  border-color: var(--series-3);
+}
+
+.badge.op-type-LP,
+.badge.op-type-LC {
+  color: var(--series-4);
+  border-color: var(--series-4);
 }
 
 /* ---------------- expandable cycle rows ---------------- */
@@ -839,7 +988,6 @@ tr.detail > td {
   color: var(--critical);
 }
 
-/* The calculation behind the value(s) above -- how, not just what. */
 #tooltip .tt-formula {
   margin-top: 6px;
   padding-top: 6px;
@@ -885,6 +1033,7 @@ tr.detail > td {
 }
 
 /* ---- open-hedge banner ---- */
+
 #hedge-banner {
   margin-bottom: var(--gap);
   display: grid;
@@ -913,10 +1062,12 @@ tr.detail > td {
 .hedge-row.runway {
   border-left-color: var(--series-1);
 }
+
 .hedge-row.wind_down {
   border-left-color: var(--warning);
   background: var(--noactivity-bg);
 }
+
 .hedge-row.expiring {
   border-left-color: var(--critical);
   background: var(--closed-bg);
@@ -938,12 +1089,15 @@ tr.detail > td {
   border: 1px solid currentColor;
   white-space: nowrap;
 }
+
 .hedge-row.runway .hedge-chip {
   color: var(--series-1);
 }
+
 .hedge-row.wind_down .hedge-chip {
   color: var(--warning);
 }
+
 .hedge-row.expiring .hedge-chip {
   color: var(--critical);
 }
@@ -960,10 +1114,12 @@ tr.detail > td {
   gap: 6px 14px;
   flex-wrap: wrap;
 }
+
 .hedge-econ .pos {
   color: var(--success-text);
   font-weight: 600;
 }
+
 .hedge-econ .neg {
   color: var(--critical);
   font-weight: 600;
@@ -985,7 +1141,6 @@ tr.detail > td {
   margin-bottom: 14px;
 }
 
-/* an open long option leg still on the books, in the Trade Log table */
 #tradelog-table tr.open-hedge td {
   background-color: var(--noactivity-bg);
   box-shadow: inset 3px 0 0 var(--warning);
@@ -996,10 +1151,14 @@ tr.detail > td {
   transition: opacity 0.15s;
 }
 
+/* ---------------- responsive layout ---------------- */
+
 @media (max-width: 720px) {
-  .grid.two {
+  .grid.two,
+  .analytics-grid {
     grid-template-columns: 1fr;
   }
+
   .chip-row {
     max-width: 100%;
   }
@@ -1048,8 +1207,6 @@ tr.detail > td {
   margin-bottom: 14px;
 }
 
-/* Portfolio insights sit inside the Performance card, under the tiles -- no
-   nested border/box, just a divider from the tile grid above. */
 #performance-card .tiles {
   margin-bottom: 0;
 }
@@ -1120,9 +1277,6 @@ tr.detail > td {
   min-width: 0;
 }
 
-/* Closed wheels are salmon and dormant (NO_ACTIVITY) wheels are amber in the
-   dropdown list. Only the options are tinted -- styling the <select> itself
-   bleeds its background onto every option. */
 #tradelog-pick option {
   background-color: var(--surface-1);
   color: var(--text-primary);
@@ -1140,10 +1294,6 @@ tr.detail > td {
   min-width: 34px;
 }
 
-/* Wheel stage badge: a small ring that spins clockwise while a leg is
-   actually open (blue = cash-secured put, aqua = covered call), and sits still
-   in gray once the wheel is CLOSED or amber while it is merely dormant
-   (NO_ACTIVITY) -- see wheelStageOf() in app.js. */
 .wheel-stage {
   display: flex;
   align-items: center;
@@ -1168,7 +1318,7 @@ tr.detail > td {
 
 .wheel-stage-ring .arc {
   stroke: var(--text-muted);
-  stroke-dasharray: 70 31; /* ~70% of the r=16 circumference (~100.5), leaving a gap */
+  stroke-dasharray: 70 31;
   transform-origin: center;
   transition: stroke 0.25s ease;
 }
@@ -1177,11 +1327,11 @@ tr.detail > td {
   animation: wheel-stage-spin 3s linear infinite;
 }
 
-/* Positive rotation = clockwise. */
 @keyframes wheel-stage-spin {
   from {
     transform: rotate(0deg);
   }
+
   to {
     transform: rotate(360deg);
   }
@@ -1313,16 +1463,12 @@ tr.detail > td {
   font-style: italic;
 }
 
-/* Rows for a position that is no longer active -- both the open (STO/BTO) and
-   its closes (BTC/STC/expiry/assignment), plus sales -- get a light-grey row
-   background so the still-active trades stand out. Font colours are untouched. */
 #tradelog-table tr.settled td {
   background-color: var(--mid);
 }
 
-/* Stock fills (Buy / Sell Shares) read blue so they stand apart from the
-   option rows in the Type column. */
 #tradelog-table td.shares-type {
   color: var(--series-1);
   font-weight: 600;
 }
+

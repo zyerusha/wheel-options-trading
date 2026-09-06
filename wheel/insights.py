@@ -1,14 +1,14 @@
 """Plain-rules commentary: what is working, where to improve.
 
 Two entry points, same shape (``{"strengths": [...], "improvements": [...]}``)
-and same house style -- no model, no network, every line a threshold on figures
+and same house style — no model, no network, every line a threshold on figures
 :mod:`wheel.metrics` / :mod:`wheel.api` already produce, phrased as advice.
 Strengths keep a curated priority order; improvements are ranked by dollar
 impact so the costliest problem shows first.
 
-* :func:`wheel_insights` -- one wheel (Trade Log), up to two strengths / three
+* :func:`wheel_insights` — one wheel (Trade Log), up to two strengths / three
   improvements.
-* :func:`portfolio_insights` -- the whole book (Dashboard), up to three each,
+* :func:`portfolio_insights` — the whole book (Dashboard), up to three each,
   working purely off the already-serialized payload dicts.
 """
 
@@ -57,7 +57,7 @@ def wheel_insights(
                 f"{held:,.0f} shares still held" if held > 1e-9 else f"realized {_money(net)}"
             )
             line = (
-                f"Plain buy-and-hold of {cycle.underlying} -- no option has ever been written "
+                f"Plain buy-and-hold of {cycle.underlying}, no option has ever been written "
                 f"against it ({state}). Not a wheel; its P&L counts but the wheel-return "
                 "ratios do not apply. Selling a covered call turns it into one."
             )
@@ -119,18 +119,18 @@ def wheel_insights(
 
     if premium_covers_basis:
         strengths.append(
-            "Premium and profit already banked exceed your remaining share cost -- "
+            "Premium and profit already banked exceed your remaining share cost, "
             "anything the stock does from here is upside."
         )
     if above_water:
         strengths.append(
             f"Shares sit above the wheel's break-even ({_price(break_even_price)}) "
-            f"at {_price(current_price)} -- you could close flat-plus right now."
+            f"at {_price(current_price)}, you could close flat-plus right now."
         )
     if metrics.win_rate_pct is not None and metrics.win_rate_pct >= 70 and decided >= 5:
         strengths.append(
             f"{metrics.wins} of {decided} closed legs finished green "
-            f"({metrics.win_rate_pct:.0f}% win rate) -- strike selection is working."
+            f"({metrics.win_rate_pct:.0f}% win rate), strike selection is working."
         )
     if metrics.wheel_core_realized_pl > 50 and metrics.premium_received > 0:
         kept = 100 * metrics.wheel_core_realized_pl / metrics.premium_received
@@ -140,7 +140,7 @@ def wheel_insights(
         )
     if metrics.hedge_realized_pl > 50:
         strengths.append(
-            f"Protective/long options netted +{_money(metrics.hedge_realized_pl)} -- "
+            f"Protective/long options netted +{_money(metrics.hedge_realized_pl)}, "
             "the hedge more than paid for itself."
         )
     if (
@@ -161,7 +161,7 @@ def wheel_insights(
         improvements.append(
             (
                 metrics.wheel_core_realized_pl,
-                "Buying short options back has cost more than they collected -- the core "
+                "Buying short options back has cost more than they collected, the core "
                 f"wheel is {_money(metrics.wheel_core_realized_pl)}. Letting more puts "
                 "expire, or taking assignment, keeps more premium than rolling losers at a debit.",
             )
@@ -182,7 +182,7 @@ def wheel_insights(
         improvements.append(
             (
                 None,
-                f"{shares_held:,.0f} shares are held with no covered call written -- that "
+                f"{shares_held:,.0f} shares are held with no covered call written, that "
                 f"capital earns nothing right now. A call{tail} adds premium against stock "
                 "you already own.",
             )
@@ -227,7 +227,7 @@ def wheel_insights(
                 (
                     metrics.stock_unrealized_pl,
                     f"Puts were added at falling strikes ({strikes[0]:g} -> {strikes[-1]:g}) as "
-                    f"the stock dropped -- averaging down deepened the unrealized loss "
+                    f"the stock dropped, averaging down deepened the unrealized loss "
                     f"({_money(metrics.stock_unrealized_pl)}).",
                 )
             )
@@ -236,7 +236,7 @@ def wheel_insights(
         improvements.append(
             (
                 None,
-                "Some held shares pre-date the export, so their cost basis is unknown -- "
+                "Some held shares pre-date the export, so their cost basis is unknown; "
                 "break-even and stock P&L here are estimates.",
             )
         )
@@ -245,7 +245,7 @@ def wheel_insights(
             (
                 None,
                 "Committed capital uses a strike-based proxy for shares bought before the "
-                "export -- the ROC figures are approximate.",
+                "export, the ROC figures are approximate.",
             )
         )
 
@@ -269,22 +269,22 @@ def portfolio_insights(
     open_hedges: list[dict],
     *,
     wheel_return: dict | None = None,
-    benchmark: dict | None = None,  # whole-account XIRR block; accepted but not used -- see below
+    benchmark: dict | None = None,  # whole-account XIRR block; accepted but not used — see below
     wheel_state: dict | None = None,
 ) -> dict[str, list[str]]:
     """Book-level commentary for the Dashboard, from the already-built payload.
 
-    Everything here reads serialized dicts -- ``portfolio`` (the filtered
+    Everything here reads serialized dicts — ``portfolio`` (the filtered
     ``PortfolioMetrics``), the full-history Trade Log ``wheels``, the
-    ``open_hedges`` list, and the wheel-only XIRR block -- so it is trivially
+    ``open_hedges`` list, and the wheel-only XIRR block — so it is trivially
     testable and never re-derives a figure the API already computed.
 
     ``benchmark`` (the *whole-account* XIRR vs SPY buy-and-hold) is deliberately
     not turned into an insight: it blends in idle cash and deliberate
     buy-and-hold holdings and rests on a hand-configured opening balance, so a
     "trails SPY" line there says nothing about the wheel. The wheel-vs-SPY
-    comparison that *is* apples-to-apples -- the same dollars, same dates, put
-    in SPY instead -- comes from ``wheel_return`` and is the first strength.
+    comparison that *is* apples-to-apples — the same dollars, same dates, put
+    in SPY instead — comes from ``wheel_return`` and is the first strength.
     """
     portfolio = portfolio or {}
     wheels = wheels or []
@@ -301,7 +301,7 @@ def portfolio_insights(
     wr_bench = _num((wr.get("benchmark") or {}).get("xirr_pct"))
     if wr.get("available") and wr_xirr is not None and wr_bench is not None and wr_xirr - wr_bench >= 3:
         added = _num(wr.get("value_added"))
-        added_s = f" -- {_money(added)} ahead" if added else ""
+        added_s = f", {_money(added)} ahead" if added else ""
         bench_name = (wr.get("benchmark") or {}).get("name", "SPY")
         strengths.append(
             f"On the capital actually committed to the wheel, its money-weighted return is "
@@ -334,7 +334,7 @@ def portfolio_insights(
     if runway_hedges:
         names = ", ".join(dict.fromkeys(h["underlying"] for h in runway_hedges[:3]))
         strengths.append(
-            f"{len(runway_hedges)} protective hedge(s) in place with runway ({names}) -- "
+            f"{len(runway_hedges)} protective hedge(s) in place with runway ({names}), "
             "downside is capped while premium keeps coming in."
         )
 
@@ -372,7 +372,7 @@ def portfolio_insights(
             (
                 -hold_amt * 0.01,
                 f"{_money(hold_amt)} of held shares across {hold_n} positions have no covered "
-                "call written -- that capital collects no premium. Selling calls at or above "
+                "call written, that capital collects no premium. Selling calls at or above "
                 "break-even adds income against stock already owned.",
             )
         )
@@ -409,7 +409,7 @@ def portfolio_insights(
         improvements.append(
             (
                 None,
-                f"{len(urgent)} protective hedge(s) are inside the wind-down window ({names}) -- "
+                f"{len(urgent)} protective hedge(s) are inside the wind-down window ({names}), "
                 "sell them for their remaining time value or roll them out before they decay.",
             )
         )
@@ -422,7 +422,7 @@ def portfolio_insights(
             (
                 None,
                 f"{len(est)} active wheels ({', '.join(est)}) price capital with a strike-based "
-                "proxy for pre-export shares -- their ROC figures are approximate.",
+                "proxy for pre-export shares, their ROC figures are approximate.",
             )
         )
 

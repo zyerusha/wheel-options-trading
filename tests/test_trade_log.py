@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests.test_engine import tx  # noqa: E402
 from wheel.api import Dashboard, _trade_log_entry  # noqa: E402
 from wheel.engine import build_cycles  # noqa: E402
-from wheel.parser import ASSIGNED, BTC, BTO, EXPIRED, OTHER, SELL_STOCK, STC, STO  # noqa: E402
+from wheel.parser import ASSIGNED, BTC, BTO, BUY_STOCK, EXPIRED, OTHER, SELL_STOCK, STC, STO  # noqa: E402
 
 
 def _trade_log(transactions, names=None, prices=None) -> dict:
@@ -55,6 +55,44 @@ class TestTransactionRows(unittest.TestCase):
         # Cumulative is the running sum.
         self.assertEqual(sell["running_cash_flow"], 199.34)
         self.assertAlmostEqual(buy["running_cash_flow"], 159.32)
+
+    def test_share_row_greys_when_its_own_lot_is_sold_not_only_when_cycle_flat(self):
+        rows = _trade_log(
+            [
+                # CSP -> assigned keeps this one continuous wheel cycle alive
+                # while shares rotate through it.
+                tx("2025-06-02", STO, "-GILD250620P100", -1, 2.0, 200.0, row_id=1),
+                tx("2025-06-20", ASSIGNED, "-GILD250620P100", 1, None, 0.0, row_id=2, as_of="2025-06-20"),
+                tx("2025-07-10", BUY_STOCK, "GILD", 100, 118.0, -11800.0, row_id=3),
+                tx("2025-07-20", BUY_STOCK, "GILD", 100, 119.0, -11900.0, row_id=4),
+                # FIFO: retires the assigned 2025-06-20 lot.
+                tx("2025-08-01", SELL_STOCK, "GILD", -100, 130.0, 13000.0, row_id=5),
+                # FIFO: retires the 2025-07-10 lot.
+                tx("2025-08-10", SELL_STOCK, "GILD", -100, 131.0, 13100.0, row_id=6),
+                # Bought again -- the cycle is NOT flat, it still holds 200 shares.
+                tx("2025-09-01", BUY_STOCK, "GILD", 100, 125.0, -12500.0, row_id=7),
+            ]
+        )
+        (wheel,) = rows["wheels"]
+        self.assertEqual(wheel["status"], "ACTIVE")
+        self.assertEqual(wheel["shares_held"], 200.0)
+
+        buys = [r for r in wheel["transactions"] if r["type"] == "Buy Shares"]
+        self.assertEqual([b["date"] for b in buys], ["2025-07-10", "2025-07-20", "2025-09-01"])
+        # The 2025-07-10 lot is gone even though the cycle still holds shares -> greyed.
+        self.assertTrue(buys[0]["is_settled"])
+        # The 2025-07-20 and 2025-09-01 lots are still held.
+        self.assertFalse(buys[1]["is_settled"])
+        self.assertFalse(buys[2]["is_settled"])
+
+        # The assigned lot is also gone -> its row greys too.
+        assigned = [r for r in wheel["transactions"] if r["type"] == "Shares Assigned"]
+        self.assertEqual(len(assigned), 1)
+        self.assertTrue(assigned[0]["is_settled"])
+
+        # A sale is always settled on arrival.
+        sells = [r for r in wheel["transactions"] if r["type"] == "Sell Shares"]
+        self.assertTrue(all(s["is_settled"] for s in sells))
 
     def test_dividend_row_is_settled_immediately(self):
         rows = _trade_log(

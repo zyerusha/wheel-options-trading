@@ -32,7 +32,7 @@ Three properties of export A shape the whole design:
 per-share premium and `Price ($)` holds the signed contract count. The parser does
 not hard-code this — `_detect_swapped_columns` scores both readings and picks the
 winner, so a corrected export still parses. Note that the obvious test does *not*
-work: `Amount = −contracts × price × 100 − fees` is symmetric in the two fields, so
+work: `Amount = -contracts × price × 100 - fees` is symmetric in the two fields, so
 it validates magnitude but can never reveal orientation. The signals that do
 discriminate are that contract counts are whole numbers, quoted prices are strictly
 positive, and a sale pairs a negative quantity with positive cash. On this file the
@@ -139,7 +139,7 @@ lower-strike long put to cap the tail risk, then keep writing puts over the mont
 hedge is alive so the accumulated premium pays for it — winding the hedge down ~2 months
 before expiry to salvage its remaining time value. The failure mode is giving up early:
 closing the hedge after a few weeks locks in its decay with little premium collected
-against it (the TQQQ Joint cycle — $633 hedge closed at −$230 after ~5 weeks).
+against it (the TQQQ Joint cycle — $633 hedge closed at -$230 after ~5 weeks).
 
 `Dashboard._build_open_hedges` (`wheel/api.py`, filter-independent like the Trade Log)
 surfaces every **open, unpaired long option leg** — `leg.is_open and leg.side == LONG`,
@@ -172,18 +172,25 @@ row highlighted for as long as it stays open (`is_open_long` on the row).
 ### Open option positions table
 
 `Dashboard._build_open_positions` (`wheel/api.py`, filter-independent like the Trade Log
-and the hedge banner) emits one row per **open short option leg** — `leg.is_open and
-leg.side == SHORT and leg.strategy in (CSP, COVERED_CALL)` — across every cycle. Plain
-buy-and-hold share lots and long-only hedges are excluded (the hedge banner covers the
-latter). `_open_position_row` computes, per leg:
+and the hedge banner) emits one row per **open option leg** across every cycle — a short
+covered call / cash-secured put (`leg.side == SHORT and leg.strategy in (CSP,
+COVERED_CALL)`), **or** any open long put / call (`leg.side == LONG`), i.e. the same
+protective hedges and directional punts the hedge banner reasons about, shown here as
+compact data rows. Plain buy-and-hold share lots are excluded. `_open_position_row`
+computes, per leg:
 
-- `type` — `CSP` for a short put, `CC` for a short call.
-- `net_premium` — `leg.open_premium`, the credit still standing on the un-closed portion
-  (fees already netted in). `premium/share` = that ÷ (contracts × 100).
-- `breakeven` — **this contract alone.** Short put: `strike − premium/share`; short call:
-  `cost_basis − premium/share`, where `cost_basis` is the known-basis mean of the cycle's
+- `type` — `CSP` / `CC` for a short put / call, `LP` / `LC` for a long put / call.
+- `side` — `"SHORT"` or `"LONG"`. The frontend puts long rows on an amber
+  (`--long-bg`) background — the same `--series-4` "long-option debit" hue at background
+  weight — as the "premium was *paid*" cue, reinforced by a negative `net_premium`.
+- `net_premium` — `leg.open_premium`, the cash still standing on the un-closed portion
+  (fees already netted in): a credit (positive) for a short leg, a debit (negative) for
+  a long one. `premium/share` = that ÷ (contracts × 100).
+- `breakeven` — **this contract alone.** Short put: `strike - premium/share`. Short call:
+  `cost_basis - premium/share`, where `cost_basis` is the known-basis mean of the cycle's
   still-held lots (`None`, shown as `—`, when only pre-history unknown-basis shares back
-  the call).
+  the call). Long put: `strike - cost/share`; long call: `strike + cost/share` — the
+  buyer's at-expiry break-even.
 - `wheel_breakeven` — **the whole cycle's** campaign break-even price, looked up by
   `cycle_id` from the already-built Trade Log's `wheels` (the Trade Log's own "Break-even
   price": raw share cost less every dollar the cycle has banked — premium, realized P/L,
@@ -193,18 +200,25 @@ latter). `_open_position_row` computes, per leg:
 Both break-even cells carry one shared color in the frontend: is the **entire wheel**
 in profit or underwater? That is `last_close` vs. `wheel_breakeven` (green at or above,
 red below) — for a share-less CSP wheel, which has no `wheel_breakeven`, its own
-`breakeven` stands in. Uncolored when the reference or the price is missing. The
+`breakeven` stands in. Uncolored when the reference or the price is missing, and also
+for a **standalone directional long** (a long leg in a non-wheel cycle): its break-even
+isn't a wheel-profit signal, and a long put/call flips which side of it is "good." The
 per-contract `breakeven` number is still shown; only its color follows the whole wheel.
-- `moneyness_pct` — signed, vs `last_close`: `+` = out-of-the-money cushion, `−` =
-  in-the-money (assignment risk). `in_the_money` is just `moneyness_pct < 0`.
+- `moneyness_pct` — signed, vs `last_close`: `+` = strike out-of-the-money, `-` =
+  in-the-money. `in_the_money` is just `moneyness_pct < 0`. A raw geometric reading,
+  side-agnostic — the frontend colors it green when *favorable*, which is OTM for a
+  short (expires worthless, keep the premium) but ITM for a long (has intrinsic value).
 - `last_close` / `last_close_pct` — latest close and its day-over-day % change, from
   `Dashboard._prev_closes` (the prior trading day's close, captured alongside
   `_price_cache` in `_current_prices` — whose ticker set was widened to include every
   cycle with an open leg, so a shares-free CSP wheel still gets a mark).
 - `annualized_yield_pct` — `net_premium ÷ (strike × 100 × contracts) × (365 ÷
-  contract_days)`, where `contract_days` is the leg's own open-to-expiry span.
-- `signed_contracts` — negative (short); **not** color-coded, unlike every other
-  numeric column.
+  contract_days)`, where `contract_days` is the leg's own open-to-expiry span. `None`
+  for a long leg (premium paid is a cost, not a yield on committed collateral); so is
+  `collateral`.
+- `signed_contracts` — negative for a short leg, positive for a long one (the Trade
+  Log's `signed_quantity` convention); **not** color-coded, unlike every other numeric
+  column.
 
 The dashboard renders `data.open_positions` as a sortable table (`#open-positions-table`,
 `renderOpenPositions` in `app.js`) inside the Performance card, directly under *Portfolio
@@ -216,6 +230,90 @@ Symbol header is a plain A→Z / Z→A of the groups (rows in expiry order); nul
 sink. Default is symbol A→Z, expiry ascending. The Combined view concatenates each
 account's rows via `_combine_open_positions` (`wheel/accounts.py`), `cycle_id`
 account-prefixed like the rest.
+
+### Covered-call candidates table
+
+`Dashboard._build_cc_candidates` (`wheel/api.py`, filter-independent) lists every
+position **holding shares with no covered call currently written against it**. Lots of
+**≥ 100 shares** are the actionable ones — a call could be written — and lead the
+table; smaller lots follow (`meets_threshold == False`) for visibility only, with
+`target_cc_strike` and `contracts_available` both `None`. Built entirely from the
+already-assembled Trade Log `wheels` (share count, cost basis, both break-evens, last
+close) and `open_positions` (a cycle is skipped when it has a row of `type == "CC"`);
+an open cash-secured put does **not** disqualify it, since a CSP ties up cash, not the
+shares. Plain buy-and-hold lots qualify too (their `wheel` column is blank).
+
+The computed column is **`target_cc_strike`** — `max(cost_basis_per_share,
+break_even_per_share, break_even_price, last_close)` over whichever are known, then
+**rounded up to the next $0.50** (real strikes sit on 0.50-or-wider increments, and
+rounding up keeps it a valid floor). It is the lowest strike worth writing a call at:
+called away there, the shares sell for at least their cost (every premium already
+collected kept) and never below the current market. It is deliberately a *floor*, not
+a recommendation. `None` only when nothing at all is known; a bare last close is
+enough. The raw `cost_basis_per_share` that feeds it is its own **Avg Cost Basis**
+column. **`contracts_available`** is the covered-call position that could be opened,
+carried **negative** (a short call: 175 shares → `-1`); the **Shares** column shows
+the raw current count, which can be fractional — a fractional-share sale or DRIP dust
+leaves an odd remainder (e.g. an IRA QQQ lot reads 151.806, a 0.194-share sale short
+of 152), harmless for a 100-lot call, so the frontend rounds it for the eye and keeps
+the exact figure in the tooltip.
+
+A **Gain / Loss** column carries the shares' total unrealized P/L —
+`shares × (last_close − cost_basis_per_share)` — with the percent beside it, green
+when positive and red when negative. It is measured against the *raw* average cost
+basis; premium already banked is not netted in (that is what the break-even columns
+are for). **Sector** and **Earnings** (`sector` / `earnings_date` /
+`days_to_earnings`) come from `wheel.reference` exactly as the CSP-candidates table's
+do — the frontend ambers the whole row when earnings land within 14 days, via the
+shared `earnings-warn` class and `earningsCell` helper.
+
+Rendered by `renderCcCandidates` (`state.ccCandSort`) as a plain sortable table
+directly under *Open option positions*; hidden when empty. The **Current Wheel**
+column (after Shares) renders the cycle id as a `wheelLink` — click or Enter/Space
+sets `state.tradeLogCycleId` to that exact id and `switchTab('tradelog')`, so it
+jumps straight to that wheel's Trade Log. The Combined view concatenates each
+account's rows via `_combine_cc_candidates`, `cycle_id` / `wheel` account-prefixed
+like the rest — which is also why the click can target the wheel by exact id
+without `matchTradeLogWheel`'s date-span fallback.
+
+Directly below it, **`renderCspCash`** shows a two-tile *Cash for Cash-Secured Puts*
+card — the dry powder for writing a new CSP. The tiles are pure frontend: liquid
+`cash_total` from the Positions snapshot (never unrealized gains or equity value)
+minus `wheel_state.buckets.puts.amount` (collateral already securing open puts, a
+hold against that same cash), floored at 0, plus its share of `total_value`. Placed
+here so *Open option positions* (what's on now) and the two "what we could do next"
+cards (CC candidates, CSP cash) read as one block. Hidden without a Positions snapshot.
+
+The same card carries a **CSP-candidates table** from `data.csp_candidates`
+(`Dashboard._build_csp_candidates`, filter-independent): one row per ticker this
+account has wheeled at a **net profit** in the past — realized P/L and wheel count
+summed over every wheel on it, plus a wheel-count-weighted mean of their annualized
+ROC as a ranking hint. `_last_closes` (the two-pass fetch `_current_prices` uses,
+factored out) pulls a current close for each, since these are usually tickers the
+account is no longer in and so absent from `_current_prices`'s set. The frontend
+then keeps only rows whose "Qty" — `floor(cash ÷ (last_close × 100))`, a rough
+at-the-money sizing — is at least 1: a name the free cash couldn't secure a single
+put on doesn't make the cut.
+
+Each row also carries:
+
+- **`strong`** — the ★ "Signal" mark: true if *any* of its three neighboring
+  columns clears its bar — `monthly_premium_pct` (gross premium / avg collateral per
+  30 days) ≥ 1%, `ppd` (blended option P/L ÷ days) ≥ $20, or `avg_annualized_roc_pct`
+  ≥ 30% (`CSP_*_STRONG` constants in `wheel/api.py`). All three are shown as columns,
+  so the mark is a summary, not the only place the numbers live. A heuristic, tuned
+  by eye.
+- **`sector`** — from `wheel.reference.SECTOR`, a hand-maintained static map (no feed
+  carries it). Unmapped → `None` → blank; never guessed. For diversification.
+- **`earnings_date` / `days_to_earnings`** — from an optional `earnings.json`
+  (`{"TICKER": "YYYY-MM-DD"}`) in the project root or `data/`, loaded by
+  `wheel.reference.load_earnings` (malformed rows skipped, absent file → empty). The
+  frontend ambers the whole row when `0 ≤ days_to_earnings ≤ 14` — don't sell a put
+  into an earnings print.
+
+The Combined view merges by ticker via `_combine_csp_candidates` and re-drops any
+that nets negative across accounts; `strong` is recomputed from the merged ROC and
+the max per-account premium/PPD, `sector`/`earnings` taken as the ticker fact they are.
 
 ### Insights
 
@@ -320,7 +418,7 @@ changes every time a put rolls to a different strike:
 - covered call → **nothing**; the capital is already in the shares
 - short call with no tracked shares → `strike × 100`, as a labelled proxy
 - a short and a long leg paired into a `Spread` (see "Credit spreads" below) →
-  `|short strike − long strike| × 100 × paired contracts`, in place of the short
+  `|short strike - long strike| × 100 × paired contracts`, in place of the short
   leg's own full CSP/covered-call figure for the paired portion
 
 That last un-paired case covers eight tickers here: calls written against stock
@@ -369,29 +467,109 @@ would rewrite `capital_deployed_now` for a book that has closed. The fix is
 provably display-only, since the time-weighted average already skipped zero days
 and a peak is a maximum.
 
+### Color vocabulary
+
+One hue per capital concept, shared verbatim by the **Capital deployed** chart, the
+**Where the wheel is right now** donut nested in the same card, the **Wheel
+timelines** chart and the Trade Log **wheel-stage** ring — so a reader who learns
+"shares are orange" on one chart is never contradicted by another:
+
+| concept | token | hue |
+|---|---|---|
+| Put collateral / cash-secured puts | `--series-1` | blue |
+| Idle shares (cost basis) / holding shares — held, no call written | `--series-2` | orange |
+| Covered-call shares — real cost basis (solid) or the pre-export strike estimate (faded) | `--series-3` | aqua |
+| Long-option debit / protective hedges | `--series-4` | yellow |
+| Cash (idle / not deployed) | `--text-muted` | light grey |
+| Unrealized | `--text-secondary` | mid grey |
+| Total (committed / value) line | `--text-primary` | ink |
+
+`--series-4` yellow and `--series-2` orange are the one weak pair (see below), so
+every ring/stack that uses both keeps them non-adjacent. The donut's wedge order
+is the wheel's own progression — sell puts → hold shares → write calls → hedge —
+which also leaves the hues in plain slot order 1·2·3·4. This realigned two charts
+that had drifted: the donut had covered calls in orange and holding in aqua (the
+reverse of everywhere else), and the timeline drew held-share bars aqua.
+
 ### Charting committed capital
 
-Three bands, stacked largest-and-steadiest first: shares held, put collateral, then
-short calls with no tracked shares. Color is bound to the series, never to stack
-position, so reordering or filtering never repaints a survivor.
+Six bands, four hues, stacked largest-and-steadiest first: **Idle shares (cost
+basis)** (orange, on the baseline), then the two **Covered-call shares** bands —
+real cost basis (aqua) and the pre-export strike estimate (same aqua, drawn a
+touch lighter — `BAND_WASH × 0.8` — with a dashed cap, a visual "this figure is a
+guess" flag) — then **Put collateral** (blue), then **Long-option debit** and
+**Net spread collateral** (both yellow) on top. The two aqua bands sit adjacent
+so they read as one "covered-call shares" group, exactly as the donut's two
+covered-call wedges do. Color is bound to the series, never to stack position.
 
-**Long-option debit is counted but not banded.** It peaks at 0.4% of committed
-capital — about one pixel — so a legend swatch for it would point at nothing
-findable. It stays in the tooltip, the table and a legend note. Dropping it also
-leaves the stack on palette slots 1–3, the only subset validated all-pairs in both
-modes; the slot-4 yellow it gave up sat next to slot-2 orange, the documented weak
-pair.
+The idle-vs-call-backing split of held-share cost basis comes from
+`CapitalPoint.idle_stock_basis`; `_capital_point` serializes it as `idle_stock`
+plus a derived `call_stock` (= `stock - idle_stock`). `wheel_state_breakdown`'s
+`parts` reads the *same* `idle_stock_basis` rather than re-deriving a
+`has_open_covered_call` check, so the chart band and the donut wedge for "shares
+backing a call at real cost basis" are guaranteed to agree to the cent (they did
+not, before — a cycle with an untracked-shares call plus separate idle tracked
+shares split differently in the two functions).
 
-**Spread collateral gets the same treatment, for a different reason.** Unlike
-long-option debit it is not always negligible, but giving it a fourth band would
-reopen exactly the weak-color-pair problem the three existing bands were
-deliberately validated against. It is counted in the total and shown in the
-tooltip, the table and its own legend note, never banded.
+**Every component is banded — nothing is "counted but invisible".**
+Long-option debit peaks near 0.4% of committed capital (about a pixel) and net
+spread collateral is often $0, so both are usually a hairline; a 2px cap in the
+band's own hue keeps even a one-pixel band visible. Yellow (`--series-4`) is
+placed **above** put collateral so it never touches the orange idle-shares band
+— `--series-4` / `--series-2` is the one documented weak pair, and this is the
+only stack that uses slot 4. A band that is $0 on the latest day draws nothing
+and is left out of the color key too.
 
-**That makes the total line load-bearing, not decoration.** The gap between the top
-band and the line is exactly the excluded debit, and on 26 days across two tickers
-the capital committed is *entirely* long debit — every band is zero while the total
-is not. Without the line those days read as "nothing deployed", which is false.
+The chart's own legend is just that **color key** — swatch + band name, no
+figures — plus one situational note (share-mode hint, or "dots = N Positions
+snapshots" when the interpolated Cash/Unrealized band is shown). The figured
+breakdown is not repeated here; it lives once, in the donut's legend below.
+
+The six committed-capital components are named identically everywhere they
+appear — the color key, the table headers, the aria text, every "Capital
+deployed" / "Initial cap" tooltip formula, and the donut's wedges and legend:
+**Idle shares (cost basis), Covered-call shares (cost basis), Covered-call
+shares (strike estimate), Put collateral, Long-option debit, Net spread
+collateral**. `CAPITAL_BANDS` in `wheel/static/app.js` is the single source of
+truth; `CAPITAL_TABLE_HEAD`, `CAPITAL_COMPONENT_LABELS` and `CAPITAL_FORMULA_SUM`
+are derived from it, and `WHEEL_STATE_COMPONENTS` mirrors the same labels.
+
+The **wheel-state donut** ("Where the wheel is right now") shows the *same* total
+as the Capital deployed chart, cut by wheel phase instead of by instrument, and
+is nested in the same card as a `.card-subsection` directly below the history —
+one card, historical stack on top, current allocation below. `drawWheelState`
+hides only `#wheel-state-block` when there is nothing to show, never the whole
+card. It is a **single ring, one wedge per leaf component** (`wheel_state.parts`
+from `wheel_state_breakdown`), not a summary + detail nesting: for four of the
+six phases a summary ring would just repeat one
+wedge, so the phase grouping is carried by shared color + adjacency instead, and
+spelled out in the legend (a bold phase subtotal above its indented components)
+and the table (Phase / Component / Capital / Share).
+
+**The donut carries the only figured breakdown.** The Capital deployed chart
+above shows just a color key — swatch + band name, no numbers — because the
+donut's `.legend-stack` (built by the shared `capitalBreakdownRow`) already is
+that breakdown: the six components use the *same labels* as the six bands, then
+a **Total committed** subtotal (solid rule), then **Cash** / **Unrealized**,
+then **Total value** (dashed rule), each figure rounded to whole dollars and
+summed from the rounded parts so the column always adds up on screen. It
+reconciles to the chart's latest day to the cent; only Cash / Unrealized are
+dated to the (possibly older) Positions snapshot.
+
+Every `WHEEL_STATE_COMPONENTS` label matches its `CAPITAL_BANDS` twin
+("Covered-call shares (cost basis)", not "Backing shares…"), and `displayLabel`
+always uses the component label, so a wedge, its legend row and the matching
+band's key entry read identically. The phase name survives only as the bold
+group header over a multi-component phase (Covered-call shares) and in the
+table's Phase column. `parts` reconciles to `buckets` key-for-key (see
+`_WHEEL_STATE_PART_KEYS`); `_combine_wheel_state` sums it the same way it sums
+`buckets`.
+
+**The total line stays load-bearing.** Every component is banded now, so it
+normally rests on the top cap, but it is still the ink reference the Cash /
+Unrealized fill builds from, and on the 26 days across two tickers whose capital
+is *entirely* a hairline long-debit band it is the firmest mark. Without it
+those days read as "nothing deployed", which is false.
 
 Two rendering details that are easy to get wrong, and were:
 
@@ -453,7 +631,7 @@ the two addends purely so a caller can show that split; the model has no
 concept of "this leg hedges that one", so every non-core leg counts as a hedge.
 Capital for a long leg is the actual debit paid, decaying to $0 on close, never
 notional -- and a short leg paired into a same-day `Spread` (see "Credit spreads"
-above) reports the netted `|short strike − long strike| × 100` collateral for its
+above) reports the netted `|short strike - long strike| × 100` collateral for its
 paired portion instead of the full CSP/covered-call figure. An unpaired short leg
 -- no same-day long partner, or an ambiguous multi-candidate group -- is completely
 unaffected and still gets full collateral, exactly as before this feature existed.
@@ -534,7 +712,7 @@ or P/L date series, nothing here is cumulative across periods).
 `ShareLot.basis_per_share` is the raw tax-lot basis -- the bare assignment or
 purchase price, exactly what a 1099-B would show -- and nothing in this feature
 touches it. `net_adjusted_cost_basis()` (`wheel/metrics.py`) is a second, separate
-number: the wheel's own economic break-even, `strike − net option cash flow/share`,
+number: the wheel's own economic break-even, `strike - net option cash flow/share`,
 accumulated over the *whole cycle's* option activity (every roll, every covered
 call sold after assignment), not just the leg that produced the lot. When a cycle
 holds more than one concurrent lot at different strikes, the cycle's net cash flow
@@ -679,7 +857,7 @@ verbatim fails on three axes that vary between exports of the same account:
 - spacing: `BRIGHTHOUSE FINL INC NOV 21 25` vs `BRIGHTHOUSE FINL INCNOV 21 25`;
 - the as-of date format: `as of Sep-17-2025` vs `as of 2025-09-17`;
 - the cash columns: one PLTR buy-back downloaded twice shows `Fees 0.02 / Amount
-  −261.32` in the newer file and `0.03 / −261.33` in the older — Fidelity re-rounds
+  -261.32` in the newer file and `0.03 / -261.33` in the older — Fidelity re-rounds
   commission, fees and the net amount between downloads.
 
 So the key strips all whitespace, replaces the whole as-of phrase (the parsed
