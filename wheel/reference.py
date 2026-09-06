@@ -13,6 +13,12 @@ candidate tables), so they live here:
   "YYYY-MM-DD", ...}``) from the project root or ``data/``. Absent file =>
   empty map => the Earnings column is blank and nothing is flagged. Keep it
   current by hand; a date in the past just reads as stale.
+
+* ``load_fundamentals`` -- reads an optional ``fundamentals.json``
+  (``{"TICKER": {"type": "common", "market_cap_b": 12.3, "avg_vol_10d_m":
+  4.1}}``) the same way. Feeds the CSP-candidate filters (must be common
+  stock, market cap >= $1B, 10-day average volume > 1M). A missing ticker or
+  null field is "unvetted" -- the row still shows, flagged -- never hidden.
 """
 
 from __future__ import annotations
@@ -102,6 +108,19 @@ def sector_of(ticker: str) -> str | None:
     return SECTOR.get(ticker.upper())
 
 
+# Fallbacks for the CSP-candidate filter when ``fundamentals.json`` has no
+# ``type`` for a ticker. Plain ETFs are allowed to be wheeled; leveraged /
+# inverse ETFs and closed-end / mutual funds are not.
+def sector_is_leveraged_etf(ticker: str) -> bool:
+    bucket = SECTOR.get(ticker.upper()) or ""
+    return "Leveraged" in bucket or "Inverse" in bucket
+
+
+def sector_is_fund(ticker: str) -> bool:
+    """A closed-end fund, mutual fund, or similar -- not an ETF."""
+    return "Fund" in (SECTOR.get(ticker.upper()) or "")
+
+
 # --------------------------------------------------------------------------
 # Earnings dates
 # --------------------------------------------------------------------------
@@ -129,5 +148,44 @@ def load_earnings(directories: Sequence[str] = EARNINGS_DIRS) -> dict[str, date]
                 out[str(ticker).upper()] = date.fromisoformat(str(value))
             except (TypeError, ValueError):
                 continue
+        return out
+    return {}
+
+
+def _num_or_none(value: object) -> float | None:
+    try:
+        n = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return n if n == n else None  # drop NaN
+
+
+def load_fundamentals(directories: Sequence[str] = EARNINGS_DIRS) -> dict[str, dict]:
+    """``{TICKER: {"type": str|None, "market_cap_b": float|None,
+    "avg_vol_10d_m": float|None}}`` from the first ``fundamentals.json`` found.
+
+    Malformed rows are skipped, never raised on. Absent file => ``{}`` =>
+    every ticker is "unvetted" for the cap / volume / common-stock filters
+    (shown with a flag, not hidden).
+    """
+    for directory in directories:
+        path = os.path.join(directory, "fundamentals.json")
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as handle:
+                raw = json.load(handle)
+        except (OSError, ValueError):
+            return {}
+        out: dict[str, dict] = {}
+        for ticker, value in (raw or {}).items():
+            if not isinstance(value, dict):
+                continue  # the "_comment" string, or a broken row
+            kind = value.get("type")
+            out[str(ticker).upper()] = {
+                "type": str(kind).lower() if kind else None,
+                "market_cap_b": _num_or_none(value.get("market_cap_b")),
+                "avg_vol_10d_m": _num_or_none(value.get("avg_vol_10d_m")),
+            }
         return out
     return {}

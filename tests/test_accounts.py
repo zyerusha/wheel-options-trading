@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from datetime import date
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -193,6 +194,23 @@ class TestAccountRegistry(unittest.TestCase):
     def test_unknown_account_raises_keyerror(self):
         with self.assertRaises(KeyError):
             self.registry.build("does-not-exist")
+
+    def test_single_account_csp_candidates_are_widened_across_all_accounts(self):
+        import wheel.accounts as accts
+
+        calls = []
+        sentinel = [{"underlying": "SENTINEL"}]
+
+        def fake_combine(payloads, exposure):
+            calls.append(set(payloads))
+            return sentinel
+
+        with mock.patch.object(accts, "_combine_csp_candidates", side_effect=fake_combine):
+            payload = self.registry.build("ira")
+
+        self.assertEqual(payload["csp_candidates"], sentinel)  # widened list replaces the per-account one
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0], {"ira", "taxable"})  # every account fed in, not just the one asked for
 
     def test_combined_cycles_are_concatenated_not_merged(self):
         combined = self.registry.build("combined")

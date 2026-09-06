@@ -128,13 +128,12 @@ from typing import TYPE_CHECKING, Any, Sequence
 from wheel import benchmark as bm
 from wheel import cashflow as cf
 from wheel.api import (
-    CSP_MONTHLY_PREMIUM_STRONG,
-    CSP_PPD_STRONG,
-    CSP_ROC_STRONG,
     Dashboard,
     Filters,
+    csp_star_score,
     discover_exports,
     discover_multi_account_exports,
+    sector_exposure,
 )
 from wheel.insights import portfolio_insights
 from wheel.metrics import roi_and_annualized, time_weighted_average, weekly_ppd_series
@@ -820,6 +819,21 @@ class AccountRegistry:
             return self._build_combined(filters)
         payload = self.get(account_id).build(filters)
         payload["meta"] = {**payload["meta"], "account_id": account_id}
+
+        # CSP candidates are a shopping list, not a record of this account:
+        # widen it to every ticker wheeled *anywhere* in the book, re-scored on
+        # the pooled history but against THIS account's own sector exposure.
+        # The frontend still sizes each row against this account's free cash,
+        # so a name only ever traded elsewhere shows up here exactly when this
+        # account could actually write the put.
+        if len(self._accounts) > 1:
+            others = {
+                aid: (payload if aid == account_id else dash.build(filters))
+                for aid, dash in self._accounts.items()
+            }
+            own_exposure = sector_exposure((payload.get("trade_log") or {}).get("wheels", []))
+            payload["csp_candidates"] = _combine_csp_candidates(others, own_exposure)
+
         return payload
 
     # ---- combined aggregation ----
@@ -838,7 +852,9 @@ class AccountRegistry:
         combined_hedges = _combine_open_hedges(payloads)
         combined_open_positions = _combine_open_positions(payloads)
         combined_cc_candidates = _combine_cc_candidates(payloads)
-        combined_csp_candidates = _combine_csp_candidates(payloads)
+        combined_csp_candidates = _combine_csp_candidates(
+            payloads, sector_exposure(combined_trade_log.get("wheels", []))
+        )
         combined_wheel_state = _combine_wheel_state(payloads)
         combined_benchmark = _combine_benchmark(payloads)
         combined_wheel_return = _combine_wheel_return(payloads)
@@ -1009,16 +1025,14 @@ def _combine_cc_candidates(payloads: dict[str, dict]) -> list[dict]:
     return rows
 
 
-def _combine_csp_candidates(payloads: dict[str, dict]) -> list[dict]:
+def _combine_csp_candidates(payloads: dict[str, dict], exposure: dict[str, float]) -> list[dict]:
     """One row per underlying across every account -- a ticker wheeled in more
-    than one account is merged, its realized P/L and wheel count summed, and
-    kept only if the *combined* result is still net-positive. ``last_close`` is
-    the same everywhere, so any account's value stands.
+    than one account is merged (P/L and wheel count summed, rate signals
+    wheel-weighted, recency the soonest), kept only if the *combined* result is
+    still net-positive, and its star rating re-computed from the merged inputs
+    against the whole book's ``exposure``. ``last_close`` / sector / earnings
+    are ticker facts, so any account's value stands.
     """
-    def _keep_max(current, candidate):
-        if candidate is None:
-            return current
-        return candidate if current is None else max(current, candidate)
 
     by_ticker: dict[str, dict] = {}
     for payload in payloads.values():
@@ -1028,30 +1042,40 @@ def _combine_csp_candidates(payloads: dict[str, dict]) -> list[dict]:
                 {
                     "net_realized_pl": 0.0,
                     "wheels": 0,
-                    "roc_sum": 0.0,
-                    "roc_n": 0,
+                    "wsum": 0.0,
+                    "roc_w": 0.0,
+                    "mp_w": 0.0,
+                    "ppdy_w": 0.0,
+                    "ppd_w": 0.0,
+                    "wins": 0,
+                    "losses": 0,
+                    "days_since": None,
                     "last_close": None,
                     "name": None,
-                    "monthly_premium_pct": None,
-                    "ppd": None,
                     "sector": None,
                     "earnings_date": None,
                     "days_to_earnings": None,
+                    "vol_annual_pct": None,
+                    "price_position": None,
+                    "vetting": None,
                 },
             )
             agg["net_realized_pl"] += row.get("net_realized_pl") or 0.0
-            wheels = row.get("wheels") or 0
-            agg["wheels"] += wheels
-            if row.get("avg_annualized_roc_pct") is not None:
-                agg["roc_sum"] += row["avg_annualized_roc_pct"] * max(wheels, 1)
-                agg["roc_n"] += max(wheels, 1)
-            if row.get("last_close") is not None:
-                agg["last_close"] = row["last_close"]
-            agg["name"] = agg["name"] or row.get("name")
-            agg["monthly_premium_pct"] = _keep_max(agg["monthly_premium_pct"], row.get("monthly_premium_pct"))
-            agg["ppd"] = _keep_max(agg["ppd"], row.get("ppd"))
-            # Sector and earnings are ticker facts, identical across accounts.
-            agg["sector"] = agg["sector"] or row.get("sector")
+            w = max(row.get("wheels") or 0, 1)
+            agg["wheels"] += row.get("wheels") or 0
+            agg["wsum"] += w
+            agg["roc_w"] += (row.get("roc_pct") or 0.0) * w
+            agg["mp_w"] += (row.get("monthly_premium_pct") or 0.0) * w
+            agg["ppdy_w"] += (row.get("ppd_yield_pct") or 0.0) * w
+            agg["ppd_w"] += (row.get("ppd") or 0.0) * w
+            agg["wins"] += row.get("wins") or 0
+            agg["losses"] += row.get("losses") or 0
+            dsw = row.get("days_since_last_wheel")
+            if dsw is not None:
+                agg["days_since"] = dsw if agg["days_since"] is None else min(agg["days_since"], dsw)
+            for key in ("last_close", "name", "sector", "vol_annual_pct", "price_position", "vetting"):
+                if agg[key] is None and row.get(key) is not None:
+                    agg[key] = row[key]
             if row.get("earnings_date") is not None:
                 agg["earnings_date"] = row["earnings_date"]
                 agg["days_to_earnings"] = row.get("days_to_earnings")
@@ -1060,7 +1084,26 @@ def _combine_csp_candidates(payloads: dict[str, dict]) -> list[dict]:
     for ticker, agg in by_ticker.items():
         if agg["net_realized_pl"] <= 0:
             continue
-        roc = round(agg["roc_sum"] / agg["roc_n"], 2) if agg["roc_n"] else None
+        ws = agg["wsum"] or 1.0
+        roc = round(agg["roc_w"] / ws, 2)
+        mp = round(agg["mp_w"] / ws, 2)
+        ppdy = round(agg["ppdy_w"] / ws, 2)
+        win_rate = (
+            agg["wins"] / (agg["wins"] + agg["losses"]) if (agg["wins"] + agg["losses"]) > 0 else None
+        )
+        comp = {
+            "roc_pct": roc,
+            "monthly_premium_pct": mp,
+            "ppd_yield_pct": ppdy,
+            "net_realized_pl": agg["net_realized_pl"],
+            "win_rate": win_rate,
+            "wheels": agg["wheels"],
+            "days_since_last_wheel": agg["days_since"],
+            "vol_annual_pct": agg["vol_annual_pct"],
+            "price_position": agg["price_position"],
+            "sector": agg["sector"],
+        }
+        scored = csp_star_score(comp, exposure.get(agg["sector"] or "Unknown", 0.0), agg["days_to_earnings"])
         rows.append(
             {
                 "underlying": ticker,
@@ -1068,20 +1111,26 @@ def _combine_csp_candidates(payloads: dict[str, dict]) -> list[dict]:
                 "wheels": agg["wheels"],
                 "net_realized_pl": round(agg["net_realized_pl"], 2),
                 "avg_annualized_roc_pct": roc,
-                "monthly_premium_pct": agg["monthly_premium_pct"],
-                "ppd": agg["ppd"],
-                "strong": bool(
-                    (agg["monthly_premium_pct"] is not None and agg["monthly_premium_pct"] >= CSP_MONTHLY_PREMIUM_STRONG)
-                    or (agg["ppd"] is not None and agg["ppd"] >= CSP_PPD_STRONG)
-                    or (roc is not None and roc >= CSP_ROC_STRONG)
-                ),
+                "monthly_premium_pct": mp,
+                "ppd": round(agg["ppd_w"] / ws, 2),
                 "last_close": agg["last_close"],
                 "sector": agg["sector"],
                 "earnings_date": agg["earnings_date"],
                 "days_to_earnings": agg["days_to_earnings"],
+                "stars": scored["stars"],
+                "star_breakdown": scored,
+                "vetting": agg["vetting"],
+                "roc_pct": roc,
+                "ppd_yield_pct": ppdy,
+                "win_rate": round(win_rate, 4) if win_rate is not None else None,
+                "wins": agg["wins"],
+                "losses": agg["losses"],
+                "days_since_last_wheel": agg["days_since"],
+                "vol_annual_pct": agg["vol_annual_pct"],
+                "price_position": agg["price_position"],
             }
         )
-    rows.sort(key=lambda r: -r["net_realized_pl"])
+    rows.sort(key=lambda r: (-r["stars"], -r["net_realized_pl"]))
     return rows
 
 

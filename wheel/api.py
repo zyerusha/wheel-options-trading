@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import math
 import os
+import re
+import statistics
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
@@ -73,15 +75,262 @@ from wheel.positions import (
     latest_snapshot_per_account,
     load_snapshots,
 )
-from wheel.reference import load_earnings, sector_of
-
-# "Strong CSP" thresholds -- any one flags a ticker whose past wheels paid well
-# for the capital they tied up. Tuned by eye; easy to move.
-CSP_MONTHLY_PREMIUM_STRONG = 1.0  # gross premium / avg collateral, per 30 days, %
-CSP_PPD_STRONG = 20.0  # blended option P/L per day, $
-CSP_ROC_STRONG = 30.0  # annualized wheel ROC, %
+from wheel.reference import (
+    load_earnings,
+    load_fundamentals,
+    sector_is_fund,
+    sector_is_leveraged_etf,
+    sector_of,
+)
 
 EXPORT_DIRS = (".", "data")
+
+
+# --------------------------------------------------------------------------
+# CSP-candidate recommender: 0-5 stars synthesised from this ticker's past
+# wheels plus its current market shape, then nudged by earnings timing and
+# how concentrated the book already is in its sector. All of the numbers
+# below are deliberately soft -- a heuristic to rank names, not a model.
+# --------------------------------------------------------------------------
+
+# Weights sum to 1.0; each component is scored 0..1, the weighted sum x5 is
+# the base star count before the earnings / sector modifiers.
+CSP_STAR_WEIGHTS = {
+    "roc": 0.22,  # annualized wheel ROC (how the wheel actually returned)
+    "monthly_premium": 0.16,  # gross premium / collateral per 30d (premium richness)
+    "ppd_yield": 0.10,  # annualized blended PPD on capital (kept-premium efficiency)
+    "profit": 0.09,  # total realized $ banked on this ticker, saturating
+    "win_rate": 0.15,  # share of past legs that won
+    "consistency": 0.09,  # how many wheels of evidence there is
+    "recency": 0.07,  # how long ago the last wheel wrapped
+    "volatility": 0.08,  # realized vol now -- enough IV to sell, not a casino
+    "price_position": 0.04,  # where price sits in its 1y range -- not a falling knife
+}
+
+
+def _sat(value: float | None, scale: float) -> float:
+    """Saturating 0..1 curve: ``1 - exp(-value/scale)`` (~0.63 at value==scale)."""
+    if value is None or value <= 0:
+        return 0.0
+    return 1.0 - math.exp(-value / scale)
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, value))
+
+
+def _vol_fit_score(vol_annual_pct: float | None) -> float:
+    """Tent curve: too calm = thin premium, sweet spot ~30-55% annualized,
+    then a decline into "this is a gamble" past ~90%."""
+    if vol_annual_pct is None:
+        return 0.4
+    v = vol_annual_pct
+    if v <= 12:
+        return 0.15
+    if v <= 30:
+        return 0.15 + (v - 12) / 18 * 0.75
+    if v <= 55:
+        return 0.90
+    if v <= 90:
+        return 0.90 - (v - 55) / 35 * 0.70
+    return 0.15
+
+
+def _price_position_score(pos: float | None) -> float:
+    """Favor the middle-to-upper part of the 1y range; dock a falling knife
+    (bottom ~15%) and shave a little right at the highs."""
+    if pos is None:
+        return 0.5
+    if pos < 0.15:
+        return 0.25
+    if pos < 0.30:
+        return 0.25 + (pos - 0.15) / 0.15 * 0.55
+    if pos <= 0.85:
+        return 0.85
+    return 0.85 - (pos - 0.85) / 0.15 * 0.35
+
+
+def _earnings_modifier(days_to_earnings: int | None) -> tuple[float, str]:
+    """Star adjustment for where the next earnings print falls. Inside a week
+    is a real penalty (gap risk, no time to react); ~2-4 weeks out is a bonus
+    -- fat IV to sell, and it clears before a typical 30-45 DTE put expires."""
+    d = days_to_earnings
+    if d is None or d < 0:
+        return 0.0, "no earnings date on file"
+    if d <= 7:
+        return -1.8, f"earnings in {d}d — gap risk, no time to react"
+    if d <= 14:
+        return -0.3, f"earnings in {d}d — a little close"
+    if d <= 28:
+        return 0.5, f"earnings in {d}d — sell into elevated IV, clears before a ~30-45 DTE put"
+    if d <= 45:
+        return 0.2, f"earnings in {d}d"
+    return 0.0, f"earnings in {d}d — too far to matter"
+
+
+def _sector_modifier(current_weight: float | None, sector: str | None) -> tuple[float, str]:
+    """Reward a sector the book has little/none of; penalize piling into one
+    that is already a big share of committed capital."""
+    if not sector:
+        return 0.0, "sector unknown"
+    w = current_weight or 0.0
+    if w <= 0.02:
+        return 0.5, f"{sector}: not in the book yet — diversifies"
+    if w < 0.15:
+        return 0.2, f"{sector}: lightly held ({w * 100:.0f}% of committed capital)"
+    if w < 0.30:
+        return 0.0, f"{sector}: {w * 100:.0f}% of committed capital"
+    if w < 0.45:
+        return -0.3, f"{sector}: already {w * 100:.0f}% of the book — concentration"
+    return -0.6, f"{sector}: already {w * 100:.0f}% of the book — heavy concentration"
+
+
+def csp_star_score(
+    comp: dict[str, Any],
+    sector_current_weight: float | None,
+    days_to_earnings: int | None,
+) -> dict[str, Any]:
+    """Turn a ticker's aggregated signals into a 0-5 star rating plus a full
+    breakdown (every sub-score and modifier) for the tooltip. Pure -- the
+    Combined view calls it again on re-aggregated inputs.
+    """
+    scores = {
+        "roc": _sat(comp.get("roc_pct"), 35.0),
+        "monthly_premium": _sat(comp.get("monthly_premium_pct"), 2.5),
+        "ppd_yield": _sat(comp.get("ppd_yield_pct"), 25.0),
+        "profit": _sat(comp.get("net_realized_pl"), 6000.0),
+        "win_rate": (
+            _clamp01((comp["win_rate"] - 0.4) / 0.6) if comp.get("win_rate") is not None else 0.4
+        ),
+        "consistency": _sat(comp.get("wheels", 0), 3.0),
+        "recency": (
+            math.exp(-comp["days_since_last_wheel"] / 400.0)
+            if comp.get("days_since_last_wheel") is not None
+            else 0.5
+        ),
+        "volatility": _vol_fit_score(comp.get("vol_annual_pct")),
+        "price_position": _price_position_score(comp.get("price_position")),
+    }
+    base01 = sum(CSP_STAR_WEIGHTS[key] * scores[key] for key in CSP_STAR_WEIGHTS)
+    base_stars = base01 * 5.0
+
+    earn_mod, earn_note = _earnings_modifier(days_to_earnings)
+    sector_mod, sector_note = _sector_modifier(sector_current_weight, comp.get("sector"))
+
+    raw_stars = max(0.0, min(5.0, base_stars + earn_mod + sector_mod))
+    # Whole stars, 0-5. `raw_stars` is the absolute score; the dashboard
+    # re-grades it on a curve across only the tickers it actually shows (those
+    # the current free cash can sell a contract on) -- see `spreadStars` in
+    # app.js -- so the displayed 0-5 range tracks this list, not the whole book.
+    stars = int(round(raw_stars))
+
+    return {
+        "stars": stars,
+        "raw_stars": round(raw_stars, 3),
+        "base_stars": round(base_stars, 2),
+        "components": {
+            key: {"score": round(scores[key], 3), "weight": CSP_STAR_WEIGHTS[key]}
+            for key in CSP_STAR_WEIGHTS
+        },
+        "modifiers": {
+            "earnings": {"stars": earn_mod, "note": earn_note},
+            "sector": {"stars": round(sector_mod, 2), "note": sector_note},
+        },
+        "values": {
+            "roc_pct": comp.get("roc_pct"),
+            "monthly_premium_pct": comp.get("monthly_premium_pct"),
+            "ppd_yield_pct": comp.get("ppd_yield_pct"),
+            "net_realized_pl": comp.get("net_realized_pl"),
+            "win_rate": comp.get("win_rate"),
+            "wheels": comp.get("wheels"),
+            "days_since_last_wheel": comp.get("days_since_last_wheel"),
+            "vol_annual_pct": comp.get("vol_annual_pct"),
+            "price_position": comp.get("price_position"),
+        },
+    }
+
+
+def sector_exposure(wheels: Sequence[dict[str, Any]]) -> dict[str, float]:
+    """``{sector: share of currently-committed capital}`` from the open wheels,
+    for the CSP recommender's diversification nudge. Unknown-sector capital is
+    bucketed under ``"Unknown"`` so the shares still sum to 1."""
+    by_sector: dict[str, float] = {}
+    total = 0.0
+    for wheel in wheels:
+        capital = wheel.get("capital_committed_now") or 0.0
+        if capital <= 0:
+            continue
+        key = sector_of(wheel["underlying"]) or "Unknown"
+        by_sector[key] = by_sector.get(key, 0.0) + capital
+        total += capital
+    return {key: value / total for key, value in by_sector.items()} if total else {}
+
+
+# --------------------------------------------------------------------------
+# CSP-candidate eligibility -- keep the list to names that are actually
+# reasonable to write a cash-secured put on. Cap / volume come from the
+# hand-maintained data/fundamentals.json (see wheel/reference.py); when a
+# figure is missing the row still shows, flagged "unvetted", never hidden.
+# --------------------------------------------------------------------------
+
+CSP_PRICE_MIN = 10.0
+CSP_PRICE_MAX = 350.0
+CSP_MIN_MARKET_CAP_B = 1.0
+CSP_MIN_AVG_VOL_M = 1.0
+# Security types that can't be wheeled like a stock. Plain ``etf`` is *not*
+# here -- ordinary ETFs (index, sector, commodity) are allowed; leveraged /
+# inverse ETFs and closed-end / mutual funds are not.
+_EXCLUDED_TYPES = {
+    "leveraged_etf", "inverse_etf", "fund", "mutual_fund", "closed_end_fund",
+    "cef", "mlp", "lp", "note", "etn",
+}
+_LP_IN_NAME = re.compile(r"\bL\.?\s?P\.?\b", re.IGNORECASE)
+
+
+def _csp_ticker_verdict(
+    ticker: str, name: str | None, last_close: float | None, fund: dict | None
+) -> tuple[str | None, list[str]]:
+    """``(exclude_reason, unvetted_notes)`` for one candidate ticker.
+
+    A non-``None`` reason drops the row outright: a leveraged/inverse ETF, a
+    closed-end / mutual fund, an ``LP`` in the name, a last close outside
+    ``$10-$350``, or a *known* sub-$1B cap / sub-1M volume. Ordinary ETFs and
+    ADRs of operating companies are allowed. ``unvetted_notes`` lists what we
+    simply don't know (missing cap, missing volume, unknown security type) --
+    the row stays, with the notes shown on hover. Market cap isn't asked of an
+    ETF (AUM, not cap, and we're choosing to allow them).
+    """
+    fund = fund or {}
+    kind = fund.get("type")
+    cap = fund.get("market_cap_b")
+    vol = fund.get("avg_vol_10d_m")
+    is_etf = kind == "etf"
+
+    if name and _LP_IN_NAME.search(name):
+        return f"'{name.strip()}' looks like an LP", []
+    if kind in _EXCLUDED_TYPES:
+        return f"excluded security type ({kind.replace('_', ' ')})", []
+    if kind is None and sector_is_leveraged_etf(ticker):
+        return "leveraged/inverse ETF", []
+    if kind is None and sector_is_fund(ticker):
+        return "closed-end / mutual fund, not common stock", []
+    if last_close is not None and not (CSP_PRICE_MIN <= last_close <= CSP_PRICE_MAX):
+        return f"last close ${last_close:,.2f} outside ${CSP_PRICE_MIN:.0f}-${CSP_PRICE_MAX:.0f}", []
+    if cap is not None and not is_etf and cap < CSP_MIN_MARKET_CAP_B:
+        return f"market cap ${cap:.2f}B < ${CSP_MIN_MARKET_CAP_B:.0f}B", []
+    if vol is not None and vol < CSP_MIN_AVG_VOL_M:
+        return f"10d avg volume {vol:.2f}M < {CSP_MIN_AVG_VOL_M:.0f}M", []
+
+    notes: list[str] = []
+    if kind is None and not sector_of(ticker):  # "adr" is fine; "etf" is fine
+        notes.append("security type unknown")
+    if cap is None and not is_etf:
+        notes.append("market cap unknown")
+    if vol is None:
+        notes.append("10d volume unknown")
+    if last_close is None:
+        notes.append("last close unknown")
+    return None, notes
 
 
 def _find_history_header(path: str) -> str | None:
@@ -1395,16 +1644,46 @@ class Dashboard:
         self._price_warnings = warnings
         return prices
 
-    def _last_closes(self, tickers: Sequence[str]) -> dict[str, float | None]:
-        """Latest close for each of ``tickers`` -- the same two-pass strategy
-        ``_current_prices`` documents (cache/memo first, then a thread pool for
-        genuine misses), but for an arbitrary list: the CSP-candidates table
-        wants closes for tickers this account is no longer holding anything in,
-        so they aren't in ``_current_prices``'s set. Fetch warnings append to
-        ``self._price_warnings``.
+    def _price_stats(self, tickers: Sequence[str]) -> dict[str, dict[str, float | None]]:
+        """Per-ticker ``{"last", "vol_annual_pct", "price_position"}`` -- the same
+        two-pass fetch ``_current_prices`` documents (cache/memo first, then a
+        thread pool for misses), for an arbitrary list. The CSP-candidates
+        recommender wants a current mark *and* two shape features for tickers
+        this account is no longer in, so they aren't in ``_current_prices``'s
+        set. Fetch warnings append to ``self._price_warnings``.
+
+        * ``vol_annual_pct`` -- stdev of the last ~30 daily log returns,
+          annualized (x sqrt(252)); "how much premium is on the table."
+        * ``price_position`` -- where the last close sits in the trailing
+          ~1y range, 0 (at the low) to 1 (at the high); flags a falling knife.
         """
-        out: dict[str, float | None] = {}
+        out: dict[str, dict[str, float | None]] = {}
         misses: list[str] = []
+
+        def _compute(ticker: str, points) -> None:
+            if not points:
+                out[ticker] = {"last": None, "vol_annual_pct": None, "price_position": None}
+                return
+            closes = [p.close for p in points]
+            last = closes[-1]
+            vol = None
+            window = [c for c in closes[-31:] if c > 0]
+            if len(window) >= 6:
+                rets = [math.log(window[i] / window[i - 1]) for i in range(1, len(window))]
+                if len(rets) >= 5:
+                    vol = statistics.pstdev(rets) * math.sqrt(252) * 100.0
+            year = closes[-252:]
+            pos = None
+            if len(year) >= 20:
+                lo, hi = min(year), max(year)
+                if hi - lo > 1e-9:
+                    pos = (last - lo) / (hi - lo)
+            out[ticker] = {
+                "last": last,
+                "vol_annual_pct": round(vol, 1) if vol is not None else None,
+                "price_position": round(pos, 3) if pos is not None else None,
+            }
+
         for ticker in tickers:
             local = marketdata.get_price_series(ticker, local_only=True)
             if local is None:
@@ -1412,12 +1691,45 @@ class Dashboard:
                 continue
             points, warns = local
             self._price_warnings.extend(warns)
-            out[ticker] = points[-1].close if points else None
+            _compute(ticker, points)
         if misses:
             with ThreadPoolExecutor(max_workers=min(8, len(misses))) as pool:
                 for ticker, (points, warns) in zip(misses, pool.map(marketdata.get_price_series, misses)):
                     self._price_warnings.extend(warns)
-                    out[ticker] = points[-1].close if points else None
+                    _compute(ticker, points)
+        return out
+
+    def _fundamentals(self, tickers: Sequence[str]) -> dict[str, dict[str, Any]]:
+        """Per-ticker ``{"type", "market_cap_b", "avg_vol_10d_m",
+        "earnings_date"}`` for the CSP- / CC-candidate filters.
+
+        Fetched from Yahoo and cached (``marketdata.get_fundamentals``), then
+        overlaid with the hand-maintained ``data/fundamentals.json`` and
+        ``data/earnings.json`` -- a non-``None`` field there wins, so a wrong
+        or missing fetched value can always be corrected by hand without
+        having to fill the rest in. Fetch warnings append to
+        ``self._price_warnings``.
+        """
+        fetched, warns = marketdata.get_fundamentals(sorted({t for t in tickers if t}))
+        self._price_warnings.extend(warns)
+        fund_overrides = load_fundamentals()
+        earn_overrides = load_earnings()
+
+        out: dict[str, dict[str, Any]] = {}
+        for ticker in tickers:
+            f = fetched.get(ticker)
+            row: dict[str, Any] = {
+                "type": f.kind if f else None,
+                "market_cap_b": f.market_cap_b if f else None,
+                "avg_vol_10d_m": f.avg_vol_10d_m if f else None,
+                "earnings_date": f.earnings_date if f else None,
+            }
+            for key, value in (fund_overrides.get(ticker) or {}).items():
+                if key in row and value is not None:
+                    row[key] = value
+            if ticker in earn_overrides:
+                row["earnings_date"] = earn_overrides[ticker]
+            out[ticker] = row
         return out
 
     # ---- metadata ----
@@ -1942,11 +2254,14 @@ class Dashboard:
 
         ``unrealized_pl`` / ``unrealized_pl_pct`` are the shares' total gain or
         loss against their raw average cost basis (premium already banked is
-        deliberately *not* netted in), marked to the last close. ``sector`` and
-        ``earnings_date`` / ``days_to_earnings`` come from ``wheel.reference``.
+        deliberately *not* netted in), marked to the last close. ``sector``
+        comes from ``wheel.reference``; ``earnings_date`` / ``days_to_earnings``
+        from :meth:`_fundamentals` (Yahoo, cached, hand-file override).
         """
         cc_cycle_ids = {p["cycle_id"] for p in open_positions if p.get("type") == "CC"}
-        earnings = load_earnings()
+        fundamentals = self._fundamentals(
+            [w["underlying"] for w in wheels if (w.get("shares_held") or 0.0) > 1e-9]
+        )
         today = date.today()
         rows: list[dict[str, Any]] = []
         for wheel in wheels:
@@ -2004,10 +2319,14 @@ class Dashboard:
                     "unrealized_pl_pct": gain_pct,
                     "sector": sector_of(wheel["underlying"]),
                     "earnings_date": (
-                        earnings[wheel["underlying"]].isoformat() if wheel["underlying"] in earnings else None
+                        earn.isoformat()
+                        if (earn := (fundamentals.get(wheel["underlying"], {}) or {}).get("earnings_date"))
+                        else None
                     ),
                     "days_to_earnings": (
-                        (earnings[wheel["underlying"]] - today).days if wheel["underlying"] in earnings else None
+                        (earn - today).days
+                        if (earn := (fundamentals.get(wheel["underlying"], {}) or {}).get("earnings_date"))
+                        else None
                     ),
                 }
             )
@@ -2015,24 +2334,28 @@ class Dashboard:
         rows.sort(key=lambda r: (not r["meets_threshold"], r["underlying"]))
         return rows
 
-    def _build_csp_candidates(self, wheels: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _build_csp_candidates(
+        self,
+        wheels: Sequence[dict[str, Any]],
+        exposure: dict[str, float],
+    ) -> list[dict[str, Any]]:
         """Tickers this account has wheeled **profitably** in the past -- names
         worth a fresh cash-secured put -- one row per underlying, summed over
         every wheel on it, keeping only the net-positive ones. Each carries its
-        latest close so the frontend can size it against whatever cash is free
-        (how many 100-share puts that cash could secure at roughly that price).
-
-        ``avg_annualized_roc_pct`` is a rough wheel-count-weighted mean of each
-        wheel's own annualized ROC. ``strong`` flags a ticker whose past wheels
-        paid well for the capital they tied up -- any of: monthly premium yield
-        (gross premium / avg collateral, per 30 days) >= 1%, blended PPD
-        (option P/L / days) >= $20, or annualized wheel ROC >= 30%. ``sector``
-        and ``earnings_date`` / ``days_to_earnings`` come from
-        ``wheel.reference`` (a static map and an optional ``earnings.json``).
+        latest close (so the frontend can size it against free cash) and a
+        0-5 **``stars``** rating with a full ``star_breakdown`` -- see
+        :func:`csp_star_score`. ``exposure`` is :func:`sector_exposure` for the
+        book, feeding the diversification nudge.
         """
         by_ticker: dict[str, dict[str, Any]] = {}
         for wheel in wheels:
-            if not wheel.get("is_wheel"):
+            is_wheel = bool(wheel.get("is_wheel"))
+            has_options = bool(wheel.get("gross_premium_received") or wheel.get("option_realized_pl"))
+            # Full wheels *and* bare option cycles (a CSP sold and closed, never
+            # assigned) both count -- a put that had to be bought back at a loss
+            # is exactly the history that should drag a ticker's rating down.
+            # Pure buy-and-hold stock cycles (no premium either way) don't.
+            if not is_wheel and not has_options:
                 continue
             agg = by_ticker.setdefault(
                 wheel["underlying"],
@@ -2045,10 +2368,16 @@ class Dashboard:
                     "option_pl": 0.0,
                     "avg_collateral": 0.0,
                     "days": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "last_dt": None,
                 },
             )
             agg["net_realized_pl"] += wheel.get("net_realized_pl") or 0.0
-            agg["wheels"] += 1
+            # "wheels" (and the consistency sub-score) counts only true wheels,
+            # so tacking on a losing CSP can't *raise* the score via consistency.
+            if is_wheel:
+                agg["wheels"] += 1
             roc = wheel.get("annualized_wheel_roc_pct")
             if roc is not None:
                 agg["roc_sum"] += roc
@@ -2057,27 +2386,75 @@ class Dashboard:
             agg["option_pl"] += wheel.get("option_realized_pl") or 0.0
             agg["avg_collateral"] += wheel.get("avg_collateral") or 0.0
             agg["days"] += wheel.get("days_active") or 0
+            agg["wins"] += wheel.get("wins") or 0
+            agg["losses"] += wheel.get("losses") or 0
+            edge = wheel.get("end_date") or wheel.get("start_date")
+            if edge and (agg["last_dt"] is None or edge > agg["last_dt"]):
+                agg["last_dt"] = edge
 
-        winners = {t: a for t, a in by_ticker.items() if a["net_realized_pl"] > 0}
-        closes = self._last_closes(sorted(winners))
-        earnings = load_earnings()
+        # Keep names actually wheeled at least once (>= 1 true wheel) and
+        # net-positive once every option cycle on them is counted.
+        winners = {
+            t: a for t, a in by_ticker.items() if a["wheels"] >= 1 and a["net_realized_pl"] > 0
+        }
+        fundamentals = self._fundamentals(sorted(winners))
+        # Drop the outright-ineligible (non-common, LP in the name) before
+        # paying for a price fetch; the price-band check waits for last close.
+        winners = {
+            t: a
+            for t, a in winners.items()
+            if _csp_ticker_verdict(t, self._company_names.get(t), None, fundamentals.get(t))[0] is None
+        }
+        stats = self._price_stats(sorted(winners))
         today = date.today()
 
         rows: list[dict[str, Any]] = []
         for ticker, agg in winners.items():
+            reason, unvetted = _csp_ticker_verdict(
+                ticker, self._company_names.get(ticker), stats.get(ticker, {}).get("last"),
+                fundamentals.get(ticker),
+            )
+            if reason:  # price now known: outside the $10-$350 band, or a known thin/small name
+                continue
             avg_roc = round(agg["roc_sum"] / agg["roc_n"], 2) if agg["roc_n"] else None
             monthly_premium_pct = (
-                100.0 * agg["gross_premium"] / agg["avg_collateral"] * (30.0 / max(agg["days"], 1))
+                round(100.0 * agg["gross_premium"] / agg["avg_collateral"] * (30.0 / max(agg["days"], 1)), 2)
                 if agg["avg_collateral"] > 1e-9
                 else None
             )
             ppd = agg["option_pl"] / agg["days"] if agg["days"] else None
-            strong = (
-                (monthly_premium_pct is not None and monthly_premium_pct >= CSP_MONTHLY_PREMIUM_STRONG)
-                or (ppd is not None and ppd >= CSP_PPD_STRONG)
-                or (avg_roc is not None and avg_roc >= CSP_ROC_STRONG)
+            ppd_yield_pct = (
+                round(365.0 * (ppd or 0.0) / agg["avg_collateral"] * 100.0, 2)
+                if agg["avg_collateral"] > 1e-9 and ppd is not None
+                else None
             )
-            earn = earnings.get(ticker)
+            win_rate = (
+                agg["wins"] / (agg["wins"] + agg["losses"])
+                if (agg["wins"] + agg["losses"]) > 0
+                else None
+            )
+            days_since = (
+                max((today - date.fromisoformat(agg["last_dt"])).days, 0) if agg["last_dt"] else None
+            )
+            stat = stats.get(ticker, {})
+            sector = sector_of(ticker)
+            earn = (fundamentals.get(ticker) or {}).get("earnings_date")
+            dte = (earn - today).days if earn else None
+
+            comp = {
+                "roc_pct": avg_roc,
+                "monthly_premium_pct": monthly_premium_pct,
+                "ppd_yield_pct": ppd_yield_pct,
+                "net_realized_pl": agg["net_realized_pl"],
+                "win_rate": win_rate,
+                "wheels": agg["wheels"],
+                "days_since_last_wheel": days_since,
+                "vol_annual_pct": stat.get("vol_annual_pct"),
+                "price_position": stat.get("price_position"),
+                "sector": sector,
+            }
+            scored = csp_star_score(comp, exposure.get(sector or "Unknown", 0.0), dte)
+
             rows.append(
                 {
                     "underlying": ticker,
@@ -2085,16 +2462,33 @@ class Dashboard:
                     "wheels": agg["wheels"],
                     "net_realized_pl": _money(agg["net_realized_pl"]),
                     "avg_annualized_roc_pct": avg_roc,
-                    "monthly_premium_pct": round(monthly_premium_pct, 2) if monthly_premium_pct is not None else None,
+                    "monthly_premium_pct": monthly_premium_pct,
                     "ppd": _money(ppd),
-                    "strong": strong,
-                    "last_close": _money(closes.get(ticker)),
-                    "sector": sector_of(ticker),
+                    "last_close": _money(stat.get("last")),
+                    "sector": sector,
                     "earnings_date": earn.isoformat() if earn else None,
-                    "days_to_earnings": (earn - today).days if earn else None,
+                    "days_to_earnings": dte,
+                    "stars": scored["stars"],
+                    "star_breakdown": scored,
+                    "vetting": {
+                        "unvetted": unvetted,
+                        "type": (fundamentals.get(ticker) or {}).get("type"),
+                        "market_cap_b": (fundamentals.get(ticker) or {}).get("market_cap_b"),
+                        "avg_vol_10d_m": (fundamentals.get(ticker) or {}).get("avg_vol_10d_m"),
+                    },
+                    # Raw signal inputs, carried so the Combined view can
+                    # re-aggregate and re-score without the underlying wheels.
+                    "roc_pct": avg_roc,
+                    "ppd_yield_pct": ppd_yield_pct,
+                    "win_rate": round(win_rate, 4) if win_rate is not None else None,
+                    "wins": agg["wins"],
+                    "losses": agg["losses"],
+                    "days_since_last_wheel": days_since,
+                    "vol_annual_pct": stat.get("vol_annual_pct"),
+                    "price_position": stat.get("price_position"),
                 }
             )
-        rows.sort(key=lambda r: -(r["net_realized_pl"] or 0.0))
+        rows.sort(key=lambda r: (-r["stars"], -(r["net_realized_pl"] or 0.0)))
         return rows
 
     # ---- query ----
@@ -2187,7 +2581,8 @@ class Dashboard:
                 (self._trade_log or {}).get("wheels", []), self._open_positions or []
             )
         if self._csp_candidates is None:
-            self._csp_candidates = self._build_csp_candidates((self._trade_log or {}).get("wheels", []))
+            _wheels = (self._trade_log or {}).get("wheels", [])
+            self._csp_candidates = self._build_csp_candidates(_wheels, sector_exposure(_wheels))
 
         portfolio = portfolio_metrics(
             cycles,

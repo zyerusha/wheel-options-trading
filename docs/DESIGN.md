@@ -263,9 +263,10 @@ A **Gain / Loss** column carries the shares' total unrealized P/L —
 when positive and red when negative. It is measured against the *raw* average cost
 basis; premium already banked is not netted in (that is what the break-even columns
 are for). **Sector** and **Earnings** (`sector` / `earnings_date` /
-`days_to_earnings`) come from `wheel.reference` exactly as the CSP-candidates table's
-do — the frontend ambers the whole row when earnings land within 14 days, via the
-shared `earnings-warn` class and `earningsCell` helper.
+`days_to_earnings`) are resolved exactly as the CSP-candidates table's are — the
+shared `earningsCell` helper ambers the **Earnings cell** (not the row) and appends a
+`⚠` when `0 ≤ days_to_earnings ≤ 14`, matching how Expiration is flagged in Open
+option positions.
 
 Rendered by `renderCcCandidates` (`state.ccCandSort`) as a plain sortable table
 directly under *Open option positions*; hidden when empty. The **Current Wheel**
@@ -286,34 +287,109 @@ cards (CC candidates, CSP cash) read as one block. Hidden without a Positions sn
 
 The same card carries a **CSP-candidates table** from `data.csp_candidates`
 (`Dashboard._build_csp_candidates`, filter-independent): one row per ticker this
-account has wheeled at a **net profit** in the past — realized P/L and wheel count
-summed over every wheel on it, plus a wheel-count-weighted mean of their annualized
-ROC as a ranking hint. `_last_closes` (the two-pass fetch `_current_prices` uses,
-factored out) pulls a current close for each, since these are usually tickers the
-account is no longer in and so absent from `_current_prices`'s set. The frontend
+account has wheeled at least once and at a **net profit** in the past — realized P/L
+and wheel count summed over its history, plus a wheel-count-weighted mean of their
+annualized ROC as a ranking hint. The aggregation folds in *bare option cycles* too
+(`is_wheel` false but premium changed hands — a CSP sold and closed, never assigned):
+their P/L, wins/losses, premium, days and recency all count, so a put that had to be
+bought back at a loss drags the ticker's rating down instead of being invisible. Such
+cycles don't add to the `wheels` count (or the consistency sub-score), so tacking a
+loss on can't *raise* the score. `_last_closes` (the two-pass fetch `_current_prices`
+uses, factored out) pulls a current close for each, since these are usually tickers
+the account is no longer in and so absent from `_current_prices`'s set. The frontend
 then keeps only rows whose "Qty" — `floor(cash ÷ (last_close × 100))`, a rough
 at-the-money sizing — is at least 1: a name the free cash couldn't secure a single
-put on doesn't make the cut.
+put on doesn't make the cut. "Cash / Contract" alongside it is just `last_close × 100`,
+the collateral one at-the-money put would tie up.
 
-Each row also carries:
+**Cross-account universe.** A single account's view isn't limited to what *that*
+account wheeled: `AccountRegistry.build` replaces the per-account `csp_candidates`
+with `_combine_csp_candidates` run over *every* account's list (the same merge the
+Combined view uses — P/L and wheel count summed, rate signals wheel-weighted, recency
+the soonest), re-scored against **this** account's own `sector_exposure`. The frontend
+still sizes every row against this account's free cash, so a ticker only ever traded
+elsewhere surfaces here exactly when this account could write the put. The Combined
+view is unchanged.
 
-- **`strong`** — the ★ "Signal" mark: true if *any* of its three neighboring
-  columns clears its bar — `monthly_premium_pct` (gross premium / avg collateral per
-  30 days) ≥ 1%, `ppd` (blended option P/L ÷ days) ≥ $20, or `avg_annualized_roc_pct`
-  ≥ 30% (`CSP_*_STRONG` constants in `wheel/api.py`). All three are shown as columns,
-  so the mark is a summary, not the only place the numbers live. A heuristic, tuned
-  by eye.
-- **`sector`** — from `wheel.reference.SECTOR`, a hand-maintained static map (no feed
-  carries it). Unmapped → `None` → blank; never guessed. For diversification.
-- **`earnings_date` / `days_to_earnings`** — from an optional `earnings.json`
-  (`{"TICKER": "YYYY-MM-DD"}`) in the project root or `data/`, loaded by
-  `wheel.reference.load_earnings` (malformed rows skipped, absent file → empty). The
-  frontend ambers the whole row when `0 ≤ days_to_earnings ≤ 14` — don't sell a put
-  into an earnings print.
+**Eligibility filters** (`_csp_ticker_verdict`). A row is dropped outright if the name
+looks like an LP (`\bL.?P.?\b`), the security type is `leveraged_etf` / `inverse_etf` /
+`mutual_fund` / `closed_end_fund` / `mlp` / `lp` (or — absent a type — a SECTOR bucket
+with "Leveraged"/"Inverse", or one containing "Fund"), the last close is outside
+**$10–$350**, or a *known* market cap is `< $1B` (stocks only — not asked of an ETF) /
+a *known* 10-day average volume is `< 1M`. Plain ETFs (index, sector, commodity) and
+ADRs of operating companies are allowed.
 
-The Combined view merges by ticker via `_combine_csp_candidates` and re-drops any
-that nets negative across accounts; `strong` is recomputed from the merged ROC and
-the max per-account premium/PPD, `sector`/`earnings` taken as the ticker fact they are.
+Market cap, 10-day average volume, security type and the next earnings date are
+**fetched from Yahoo's quote endpoint** and cached in `data/fundamentals_cache.json` —
+`marketdata.get_fundamentals`, same fail-soft contract as prices: one batched request
+covers every stale ticker, a fetch failure keeps the stale cache and warns, and
+`local_only` never touches the network. Staleness: a cache entry older than 14 days, an
+`earnings_date` now in the past (chase the next one, at most daily), or a stock that
+never got one (retry every ~3 days). `quoteType` maps to the `type` (`EQUITY`→`common`,
+but an `EQUITY` whose name ends "… Fund" → `closed_end_fund`; `ETF` + a leveraged/inverse
+name → `leveraged_etf`/`inverse_etf`). `data/fundamentals.json` and `data/earnings.json`
+are now **per-field manual overrides** (`load_fundamentals` / `load_earnings` in
+`wheel.reference`): a non-null field there wins over what was fetched, so a wrong Yahoo
+value can be corrected without hand-filling the rest. `Dashboard._fundamentals` does the
+fetch-then-overlay and both candidate tables read it.
+
+When a value is still *missing* (Yahoo carried nothing, no override), the row is kept
+and its `vetting.unvetted` list names the gap ("market cap unknown", "security type
+unknown", …); the frontend shows a `?` marker on the symbol with those notes on hover.
+So leveraged ETFs, closed-end/mutual funds, LPs and penny/mega/thin names are hidden; a
+name we still lack data for is shown, flagged.
+
+Each row also carries a **`stars`** rating (integer 0–5, no half steps) with a full
+`star_breakdown` for the hover — `csp_star_score` in `wheel/api.py`. Nine
+sub-scores, each squashed to 0..1, weighted (weights in `CSP_STAR_WEIGHTS`,
+summing to 1) and ×5 for a base star count:
+
+| sub-score | ~weight | reads |
+|---|---|---|
+| ROC | 0.22 | annualized wheel ROC — how it actually returned |
+| Monthly premium | 0.16 | gross premium ÷ avg collateral, per 30 days — premium richness |
+| PPD yield | 0.10 | annualized blended PPD on capital — kept-premium efficiency |
+| Realized P/L | 0.09 | total $ banked on the ticker, saturating (`_sat(pl/6000)`) |
+| Win rate | 0.15 | share of past legs that won |
+| Consistency | 0.09 | how many wheels of evidence (`_sat(wheels/3)`) |
+| Recency | 0.07 | `exp(-days_since_last_wheel/400)` |
+| Volatility | 0.08 | realized 30d vol annualized — a tent: enough IV to sell, not a casino |
+| Price position | 0.04 | where price sits in its 1y range — dock a falling knife |
+
+then two additive **modifiers** in star units: **earnings timing** (`_earnings_modifier`
+— −1.8 inside a week, +0.5 at ~2–4 weeks out to sell into elevated IV that clears before
+a 30–45 DTE put, tapering after) and **sector concentration** (`_sector_modifier` —
++0.5 for a sector the book isn't in, down to −0.6 once it's ≥45% of committed capital,
+using `sector_exposure` over the open wheels' `capital_committed_now`). That gives a
+per-ticker **`raw_stars`** = `clamp(base + earnings_mod + sector_mod, 0, 5)`.
+
+Left there, the weighted average buries almost every ticker in the 2–4 band, so the
+dashboard re-grades on a curve — and against the names it actually shows, not the whole
+book. `spreadStars` (in `app.js`) runs *after* the affordability filter: it's a straight
+min/max stretch across the shortlist — the weakest shown name maps to **0** stars, the
+strongest to **5**, everyone else linearly between — so the full range is always visible
+on the list. A ticker too expensive for the current cash is filtered out first and so
+can't anchor either end. The stretch only engages with ≥3 shown rows and real range to
+stretch; its pull ramps in between 0.5 and 1.5 stars of range, so a shortlist bunched
+within half a star (or fewer than three names) keeps plain absolute rounding rather than
+blowing noise up into a full spread. Order is preserved; the tooltip shows both the
+`raw` value and that a curve was applied.
+Volatility and price-position come from
+`_price_stats` (the two-pass fetch factored out of `_current_prices`, now also computing
+stdev of the last ~30 log returns and the 52-week range position). It is a ranking
+heuristic, not a model — every curve is soft.
+
+`sector` is `wheel.reference.SECTOR`, a hand-maintained static map (no feed carries it);
+unmapped → `None` → blank, never guessed. `earnings_date` / `days_to_earnings` are
+fetched (Yahoo, cached) with `data/earnings.json` as a per-ticker override; the frontend
+ambers the **Earnings cell** and adds a `⚠` when `0 ≤ days_to_earnings ≤ 14`
+(`earningsCell`), the same flag Expiration gets in Open option positions.
+
+The Combined view merges by ticker via `_combine_csp_candidates` (P/L and wheel count
+summed, rate signals wheel-weighted, recency the soonest) and re-runs `csp_star_score`
+on the merged inputs against the **whole book's** `sector_exposure`, so the rating
+reflects the combined portfolio, not one account's slice. Net-negative tickers are
+dropped; `sector` / `earnings` are taken as the ticker facts they are.
 
 ### Insights
 

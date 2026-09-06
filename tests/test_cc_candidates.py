@@ -7,7 +7,6 @@ import os
 import sys
 import unittest
 from datetime import date, timedelta
-from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -30,8 +29,13 @@ def _wheel(cycle_id, underlying, *, shares, cost=None, be=None, whlbe=None, last
 
 
 def _candidates(wheels, open_positions=(), earnings=None):
-    with mock.patch("wheel.api.load_earnings", return_value=(earnings or {})):
-        return Dashboard._build_cc_candidates(None, wheels, open_positions)
+    earns = earnings or {}
+    dash = Dashboard.__new__(Dashboard)
+    dash._fundamentals = lambda tickers: {
+        t: {"type": None, "market_cap_b": None, "avg_vol_10d_m": None, "earnings_date": earns.get(t)}
+        for t in tickers
+    }
+    return Dashboard._build_cc_candidates(dash, wheels, open_positions)
 
 
 class TestSelection(unittest.TestCase):

@@ -21,10 +21,13 @@ from wheel.marketdata import (  # noqa: E402
     MarketDataError,
     PricePoint,
     _default_cache_path,
+    _leverage_kind,
     _sessions_elapsed,
+    get_fundamentals,
     get_price_series,
     load_cache,
     parse_yahoo_chart,
+    parse_yahoo_quotes,
     price_on_or_before,
     save_cache,
     yahoo_chart_url,
@@ -318,6 +321,145 @@ class TestPerTicker(unittest.TestCase):
             )
             self.assertEqual(spy_warnings, [])
             self.assertEqual(len(spy_points), 3)
+
+
+def _quote_payload(rows: list[dict]) -> str:
+    return json.dumps({"quoteResponse": {"result": rows, "error": None}})
+
+
+class TestParseYahooQuotes(unittest.TestCase):
+    def test_keys_by_symbol_and_skips_symbolless_rows(self):
+        text = _quote_payload([{"symbol": "mu", "marketCap": 1}, {"marketCap": 2}])
+        self.assertEqual(list(parse_yahoo_quotes(text)), ["MU"])
+
+    def test_error_payload_raises(self):
+        with self.assertRaises(MarketDataError):
+            parse_yahoo_quotes('{"finance": {"error": "nope"}}')
+
+
+class TestLeverageKind(unittest.TestCase):
+    def test_equity_is_common(self):
+        self.assertEqual(_leverage_kind("Micron Technology, Inc.", "EQUITY"), "common")
+
+    def test_equity_named_fund_is_a_closed_end_fund(self):
+        self.assertEqual(_leverage_kind("PIMCO Dynamic Income Fund", "EQUITY"), "closed_end_fund")
+
+    def test_plain_etf(self):
+        self.assertEqual(_leverage_kind("Invesco QQQ Trust", "ETF"), "etf")
+
+    def test_leveraged_etf_by_name(self):
+        self.assertEqual(_leverage_kind("ProShares UltraPro QQQ", "ETF"), "leveraged_etf")
+        self.assertEqual(_leverage_kind("Direxion Daily Semiconductor Bull 3X Shares", "ETF"), "leveraged_etf")
+
+    def test_inverse_etf_by_name(self):
+        self.assertEqual(_leverage_kind("ProShares Short QQQ", "ETF"), "inverse_etf")
+
+    def test_mutualfund(self):
+        self.assertEqual(_leverage_kind("Fidelity Blue Chip Growth", "MUTUALFUND"), "mutual_fund")
+
+    def test_unknown_quote_type_is_none(self):
+        self.assertIsNone(_leverage_kind("Some Index", "INDEX"))
+
+
+class TestGetFundamentals(unittest.TestCase):
+    TODAY = date(2026, 9, 5)
+
+    def _fetch(self, rows):
+        payload = _quote_payload(rows)
+        return lambda symbols: payload
+
+    def test_cold_fetch_populates_cache_and_maps_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = os.path.join(tmp, "f.json")
+            rows = [{
+                "symbol": "MU", "marketCap": 1_148_129_800_000, "averageDailyVolume10Day": 25_069_100,
+                "quoteType": "EQUITY", "longName": "Micron Technology, Inc.",
+                "earningsTimestampStart": int(datetime(2026, 9, 30, tzinfo=timezone.utc).timestamp()),
+            }]
+            out, warns = get_fundamentals(["MU"], fetch=self._fetch(rows), cache_path=cache, today=self.TODAY)
+            self.assertEqual(warns, [])
+            f = out["MU"]
+            self.assertEqual(f.kind, "common")
+            self.assertAlmostEqual(f.market_cap_b, 1148.1298, places=3)
+            self.assertAlmostEqual(f.avg_vol_10d_m, 25.0691, places=3)
+            self.assertEqual(f.earnings_date, date(2026, 9, 30))
+            # written through
+            out2, _ = get_fundamentals(["MU"], fetch=self._boom, cache_path=cache, today=self.TODAY)
+            self.assertEqual(out2["MU"].kind, "common")
+
+    def _boom(self, symbols):
+        raise MarketDataError("must not fetch")
+
+    def test_fresh_cache_is_not_refetched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = os.path.join(tmp, "f.json")
+            earn = int(datetime(2026, 11, 1, tzinfo=timezone.utc).timestamp())
+            rows = [{
+                "symbol": "AAA", "marketCap": 5e9, "quoteType": "EQUITY", "longName": "A",
+                "earningsTimestampStart": earn,
+            }]
+            get_fundamentals(["AAA"], fetch=self._fetch(rows), cache_path=cache, today=self.TODAY)
+            # a few days later, still inside max_age and earnings still ahead -> no fetch
+            out, warns = get_fundamentals(
+                ["AAA"], fetch=self._boom, cache_path=cache, today=self.TODAY + timedelta(days=5)
+            )
+            self.assertEqual(warns, [])
+            self.assertEqual(out["AAA"].market_cap_b, 5.0)
+
+    def test_stale_entry_is_refetched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = os.path.join(tmp, "f.json")
+            get_fundamentals(
+                ["AAA"], fetch=self._fetch([{"symbol": "AAA", "marketCap": 5e9, "quoteType": "EQUITY"}]),
+                cache_path=cache, today=self.TODAY,
+            )
+            out, _ = get_fundamentals(
+                ["AAA"], fetch=self._fetch([{"symbol": "AAA", "marketCap": 9e9, "quoteType": "EQUITY"}]),
+                cache_path=cache, today=self.TODAY + timedelta(days=40),
+            )
+            self.assertEqual(out["AAA"].market_cap_b, 9.0)
+
+    def test_past_earnings_date_forces_a_refetch_next_day(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = os.path.join(tmp, "f.json")
+            old = int(datetime(2026, 9, 1, tzinfo=timezone.utc).timestamp())
+            get_fundamentals(
+                ["AAA"], fetch=self._fetch([{"symbol": "AAA", "quoteType": "EQUITY", "earningsTimestampStart": old}]),
+                cache_path=cache, today=self.TODAY,
+            )
+            hit = {"n": 0}
+
+            def counting(symbols):
+                hit["n"] += 1
+                new = int(datetime(2026, 12, 1, tzinfo=timezone.utc).timestamp())
+                return _quote_payload([{"symbol": "AAA", "quoteType": "EQUITY", "earningsTimestampStart": new}])
+
+            out, _ = get_fundamentals(["AAA"], fetch=counting, cache_path=cache, today=self.TODAY + timedelta(days=1))
+            self.assertEqual(hit["n"], 1)
+            self.assertEqual(out["AAA"].earnings_date, date(2026, 12, 1))
+
+    def test_fetch_failure_keeps_cache_and_warns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = os.path.join(tmp, "f.json")
+            get_fundamentals(
+                ["AAA"], fetch=self._fetch([{"symbol": "AAA", "marketCap": 5e9, "quoteType": "EQUITY"}]),
+                cache_path=cache, today=self.TODAY,
+            )
+
+            def failing(symbols):
+                raise MarketDataError("offline")
+
+            out, warns = get_fundamentals(
+                ["AAA"], fetch=failing, cache_path=cache, today=self.TODAY + timedelta(days=99)
+            )
+            self.assertEqual(out["AAA"].market_cap_b, 5.0)  # stale but usable
+            self.assertEqual(len(warns), 1)
+
+    def test_local_only_never_fetches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = os.path.join(tmp, "f.json")
+            out, warns = get_fundamentals(["AAA"], fetch=self._boom, cache_path=cache, local_only=True)
+            self.assertEqual((out, warns), ({}, []))
 
 
 if __name__ == "__main__":

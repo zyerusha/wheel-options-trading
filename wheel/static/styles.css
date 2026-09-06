@@ -398,22 +398,32 @@ button.primary {
   border-width: 1px;
 }
 
-/* "Strong CSP" marker -- a warm yellow star. */
+/* CSP recommender: a 0-5 star rating, half-star aware. */
 #csp-candidates-table td.csp-star {
+  white-space: nowrap;
+}
+
+.stars {
   color: var(--warning);
-  font-size: 15px;
+  font-size: 13px;
+  letter-spacing: 0.5px;
   line-height: 1;
 }
 
-/* A candidate whose earnings land within 14 days -- don't write into an
-   earnings print. Amber the whole row (td-level, so it holds on hover). */
-#csp-candidates-table tr.earnings-warn > td,
-#cc-candidates-table tr.earnings-warn > td {
-  background: var(--noactivity-bg);
+.stars.none {
+  color: var(--text-muted);
 }
-#csp-candidates-table tr.earnings-warn > td:first-child,
-#cc-candidates-table tr.earnings-warn > td:first-child {
-  box-shadow: inset 3px 0 0 var(--warning);
+
+/* A candidate whose earnings land within 14 days -- don't write into an
+   earnings print. Amber just the Earnings cell + a warning glyph, the same
+   treatment Expiration gets in Open option positions. */
+#csp-candidates-table td.earnings-soon,
+#cc-candidates-table td.earnings-soon {
+  color: var(--warning);
+  font-weight: 600;
+}
+.earnings-warn-icon {
+  cursor: help;
 }
 
 .tile.primary .value {
@@ -802,6 +812,19 @@ th.sortable:hover {
   font-weight: 620;
 }
 
+/* CSP candidate whose common-stock / market-cap / volume data is incomplete:
+   the row still shows, this marks what we couldn't check (hover for detail). */
+.unvetted-flag {
+  margin-left: 3px;
+  padding: 0 3px;
+  border-radius: 4px;
+  background: var(--noactivity-bg);
+  color: var(--warning);
+  font-size: 9px;
+  font-weight: 700;
+  cursor: help;
+}
+
 .est-flag {
   color: var(--text-muted);
   font-size: 11px;
@@ -813,6 +836,15 @@ th.sortable:hover {
 
 #open-positions-table tr.op-group-start > td {
   border-top: 2px solid var(--border);
+}
+
+#open-positions-table td.op-near-expiry {
+  color: var(--warning);
+  font-weight: 600;
+}
+
+.op-expiry-warn {
+  cursor: help;
 }
 
 #open-positions-table td.op-wheel {

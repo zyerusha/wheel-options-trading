@@ -34,7 +34,7 @@ const state = {
   // Covered-call candidates table: which column sorts it, and which direction.
   ccCandSort: { key: 'underlying', dir: 1 },
   // CSP-candidates table (inside the Cash for CSPs card): sort column + dir.
-  cspCandSort: { key: 'net_realized_pl', dir: -1 },
+  cspCandSort: { key: 'stars', dir: -1 },
   // How the capital chart expresses its bands: 'value' (dollars) or 'share' (%
   // of the day's total). A view of one chart, not a filter -- it changes no data.
   capitalMode: 'value',
@@ -5450,17 +5450,17 @@ function renderDashboardInsights() {
  */
 const OPEN_POS_COLUMNS = [
   { key: 'underlying', label: 'Symbol', left: true },
-  { key: 'cycle_id', label: 'Wheel', left: true },
   { key: 'type', label: 'Type', left: true },
+  { key: 'strike', label: 'Strike' },
+  { key: 'expiration', label: 'Expiration' },
   { key: 'breakeven', label: 'Breakeven' },
   { key: 'wheel_breakeven', label: 'Wheel Breakeven' },
   { key: 'moneyness_pct', label: 'ITM/OTM (%)' },
-  { key: 'strike', label: 'Strike' },
   { key: 'last_close', label: 'Last Close' },
   { key: 'last_close_pct', label: 'Last Close %' },
-  { key: 'expiration', label: 'Expiration' },
   { key: 'signed_contracts', label: 'Qty' },
   { key: 'net_premium', label: 'Net Premium' },
+  { key: 'cycle_id', label: 'Wheel', left: true },
   { key: 'annualized_yield_pct', label: 'Annualized Yield' },
 ];
 
@@ -5493,13 +5493,34 @@ function openPositionRow(row, isGroupStart, groupSize) {
   }
   tr.appendChild(symCell);
 
-  tr.appendChild(el('td', { class: 'left op-wheel' }, row.cycle_id));
-
   const typeCell = el('td', { class: 'left' });
   typeCell.appendChild(
     el('span', { class: 'badge op-type op-type-' + row.type, title: OP_TYPE_LABEL[row.type] || row.type }, row.type)
   );
   tr.appendChild(typeCell);
+
+  tr.appendChild(el('td', { class: 'num' }, money(row.strike, { cents: true })));
+
+  // Expiration, with a warning glyph when the contract is inside a week.
+  const nearExpiry =
+    row.days_to_expiry !== null && row.days_to_expiry !== undefined && row.days_to_expiry < 8;
+  const expCell = el('td', { class: 'num' + (nearExpiry ? ' op-near-expiry' : '') });
+  if (row.expiration) {
+    const dow = parseDay(row.expiration).toLocaleDateString('en-US', { weekday: 'short' });
+    expCell.appendChild(document.createTextNode(`${row.expiration} · ${dow} · ${row.days_to_expiry}d`));
+    if (nearExpiry) {
+      expCell.appendChild(
+        el(
+          'span',
+          { class: 'op-expiry-warn', title: `Near expiration: ${row.days_to_expiry} day(s) left` },
+          ' ⚠'
+        )
+      );
+    }
+  } else {
+    expCell.appendChild(document.createTextNode('—'));
+  }
+  tr.appendChild(expCell);
 
   // Both break-even cells carry ONE signal: is the entire wheel in profit or
   // underwater? That is the last close vs. the wheel break-even (for a
@@ -5562,19 +5583,17 @@ function openPositionRow(row, isGroupStart, groupSize) {
     : 'Strike vs. last close. Positive = out-of-the-money cushion; negative = in-the-money (assignment risk).';
   tr.appendChild(moneyness);
 
-  tr.appendChild(el('td', { class: 'num' }, money(row.strike, { cents: true })));
   tr.appendChild(el('td', { class: 'num' }, money(row.last_close, { cents: true })));
   tr.appendChild(el('td', { class: 'num ' + toneOf(row.last_close_pct) }, signedPct(row.last_close_pct)));
 
-  const expCell = el(
-    'td',
-    { class: 'num' },
-    row.expiration ? `${row.expiration} · ${row.days_to_expiry}d` : '—'
-  );
-  tr.appendChild(expCell);
-
   tr.appendChild(el('td', { class: 'num' }, row.signed_contracts));
   tr.appendChild(el('td', { class: 'num ' + toneOf(row.net_premium) }, money(row.net_premium, { cents: true, sign: true })));
+
+  const wheelCell = el('td', { class: 'left op-wheel' });
+  wheelCell.appendChild(
+    row.cycle_id ? wheelLink(row.cycle_id, row.underlying) : document.createTextNode('—')
+  );
+  tr.appendChild(wheelCell);
 
   const yieldCell = el('td', { class: 'num ' + toneOf(row.annualized_yield_pct) }, pct(row.annualized_yield_pct));
   yieldCell.title =
@@ -5746,9 +5765,9 @@ function renderCcCandidates() {
 
   const tbody = el('tbody');
   for (const row of sorted) {
-    const { cell: earnCell, soon: earningsSoon } = earningsCell(row);
+    const { cell: earnCell } = earningsCell(row);
     const tr = el('tr', {
-      class: 'op-row' + (row.meets_threshold ? '' : ' cc-below-100') + (earningsSoon ? ' earnings-warn' : ''),
+      class: 'op-row' + (row.meets_threshold ? '' : ' cc-below-100'),
     });
     const symCell = el('td', { class: 'left ticker-cell' }, row.underlying);
     if (row.name) symCell.title = row.name;
@@ -5908,8 +5927,9 @@ function renderCspCash() {
 
 const CSP_CAND_COLUMNS = [
   { key: 'underlying', label: 'Symbol', left: true },
-  { key: 'strong', label: 'Signal' },
+  { key: 'stars', label: 'Signal' },
   { key: 'contracts', label: 'Qty' },
+  { key: 'cash_per_contract', label: 'Cash / Contract' },
   { key: 'avg_annualized_roc_pct', label: 'Avg Ann. ROC' },
   { key: 'monthly_premium_pct', label: 'Mo. Prem %' },
   { key: 'ppd', label: 'PPD' },
@@ -5923,20 +5943,135 @@ const CSP_CAND_COLUMNS = [
 const EARNINGS_WARN_DAYS = 14;
 
 /**
- * `<td>` for a "next earnings" date plus whether it's within the warning
- * window (0..14 days out). Shared by the CSP- and CC-candidate tables; the
- * caller adds the `earnings-warn` class to the row when `.soon`.
+ * Re-grade a set of CSP-candidate rows on a curve so the whole 0-5 star range
+ * gets used -- and graded against *these* rows only. The backend hands every
+ * past profitable ticker with its absolute `star_breakdown.raw_stars`; the
+ * dashboard then filters to the names the current free cash can actually sell
+ * a contract on, and the curve runs over that shown list, not the whole book
+ * (so a name that isn't even displayed can't anchor the low end).
+ *
+ * When the curve engages, it's a straight min/max stretch across the shown
+ * set: the weakest name maps to 0 stars, the strongest to 5, everyone else
+ * linearly between -- so the whole 0-5 range is always visible on the list.
+ * It only engages with >= 3 rows and a real range to stretch; a shortlist
+ * bunched within half a star (or fewer than three names) keeps plain absolute
+ * rounding rather than blowing noise up into a full spread, and the pull ramps
+ * in between 0.5 and 1.5 stars of range so a nearly-flat list isn't yanked to
+ * the extremes. Mutates each row's `.stars`, and `.star_breakdown.stars` /
+ * `.curve` for the tooltip. Idempotent (always reads `raw_stars`), so it's
+ * safe to re-run every render.
+ */
+function spreadStars(rows) {
+  if (!rows.length) return;
+  const raw = (r) => {
+    const bk = r.star_breakdown || {};
+    const s = bk.raw_stars != null ? bk.raw_stars : r.stars;
+    return Math.max(0, Math.min(5, s || 0));
+  };
+  const scores = rows.map(raw);
+  const n = scores.length;
+  const lo = Math.min(...scores);
+  const hi = Math.max(...scores);
+  const span = hi - lo;
+  // 0 below half a star of range, full stretch by 1.5 -- linear between.
+  const pull = n >= 3 ? Math.max(0, Math.min(1, (span - 0.5) / 1)) : 0;
+
+  rows.forEach((r, i) => {
+    const s = scores[i];
+    let graded;
+    if (pull <= 0) {
+      graded = Math.round(s);
+    } else {
+      const stretched = ((s - lo) / span) * 5;
+      graded = Math.round(Math.max(0, Math.min(5, pull * stretched + (1 - pull) * s)));
+    }
+    r.stars = graded;
+    if (r.star_breakdown) {
+      r.star_breakdown = { ...r.star_breakdown, stars: graded, curve: { n, applied: pull > 0 } };
+    }
+  });
+}
+
+/** A 0-5 star widget for the CSP recommender -- whole stars only, and only
+ * the earned ones are drawn (no empty placeholders). */
+function starWidget(stars) {
+  const n = Math.max(0, Math.min(5, Math.round(stars || 0)));
+  const wrap = el('span', { class: 'stars', 'aria-label': `${n} of 5 stars` });
+  if (!n) return el('span', { class: 'stars none' }, '—');
+  for (let i = 0; i < n; i += 1) wrap.appendChild(el('span', {}, '★'));
+  return wrap;
+}
+
+/** The plain-text breakdown behind a Signal rating (see `csp_star_score`). */
+function cspStarTooltip(bk) {
+  if (!bk) return null;
+  const v = bk.values || {};
+  const c = bk.components || {};
+  const bar = (score) => {
+    const n = Math.max(0, Math.min(10, Math.round((score || 0) * 10)));
+    return '█'.repeat(n) + '░'.repeat(10 - n);
+  };
+  const line = (label, valueText, keyName) => {
+    const comp = c[keyName] || { score: 0, weight: 0 };
+    return `  ${label.padEnd(15)}${String(valueText).padStart(9)}  ${bar(comp.score)}  ${comp.score.toFixed(2)} ·${Math.round(comp.weight * 100)}%`;
+  };
+  const mod = (x) => (x > 0 ? `+${x.toFixed(1)}` : x < 0 ? `−${Math.abs(x).toFixed(1)}` : '±0');
+  const inline = (x) => (x > 0 ? ` + ${x.toFixed(1)}` : x < 0 ? ` − ${Math.abs(x).toFixed(1)}` : '');
+  const em = bk.modifiers && bk.modifiers.earnings ? bk.modifiers.earnings : { stars: 0, note: '' };
+  const sm = bk.modifiers && bk.modifiers.sector ? bk.modifiers.sector : { stars: 0, note: '' };
+  const pct1 = (x) => (x === null || x === undefined ? '—' : x.toFixed(1) + '%');
+  const curve = bk.curve || {};
+  const rawLine =
+    `  base ${bk.base_stars}${inline(em.stars)}${inline(sm.stars)} = ${bk.raw_stars} raw` +
+    (curve.applied ? `, graded on a curve across ${curve.n} candidates` : '');
+  return formula([
+    `Signal ${bk.stars} / 5`,
+    rawLine,
+    '',
+    'Past wheels',
+    line('ROC', pct(v.roc_pct), 'roc'),
+    line('Monthly prem', pct(v.monthly_premium_pct, 2), 'monthly_premium'),
+    line('PPD yield', pct1(v.ppd_yield_pct), 'ppd_yield'),
+    line('Realized P/L', money(v.net_realized_pl), 'profit'),
+    line('Win rate', v.win_rate === null || v.win_rate === undefined ? '—' : Math.round(v.win_rate * 100) + '%', 'win_rate'),
+    line('Consistency', (v.wheels || 0) + ' wh', 'consistency'),
+    line('Recency', v.days_since_last_wheel === null || v.days_since_last_wheel === undefined ? '—' : v.days_since_last_wheel + 'd', 'recency'),
+    '',
+    'Market now',
+    line('Volatility', v.vol_annual_pct === null || v.vol_annual_pct === undefined ? '—' : Math.round(v.vol_annual_pct) + '%/y', 'volatility'),
+    line('Price pos.', v.price_position === null || v.price_position === undefined ? '—' : v.price_position.toFixed(2), 'price_position'),
+    '',
+    'Adjustments',
+    `  ${mod(em.stars).padEnd(6)} ${em.note || ''}`,
+    `  ${mod(sm.stars).padEnd(6)} ${sm.note || ''}`,
+  ]);
+}
+
+/**
+ * `<td>` for a "next earnings" date. When it's inside the warning window
+ * (0..14 days out) the cell itself turns amber and gets a ` ⚠` glyph -- the
+ * same treatment Expiration gets in Open option positions -- rather than
+ * tinting the whole row. Shared by the CSP- and CC-candidate tables.
  */
 function earningsCell(row) {
   const dte = row.days_to_earnings;
   const soon = dte !== null && dte !== undefined && dte >= 0 && dte <= EARNINGS_WARN_DAYS;
-  const cell = el('td', { class: 'num' }, row.earnings_date ? longDate(row.earnings_date) : '—');
+  const cell = el(
+    'td',
+    { class: 'num' + (soon ? ' earnings-soon' : '') },
+    row.earnings_date ? longDate(row.earnings_date) : '—'
+  );
   if (row.earnings_date) {
     cell.title =
       dte >= 0
         ? `${row.earnings_date} · ${dte}d away` +
           (soon ? ' — within 14 days, hold off on writing here' : '')
         : `${row.earnings_date} · reported ${-dte}d ago (earnings.json is stale)`;
+    if (soon) {
+      cell.appendChild(
+        el('span', { class: 'earnings-warn-icon', title: `Earnings in ${dte} day(s)` }, ' ⚠')
+      );
+    }
   }
   return { cell, soon };
 }
@@ -5961,8 +6096,12 @@ function renderCspCandidates(available) {
       ...row,
       contracts:
         row.last_close && row.last_close > 0 ? Math.floor(available / (row.last_close * 100)) : 0,
+      cash_per_contract: row.last_close && row.last_close > 0 ? row.last_close * 100 : null,
     }))
     .filter((row) => row.contracts >= 1);
+
+  // Grade the 0-5 curve against the names actually shown, not the whole book.
+  spreadStars(rows);
 
   if (hint) hint.hidden = rows.length === 0;
   if (!rows.length) return;
@@ -5996,22 +6135,26 @@ function renderCspCandidates(available) {
 
   const tbody = el('tbody');
   for (const row of sorted) {
-    const { cell: earnCell, soon: earningsSoon } = earningsCell(row);
-    const tr = el('tr', { class: 'op-row' + (earningsSoon ? ' earnings-warn' : '') });
+    const { cell: earnCell } = earningsCell(row);
+    const tr = el('tr', { class: 'op-row' });
 
     const symCell = el('td', { class: 'left ticker-cell' }, row.underlying);
     if (row.name) symCell.title = row.name;
+    const unvetted = (row.vetting && row.vetting.unvetted) || [];
+    if (unvetted.length) {
+      const flag = el('sup', { class: 'unvetted-flag' }, '?');
+      flag.title = 'Not fully vetted:\n· ' + unvetted.join('\n· ');
+      symCell.appendChild(flag);
+    }
     tr.appendChild(symCell);
 
-    const sigCell = el('td', { class: 'num csp-star' }, row.strong ? '★' : '');
-    sigCell.title = formula([
-      row.strong ? 'Strong CSP signal — at least one of:' : 'No strong signal — none of:',
-      `  Monthly premium yield  ${pct(row.monthly_premium_pct)}   (≥ 1.0%)`,
-      `  Blended PPD            ${money(row.ppd, { cents: true })}/day   (≥ $20/day)`,
-      `  Avg annualized ROC     ${pct(row.avg_annualized_roc_pct)}   (≥ 30%)`,
-      '',
-      'From this ticker\'s past wheels — how well they paid for the capital tied up.',
-    ]);
+    const sigCell = el('td', { class: 'num csp-star' });
+    sigCell.appendChild(starWidget(row.stars));
+    setFormula(
+      sigCell,
+      cspStarTooltip(row.star_breakdown) ||
+        `Signal ${row.stars === null || row.stars === undefined ? '—' : row.stars} / 5`
+    );
     tr.appendChild(sigCell);
 
     const qtyCell = el('td', { class: 'num' }, String(row.contracts));
@@ -6023,6 +6166,16 @@ function renderCspCandidates(available) {
       'A rough at-the-money sizing; a real strike / collateral differs.',
     ]);
     tr.appendChild(qtyCell);
+
+    const cpcCell = el('td', { class: 'num' }, money(row.cash_per_contract));
+    cpcCell.title = formula([
+      'Cash / Contract = last close × 100',
+      `= ${money(row.last_close, { cents: true })} × 100`,
+      `= ${money(row.cash_per_contract, { cents: true })}`,
+      '',
+      'Collateral to secure one at-the-money put; a lower strike needs less.',
+    ]);
+    tr.appendChild(cpcCell);
 
     tr.appendChild(
       el('td', { class: 'num ' + toneOf(row.avg_annualized_roc_pct) }, pct(row.avg_annualized_roc_pct))
