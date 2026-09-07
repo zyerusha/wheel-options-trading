@@ -157,6 +157,21 @@ class TestRealExport(unittest.TestCase):
         for point in self.payload["capital_series"]:
             self.assertGreaterEqual(point["total"], -1e-6, point["date"])
 
+    def test_shares_held_split_reconciles(self):
+        """`stock` (all held-share cost basis) splits into `idle_stock` (no call
+        written) + `call_stock` (backing an open covered call). The Capital
+        deployed chart draws them as two bands, so the split must add up.
+        """
+        for point in self.payload["capital_series"]:
+            self.assertIn("call_stock", point, point["date"])
+            self.assertAlmostEqual(
+                point["idle_stock"] + point["call_stock"],
+                point["stock"],
+                places=2,
+                msg=point["date"],
+            )
+            self.assertGreaterEqual(point["call_stock"], -1e-6, point["date"])
+
     def test_a_full_wheel_is_reconstructed(self):
         """A put assigned into stock, then called away, stays one campaign.
 

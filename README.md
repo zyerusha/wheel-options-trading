@@ -68,6 +68,18 @@ Drop a Fidelity **Positions** export (Accounts & Trade → Portfolio → Positio
 
 Positions exports are point-in-time account snapshots (a single moment's holdings), a different shape from the transaction-history exports above. The dashboard tells the two apart automatically from their headers, so both kinds of file can live in the same folder. Add another Positions export later, on a different date, and it becomes a second point on the net worth and benchmark charts — more snapshots over time make both more accurate.
 
+### Closed lots (realized gains)
+
+Drop a Fidelity **Closed Positions / Realized Gain & Loss** export (`Portfolio_Closed_Lots_*.csv`) into `data/` to fill the **Realized Gains** tab: Fidelity's own per-lot table with the short-/long-term split and a `⬇ CSV` re-export, plus a rough per-ticker cross-check against the wheel engine's option P/L over the same period.
+
+### Earnings dates
+
+The Planner and the covered-call candidates table show each holding's next earnings date. These are fetched from Yahoo and cached; to override one (or supply a missing one), add `data/earnings.json`:
+
+```json
+{ "MU": "2026-09-30", "WFC": "2026-10-13" }
+```
+
 ### Multiple Accounts
 
 Organize `data/` into one subfolder per account:
@@ -237,12 +249,15 @@ A `BALANCED` result means the imported transaction cash reconciles to the broker
 
 | Route                | Description                                  |
 | -------------------- | --------------------------------------------- |
-| `GET /api/dashboard` | Dashboard data, including `net_worth` and `benchmark` |
+| `GET /api/dashboard` | Dashboard data, including `net_worth`, `benchmark` / `benchmarks`, `assignment_risk`, `expiration_calendar`, `workflow`, `earnings_in_view`, `realized_gains` |
 | `GET /api/health`    | Health and reconciliation status              |
 | `GET /api/datasets`  | Available/active exports (default account)    |
 | `GET /api/accounts`  | Every discovered account                      |
+| `GET /api/export/{cycles,tickers,trade-log,closed-lots}.csv` | Flat CSV of that payload list, with the same filters applied |
 | `POST /api/upload`   | Upload CSVs (default account)                 |
 | `POST /api/select`   | Select active exports (default account)       |
+
+Load `#present` in the URL (or the **Present** button) for a chrome-free, large-tile view for screenshots.
 
 `/api/dashboard` also accepts `account=<id>` (an id from `/api/accounts`, or `combined` — the default) to scope the whole payload, filters included, to one account or every account aggregated.
 
@@ -332,12 +347,15 @@ Capital is estimated because the supporting shares predate the available export 
 | `wheel/engine.py`      | Positions, rolls, assignments, cycles          |
 | `wheel/metrics.py`     | P/L, ROC, capital                              |
 | `wheel/positions.py`   | Portfolio Positions snapshot parser            |
-| `wheel/marketdata.py`  | SPY price history, fetched and cached          |
+| `wheel/closed_lots.py` | Fidelity closed-lots (realized gains) parser   |
+| `wheel/marketdata.py`  | SPY/QQQ price history and fundamentals, cached |
 | `wheel/benchmark.py`   | Cash-flow classification, XIRR, benchmark replay |
+| `wheel/assignment.py` `wheel/expiration.py` `wheel/workflow.py` `wheel/taxes.py` | Planner and Realized-Gains logic |
+| `wheel/exporter.py`    | CSV export of payload lists                    |
 | `wheel/accounts.py`    | Account discovery and the Combined view        |
 | `wheel/api.py`         | JSON payload assembly                          |
 | `wheel/serve.py`       | HTTP server                                    |
-| `wheel/static/`        | Dashboard                                      |
+| `wheel/static/`        | Dashboard (Dashboard / Planner / Realized Gains / Trade Log tabs) |
 | `tests/`               | Tests                                          |
 | `docs/DESIGN.md`       | Detailed design and accounting rules           |
 

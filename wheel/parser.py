@@ -131,22 +131,26 @@ _NAME_DATE_TAIL_RE = re.compile(
 
 _HEADER_KEY = "run date"
 
-# Two dialects of the same four dollar/quantity columns -- see the module
+# Two dialects of the same five dollar/quantity columns -- see the module
 # docstring. "Quantity" itself is spelled identically in both and so isn't
-# part of either map. "Accrued Interest" and "Cash Balance" also differ the
-# same way between dialects but are never read by this parser, so they're
-# left out rather than tracked for no reason.
+# part of either map. "Accrued Interest" differs the same way between dialects
+# but is never read by this parser, so it's left out rather than tracked for
+# no reason. "Cash Balance" *is* tracked, despite never feeding a `Transaction`
+# field, purely to spot the pending-repost pattern `_drop_pending_reposts`
+# looks for -- see its docstring.
 _LEGACY_COLUMNS = {
     "price": "Price ($)",
     "commission": "Commission ($)",
     "fees": "Fees ($)",
     "amount": "Amount ($)",
+    "cash_balance": "Cash Balance ($)",
 }
 _MODERN_COLUMNS = {
     "price": "Price",
     "commission": "Commission",
     "fees": "Fees",
     "amount": "Amount",
+    "cash_balance": "Cash Balance",
 }
 
 
@@ -479,6 +483,70 @@ def _read_rows(path: str) -> tuple[list[dict], dict[str, str]]:
     return rows, columns
 
 
+# Every raw column that identifies *what happened*, as opposed to *how the
+# ledger currently stands* -- i.e. everything but Cash Balance, which is a
+# running total that necessarily changes between the two copies of a repost
+# and is otherwise never read by this parser (see the dialect maps above).
+_REPOST_IDENTITY_COLUMNS = (
+    "Run Date",
+    "Action",
+    "Symbol",
+    "Description",
+    "Type",
+    "Quantity",
+    "Settlement Date",
+)
+
+
+def _drop_pending_reposts(rows: list[dict], columns: dict[str, str]) -> tuple[list[dict], int]:
+    """Drop a same-file row that is a settled re-post of an identical, still-
+    "Processing" one -- one fill printed twice, not two fills.
+
+    Fidelity sometimes posts a trade with its ``Cash Balance`` cell reading the
+    literal string ``"Processing"`` (the running balance hasn't caught up yet),
+    then re-prints the *exact same* row later once it has, with a real number
+    in that cell and nothing else different. Left alone, both copies parse into
+    two byte-for-byte identical :class:`Transaction` objects -- a double-posted
+    CSP or covered call, a duplicate row in the Open option positions table.
+
+    This is deliberately narrower than "drop every literal Processing row":
+    the ordinary case -- a trade from the file's own last day or two, whose
+    balance simply hasn't posted by download time -- has no settled
+    duplicate anywhere in the file and is left exactly as parsed.
+    :func:`merge_transactions` draws the same distinction across files, for
+    the same reason: a real repeated fill (same price, same day) is one order
+    book entry per copy, not a duplicate, so only a row *fully superseded* by
+    an identical settled twin is ever removed here.
+    """
+    balance_col = columns.get("cash_balance")
+    if not balance_col:
+        return rows, 0
+
+    identity_cols = _REPOST_IDENTITY_COLUMNS + (
+        columns["price"],
+        columns["commission"],
+        columns["fees"],
+        columns["amount"],
+    )
+
+    def signature(row: dict) -> tuple:
+        return tuple((row.get(col) or "").strip() for col in identity_cols)
+
+    def is_pending(row: dict) -> bool:
+        return (row.get(balance_col) or "").strip().lower() == "processing"
+
+    settled_signatures = {signature(row) for row in rows if not is_pending(row)}
+
+    kept: list[dict] = []
+    dropped = 0
+    for row in rows:
+        if is_pending(row) and signature(row) in settled_signatures:
+            dropped += 1
+            continue
+        kept.append(row)
+    return kept, dropped
+
+
 def parse_fidelity_csv(path: str, report: ParseReport | None = None) -> tuple[list[Transaction], ParseReport]:
     """Parse a Fidelity history export into normalized transactions.
 
@@ -488,6 +556,12 @@ def parse_fidelity_csv(path: str, report: ParseReport | None = None) -> tuple[li
     """
     report = report or ParseReport()
     rows, columns = _read_rows(path)
+    rows, pending_reposts_dropped = _drop_pending_reposts(rows, columns)
+    if pending_reposts_dropped:
+        report.warnings.append(
+            f"{pending_reposts_dropped} row(s) dropped: a trade was re-posted a second time once its "
+            "cash balance settled (Fidelity's own \"Processing\" placeholder pattern)"
+        )
     report.total_rows = len(rows)
 
     swapped, reason = _detect_swapped_columns(rows, columns)

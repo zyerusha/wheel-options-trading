@@ -4,8 +4,9 @@ Unrealized P&L.
 
 The project is stdlib-only, so price history comes from Yahoo Finance's
 no-key chart JSON endpoint via :mod:`urllib.request` rather than a
-third-party market-data package -- the only network access anywhere in this
-project. (An earlier version of this module used Stooq's CSV endpoint; Stooq
+third-party market-data package -- this module (prices, plus the fundamentals
+fetch at the bottom) is the only network access anywhere in this project.
+(An earlier version of this module used Stooq's CSV endpoint; Stooq
 now fronts that endpoint with a JavaScript bot challenge that a stdlib-only
 fetch cannot solve, so it stopped returning usable data.) Each ticker gets
 its own cache file under ``data/prices/`` (already gitignored) in a small
@@ -24,10 +25,13 @@ that ticker's figures instead of crashing the dashboard.
 
 from __future__ import annotations
 
+import http.cookiejar
 import json
 import os
+import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from bisect import bisect_right
 from dataclasses import dataclass
@@ -281,3 +285,267 @@ def price_on_or_before(points: Sequence[PricePoint], day: date) -> PricePoint | 
     if index < 0:
         return None
     return points[index]
+
+
+# --------------------------------------------------------------------------
+# Fundamentals -- market cap, 10-day average volume, security type, and the
+# next earnings date, from Yahoo's quote endpoint. Same contract as prices:
+# cached locally (``data/fundamentals_cache.json``), refreshed when stale,
+# and never raised past the public entry point -- a fetch failure just leaves
+# the affected tickers "unknown" (the CSP-candidate filter shows them flagged
+# rather than hidden). ``data/fundamentals.json`` / ``data/earnings.json``
+# stay as hand-maintained per-field overrides on top of what's fetched here.
+# --------------------------------------------------------------------------
+
+_FUNDAMENTALS_CACHE_PATH = os.path.join(PROJECT_ROOT, "data", "fundamentals_cache.json")
+_QUOTE_URL = "https://query2.finance.yahoo.com/v7/finance/quote"
+_CRUMB_URL = "https://query2.finance.yahoo.com/v1/test/getcrumb"
+_COOKIE_URL = "https://fc.yahoo.com/"
+
+# Fund names that mean "not an ordinary ETF you'd wheel".
+_LEVERAGED_RE = re.compile(
+    r"\b(?:ultra(?:pro)?|[1-9](?:\.5)?x|-[1-9]x|leveraged|geared|"
+    r"bull\s+[2-9]x|bear\s+[2-9]x|(?:bull|bear)\s+[2-9]x)\b",
+    re.IGNORECASE,
+)
+_INVERSE_RE = re.compile(r"\b(?:inverse|-1x|short)\b", re.IGNORECASE)
+# Yahoo tags many closed-end funds as EQUITY; a name ending "... Fund" gives
+# them away (operating companies almost never do).
+_FUND_NAME_RE = re.compile(r"\bfund\b", re.IGNORECASE)
+
+# Per-process Yahoo auth (cookie jar opener + crumb). Fetched once; a failure
+# is remembered as (None, None) so a broken run doesn't retry the handshake
+# on every ticker batch.
+_YAHOO_AUTH: tuple[urllib.request.OpenerDirector | None, str | None] | None = None
+
+
+@dataclass(frozen=True)
+class Fundamentals:
+    """What the CSP-candidate filter needs about a ticker. ``as_of`` is the
+    fetch date; every other field may be ``None`` when Yahoo didn't carry it."""
+
+    ticker: str
+    as_of: date
+    market_cap_b: float | None = None
+    avg_vol_10d_m: float | None = None
+    quote_type: str | None = None  # Yahoo's raw: EQUITY / ETF / MUTUALFUND / ...
+    kind: str | None = None  # mapped: common / etf / leveraged_etf / mutual_fund / ...
+    earnings_date: date | None = None
+    long_name: str | None = None
+
+
+def _leverage_kind(name: str | None, quote_type: str | None) -> str | None:
+    """Map Yahoo's ``quoteType`` (+ the fund name) to one of the ``type``
+    values ``wheel.api._EXCLUDED_TYPES`` / the CSP filter understand."""
+    qt = (quote_type or "").upper()
+    if qt == "EQUITY":
+        return "closed_end_fund" if name and _FUND_NAME_RE.search(name) else "common"
+    if qt == "ETF":
+        if name and _INVERSE_RE.search(name):
+            return "inverse_etf"
+        if name and _LEVERAGED_RE.search(name):
+            return "leveraged_etf"
+        return "etf"
+    if qt in ("MUTUALFUND", "MONEYMARKET"):
+        return "mutual_fund"
+    return None
+
+
+def _epoch_to_date(value: object) -> date | None:
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).date()  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _yahoo_auth() -> tuple[urllib.request.OpenerDirector | None, str | None]:
+    """A cookie-jar opener plus a matching crumb -- Yahoo's quote endpoint
+    rejects requests without both. Memoized for the process; on any failure
+    returns ``(None, None)`` and callers fall back to a crumbless request
+    (which usually 401s, handled as a normal fetch failure)."""
+    global _YAHOO_AUTH
+    if _YAHOO_AUTH is not None:
+        return _YAHOO_AUTH
+    try:
+        jar = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        opener.addheaders = [("User-Agent", _USER_AGENT)]
+        try:
+            opener.open(_COOKIE_URL, timeout=10.0)
+        except urllib.error.HTTPError:
+            pass  # 404 is expected; we only want the Set-Cookie it carries
+        with opener.open(_CRUMB_URL, timeout=10.0) as response:
+            crumb = response.read().decode("utf-8", errors="replace").strip()
+        if not crumb or "<" in crumb:  # an HTML challenge page, not a crumb
+            raise MarketDataError("no crumb")
+        _YAHOO_AUTH = (opener, crumb)
+    except (urllib.error.URLError, OSError, ValueError, MarketDataError):
+        _YAHOO_AUTH = (None, None)
+    return _YAHOO_AUTH
+
+
+def fetch_yahoo_quotes(tickers: Sequence[str], timeout: float = 10.0) -> str:
+    """Raw JSON text from Yahoo's batched quote endpoint. MarketDataError on
+    any transport failure (the crumb handshake included)."""
+    opener, crumb = _yahoo_auth()
+    query = {"symbols": ",".join(sorted({t.upper() for t in tickers}))}
+    if crumb:
+        query["crumb"] = crumb
+    url = f"{_QUOTE_URL}?{urllib.parse.urlencode(query)}"
+    request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    opener = opener or urllib.request.build_opener()
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return response.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        raise MarketDataError(f"could not fetch quotes for {query['symbols']}: {error}") from error
+
+
+def parse_yahoo_quotes(text: str) -> dict[str, dict]:
+    """Yahoo ``quoteResponse.result`` -> ``{TICKER: raw quote dict}``. Raises
+    MarketDataError on a response with no parseable ``quoteResponse`` (an error
+    payload or a challenge page), the same way :func:`parse_yahoo_chart` does."""
+    try:
+        results = json.loads(text)["quoteResponse"]["result"]
+    except (json.JSONDecodeError, KeyError, TypeError) as error:
+        raise MarketDataError(f"unrecognized Yahoo quote response: {error}") from error
+    out: dict[str, dict] = {}
+    for row in results or []:
+        symbol = str(row.get("symbol", "")).upper()
+        if symbol:
+            out[symbol] = row
+    return out
+
+
+def _fundamentals_from_quote(ticker: str, row: dict, as_of: date) -> Fundamentals:
+    name = row.get("longName") or row.get("shortName")
+    cap = row.get("marketCap")
+    vol = row.get("averageDailyVolume10Day") or row.get("averageDailyVolume3Month")
+    quote_type = row.get("quoteType")
+    earn = _epoch_to_date(row.get("earningsTimestampStart") or row.get("earningsTimestamp"))
+    return Fundamentals(
+        ticker=ticker,
+        as_of=as_of,
+        market_cap_b=round(cap / 1e9, 4) if isinstance(cap, (int, float)) and cap > 0 else None,
+        avg_vol_10d_m=round(vol / 1e6, 4) if isinstance(vol, (int, float)) and vol > 0 else None,
+        quote_type=quote_type,
+        kind=_leverage_kind(name, quote_type),
+        earnings_date=earn,
+        long_name=name,
+    )
+
+
+def _load_fundamentals_cache(path: str) -> dict[str, Fundamentals]:
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    out: dict[str, Fundamentals] = {}
+    for ticker, entry in (raw or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        as_of = _parse_date(str(entry.get("as_of", "")))
+        if as_of is None:
+            continue
+        out[ticker.upper()] = Fundamentals(
+            ticker=ticker.upper(),
+            as_of=as_of,
+            market_cap_b=entry.get("market_cap_b"),
+            avg_vol_10d_m=entry.get("avg_vol_10d_m"),
+            quote_type=entry.get("quote_type"),
+            kind=entry.get("kind"),
+            earnings_date=_parse_date(str(entry.get("earnings_date", ""))),
+            long_name=entry.get("long_name"),
+        )
+    return out
+
+
+def _save_fundamentals_cache(cache: dict[str, Fundamentals], path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    serializable = {
+        ticker: {
+            "as_of": f.as_of.isoformat(),
+            "market_cap_b": f.market_cap_b,
+            "avg_vol_10d_m": f.avg_vol_10d_m,
+            "quote_type": f.quote_type,
+            "kind": f.kind,
+            "earnings_date": f.earnings_date.isoformat() if f.earnings_date else None,
+            "long_name": f.long_name,
+        }
+        for ticker, f in sorted(cache.items())
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(serializable, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def _fundamentals_stale(entry: Fundamentals | None, today: date, max_age_days: int) -> bool:
+    if entry is None:
+        return True
+    age = (today - entry.as_of).days
+    if age >= max_age_days:
+        return True
+    # A known earnings date that's now in the past means the *next* one is out
+    # there unfetched -- chase it, but no more than daily.
+    if entry.earnings_date is not None and entry.earnings_date < today and age >= 1:
+        return True
+    # A stock that never got an earnings date at all: retry every few days
+    # (an ETF / fund legitimately has none -- don't churn on those).
+    if entry.earnings_date is None and entry.kind == "common" and age >= 3:
+        return True
+    return False
+
+
+def get_fundamentals(
+    tickers: Sequence[str],
+    *,
+    fetch: Callable[[Sequence[str]], str] | None = None,
+    cache_path: str | None = None,
+    max_age_days: int = 14,
+    local_only: bool = False,
+    force_refresh: bool = False,
+    today: date | None = None,
+) -> tuple[dict[str, Fundamentals], list[str]]:
+    """``({TICKER: Fundamentals}, warnings)`` for ``tickers``, refreshing the
+    local cache when an entry is missing or stale. Never raises.
+
+    One batched network call covers every stale ticker. ``local_only`` skips
+    the network entirely and returns whatever the cache holds (fresh or not).
+    A fetch failure keeps the existing cache and adds one warning; tickers
+    with no cache entry are simply absent from the result.
+
+    ``fetch`` (symbols -> JSON text) and ``cache_path`` default to Yahoo and
+    ``data/fundamentals_cache.json``; tests inject both.
+    """
+    path = cache_path or _FUNDAMENTALS_CACHE_PATH
+    fetch = fetch or fetch_yahoo_quotes
+    today = today or date.today()
+    wanted = sorted({t.upper() for t in tickers if t})
+
+    cache = _load_fundamentals_cache(path)
+    if local_only:
+        return {t: cache[t] for t in wanted if t in cache}, []
+
+    stale = [
+        t for t in wanted if force_refresh or _fundamentals_stale(cache.get(t), today, max_age_days)
+    ]
+    warnings: list[str] = []
+    if stale:
+        try:
+            quotes = parse_yahoo_quotes(fetch(stale))
+            touched = False
+            for ticker in stale:
+                row = quotes.get(ticker)
+                if not row or not (row.get("quoteType") or row.get("marketCap")):
+                    continue  # nothing usable came back -- don't cache a blank
+                cache[ticker] = _fundamentals_from_quote(ticker, row, today)
+                touched = True
+            if touched:
+                _save_fundamentals_cache(cache, path)
+        except MarketDataError as error:
+            warnings.append(f"could not refresh fundamentals ({len(stale)} ticker(s)): {error}")
+
+    return {t: cache[t] for t in wanted if t in cache}, warnings

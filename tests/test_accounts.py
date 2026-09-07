@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from datetime import date
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -193,6 +194,23 @@ class TestAccountRegistry(unittest.TestCase):
     def test_unknown_account_raises_keyerror(self):
         with self.assertRaises(KeyError):
             self.registry.build("does-not-exist")
+
+    def test_single_account_csp_candidates_are_widened_across_all_accounts(self):
+        import wheel.accounts as accts
+
+        calls = []
+        sentinel = [{"underlying": "SENTINEL"}]
+
+        def fake_combine(payloads, exposure):
+            calls.append(set(payloads))
+            return sentinel
+
+        with mock.patch.object(accts, "_combine_csp_candidates", side_effect=fake_combine):
+            payload = self.registry.build("ira")
+
+        self.assertEqual(payload["csp_candidates"], sentinel)  # widened list replaces the per-account one
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0], {"ira", "taxable"})  # every account fed in, not just the one asked for
 
     def test_combined_cycles_are_concatenated_not_merged(self):
         combined = self.registry.build("combined")
@@ -866,6 +884,32 @@ class TestCombineBenchmarkDateAlignment(unittest.TestCase):
         # summed with 'b's own real reading -- never silently just 30000.
         self.assertAlmostEqual(series["2026-07-15"]["actual_value"], 80000.0, places=2)
         self.assertAlmostEqual(series["2026-07-15"]["benchmark_value"], 48000.0 + 29000.0, places=2)
+
+    def test_multiple_indices_are_summed_and_carried_through(self):
+        from wheel.accounts import _combine_benchmark
+
+        def payload(actual, spy, qqq):
+            base = self._benchmark_payload(
+                [{"as_of": "2026-07-01", "actual_value": actual, "benchmark_value": spy}]
+            )
+            base["series"][0]["benchmark_value_qqq"] = qqq
+            base["benchmarks"] = [
+                {"name": "SPY", "terminal_value": spy, "xirr_pct": None, "value_added": None},
+                {"name": "QQQ", "terminal_value": qqq, "xirr_pct": None, "value_added": None},
+            ]
+            base["benchmark"] = base["benchmarks"][0]
+            return {"benchmark": base}
+
+        combined = _combine_benchmark({"a": payload(50000.0, 48000.0, 52000.0),
+                                       "b": payload(30000.0, 29000.0, 31000.0)})
+        names = [e["name"] for e in combined["benchmarks"]]
+        self.assertEqual(names, ["SPY", "QQQ"])
+        self.assertAlmostEqual(combined["benchmarks"][1]["terminal_value"], 83000.0, places=2)
+        point = combined["series"][0]
+        self.assertAlmostEqual(point["benchmark_value"], 77000.0, places=2)
+        self.assertAlmostEqual(point["benchmark_value_qqq"], 83000.0, places=2)
+        # Legacy key still points at the primary index
+        self.assertEqual(combined["benchmark"]["name"], "SPY")
 
 
 if __name__ == "__main__":

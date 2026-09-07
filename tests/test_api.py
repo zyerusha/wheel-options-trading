@@ -218,5 +218,120 @@ class TestCapitalThroughExtendsToPositionsSnapshot(unittest.TestCase):
             self.assertEqual(last_point["date"], "2026-08-03")  # not stretched to the snapshot date
 
 
+class TestUntrackedEquityValue(unittest.TestCase):
+    """`net_worth.untracked_equity_value` -- the market value of Positions-
+    snapshot shares this dashboard's transaction history has no share lot for
+    at all: a legacy holding bought before every loaded export begins, with
+    nothing since but perhaps a stray dividend-reinvestment fraction of a
+    share. This is the single biggest reason `wheel_capital_deployed` can
+    undercount `total_value` even for a fully-funded, fully-tracked wheel.
+    """
+
+    def _positions_csv(self, path: str, rows: list[str]) -> None:
+        with open(path, "w", encoding="utf-8-sig", newline="") as handle:
+            handle.write(POSITIONS_HEADER + "\n")
+            handle.write("\n".join(rows) + "\n")
+            handle.write("\n")
+            handle.write('"Date downloaded Sep-05-2026 5:00 p.m ET"\n')
+
+    def _mu_history(self, path: str) -> None:
+        """A CSP assigned into 100 real MU shares -- the one position this
+        history actually tracks a share lot for."""
+        _write_history_csv(
+            path, _assigned_put_rows("-MU251010P100", "MU", "10/01/2025", "10/13/2025", "Oct-10-2025")
+        )
+
+    def test_a_position_with_no_history_at_all_is_fully_untracked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            history_path = os.path.join(tmp, "History.csv")
+            self._mu_history(history_path)
+            positions_path = os.path.join(tmp, "Positions.csv")
+            self._positions_csv(
+                positions_path,
+                [
+                    # 100 MU shares -- exactly what the assignment above tracks.
+                    '111111111,"Test Account",MU,"MICRON TECHNOLOGY INC",100,$100.00,,'
+                    "$10000.00,,,,,50.00%,$9700.00,$97.00,Cash,",
+                    # XOM: never appears in the transaction history at all.
+                    '111111111,"Test Account",XOM,"EXXON MOBIL CORP",50,$100.00,,'
+                    "$5000.00,,,,,25.00%,$3000.00,$60.00,Cash,",
+                ],
+            )
+            data = Dashboard(history_path, position_paths=[positions_path]).build()
+            self.assertAlmostEqual(data["net_worth"]["untracked_equity_value"], 5000.0, places=2)
+
+    def test_a_partially_tracked_position_only_counts_its_untracked_share(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            history_path = os.path.join(tmp, "History.csv")
+            self._mu_history(history_path)  # tracks 100 of the 150 real shares below
+            positions_path = os.path.join(tmp, "Positions.csv")
+            self._positions_csv(
+                positions_path,
+                [
+                    '111111111,"Test Account",MU,"MICRON TECHNOLOGY INC",150,$100.00,,'
+                    "$15000.00,,,,,50.00%,$14550.00,$97.00,Cash,",
+                ],
+            )
+            data = Dashboard(history_path, position_paths=[positions_path]).build()
+            # 50 of 150 shares untracked -> 1/3 of the $15,000 market value.
+            self.assertAlmostEqual(data["net_worth"]["untracked_equity_value"], 5000.0, places=2)
+
+    def test_fully_tracked_position_contributes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            history_path = os.path.join(tmp, "History.csv")
+            self._mu_history(history_path)
+            positions_path = os.path.join(tmp, "Positions.csv")
+            self._positions_csv(
+                positions_path,
+                [
+                    '111111111,"Test Account",MU,"MICRON TECHNOLOGY INC",100,$100.00,,'
+                    "$10000.00,,,,,50.00%,$9700.00,$97.00,Cash,",
+                ],
+            )
+            data = Dashboard(history_path, position_paths=[positions_path]).build()
+            self.assertAlmostEqual(data["net_worth"]["untracked_equity_value"], 0.0, places=2)
+
+
+class TestCapitalPointSharesSplit(unittest.TestCase):
+    """`_capital_point` splits `stock` (all held-share cost basis) into
+    `idle_stock` (no call written) + `call_stock` (backing an open covered
+    call), so the Capital deployed chart can draw the two as separate bands.
+    """
+
+    def test_idle_hold_is_all_idle_stock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "History.csv")
+            _write_history_csv(
+                path,
+                [
+                    '11/17/2025,"YOU SOLD OPENING TRANSACTION PUT (MU) ...",-MU251121P230,'
+                    '"PUT ...",Cash,-1,4.00,0,0,,399.33,10000.00,11/17/2025',
+                    '11/21/2025,"ASSIGNED PUT as of Nov-20-2025",-MU251121P230,"PUT ...",Cash,1,,0,0,,0.00,9700.00,11/21/2025',
+                ],
+            )
+            last = Dashboard(path, position_paths=[]).build()["capital_series"][-1]
+            self.assertAlmostEqual(last["stock"], 23000.0, places=2)
+            self.assertAlmostEqual(last["idle_stock"], 23000.0, places=2)
+            self.assertAlmostEqual(last["call_stock"], 0.0, places=2)
+
+    def test_covered_call_moves_the_basis_to_call_stock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "History.csv")
+            _write_history_csv(
+                path,
+                [
+                    '11/17/2025,"YOU SOLD OPENING TRANSACTION PUT (MU) ...",-MU251121P230,'
+                    '"PUT ...",Cash,-1,4.00,0,0,,399.33,10000.00,11/17/2025',
+                    '11/21/2025,"ASSIGNED PUT as of Nov-20-2025",-MU251121P230,"PUT ...",Cash,1,,0,0,,0.00,9700.00,11/21/2025',
+                    '11/24/2025,"YOU SOLD OPENING TRANSACTION CALL (MU) ...",-MU251219C235,'
+                    '"CALL ...",Cash,-1,2.00,0,0,,199.33,9900.00,11/24/2025',
+                ],
+            )
+            last = Dashboard(path, position_paths=[]).build()["capital_series"][-1]
+            self.assertAlmostEqual(last["idle_stock"] + last["call_stock"], last["stock"], places=2)
+            self.assertAlmostEqual(last["idle_stock"], 0.0, places=2)
+            self.assertAlmostEqual(last["call_stock"], 23000.0, places=2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

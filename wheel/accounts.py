@@ -125,9 +125,26 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import TYPE_CHECKING, Any, Sequence
 
+from wheel import assignment as assignment_mod
 from wheel import benchmark as bm
 from wheel import cashflow as cf
-from wheel.api import Dashboard, Filters, discover_exports, discover_multi_account_exports
+from wheel import expiration as expiration_mod
+from wheel import taxes as taxes_mod
+from wheel import workflow as workflow_mod
+from wheel.closed_lots import (
+    ClosedLotsFormatError,
+    discover_closed_lots,
+    parse_closed_lots,
+    realized_totals,
+)
+from wheel.api import (
+    Dashboard,
+    Filters,
+    csp_star_score,
+    discover_exports,
+    discover_multi_account_exports,
+    sector_exposure,
+)
 from wheel.insights import portfolio_insights
 from wheel.metrics import roi_and_annualized, time_weighted_average, weekly_ppd_series
 from wheel.positions import discover_position_snapshots, latest_snapshot, latest_snapshot_per_account, load_snapshots
@@ -808,11 +825,67 @@ class AccountRegistry:
         return rows
 
     def build(self, account_id: str | None, filters: Filters | None = None) -> dict[str, Any]:
-        if not account_id or account_id.lower() == COMBINED_ACCOUNT_ID:
-            return self._build_combined(filters)
-        payload = self.get(account_id).build(filters)
-        payload["meta"] = {**payload["meta"], "account_id": account_id}
+        combined = not account_id or account_id.lower() == COMBINED_ACCOUNT_ID
+        if combined:
+            payload = self._build_combined(filters)
+        else:
+            payload = self.get(account_id).build(filters)
+            payload["meta"] = {**payload["meta"], "account_id": account_id}
+        payload["realized_gains"] = self._realized_gains(None if combined else account_id)
+        if combined:
+            return payload
+
+        # CSP candidates are a shopping list, not a record of this account:
+        # widen it to every ticker wheeled *anywhere* in the book, re-scored on
+        # the pooled history but against THIS account's own sector exposure.
+        # The frontend still sizes each row against this account's free cash,
+        # so a name only ever traded elsewhere shows up here exactly when this
+        # account could actually write the put.
+        if len(self._accounts) > 1:
+            others = {
+                aid: (payload if aid == account_id else dash.build(filters))
+                for aid, dash in self._accounts.items()
+            }
+            own_exposure = sector_exposure((payload.get("trade_log") or {}).get("wheels", []))
+            payload["csp_candidates"] = _combine_csp_candidates(others, own_exposure)
+
         return payload
+
+    def _realized_gains(self, account_id: str | None) -> dict[str, Any] | None:
+        """Reconcile the wheel engine's option P/L against any Fidelity
+        closed-lots export found loose in ``.`` / ``data/``. ``None`` when none
+        is present.
+
+        The engine side is rebuilt scoped to the export's own coverage window
+        (a closed-lots export is a *period* report, not all-time), so the two
+        figures are measured over the same span; a leg that straddles the window
+        edge still drifts a little, which is what the "investigate" band and the
+        notes are for. Not account-tagged, so ``account_id=None`` reconciles the
+        whole book.
+        """
+        paths = discover_closed_lots()
+        if not paths:
+            return None
+        lots: list = []
+        for path in paths:
+            try:
+                lots.extend(parse_closed_lots(path).lots)
+            except ClosedLotsFormatError:
+                continue
+        if not lots:
+            return None
+
+        totals = realized_totals(lots)
+        window = Filters(
+            start=date.fromisoformat(totals["coverage_start"]) if totals["coverage_start"] else None,
+            end=date.fromisoformat(totals["coverage_end"]) if totals["coverage_end"] else None,
+        )
+        if account_id is None:
+            payloads = {aid: dash.build(window) for aid, dash in self._accounts.items()}
+            ticker_rows = _combine_tickers(payloads)
+        else:
+            ticker_rows = self.get(account_id).build(window)["tickers"]
+        return taxes_mod.reconcile(ticker_rows, lots)
 
     # ---- combined aggregation ----
 
@@ -828,9 +901,35 @@ class AccountRegistry:
         combined_portfolio = _combine_portfolio(payloads, capital_series)
         combined_trade_log = _combine_trade_log(payloads)
         combined_hedges = _combine_open_hedges(payloads)
+        combined_open_positions = _combine_open_positions(payloads)
+        combined_cc_candidates = _combine_cc_candidates(payloads)
+        combined_csp_candidates = _combine_csp_candidates(
+            payloads, sector_exposure(combined_trade_log.get("wheels", []))
+        )
         combined_wheel_state = _combine_wheel_state(payloads)
         combined_benchmark = _combine_benchmark(payloads)
         combined_wheel_return = _combine_wheel_return(payloads)
+        combined_earnings = _combine_earnings_in_view(payloads)
+        _earn_rows = {r["ticker"]: r for r in combined_earnings["tickers"]}
+        _earn_dates = {t: r["earnings_date"] for t, r in _earn_rows.items()}
+        _earn_before_expiry = [r["ticker"] for r in combined_earnings["tickers"] if r["before_expiry"]]
+        # Re-stamp the earnings columns on the combined Open positions rows;
+        # days are counted from today (matching the candidate tables), so they
+        # don't drift with each account's own transaction window.
+        _today = date.today()
+        for _row in combined_open_positions:
+            _ed = (_earn_rows.get(_row["underlying"]) or {}).get("earnings_date")
+            _row["earnings_date"] = _ed
+            _row["days_to_earnings"] = (date.fromisoformat(_ed) - _today).days if _ed else None
+
+        # Every account's assigned / called-away legs from the current month,
+        # for the expiration calendar's faded "what just happened" bars.
+        combined_recent_closes = [
+            close
+            for payload in payloads.values()
+            for close in (payload.get("recent_closes") or [])
+        ]
+        combined_recent_closes.sort(key=lambda r: (r["close_date"], r["underlying"]))
 
         return {
             "meta": _combine_meta(payloads, labels, self._build_warnings),
@@ -849,6 +948,10 @@ class AccountRegistry:
             "pnl_series": _combine_pnl_series(payloads),
             "ppd_series": _combine_ppd_series(payloads, combined_portfolio),
             "cash_flow": _combine_cash_flow(payloads, capital_series),
+            "period_pl": {
+                "weeks": _combine_period_pl(payloads, "weeks"),
+                "months": _combine_period_pl(payloads, "months"),
+            },
             "wheel_state": combined_wheel_state,
             "reconciliation": _combine_reconciliation(payloads),
             "net_worth": net_worth,
@@ -856,6 +959,16 @@ class AccountRegistry:
             "wheel_return": combined_wheel_return,
             "trade_log": combined_trade_log,
             "open_hedges": combined_hedges,
+            "open_positions": combined_open_positions,
+            "cc_candidates": combined_cc_candidates,
+            "csp_candidates": combined_csp_candidates,
+            "earnings_in_view": combined_earnings,
+            "assignment_risk": assignment_mod.assignment_risk(combined_open_positions, net_worth),
+            "expiration_calendar": expiration_mod.expiration_calendar(
+                combined_open_positions, _earn_dates, recent_closes=combined_recent_closes
+            ),
+            "recent_closes": combined_recent_closes,
+            "workflow": workflow_mod.classify_open_legs(combined_open_positions, _earn_before_expiry),
         }
 
 
@@ -954,6 +1067,172 @@ def _combine_open_hedges(payloads: dict[str, dict]) -> list[dict]:
     return hedges
 
 
+def _combine_open_positions(payloads: dict[str, dict]) -> list[dict]:
+    """Every account's open covered calls / cash-secured puts in one list,
+    ``cycle_id`` account-prefixed to match the combined timeline / Trade Log.
+    Grouped by underlying then expiry, the same order each account already uses.
+    """
+    positions: list[dict] = []
+    for account_id, payload in payloads.items():
+        for position in payload.get("open_positions") or []:
+            positions.append(
+                {**position, "account_id": account_id, "cycle_id": f"{account_id}:{position['cycle_id']}"}
+            )
+    positions.sort(key=lambda p: (p["underlying"], p["expiration"] or "", p["strike"] or 0.0))
+    return positions
+
+
+def _combine_earnings_in_view(payloads: dict[str, dict]) -> dict[str, Any]:
+    """One earnings-in-view block for the whole book. Earnings dates are a
+    per-ticker fact, so accounts agree on them; ``before_expiry`` is OR-ed
+    (a report that lands before *any* account's open leg on that ticker is a
+    gap-risk for the book), and the shortest ``soonest_leg_expiry`` wins.
+    """
+    merged: dict[str, dict[str, Any]] = {}
+    for payload in payloads.values():
+        for row in ((payload.get("earnings_in_view") or {}).get("tickers")) or []:
+            cur = merged.get(row["ticker"])
+            if cur is None:
+                merged[row["ticker"]] = dict(row)
+                continue
+            cur["before_expiry"] = cur["before_expiry"] or row["before_expiry"]
+            a, b = cur.get("soonest_leg_expiry"), row.get("soonest_leg_expiry")
+            cur["soonest_leg_expiry"] = min([x for x in (a, b) if x], default=None)
+    rows = sorted(merged.values(), key=lambda r: r["days_to_earnings"])
+    return {"tickers": rows, "within_7d": [r["ticker"] for r in rows if r["days_to_earnings"] <= 7]}
+
+
+def _combine_cc_candidates(payloads: dict[str, dict]) -> list[dict]:
+    """Every account's covered-call candidates in one list, ``cycle_id`` /
+    ``wheel`` account-prefixed to match the combined Trade Log; sorted by
+    underlying like each account's own table.
+    """
+    rows: list[dict] = []
+    for account_id, payload in payloads.items():
+        for row in payload.get("cc_candidates") or []:
+            rows.append(
+                {
+                    **row,
+                    "account_id": account_id,
+                    "cycle_id": f"{account_id}:{row['cycle_id']}",
+                    "wheel": f"{account_id}:{row['wheel']}" if row.get("wheel") else None,
+                }
+            )
+    # Actionable (100+ share) rows first, then the sub-100 lots -- same order
+    # each account's own table already uses.
+    rows.sort(key=lambda r: (not r.get("meets_threshold", True), r["underlying"]))
+    return rows
+
+
+def _combine_csp_candidates(payloads: dict[str, dict], exposure: dict[str, float]) -> list[dict]:
+    """One row per underlying across every account -- a ticker wheeled in more
+    than one account is merged (P/L and wheel count summed, rate signals
+    wheel-weighted, recency the soonest), kept only if the *combined* result is
+    still net-positive, and its star rating re-computed from the merged inputs
+    against the whole book's ``exposure``. ``last_close`` / sector / earnings
+    are ticker facts, so any account's value stands.
+    """
+
+    by_ticker: dict[str, dict] = {}
+    for payload in payloads.values():
+        for row in payload.get("csp_candidates") or []:
+            agg = by_ticker.setdefault(
+                row["underlying"],
+                {
+                    "net_realized_pl": 0.0,
+                    "wheels": 0,
+                    "wsum": 0.0,
+                    "roc_w": 0.0,
+                    "mp_w": 0.0,
+                    "ppdy_w": 0.0,
+                    "ppd_w": 0.0,
+                    "wins": 0,
+                    "losses": 0,
+                    "days_since": None,
+                    "last_close": None,
+                    "name": None,
+                    "sector": None,
+                    "earnings_date": None,
+                    "days_to_earnings": None,
+                    "vol_annual_pct": None,
+                    "price_position": None,
+                    "vetting": None,
+                },
+            )
+            agg["net_realized_pl"] += row.get("net_realized_pl") or 0.0
+            w = max(row.get("wheels") or 0, 1)
+            agg["wheels"] += row.get("wheels") or 0
+            agg["wsum"] += w
+            agg["roc_w"] += (row.get("roc_pct") or 0.0) * w
+            agg["mp_w"] += (row.get("monthly_premium_pct") or 0.0) * w
+            agg["ppdy_w"] += (row.get("ppd_yield_pct") or 0.0) * w
+            agg["ppd_w"] += (row.get("ppd") or 0.0) * w
+            agg["wins"] += row.get("wins") or 0
+            agg["losses"] += row.get("losses") or 0
+            dsw = row.get("days_since_last_wheel")
+            if dsw is not None:
+                agg["days_since"] = dsw if agg["days_since"] is None else min(agg["days_since"], dsw)
+            for key in ("last_close", "name", "sector", "vol_annual_pct", "price_position", "vetting"):
+                if agg[key] is None and row.get(key) is not None:
+                    agg[key] = row[key]
+            if row.get("earnings_date") is not None:
+                agg["earnings_date"] = row["earnings_date"]
+                agg["days_to_earnings"] = row.get("days_to_earnings")
+
+    rows = []
+    for ticker, agg in by_ticker.items():
+        if agg["net_realized_pl"] <= 0:
+            continue
+        ws = agg["wsum"] or 1.0
+        roc = round(agg["roc_w"] / ws, 2)
+        mp = round(agg["mp_w"] / ws, 2)
+        ppdy = round(agg["ppdy_w"] / ws, 2)
+        win_rate = (
+            agg["wins"] / (agg["wins"] + agg["losses"]) if (agg["wins"] + agg["losses"]) > 0 else None
+        )
+        comp = {
+            "roc_pct": roc,
+            "monthly_premium_pct": mp,
+            "ppd_yield_pct": ppdy,
+            "net_realized_pl": agg["net_realized_pl"],
+            "win_rate": win_rate,
+            "wheels": agg["wheels"],
+            "days_since_last_wheel": agg["days_since"],
+            "vol_annual_pct": agg["vol_annual_pct"],
+            "price_position": agg["price_position"],
+            "sector": agg["sector"],
+        }
+        scored = csp_star_score(comp, exposure.get(agg["sector"] or "Unknown", 0.0), agg["days_to_earnings"])
+        rows.append(
+            {
+                "underlying": ticker,
+                "name": agg["name"],
+                "wheels": agg["wheels"],
+                "net_realized_pl": round(agg["net_realized_pl"], 2),
+                "avg_annualized_roc_pct": roc,
+                "monthly_premium_pct": mp,
+                "ppd": round(agg["ppd_w"] / ws, 2),
+                "last_close": agg["last_close"],
+                "sector": agg["sector"],
+                "earnings_date": agg["earnings_date"],
+                "days_to_earnings": agg["days_to_earnings"],
+                "stars": scored["stars"],
+                "star_breakdown": scored,
+                "vetting": agg["vetting"],
+                "roc_pct": roc,
+                "ppd_yield_pct": ppdy,
+                "win_rate": round(win_rate, 4) if win_rate is not None else None,
+                "wins": agg["wins"],
+                "losses": agg["losses"],
+                "days_since_last_wheel": agg["days_since"],
+                "vol_annual_pct": agg["vol_annual_pct"],
+                "price_position": agg["price_position"],
+            }
+        )
+    rows.sort(key=lambda r: (-r["stars"], -r["net_realized_pl"]))
+    return rows
+
+
 def _combine_tickers(payloads: dict[str, dict]) -> list[dict]:
     combined = [
         {**row, "account_id": account_id} for account_id, payload in payloads.items() for row in payload["tickers"]
@@ -968,9 +1247,9 @@ def _combine_capital_series(payloads: dict[str, dict]) -> list[dict]:
         for point in payload["capital_series"]:
             bucket = buckets.setdefault(
                 point["date"],
-                {"put": 0.0, "stock": 0.0, "call": 0.0, "long": 0.0, "spread": 0.0, "idle_stock": 0.0},
+                {"put": 0.0, "stock": 0.0, "call": 0.0, "long": 0.0, "spread": 0.0, "idle_stock": 0.0, "call_stock": 0.0},
             )
-            for field_name in ("put", "stock", "call", "long", "spread", "idle_stock"):
+            for field_name in ("put", "stock", "call", "long", "spread", "idle_stock", "call_stock"):
                 bucket[field_name] += point.get(field_name) or 0.0
 
     series: list[dict] = []
@@ -989,6 +1268,7 @@ def _combine_capital_series(payloads: dict[str, dict]) -> list[dict]:
                 "spread": round(values["spread"], 2),
                 "total": total,
                 "idle_stock": round(values["idle_stock"], 2),
+                "call_stock": round(values["call_stock"], 2),
             }
         )
     return series
@@ -1025,6 +1305,39 @@ def _combine_pnl_series(payloads: dict[str, dict]) -> list[dict]:
             }
         )
     return series
+
+
+def _combine_period_pl(payloads: dict[str, dict], key: str) -> list[dict]:
+    """Sum every account's Periodic P/L rows (``key`` is ``"weeks"`` or
+    ``"months"``) by their shared ``period`` key. Safe to merge by that key
+    alone, unlike a date series: ``period`` is a deterministic function of the
+    calendar (Monday-anchored ISO week, or ``YYYY-MM``), so two accounts'
+    rows for the same period always describe the exact same span. Every field
+    here is a plain per-period dollar figure, none of them running/cumulative,
+    so summing across accounts needs no recomputation pass the way
+    :func:`_combine_pnl_series` does.
+    """
+    buckets: dict[str, dict[str, Any]] = {}
+    for payload in payloads.values():
+        for row in (payload.get("period_pl") or {}).get(key, []):
+            bucket = buckets.setdefault(
+                row["period"],
+                {
+                    field_name: row[field_name]
+                    for field_name in row
+                    if field_name not in ("net_premium", "closed_pl", "net_pl")
+                },
+            )
+            for field_name in ("net_premium", "closed_pl", "net_pl"):
+                bucket[field_name] = bucket.get(field_name, 0.0) + (row.get(field_name) or 0.0)
+
+    rows = []
+    for period in sorted(buckets):
+        row = dict(buckets[period])
+        for field_name in ("net_premium", "closed_pl", "net_pl"):
+            row[field_name] = round(row.get(field_name, 0.0), 2)
+        rows.append(row)
+    return rows
 
 
 def _combine_wheel_pnl_series(payloads: dict[str, dict]) -> list[dict]:
@@ -1142,9 +1455,18 @@ def _combine_wheel_state(payloads: dict[str, dict]) -> dict[str, Any]:
     cycles.
     """
     keys = ("puts", "calls", "holding", "other")
+    part_keys = (
+        "put_collateral",
+        "calls_cost_basis",
+        "calls_strike_estimate",
+        "holding_cost_basis",
+        "long_option_debit",
+        "spread_collateral",
+    )
     buckets: dict[str, dict[str, Any]] = {
         key: {"amount": 0.0, "cycles": 0, "tickers": set()} for key in keys
     }
+    parts: dict[str, float] = {key: 0.0 for key in part_keys}
     active_cycles = 0
     for payload in payloads.values():
         state = payload.get("wheel_state") or {}
@@ -1153,6 +1475,8 @@ def _combine_wheel_state(payloads: dict[str, dict]) -> dict[str, Any]:
             buckets[key]["amount"] += bucket.get("amount", 0.0)
             buckets[key]["cycles"] += bucket.get("cycles", 0)
             buckets[key]["tickers"].update(bucket.get("tickers", []))
+        for key in part_keys:
+            parts[key] += (state.get("parts") or {}).get(key, 0.0)
         active_cycles += state.get("active_cycles", 0)
 
     return {
@@ -1164,6 +1488,7 @@ def _combine_wheel_state(payloads: dict[str, dict]) -> dict[str, Any]:
             }
             for key, bucket in buckets.items()
         },
+        "parts": {key: round(amount, 2) for key, amount in parts.items()},
         "active_cycles": active_cycles,
     }
 
@@ -1330,7 +1655,14 @@ def _combine_net_worth(payloads: dict[str, dict]) -> dict[str, Any]:
             "accounts": [],
         }
 
-    totals = {"total_value": 0.0, "cash_total": 0.0, "equity_value": 0.0, "option_value": 0.0, "wheel_capital_deployed": 0.0}
+    totals = {
+        "total_value": 0.0,
+        "cash_total": 0.0,
+        "equity_value": 0.0,
+        "option_value": 0.0,
+        "wheel_capital_deployed": 0.0,
+        "untracked_equity_value": 0.0,
+    }
     accounts_out = []
     for account_id, net_worth in available:
         accounts_out.append({**net_worth, "account_id": account_id})
@@ -1400,11 +1732,42 @@ def _combine_benchmark(payloads: dict[str, dict]) -> dict[str, Any]:
 
     as_of = max(date.fromisoformat(benchmark_payload["as_of"]) for _, benchmark_payload in available)
     actual_terminal_value = sum(benchmark_payload["actual"]["terminal_value"] for _, benchmark_payload in available)
-    benchmark_terminals = [benchmark_payload["benchmark"]["terminal_value"] for _, benchmark_payload in available]
-    benchmark_terminal_value = (
-        sum(benchmark_terminals) if all(value is not None for value in benchmark_terminals) else None
-    )
 
+    # Every index each account replayed (SPY first). Each account's `benchmarks`
+    # list is authoritative for the names; fall back to the legacy single entry.
+    index_names: list[str] = []
+    for _, bp in available:
+        for entry in bp.get("benchmarks") or [bp["benchmark"]]:
+            if entry["name"] not in index_names:
+                index_names.append(entry["name"])
+
+    def _index_terminal(name: str) -> float | None:
+        totals = []
+        for _, bp in available:
+            entry = next(
+                (e for e in (bp.get("benchmarks") or [bp["benchmark"]]) if e["name"] == name), None
+            )
+            totals.append(entry["terminal_value"] if entry else None)
+        return sum(totals) if all(v is not None for v in totals) else None
+
+    benchmark_entries = []
+    for name in index_names:
+        terminal = _index_terminal(name)
+        index_result = bm.compare_to_benchmark(pooled_events, actual_terminal_value, terminal, as_of)
+        benchmark_entries.append(
+            {
+                "name": name,
+                "terminal_value": round(terminal, 2) if terminal is not None else None,
+                "xirr_pct": round(index_result.benchmark_xirr_pct, 2)
+                if index_result.benchmark_xirr_pct is not None
+                else None,
+                "value_added": round(index_result.value_added, 2)
+                if index_result.value_added is not None
+                else None,
+            }
+        )
+
+    benchmark_terminal_value = _index_terminal(index_names[0]) if index_names else None
     result = bm.compare_to_benchmark(pooled_events, actual_terminal_value, benchmark_terminal_value, as_of)
 
     # Each account's own series only has a point on the dates *it* happened to
@@ -1416,8 +1779,13 @@ def _combine_benchmark(payloads: dict[str, dict]) -> dict[str, Any]:
     # day reflects every account's most recent real reading, not just
     # whichever accounts happened to snapshot that exact day.
     actual_by_account = {account_id: _sparse_series_by_date(bp["series"], "actual_value") for account_id, bp in available}
-    benchmark_by_account = {
-        account_id: _sparse_series_by_date(bp["series"], "benchmark_value") for account_id, bp in available
+    # For each index: the legacy "benchmark_value" key holds the primary index;
+    # each additional index has its own "benchmark_value_<name>" key.
+    series_key = {name: ("benchmark_value" if i == 0 else f"benchmark_value_{name.lower()}")
+                  for i, name in enumerate(index_names)}
+    by_account_by_index = {
+        name: {aid: _sparse_series_by_date(bp["series"], series_key[name]) for aid, bp in available}
+        for name in index_names
     }
     all_dates = sorted({date.fromisoformat(point["as_of"]) for _, bp in available for point in bp["series"]})
 
@@ -1425,27 +1793,25 @@ def _combine_benchmark(payloads: dict[str, dict]) -> dict[str, Any]:
     for day in all_dates:
         actual_total = 0.0
         actual_known = False
-        benchmark_total = 0.0
-        benchmark_known = True
         for account_id, _ in available:
             actual_value = _forward_fill_at(actual_by_account[account_id], day)
             if actual_value is not None:
                 actual_total += actual_value
                 actual_known = True
-            benchmark_value = _forward_fill_at(benchmark_by_account[account_id], day)
-            if benchmark_value is None:
-                benchmark_known = False
-            else:
-                benchmark_total += benchmark_value
         if not actual_known:
             continue
-        series.append(
-            {
-                "as_of": day.isoformat(),
-                "actual_value": round(actual_total, 2),
-                "benchmark_value": round(benchmark_total, 2) if benchmark_known else None,
-            }
-        )
+        point = {"as_of": day.isoformat(), "actual_value": round(actual_total, 2)}
+        for name in index_names:
+            total = 0.0
+            known = True
+            for account_id, _ in available:
+                value = _forward_fill_at(by_account_by_index[name][account_id], day)
+                if value is None:
+                    known = False
+                else:
+                    total += value
+            point[series_key[name]] = round(total, 2) if known else None
+        series.append(point)
 
     return {
         "available": True,
@@ -1459,11 +1825,8 @@ def _combine_benchmark(payloads: dict[str, dict]) -> dict[str, Any]:
             "terminal_value": round(actual_terminal_value, 2),
             "xirr_pct": round(result.actual_xirr_pct, 2) if result.actual_xirr_pct is not None else None,
         },
-        "benchmark": {
-            "name": "SPY",
-            "terminal_value": round(benchmark_terminal_value, 2) if benchmark_terminal_value is not None else None,
-            "xirr_pct": round(result.benchmark_xirr_pct, 2) if result.benchmark_xirr_pct is not None else None,
-        },
+        "benchmark": benchmark_entries[0] if benchmark_entries else {"name": "SPY", "terminal_value": None, "xirr_pct": None},
+        "benchmarks": benchmark_entries,
         "value_added": round(result.value_added, 2) if result.value_added is not None else None,
         "series": series,
     }

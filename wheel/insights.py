@@ -1,14 +1,14 @@
 """Plain-rules commentary: what is working, where to improve.
 
 Two entry points, same shape (``{"strengths": [...], "improvements": [...]}``)
-and same house style -- no model, no network, every line a threshold on figures
+and same house style — no model, no network, every line a threshold on figures
 :mod:`wheel.metrics` / :mod:`wheel.api` already produce, phrased as advice.
 Strengths keep a curated priority order; improvements are ranked by dollar
 impact so the costliest problem shows first.
 
-* :func:`wheel_insights` -- one wheel (Trade Log), up to two strengths / three
+* :func:`wheel_insights` — one wheel (Trade Log), up to two strengths / three
   improvements.
-* :func:`portfolio_insights` -- the whole book (Dashboard), up to three each,
+* :func:`portfolio_insights` — the whole book (Dashboard), up to three each,
   working purely off the already-serialized payload dicts.
 """
 
@@ -46,19 +46,30 @@ def wheel_insights(
     strengths: list[str] = []
     improvements: list[tuple[float | None, str]] = []
 
-    # Not a wheel -- a lone directional/long-only cycle. Wheel coaching (strike
-    # selection, buyback drag, break-even, idle shares) does not apply; every
-    # rule below is wheel-shaped, so short-circuit with one honest line.
+    # Not a wheel. Wheel coaching (strike selection, buyback drag, break-even,
+    # idle shares) does not apply; every rule below is wheel-shaped, so
+    # short-circuit with one honest line, phrased by kind.
     if not cycle.is_wheel:
         net = metrics.net_realized_pl + metrics.option_open_premium
-        outcome = f"closed up {_money(net)}" if net > 0 else f"closed down {_money(net)}" if net < 0 else "closed flat"
-        return {
-            "strengths": [],
-            "improvements": [
+        if cycle.kind == "hold":
+            held = sum(lot.remaining for lot in cycle.share_lots if lot.remaining > 1e-9)
+            state = (
+                f"{held:,.0f} shares still held" if held > 1e-9 else f"realized {_money(net)}"
+            )
+            line = (
+                f"Plain buy-and-hold of {cycle.underlying}, no option has ever been written "
+                f"against it ({state}). Not a wheel; its P&L counts but the wheel-return "
+                "ratios do not apply. Selling a covered call turns it into one."
+            )
+        else:
+            outcome = (
+                f"closed up {_money(net)}" if net > 0 else f"closed down {_money(net)}" if net < 0 else "closed flat"
+            )
+            line = (
                 f"This was a directional long-option position, not a wheel ({outcome}). "
                 "It is kept out of the wheel-return figures; only its P&L counts."
-            ],
-        }
+            )
+        return {"strengths": [], "improvements": [line]}
 
     closed = [leg for leg in cycle.legs if not leg.is_open]
     open_legs = [leg for leg in cycle.legs if leg.is_open]
@@ -108,18 +119,18 @@ def wheel_insights(
 
     if premium_covers_basis:
         strengths.append(
-            "Premium and profit already banked exceed your remaining share cost -- "
+            "Premium and profit already banked exceed your remaining share cost, "
             "anything the stock does from here is upside."
         )
     if above_water:
         strengths.append(
             f"Shares sit above the wheel's break-even ({_price(break_even_price)}) "
-            f"at {_price(current_price)} -- you could close flat-plus right now."
+            f"at {_price(current_price)}, you could close flat-plus right now."
         )
     if metrics.win_rate_pct is not None and metrics.win_rate_pct >= 70 and decided >= 5:
         strengths.append(
             f"{metrics.wins} of {decided} closed legs finished green "
-            f"({metrics.win_rate_pct:.0f}% win rate) -- strike selection is working."
+            f"({metrics.win_rate_pct:.0f}% win rate), strike selection is working."
         )
     if metrics.wheel_core_realized_pl > 50 and metrics.premium_received > 0:
         kept = 100 * metrics.wheel_core_realized_pl / metrics.premium_received
@@ -129,7 +140,7 @@ def wheel_insights(
         )
     if metrics.hedge_realized_pl > 50:
         strengths.append(
-            f"Protective/long options netted +{_money(metrics.hedge_realized_pl)} -- "
+            f"Protective/long options netted +{_money(metrics.hedge_realized_pl)}, "
             "the hedge more than paid for itself."
         )
     if (
@@ -150,7 +161,7 @@ def wheel_insights(
         improvements.append(
             (
                 metrics.wheel_core_realized_pl,
-                "Buying short options back has cost more than they collected -- the core "
+                "Buying short options back has cost more than they collected, the core "
                 f"wheel is {_money(metrics.wheel_core_realized_pl)}. Letting more puts "
                 "expire, or taking assignment, keeps more premium than rolling losers at a debit.",
             )
@@ -171,7 +182,7 @@ def wheel_insights(
         improvements.append(
             (
                 None,
-                f"{shares_held:,.0f} shares are held with no covered call written -- that "
+                f"{shares_held:,.0f} shares are held with no covered call written, that "
                 f"capital earns nothing right now. A call{tail} adds premium against stock "
                 "you already own.",
             )
@@ -216,7 +227,7 @@ def wheel_insights(
                 (
                     metrics.stock_unrealized_pl,
                     f"Puts were added at falling strikes ({strikes[0]:g} -> {strikes[-1]:g}) as "
-                    f"the stock dropped -- averaging down deepened the unrealized loss "
+                    f"the stock dropped, averaging down deepened the unrealized loss "
                     f"({_money(metrics.stock_unrealized_pl)}).",
                 )
             )
@@ -225,7 +236,7 @@ def wheel_insights(
         improvements.append(
             (
                 None,
-                "Some held shares pre-date the export, so their cost basis is unknown -- "
+                "Some held shares pre-date the export, so their cost basis is unknown; "
                 "break-even and stock P&L here are estimates.",
             )
         )
@@ -234,7 +245,7 @@ def wheel_insights(
             (
                 None,
                 "Committed capital uses a strike-based proxy for shares bought before the "
-                "export -- the ROC figures are approximate.",
+                "export, the ROC figures are approximate.",
             )
         )
 
@@ -258,15 +269,22 @@ def portfolio_insights(
     open_hedges: list[dict],
     *,
     wheel_return: dict | None = None,
-    benchmark: dict | None = None,
+    benchmark: dict | None = None,  # whole-account XIRR block; accepted but not used — see below
     wheel_state: dict | None = None,
 ) -> dict[str, list[str]]:
     """Book-level commentary for the Dashboard, from the already-built payload.
 
-    Everything here reads serialized dicts -- ``portfolio`` (the filtered
+    Everything here reads serialized dicts — ``portfolio`` (the filtered
     ``PortfolioMetrics``), the full-history Trade Log ``wheels``, the
-    ``open_hedges`` list, and the two XIRR blocks -- so it is trivially testable
-    and never re-derives a figure the API already computed.
+    ``open_hedges`` list, and the wheel-only XIRR block — so it is trivially
+    testable and never re-derives a figure the API already computed.
+
+    ``benchmark`` (the *whole-account* XIRR vs SPY buy-and-hold) is deliberately
+    not turned into an insight: it blends in idle cash and deliberate
+    buy-and-hold holdings and rests on a hand-configured opening balance, so a
+    "trails SPY" line there says nothing about the wheel. The wheel-vs-SPY
+    comparison that *is* apples-to-apples — the same dollars, same dates, put
+    in SPY instead — comes from ``wheel_return`` and is the first strength.
     """
     portfolio = portfolio or {}
     wheels = wheels or []
@@ -283,11 +301,13 @@ def portfolio_insights(
     wr_bench = _num((wr.get("benchmark") or {}).get("xirr_pct"))
     if wr.get("available") and wr_xirr is not None and wr_bench is not None and wr_xirr - wr_bench >= 3:
         added = _num(wr.get("value_added"))
-        added_s = f", {_money(added)} ahead of that replay" if added else ""
+        added_s = f", {_money(added)} ahead" if added else ""
         bench_name = (wr.get("benchmark") or {}).get("name", "SPY")
         strengths.append(
-            f"The wheel's money-weighted return is {wr_xirr:.0f}% vs {wr_bench:.0f}% for a "
-            f"same-timing {bench_name} replay{added_s}."
+            f"On the capital actually committed to the wheel, its money-weighted return is "
+            f"{wr_xirr:.0f}% vs {wr_bench:.0f}% for those same dollars, on the same dates, put in "
+            f"{bench_name} instead{added_s}. (Idle cash and buy-and-hold positions are excluded "
+            "from both sides.)"
         )
 
     win_rate = _num(portfolio.get("win_rate_pct"))
@@ -314,27 +334,19 @@ def portfolio_insights(
     if runway_hedges:
         names = ", ".join(dict.fromkeys(h["underlying"] for h in runway_hedges[:3]))
         strengths.append(
-            f"{len(runway_hedges)} protective hedge(s) in place with runway ({names}) -- "
+            f"{len(runway_hedges)} protective hedge(s) in place with runway ({names}), "
             "downside is capped while premium keeps coming in."
         )
 
     # ---------------- improvements (ranked by $ impact) ----------------
 
-    bm = benchmark or {}
-    act_xirr = _num((bm.get("actual") or {}).get("xirr_pct"))
-    ref_xirr = _num((bm.get("benchmark") or {}).get("xirr_pct"))
-    if bm.get("available") and act_xirr is not None and ref_xirr is not None and act_xirr < ref_xirr - 2:
-        va = _num(bm.get("value_added"))
-        bench_name = (bm.get("benchmark") or {}).get("name", "SPY")
-        gap_s = f" -- about {_money(abs(va))} of return forgone" if va else ""
-        improvements.append(
-            (
-                va,
-                f"The whole account's money-weighted return ({act_xirr:.0f}%) trails a "
-                f"{bench_name} buy-and-hold ({ref_xirr:.0f}%){gap_s}. The wheel itself "
-                "outperformed; the drag is elsewhere -- idle cash or non-wheel holdings.",
-            )
-        )
+    # NB: no whole-account "trails SPY buy-and-hold" rule here on purpose. That
+    # comparison blends in idle cash and deliberate buy-and-hold positions, so a
+    # cash-heavy account "trails" SPY for reasons that have nothing to do with
+    # the wheel -- and it rests on a hand-configured opening balance. The valid
+    # apples-to-apples comparison (wheel dollars vs the same dollars in SPY) is
+    # the wheel_return strength above; the whole-account figure still lives on
+    # the "Net worth & benchmark" card with its full context.
 
     underwater = sorted(
         (w for w in active if (_num(w.get("mark_to_market_pl")) or 0.0) < -200),
@@ -346,7 +358,7 @@ def portfolio_insights(
         improvements.append(
             (
                 total,
-                f"{len(underwater)} active wheels are underwater by {_money(total)} "
+                f"{len(underwater)} active positions are underwater by {_money(total)} "
                 f"mark-to-market (worst: {worst}). Covered calls at or above their break-even "
                 "close the gap without adding downside.",
             )
@@ -359,8 +371,8 @@ def portfolio_insights(
         improvements.append(
             (
                 -hold_amt * 0.01,
-                f"{_money(hold_amt)} of assigned shares across {hold_n} wheels have no covered "
-                "call written -- that capital collects no premium. Selling calls at or above "
+                f"{_money(hold_amt)} of held shares across {hold_n} positions have no covered "
+                "call written, that capital collects no premium. Selling calls at or above "
                 "break-even adds income against stock already owned.",
             )
         )
@@ -381,13 +393,13 @@ def portfolio_insights(
                 )
             )
 
-    nw_net = sum(_num(w.get("net_realized_pl")) or 0.0 for w in wheels if not w.get("is_wheel"))
-    if nw_net < -100:
+    dir_net = sum(_num(w.get("net_realized_pl")) or 0.0 for w in wheels if w.get("kind") == "directional")
+    if dir_net < -100:
         improvements.append(
             (
-                nw_net,
-                f"Directional (non-wheel) trades have cost {_money(nw_net)} net. They stay out "
-                "of the wheel-return figures, but the loss is real.",
+                dir_net,
+                f"Directional (non-wheel) option trades have cost {_money(dir_net)} net. They "
+                "stay out of the wheel-return figures, but the loss is real.",
             )
         )
 
@@ -397,7 +409,7 @@ def portfolio_insights(
         improvements.append(
             (
                 None,
-                f"{len(urgent)} protective hedge(s) are inside the wind-down window ({names}) -- "
+                f"{len(urgent)} protective hedge(s) are inside the wind-down window ({names}), "
                 "sell them for their remaining time value or roll them out before they decay.",
             )
         )
@@ -410,7 +422,7 @@ def portfolio_insights(
             (
                 None,
                 f"{len(est)} active wheels ({', '.join(est)}) price capital with a strike-based "
-                "proxy for pre-export shares -- their ROC figures are approximate.",
+                "proxy for pre-export shares, their ROC figures are approximate.",
             )
         )
 
