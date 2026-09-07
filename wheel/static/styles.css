@@ -405,6 +405,34 @@ button.primary {
   cursor: help;
 }
 
+/* User-set "% of last close" for the Target price for CSP column. */
+.csp-target-ctl {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin: 0 0 10px;
+}
+
+.csp-target-ctl[hidden] {
+  display: none;
+}
+
+.csp-target-ctl input[type='number'] {
+  width: 5.5em;
+  font: inherit;
+  color: var(--text-primary);
+  background: var(--surface-1);
+  border: 1px solid var(--axis);
+  border-radius: 7px;
+  padding: 4px 7px;
+  min-height: 30px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 /* CSP recommender: a 0-5 star rating, half-star aware. */
 #csp-candidates-table td.csp-star {
   white-space: nowrap;
@@ -421,11 +449,11 @@ button.primary {
   color: var(--text-muted);
 }
 
-/* A candidate whose earnings land within 14 days -- don't write into an
-   earnings print. Amber just the Earnings cell + a warning glyph, the same
-   treatment Expiration gets in Open option positions. */
+/* A position/candidate whose earnings land within 14 days -- don't write into
+   an earnings print. Amber just the Earnings cell + a warning glyph. */
 #csp-candidates-table td.earnings-soon,
-#cc-candidates-table td.earnings-soon {
+#cc-candidates-table td.earnings-soon,
+#open-positions-table td.earnings-soon {
   color: var(--warning);
   font-weight: 600;
 }
@@ -677,6 +705,38 @@ svg .tick-label {
   font-variant-numeric: tabular-nums;
 }
 
+/* "today" marker label on the Expiration calendar -- red, sits under the axis.
+   Needs its own rule: `svg text { fill }` outranks a fill="" attribute. */
+svg .exp-today-label {
+  fill: var(--neg);
+  font-weight: 600;
+}
+
+/* Per-bar expiry date on the Expiration calendar -- darker than the axis grid. */
+svg .exp-bar-date {
+  fill: var(--text-secondary);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Ticker label inside a stacked segment of the Expiration calendar bar. */
+svg .exp-seg-label {
+  fill: #fff;
+  font-size: 9px;
+  font-weight: 700;
+  paint-order: stroke;
+  stroke: rgba(0, 0, 0, 0.35);
+  stroke-width: 2px;
+}
+
+/* Ticker label beside a bar too narrow to hold it (daily view): plain text
+   next to the segment, in the body text colour. */
+svg .exp-seg-label-side {
+  fill: var(--text-primary);
+  font-size: 9px;
+  font-weight: 700;
+}
+
 svg .hit {
   fill: transparent;
   cursor: pointer;
@@ -756,6 +816,18 @@ th {
   text-transform: uppercase;
   color: var(--text-muted);
   z-index: 1;
+}
+
+/* Wide data tables: let multi-word headers wrap to two/three lines instead of
+   forcing a horizontal scrollbar. Planner headers all read left-aligned. */
+#open-positions-table th,
+#cc-candidates-table th,
+#csp-candidates-table th {
+  white-space: normal;
+  line-height: 1.15;
+  max-width: 10ch;
+  vertical-align: bottom;
+  text-align: left;
 }
 
 th:first-child,
@@ -879,19 +951,23 @@ th.sortable:hover {
   outline: none;
 }
 
-/* The one actionable figure in the covered-call candidates table. */
-#cc-candidates-table td.cc-target {
+/* The one actionable figure in the covered-call / cash-secured-put candidate
+   tables -- same violet, same weight in both. */
+#cc-candidates-table td.cc-target,
+#csp-candidates-table td.cc-target {
   font-weight: 700;
   color: #7c3aed; /* violet */
 }
 
 @media (prefers-color-scheme: dark) {
-  :root:not([data-theme='light']) #cc-candidates-table td.cc-target {
+  :root:not([data-theme='light']) #cc-candidates-table td.cc-target,
+  :root:not([data-theme='light']) #csp-candidates-table td.cc-target {
     color: #a78bfa; /* lighter violet for dark backgrounds */
   }
 }
 
-:root[data-theme='dark'] #cc-candidates-table td.cc-target {
+:root[data-theme='dark'] #cc-candidates-table td.cc-target,
+:root[data-theme='dark'] #csp-candidates-table td.cc-target {
   color: #a78bfa;
 }
 
@@ -1180,9 +1256,14 @@ tr.detail > td {
   margin-bottom: 14px;
 }
 
+/* An open long-option (hedge/directional) leg -- same amber highlight as the
+   Open option positions table's long rows, so a leg reads the same in both. */
 #tradelog-table tr.open-hedge td {
-  background-color: var(--noactivity-bg);
-  box-shadow: inset 3px 0 0 var(--warning);
+  background-color: var(--long-bg);
+}
+
+#tradelog-table tr.open-hedge:hover td {
+  filter: brightness(0.96);
 }
 
 .loading {
@@ -1437,6 +1518,54 @@ tr.detail > td {
   font-size: 12px;
 }
 
+/* The "now" (current price) marker on the Break-even chart -- red, and the same
+   weight as the end-of-line break-even value it sits opposite. A stylesheet
+   `svg text { fill }` rule outranks a fill="" attribute, so this needs a class. */
+#chart-tradelog-breakeven .be-now-label {
+  fill: var(--neg);
+  font-weight: 700;
+}
+
+/* The value at the end of the line -- purple, the same key-figure colour as the
+   "Target price" columns. Shared: the Break-even chart's current break-even and
+   the PPD chart's current "$x/d". */
+#chart-tradelog-breakeven .chart-endpoint-value,
+#chart-tradelog-ppd .chart-endpoint-value {
+  fill: #7c3aed;
+  font-weight: 700;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) #chart-tradelog-breakeven .chart-endpoint-value,
+  :root:not([data-theme='light']) #chart-tradelog-ppd .chart-endpoint-value {
+    fill: #a78bfa;
+  }
+}
+
+:root[data-theme='dark'] #chart-tradelog-breakeven .chart-endpoint-value,
+:root[data-theme='dark'] #chart-tradelog-ppd .chart-endpoint-value {
+  fill: #a78bfa;
+}
+
+/* Under-water / above-water badge on the Break-even chart: a red warning when
+   the stock is below break-even, a steady green happy face when above. */
+#chart-tradelog-breakeven .be-water-badge {
+  font-size: 13px;
+  font-weight: 700;
+  paint-order: stroke;
+  stroke: var(--surface-1);
+  stroke-width: 3px;
+  stroke-linejoin: round;
+}
+
+#chart-tradelog-breakeven .be-water-under {
+  fill: var(--neg);
+}
+
+#chart-tradelog-breakeven .be-water-above {
+  fill: var(--good);
+}
+
 .tradelog-ppd .ti-head {
   font-size: 10.5px;
   font-weight: 700;
@@ -1511,3 +1640,282 @@ tr.detail > td {
   font-weight: 600;
 }
 
+/* Brief key to the ledger's row shading -- each sample wears the style it names. */
+.tl-row-legend {
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  margin: 0 0 8px;
+  line-height: 1.7;
+}
+
+.tl-row-legend .tl-sw {
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.tl-row-legend .tl-sw.settled {
+  background-color: var(--mid);
+}
+
+.tl-row-legend .tl-sw.open-hedge {
+  background-color: var(--long-bg);
+}
+
+.tl-row-legend .tl-sw.synthetic {
+  color: var(--text-muted);
+  font-style: italic;
+  font-weight: 400;
+}
+
+
+/* ---- Planner tab ---------------------------------------------------------- */
+
+.tab-intro {
+  margin: 0 0 var(--gap);
+}
+
+#tab-planner .muted {
+  color: var(--text-muted);
+}
+
+.planner-earnings {
+  margin-bottom: var(--gap);
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--ghost);
+  font-size: 12px;
+  line-height: 1.9;
+}
+
+.planner-earnings-label {
+  color: var(--text-secondary);
+  font-weight: 600;
+  margin-right: 4px;
+}
+
+.planner-earnings-chip {
+  white-space: nowrap;
+}
+
+.planner-earnings-chip.warn {
+  color: var(--warning);
+  font-weight: 600;
+}
+
+/* Assignment risk -- mirror of the Cash-for-CSP card */
+#assignment-risk {
+  display: block;
+  margin-bottom: var(--gap);
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--warning);
+  border-radius: var(--radius);
+  background: var(--noactivity-bg);
+}
+
+#assignment-risk.critical {
+  border-left-color: var(--critical);
+  background: var(--closed-bg);
+}
+
+#assignment-risk .ar-head {
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+#assignment-risk .ar-figures {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  margin-bottom: 10px;
+}
+
+#assignment-risk .ar-fig {
+  display: flex;
+  flex-direction: column;
+}
+
+#assignment-risk .ar-fig .k {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+#assignment-risk .ar-fig .v {
+  font-size: 16px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+#assignment-risk table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+#assignment-risk td,
+#assignment-risk th {
+  padding: 3px 8px 3px 0;
+  text-align: right;
+  white-space: nowrap;
+}
+
+#assignment-risk th:first-child,
+#assignment-risk td:first-child {
+  text-align: left;
+}
+
+/* Workflow buckets */
+.workflow-buckets {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--gap);
+}
+
+.workflow-bucket > h4 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  border-bottom: 2px solid var(--border);
+  padding-bottom: 4px;
+}
+
+.workflow-bucket.attention > h4 {
+  border-bottom-color: var(--critical);
+}
+.workflow-bucket.take_profit_candidate > h4 {
+  border-bottom-color: var(--good);
+}
+.workflow-bucket.evaluate > h4 {
+  border-bottom-color: var(--warning);
+}
+
+.workflow-bucket .wf-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+.workflow-bucket ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.workflow-bucket li {
+  padding: 5px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.workflow-bucket li .wf-leg {
+  font-weight: 600;
+}
+
+.workflow-bucket li .wf-reason {
+  color: var(--text-secondary);
+  display: block;
+}
+
+/* Expiration calendar -- a fit-to-width SVG time-axis chart (see app.js
+   renderExpirationCalendarBody); no fixed columns, no horizontal scroll. */
+#chart-exp-calendar {
+  width: 100%;
+  display: block;
+}
+
+/* Realized Gains tab */
+#realized-gains-table,
+#closed-lots-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+#realized-gains-table th,
+#realized-gains-table td,
+#closed-lots-table th,
+#closed-lots-table td {
+  padding: 4px 10px 4px 0;
+  text-align: right;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--border);
+}
+
+#realized-gains-table th:first-child,
+#realized-gains-table td:first-child,
+#closed-lots-table th:first-child,
+#closed-lots-table td:first-child {
+  text-align: left;
+}
+
+#realized-gains-table tr.totals td {
+  font-weight: 600;
+  border-top: 2px solid var(--border);
+}
+
+.rg-status.investigate {
+  color: var(--warning);
+  font-weight: 600;
+}
+
+.rg-status.matched {
+  color: var(--success-text);
+}
+
+/* CSV export links in card headers */
+.csv-link {
+  font-size: 11px;
+  color: var(--text-secondary);
+  text-decoration: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 8px;
+  white-space: nowrap;
+  margin-left: auto;
+}
+
+.csv-link:hover {
+  color: var(--text-primary);
+  background: var(--ghost);
+}
+
+/* ---- Presentation mode: chrome-free, big headline figures ---------------- */
+
+body.presentation .source,
+body.presentation .filters,
+body.presentation #notices,
+body.presentation .tabs,
+body.presentation .card-actions,
+body.presentation .toggle,
+body.presentation .csv-link,
+body.presentation .hint,
+body.presentation .hint-list,
+body.presentation #accounts-bar {
+  display: none !important;
+}
+
+/* keep the Present button reachable so the mode can be left again */
+body.presentation #theme-toggle {
+  display: none;
+}
+
+body.presentation #performance-card .tiles {
+  gap: 22px;
+}
+
+body.presentation #performance-card .tile .value {
+  font-size: 30px;
+}
+
+body.presentation #performance-card .tile .label {
+  font-size: 13px;
+}
+
+body.presentation .wrap {
+  max-width: 1100px;
+}

@@ -885,6 +885,32 @@ class TestCombineBenchmarkDateAlignment(unittest.TestCase):
         self.assertAlmostEqual(series["2026-07-15"]["actual_value"], 80000.0, places=2)
         self.assertAlmostEqual(series["2026-07-15"]["benchmark_value"], 48000.0 + 29000.0, places=2)
 
+    def test_multiple_indices_are_summed_and_carried_through(self):
+        from wheel.accounts import _combine_benchmark
+
+        def payload(actual, spy, qqq):
+            base = self._benchmark_payload(
+                [{"as_of": "2026-07-01", "actual_value": actual, "benchmark_value": spy}]
+            )
+            base["series"][0]["benchmark_value_qqq"] = qqq
+            base["benchmarks"] = [
+                {"name": "SPY", "terminal_value": spy, "xirr_pct": None, "value_added": None},
+                {"name": "QQQ", "terminal_value": qqq, "xirr_pct": None, "value_added": None},
+            ]
+            base["benchmark"] = base["benchmarks"][0]
+            return {"benchmark": base}
+
+        combined = _combine_benchmark({"a": payload(50000.0, 48000.0, 52000.0),
+                                       "b": payload(30000.0, 29000.0, 31000.0)})
+        names = [e["name"] for e in combined["benchmarks"]]
+        self.assertEqual(names, ["SPY", "QQQ"])
+        self.assertAlmostEqual(combined["benchmarks"][1]["terminal_value"], 83000.0, places=2)
+        point = combined["series"][0]
+        self.assertAlmostEqual(point["benchmark_value"], 77000.0, places=2)
+        self.assertAlmostEqual(point["benchmark_value_qqq"], 83000.0, places=2)
+        # Legacy key still points at the primary index
+        self.assertEqual(combined["benchmark"]["name"], "SPY")
+
 
 if __name__ == "__main__":
     unittest.main()

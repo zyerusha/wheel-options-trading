@@ -14,6 +14,12 @@
           <div class="subtitle" id="subtitle">Loading…</div>
         </div>
         <div class="top-actions">
+          <button
+            id="present-toggle"
+            title="Presentation mode: hide controls, enlarge the headline figures"
+          >
+            Present
+          </button>
           <button id="theme-toggle" title="Switch light / dark">Theme</button>
         </div>
       </header>
@@ -26,6 +32,22 @@
           aria-selected="true"
         >
           Dashboard
+        </button>
+        <button
+          class="tab"
+          type="button"
+          data-tab="planner"
+          aria-selected="false"
+        >
+          Planner
+        </button>
+        <button
+          class="tab"
+          type="button"
+          data-tab="realized"
+          aria-selected="false"
+        >
+          Realized Gains
         </button>
         <button
           class="tab"
@@ -158,142 +180,6 @@
             aria-label="Portfolio insights"
             hidden
           ></div>
-        </section>
-
-        <section
-          class="card"
-          id="open-positions-card"
-          style="margin-bottom: var(--gap)"
-          hidden
-        >
-          <header>
-            <h2>Open option positions</h2>
-          </header>
-
-          <ul class="hint-list">
-            <li>
-              Open short calls (CC) and puts (CSP), plus long hedges (LP/LC)
-            </li>
-            <li>Amber rows are longs; premium paid, not received</li>
-            <li>Click a heading to sort</li>
-            <li>
-              <strong>⚠</strong> next to Expiration: under 8 days to expiry
-            </li>
-            <li>
-              <strong>Wheel</strong>: click the id to open that wheel's Trade
-              Log
-            </li>
-            <li><strong>Breakeven</strong>: this contract alone</li>
-            <li>
-              <strong>Wheel Breakeven</strong>: whole cycle: cost of shares
-              still held minus all cycle income
-            </li>
-            <li>
-              <strong>ITM/OTM %</strong>: strike vs. last close; green is the
-              cushion (short) or intrinsic value (long)
-            </li>
-            <li>
-              <strong>Annualized Yield</strong>: net premium ÷ collateral, per
-              year
-            </li>
-          </ul>
-
-          <div style="overflow-x: auto">
-            <table id="open-positions-table"></table>
-          </div>
-        </section>
-
-        <section
-          class="card"
-          id="cc-candidates-card"
-          style="margin-bottom: var(--gap)"
-          hidden
-        >
-          <header>
-            <h2>Covered-call candidates</h2>
-          </header>
-
-          <ul class="hint-list">
-            <li>
-              Positions holding shares with no covered call written against
-              them; 100+ share lots lead the table, smaller lots are listed
-              after for visibility with Target and Qty blank
-            </li>
-            <li>
-              <strong>Target price for CC</strong>: the greatest of the share
-              cost basis, the position breakeven, the wheel breakeven, and the
-              last close — never below any of them — rounded up to the next
-              $0.50
-            </li>
-            <li>
-              Write the call at or above it: an assignment then sells the stock
-              for at least what it cost, keeps every premium already collected,
-              and is never below the current market
-            </li>
-            <li>
-              It's a floor, not a pick — it doesn't say where the premium is
-              richest
-            </li>
-            <li>
-              <strong>Current Wheel</strong>: click the id to jump to that
-              wheel's Trade Log
-            </li>
-            <li>
-              <strong>Earnings</strong>: next report date, fetched from Yahoo;
-              within 14 days the date turns amber with a ⚠ — think twice before
-              writing a call into an earnings print. Override in
-              <code>data/earnings.json</code>
-            </li>
-            <li>
-              <strong>Sector</strong>: for diversification; best-effort static
-              map, blank if unknown
-            </li>
-          </ul>
-
-          <div style="overflow-x: auto">
-            <table id="cc-candidates-table"></table>
-          </div>
-        </section>
-
-        <section
-          class="card"
-          id="csp-cash-card"
-          style="margin-bottom: var(--gap)"
-          hidden
-        >
-          <header>
-            <h2>Cash for Cash-Secured Puts</h2>
-          </header>
-
-          <p class="hint">
-            Account cash not already reserved against an open put — the dry
-            powder for writing a new CSP. Rough, not a trading limit: it ignores
-            margin buying power and broker reserves.
-          </p>
-
-          <div
-            id="csp-cash-tiles"
-            aria-label="Cash available for cash-secured puts"
-          ></div>
-
-          <ul class="hint-list" id="csp-candidates-hint" hidden>
-            <li>
-              <strong
-                >Potential stocks for Cash-Secured Puts that currently can be
-                afforded in the account</strong
-              >
-            </li>
-            <li>
-              <strong>Filter Criteria</strong>: Stocks &amp; plain ETFs only; No
-              leveraged/inverse ETFs, closed-end funds, mutual funds, or LPs;
-              $10 &le; Stock Price &le; $350; Market cap &ge; $1B; 10-day avg
-              vol &gt; 1M
-            </li>
-          </ul>
-
-          <div style="overflow: auto; max-height: 420px">
-            <table id="csp-candidates-table"></table>
-          </div>
         </section>
 
         <!-- Capital deployed + Cumulative premium & realized P/L -->
@@ -565,6 +451,7 @@
           <section class="card">
             <header>
               <h2>Realized P/L by ticker</h2>
+              <a id="export-tickers" class="csv-link" download>⬇ CSV</a>
               <button
                 class="toggle"
                 data-twin="ticker-table"
@@ -677,6 +564,7 @@
             <span class="hint" style="margin: 0"
               >Click a row for legs, rolls and assignments</span
             >
+            <a id="export-cycles" class="csv-link" download>⬇ CSV</a>
           </header>
 
           <p class="hint">
@@ -704,10 +592,279 @@
       </div>
       <!-- /#tab-dashboard -->
 
+      <div id="tab-planner" hidden>
+        <p class="hint tab-intro">
+          What needs a look right now: open positions, what could be assigned,
+          what expires soon, and what the cash can do next.
+        </p>
+
+        <div id="earnings-in-view" class="planner-earnings" hidden></div>
+
+        <section id="assignment-risk" aria-label="Assignment risk" hidden></section>
+
+        <section
+          class="card"
+          id="open-positions-card"
+          style="margin-bottom: var(--gap)"
+          hidden
+        >
+          <header>
+            <h2>Open option positions</h2>
+          </header>
+
+          <ul class="hint-list">
+            <li>
+              Open short calls (CC) and puts (CSP), plus long hedges (LP/LC)
+            </li>
+            <li>Amber rows are longs; premium paid, not received</li>
+            <li>Click a heading to sort</li>
+            <li>
+              <strong>⚠</strong> next to Expiration: under 8 days to expiry
+            </li>
+            <li>
+              <strong>Wheel</strong>: click the id to open that wheel's Trade
+              Log
+            </li>
+            <li><strong>Breakeven</strong>: this contract alone</li>
+            <li>
+              <strong>Wheel Breakeven</strong>: whole cycle: cost of shares
+              still held minus all cycle income
+            </li>
+            <li>
+              <strong>ITM/OTM %</strong>: strike vs. last close; green is the
+              cushion (short) or intrinsic value (long)
+            </li>
+            <li>
+              <strong>Earnings</strong>: next report date; within 14 days the
+              cell turns amber with a ⚠ (override in
+              <code>data/earnings.json</code>)
+            </li>
+            <li>
+              <strong>Annualized Yield</strong>: net premium ÷ collateral, per
+              year
+            </li>
+            <li>
+              <strong>Min. Profit Captured (est.)</strong>: intrinsic-only
+              estimate — intrinsic is the smallest a buy-to-close could cost, so
+              this can overstate; time value still on the option makes the real
+              cost higher
+            </li>
+          </ul>
+
+          <div style="overflow-x: auto">
+            <table id="open-positions-table"></table>
+          </div>
+        </section>
+
+        <section
+          class="card"
+          id="expiration-calendar-card"
+          style="margin-bottom: var(--gap)"
+          hidden
+        >
+          <header>
+            <h2>Expiration calendar</h2>
+            <button class="toggle" id="exp-cal-grain" aria-pressed="false">
+              Daily
+            </button>
+          </header>
+
+          <p class="hint" style="margin-top: 0">
+            The <strong>Open option positions</strong> table on a time line — one
+            bar per expiry date, each split into a segment per open leg.
+          </p>
+
+          <ul class="hint-list">
+            <li>
+              <strong>The dashed line is today</strong>; a bar's distance to the
+              right is how far off it expires. The <em>Daily</em> button cycles
+              Daily / Weekly / Monthly.
+            </li>
+            <li>
+              A <strong>red edge</strong> means the strike is past break-even — a
+              covered call below the wheel break-even, or a put whose stock is
+              under the assignment break-even — so resolving there books a loss.
+            </li>
+          </ul>
+
+          <div class="chart-scroll">
+            <svg id="chart-exp-calendar" role="img"></svg>
+          </div>
+          <div class="legend" id="legend-exp-calendar"></div>
+        </section>
+
+        <section
+          class="card"
+          id="cc-candidates-card"
+          style="margin-bottom: var(--gap)"
+          hidden
+        >
+          <header>
+            <h2>Covered-call candidates</h2>
+          </header>
+
+          <ul class="hint-list">
+            <li>
+              Positions holding shares with no covered call written against
+              them; 100+ share lots lead the table, smaller lots are listed
+              after for visibility with Target and Qty blank
+            </li>
+            <li>
+              <strong>Target price for CC</strong>: the greatest of the share
+              cost basis, the position breakeven, the wheel breakeven, and the
+              last close — never below any of them — rounded up to the next
+              $0.50
+            </li>
+            <li>
+              Write the call at or above it: an assignment then sells the stock
+              for at least what it cost, keeps every premium already collected,
+              and is never below the current market
+            </li>
+            <li>
+              It's a floor, not a pick — it doesn't say where the premium is
+              richest
+            </li>
+            <li>
+              <strong>Current Wheel</strong>: click the id to jump to that
+              wheel's Trade Log
+            </li>
+            <li>
+              <strong>Earnings</strong>: next report date, fetched from Yahoo;
+              within 14 days the date turns amber with a ⚠ — think twice before
+              writing a call into an earnings print. Override in
+              <code>data/earnings.json</code>
+            </li>
+            <li>
+              <strong>Sector</strong>: for diversification; best-effort static
+              map, blank if unknown
+            </li>
+          </ul>
+
+          <div style="overflow-x: auto">
+            <table id="cc-candidates-table"></table>
+          </div>
+        </section>
+
+        <section
+          class="card"
+          id="csp-cash-card"
+          style="margin-bottom: var(--gap)"
+          hidden
+        >
+          <header>
+            <h2>Cash for Cash-Secured Puts</h2>
+          </header>
+
+          <p class="hint">
+            Account cash not already reserved against an open put — the dry
+            powder for writing a new CSP. Rough, not a trading limit: it ignores
+            margin buying power and broker reserves.
+          </p>
+
+          <div
+            id="csp-cash-tiles"
+            aria-label="Cash available for cash-secured puts"
+          ></div>
+
+          <ul class="hint-list" id="csp-candidates-hint" hidden>
+            <li>
+              <strong
+                >Potential stocks for Cash-Secured Puts that currently can be
+                afforded in the account</strong
+              >
+            </li>
+            <li>
+              <strong>Filter Criteria</strong>: Stocks &amp; plain ETFs only; No
+              leveraged/inverse ETFs, closed-end funds, mutual funds, or LPs;
+              $10 &le; Stock Price &le; $350; Market cap &ge; $1B; 10-day avg
+              vol &gt; 1M
+            </li>
+          </ul>
+
+          <label class="csp-target-ctl" id="csp-target-ctl" hidden>
+            Target price for CSP:
+            <input
+              type="number"
+              id="csp-target-pct"
+              min="50"
+              max="100"
+              step="0.5"
+              value="93"
+              inputmode="decimal"
+            />
+            % of last close, rounded down to $0.50
+          </label>
+
+          <div style="overflow-x: auto">
+            <table id="csp-candidates-table"></table>
+          </div>
+        </section>
+
+        <section
+          class="card"
+          id="workflow-card"
+          style="margin-bottom: var(--gap)"
+          hidden
+        >
+          <header>
+            <h2>Workflow</h2>
+            <span class="hint" style="margin: 0"
+              >Flags for review — not trade advice</span
+            >
+          </header>
+          <div id="workflow-buckets" class="workflow-buckets"></div>
+        </section>
+      </div>
+      <!-- /#tab-planner -->
+
+      <div id="tab-realized" hidden>
+        <section class="card">
+          <header>
+            <h2>Realized Gains</h2>
+            <a id="export-closed-lots" class="csv-link" download>⬇ CSV</a>
+          </header>
+
+          <p class="hint" style="margin-top: 0">
+            Fidelity's own closed-lots table — every position it has closed,
+            with the gain it recorded — and, below it, a rough per-ticker
+            cross-check against the wheel engine's option P/L.
+          </p>
+
+          <div id="realized-gains-empty" class="hint" hidden>
+            Add a Fidelity <em>Closed Positions / Realized Gain&nbsp;&amp;&nbsp;Loss</em>
+            export (<code>Portfolio_Closed_Lots_*.csv</code>) to
+            <code>data/</code> and reload.
+          </div>
+
+          <div id="realized-gains-body" hidden>
+            <div class="card-subsection">
+              <header>
+                <h3>Closed lots</h3>
+              </header>
+              <div style="overflow: auto; max-height: 480px">
+                <table id="closed-lots-table"></table>
+              </div>
+            </div>
+
+            <div class="card-subsection">
+              <header>
+                <h3>Per-ticker cross-check</h3>
+              </header>
+              <p class="hint" id="realized-gains-note" style="margin-top: 0"></p>
+              <div style="overflow-x: auto">
+                <table id="realized-gains-table"></table>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+      <!-- /#tab-realized -->
+
       <div id="tab-tradelog" hidden>
         <section class="card">
           <header>
             <h2>Trade Log</h2>
+            <a id="export-tradelog" class="csv-link" download>⬇ CSV</a>
           </header>
 
           <ul class="hint-list">
@@ -780,16 +937,6 @@
 
           <div id="tradelog-bridge" class="tradelog-bridge" hidden></div>
 
-          <div id="tradelog-ppd" class="tradelog-ppd" hidden>
-            <div class="ti-head">PPD by week</div>
-
-            <div class="chart-scroll">
-              <svg id="chart-tradelog-ppd" role="img"></svg>
-            </div>
-
-            <div class="legend" id="legend-tradelog-ppd"></div>
-          </div>
-
           <div id="tradelog-summary" class="tradelog-summary" hidden></div>
 
           <div style="overflow-x: auto">
@@ -802,6 +949,16 @@
             <div class="chart-scroll">
               <svg id="chart-tradelog-breakeven" role="img"></svg>
             </div>
+          </div>
+
+          <div id="tradelog-ppd" class="tradelog-ppd" hidden>
+            <div class="ti-head">PPD by week</div>
+
+            <div class="chart-scroll">
+              <svg id="chart-tradelog-ppd" role="img"></svg>
+            </div>
+
+            <div class="legend" id="legend-tradelog-ppd"></div>
           </div>
         </section>
       </div>

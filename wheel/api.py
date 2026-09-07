@@ -18,9 +18,12 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta
 from typing import Any, Sequence
 
+from wheel import assignment as assignment_mod
 from wheel import benchmark as bm
 from wheel import cashflow as cf
+from wheel import expiration as expiration_mod
 from wheel import marketdata
+from wheel import workflow as workflow_mod
 from wheel.engine import (
     COVERED_CALL,
     CSP,
@@ -645,6 +648,11 @@ _SHARE_ROW_TYPES = frozenset(
 HEDGE_WIND_DOWN_DAYS = 60  # the user's "two months"
 HEDGE_EXPIRING_DAYS = 7
 
+# The whole-account and wheel-only XIRR comparisons replay the same cash-flow
+# timing into each of these indices. SPY stays first (and keeps the legacy
+# ``benchmark`` payload key to itself); the rest are additional lines.
+BENCHMARK_TICKERS = ("SPY", "QQQ")
+
 
 def _close_return_pct(open_price: float | None, close_price: float | None, side: str) -> float | None:
     """Realized return on the contract this closing fill shut, as a % of the
@@ -674,6 +682,41 @@ def _trade_log_txn_type(transaction: Transaction, dividend_row_ids: set[int]) ->
     return "Other"
 
 
+# CSP / CC / LP / LC -- the same leg-class codes the Open option positions table
+# shows. `None` for a stock or dividend row.
+def _code_for(right: str, short: bool) -> str:
+    if short:
+        return "CSP" if right == "P" else "CC"
+    return "LP" if right == "P" else "LC"
+
+
+def _leg_type_code(right: str | None, side: str) -> str | None:
+    if right not in ("P", "C"):
+        return None
+    return _code_for(right, side == SHORT)
+
+
+def _txn_type_code(transaction: Transaction) -> str | None:
+    right = transaction.right
+    if right not in ("P", "C"):
+        return None
+    action = transaction.action
+    if action == STO:
+        short = True
+    elif action == BTO:
+        short = False
+    elif action in (BTC, ASSIGNED):
+        short = True  # closing / assignment of a short leg
+    elif action == STC:
+        short = False  # selling to close a long leg
+    elif action == EXPIRED:
+        # side isn't in the action; closing a short reads +, a long reads -.
+        short = (transaction.contracts or 0.0) >= 0
+    else:
+        return None
+    return _code_for(right, short)
+
+
 def _trade_log_raw_row(
     transaction: Transaction,
     type_: str,
@@ -691,6 +734,7 @@ def _trade_log_raw_row(
     csp = transaction.strike * OPTION_MULTIPLIER * quantity if is_csp_open else None
     return {
         "type": type_,
+        "type_code": _txn_type_code(transaction),
         "date": _iso(transaction.event_date),
         "expiration": _iso(transaction.expiry),
         "strike": transaction.strike,
@@ -733,6 +777,7 @@ def _trade_log_engine_rows(cycle: Cycle) -> list[dict[str, Any]]:
         rows.append(
             {
                 "type": _OPEN_TYPE.get((leg.open_action, leg.right), "Other"),
+                "type_code": _leg_type_code(leg.right, leg.side),
                 "date": _iso(leg.open_date),
                 "expiration": _iso(leg.expiry),
                 "strike": leg.strike,
@@ -754,6 +799,7 @@ def _trade_log_engine_rows(cycle: Cycle) -> list[dict[str, Any]]:
             rows.append(
                 {
                     "type": _CLOSE_TYPE.get((close.action, leg.right), "Other"),
+                    "type_code": _leg_type_code(leg.right, leg.side),
                     "date": _iso(close.date),
                     "expiration": _iso(leg.expiry),
                     "strike": leg.strike,
@@ -779,6 +825,7 @@ def _trade_log_assignment_row(assignment, *, is_settled: bool) -> dict[str, Any]
     acquire = assignment.direction == "ACQUIRE"
     return {
         "type": "Shares Assigned" if acquire else "Shares Called Away",
+        "type_code": None,  # a stock leg, no option-class badge
         "date": _iso(assignment.date),
         "expiration": None,
         "strike": assignment.strike,
@@ -1283,6 +1330,48 @@ def _open_hedge_entry(
     }
 
 
+def _recent_assigned_closes(
+    cycles: Sequence[Cycle],
+    since: date,
+    names: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Wheel legs that were assigned (a put -> shares bought, a call -> shares
+    called away) and finished closing on or after ``since`` (the calendar passes
+    ~6 months back) -- flattened for the expiration calendar's faded "what just
+    happened" bars. ``capital`` is the strike notional that changed hands
+    (``strike x 100 x contracts``), so an assigned covered call reads the same
+    size whether or not its shares were tracked in this export.
+    """
+    out: list[dict[str, Any]] = []
+    for cycle in cycles:
+        for leg in cycle.legs:
+            if leg.is_open or leg.outcome != "ASSIGNED":
+                continue
+            if leg.strategy not in (CSP, COVERED_CALL):
+                continue
+            close_date = leg.close_date
+            if close_date is None or close_date < since:
+                continue
+            strike = leg.strike or 0.0
+            contracts = leg.contracts or 0.0
+            out.append(
+                {
+                    "underlying": cycle.underlying,
+                    "name": names.get(cycle.underlying),
+                    "cycle_id": cycle.cycle_id,
+                    "type": "CSP" if leg.strategy == CSP else "CC",
+                    "strike": leg.strike,
+                    "contracts": round(contracts, 4),
+                    "close_date": _iso(close_date),
+                    "outcome": "ASSIGNED",
+                    "capital": round(strike * OPTION_MULTIPLIER * contracts, 2),
+                    "realized_pl": _money(leg.realized_pl),
+                }
+            )
+    out.sort(key=lambda r: (r["close_date"], r["underlying"]))
+    return out
+
+
 def _open_position_row(
     cycle: Cycle,
     leg,
@@ -1365,6 +1454,21 @@ def _open_position_row(
     else:
         type_ = "CSP" if is_put else "CC"
 
+    # "Min. Profit Captured" -- an intrinsic-only estimate of how much of the
+    # credit is banked. Intrinsic value is the *smallest* a buy-to-close could
+    # cost (time value only ever adds to it), so this is an OPTIMISTIC upper
+    # estimate: the real captured %, once time value is paid to close, is lower.
+    # An out-of-the-money short reads 100 -- "no intrinsic left to buy back",
+    # not "fully realized". None for longs, or with no last close / no credit.
+    min_profit_captured_pct = None
+    est_close_cost = None
+    if not is_long and last_close and net_premium and net_premium > 0:
+        intrinsic_per_share = (
+            max(leg.strike - last_close, 0.0) if is_put else max(last_close - leg.strike, 0.0)
+        )
+        est_close_cost = intrinsic_per_share * shares
+        min_profit_captured_pct = min(100.0, 100.0 * (net_premium - est_close_cost) / net_premium)
+
     return {
         "cycle_id": cycle.cycle_id,
         "underlying": cycle.underlying,
@@ -1394,6 +1498,10 @@ def _open_position_row(
         "collateral": None if is_long else _money(denom),
         "cost_basis": _money(cost_basis),
         "shares_tracked": leg.shares_tracked,
+        "min_profit_captured_pct": (
+            round(min_profit_captured_pct, 1) if min_profit_captured_pct is not None else None
+        ),
+        "est_close_cost": _money(est_close_cost),
     }
 
 
@@ -1925,40 +2033,52 @@ class Dashboard:
         )
         all_events = [opening_event] + [event for event in events if event.date > opening_day]
 
-        price_points, market_warnings = marketdata.get_price_series("SPY")
-        warnings.extend(market_warnings)
-
-        def price_lookup(day: date):
-            return marketdata.price_on_or_before(price_points, day)
-
         valuation_dates = sorted({opening_day, *(snapshot.as_of.date() for snapshot in account_snapshots)})
-        benchmark_values = bm.simulate_benchmark_series(all_events, valuation_dates, price_lookup)
-
         actual_terminal_value = account_snapshots[-1].total_value
-        benchmark_terminal_value = benchmark_values.get(as_of)
 
-        result = bm.compare_to_benchmark(all_events, actual_terminal_value, benchmark_terminal_value, as_of)
+        # One replay per benchmark index, all against the same cash-flow timing.
+        index_values: dict[str, dict[date, float | None]] = {}
+        benchmark_entries: list[dict[str, Any]] = []
+        for ticker in BENCHMARK_TICKERS:
+            points, index_warnings = marketdata.get_price_series(ticker)
+            warnings.extend(index_warnings)
+            values = bm.simulate_benchmark_series(
+                all_events,
+                valuation_dates,
+                lambda day, _points=points: marketdata.price_on_or_before(_points, day),
+            )
+            index_values[ticker] = values
+            index_result = bm.compare_to_benchmark(
+                all_events, actual_terminal_value, values.get(as_of), as_of
+            )
+            benchmark_entries.append(
+                {
+                    "name": ticker,
+                    "terminal_value": _money(index_result.benchmark_terminal_value),
+                    "xirr_pct": _money(index_result.benchmark_xirr_pct),
+                    "value_added": _money(index_result.value_added),
+                }
+            )
 
-        series = [
-            {
-                "as_of": snapshot.as_of.date().isoformat(),
-                "actual_value": _money(snapshot.total_value),
-                "benchmark_value": _money(benchmark_values.get(snapshot.as_of.date())),
-            }
-            for snapshot in account_snapshots
-        ]
+        primary = BENCHMARK_TICKERS[0]
+        result = bm.compare_to_benchmark(
+            all_events, actual_terminal_value, index_values[primary].get(as_of), as_of
+        )
+
+        def _series_point(day: date, actual: float) -> dict[str, Any]:
+            point = {"as_of": day.isoformat(), "actual_value": _money(actual)}
+            # Legacy key = the primary index; one extra key per additional index.
+            point["benchmark_value"] = _money(index_values[primary].get(day))
+            for ticker in BENCHMARK_TICKERS[1:]:
+                point[f"benchmark_value_{ticker.lower()}"] = _money(index_values[ticker].get(day))
+            return point
+
+        series = [_series_point(s.as_of.date(), s.total_value) for s in account_snapshots]
         if opening_day < earliest_real:
             # A configured opening point that reaches earlier than any real
             # snapshot -- give the growth-over-time chart a starting point to
             # draw from too, not just the return math above.
-            series.insert(
-                0,
-                {
-                    "as_of": opening_day.isoformat(),
-                    "actual_value": _money(opening_value),
-                    "benchmark_value": _money(benchmark_values.get(opening_day)),
-                },
-            )
+            series.insert(0, _series_point(opening_day, opening_value))
 
         return {
             "available": True,
@@ -1977,11 +2097,8 @@ class Dashboard:
                 "terminal_value": _money(result.actual_terminal_value),
                 "xirr_pct": _money(result.actual_xirr_pct),
             },
-            "benchmark": {
-                "name": "SPY",
-                "terminal_value": _money(result.benchmark_terminal_value),
-                "xirr_pct": _money(result.benchmark_xirr_pct),
-            },
+            "benchmark": benchmark_entries[0],
+            "benchmarks": benchmark_entries,
             "value_added": _money(result.value_added),
             "series": series,
         }
@@ -2026,13 +2143,30 @@ class Dashboard:
             for event_date, amount, label in events
         ]
 
-        price_points, warnings = marketdata.get_price_series("SPY")
-
-        def price_lookup(day: date):
-            return marketdata.price_on_or_before(price_points, day)
-
-        benchmark_terminal_value = bm.simulate_benchmark(cash_flow_events, through, price_lookup)
-        result = bm.compare_to_benchmark(cash_flow_events, terminal_value, benchmark_terminal_value, through)
+        warnings: list[str] = []
+        benchmark_entries: list[dict[str, Any]] = []
+        result = None
+        for ticker in BENCHMARK_TICKERS:
+            points, index_warnings = marketdata.get_price_series(ticker)
+            warnings.extend(index_warnings)
+            index_terminal = bm.simulate_benchmark(
+                cash_flow_events,
+                through,
+                lambda day, _points=points: marketdata.price_on_or_before(_points, day),
+            )
+            index_result = bm.compare_to_benchmark(
+                cash_flow_events, terminal_value, index_terminal, through
+            )
+            if result is None:
+                result = index_result  # the primary index drives the headline
+            benchmark_entries.append(
+                {
+                    "name": ticker,
+                    "terminal_value": _money(index_result.benchmark_terminal_value),
+                    "xirr_pct": _money(index_result.benchmark_xirr_pct),
+                    "value_added": _money(index_result.value_added),
+                }
+            )
 
         if result.actual_xirr_pct is None:
             return {
@@ -2054,11 +2188,8 @@ class Dashboard:
                 {"date": event.date.isoformat(), "amount": _money(event.amount), "label": event.label}
                 for event in sorted(cash_flow_events, key=lambda event: event.date)
             ],
-            "benchmark": {
-                "name": "SPY",
-                "terminal_value": _money(result.benchmark_terminal_value),
-                "xirr_pct": _money(result.benchmark_xirr_pct),
-            },
+            "benchmark": benchmark_entries[0],
+            "benchmarks": benchmark_entries,
             "value_added": _money(result.value_added),
         }
         return payload
@@ -2227,6 +2358,58 @@ class Dashboard:
                 )
         rows.sort(key=lambda r: (r["underlying"], r["expiration"] or "", r["strike"] or 0.0))
         return rows
+
+    def _build_earnings_in_view(
+        self,
+        open_positions: Sequence[dict[str, Any]],
+        wheels: Sequence[dict[str, Any]],
+        through: date,
+    ) -> dict[str, Any]:
+        """Next earnings date for every ticker that currently has an open option
+        leg or held shares, plus a short "reports within 7 days" list for the
+        Planner header.
+
+        The dates come straight from :meth:`_fundamentals` (the same Yahoo fetch
+        + ``data/earnings.json`` override the CC-/CSP-candidate tables already
+        use -- no extra network call). ``before_expiry`` is the wheel-relevant
+        bit: a report that lands on or before an open leg's expiry is a gap-risk
+        the position can't dodge, so the expiration calendar flags that week and
+        the workflow "Evaluate" bucket keys off it.
+        """
+        legs_by_ticker: dict[str, list[str]] = {}
+        for row in open_positions:
+            if row.get("expiration"):
+                legs_by_ticker.setdefault(row["underlying"], []).append(row["expiration"])
+        held = {w["underlying"] for w in wheels if (w.get("shares_held") or 0.0) > 1e-9}
+        tickers = sorted(set(legs_by_ticker) | held)
+        if not tickers:
+            return {"tickers": [], "within_7d": []}
+
+        fundamentals = self._fundamentals(tickers)
+        out: list[dict[str, Any]] = []
+        for ticker in tickers:
+            earn = (fundamentals.get(ticker) or {}).get("earnings_date")
+            if not earn:
+                continue
+            days = (earn - through).days
+            if days < 0:
+                continue  # a stale date the fetch hasn't refreshed yet
+            expiries = sorted(legs_by_ticker.get(ticker, []))
+            before_expiry = any(earn.isoformat() <= exp for exp in expiries)
+            out.append(
+                {
+                    "ticker": ticker,
+                    "earnings_date": earn.isoformat(),
+                    "days_to_earnings": days,
+                    "before_expiry": before_expiry,
+                    "soonest_leg_expiry": expiries[0] if expiries else None,
+                }
+            )
+        out.sort(key=lambda r: r["days_to_earnings"])
+        return {
+            "tickers": out,
+            "within_7d": [r["ticker"] for r in out if r["days_to_earnings"] <= 7],
+        }
 
     def _build_cc_candidates(
         self,
@@ -2583,6 +2766,43 @@ class Dashboard:
         if self._csp_candidates is None:
             _wheels = (self._trade_log or {}).get("wheels", [])
             self._csp_candidates = self._build_csp_candidates(_wheels, sector_exposure(_wheels))
+        earnings_in_view = self._build_earnings_in_view(
+            self._open_positions or [], (self._trade_log or {}).get("wheels", []), through
+        )
+        # {ticker: next-earnings ISO date} for every ticker with an open leg or
+        # held shares -- the calendar does its own per-leg "before this expiry"
+        # check; the workflow "Evaluate" rule keeps its simpler flag list.
+        _earn_rows = {row["ticker"]: row for row in earnings_in_view["tickers"]}
+        _earn_dates = {t: r["earnings_date"] for t, r in _earn_rows.items()}
+        _earn_before_expiry = [
+            row["ticker"] for row in earnings_in_view["tickers"] if row["before_expiry"]
+        ]
+        # Stamp the next-earnings date onto each Open option positions row (the
+        # table shows an Earnings column with the same amber-within-14-days rule
+        # as the candidate tables -- days counted from today, like they do).
+        _today = date.today()
+        for _row in self._open_positions or []:
+            _ed = (_earn_rows.get(_row["underlying"]) or {}).get("earnings_date")
+            _row["earnings_date"] = _ed
+            _row["days_to_earnings"] = (date.fromisoformat(_ed) - _today).days if _ed else None
+        assignment_risk = assignment_mod.assignment_risk(
+            self._open_positions or [], self._net_worth
+        )
+        # Assigned / called-away legs that closed over roughly the trailing six
+        # months -- the calendar draws them as faded bars left of "today" (the
+        # daily view still only reaches back two weeks; the weekly / monthly
+        # views show the whole span).
+        recent_closes = _recent_assigned_closes(
+            self.all_cycles, _today - timedelta(days=182), self._company_names
+        )
+        # No `through` -- the calendar's "today" anchor is the real current date,
+        # not a filtered end, so "how far ahead" reads honestly.
+        expiration_calendar = expiration_mod.expiration_calendar(
+            self._open_positions or [], _earn_dates, recent_closes=recent_closes
+        )
+        workflow = workflow_mod.classify_open_legs(
+            self._open_positions or [], _earn_before_expiry
+        )
 
         portfolio = portfolio_metrics(
             cycles,
@@ -2737,4 +2957,9 @@ class Dashboard:
             "open_positions": self._open_positions,
             "cc_candidates": self._cc_candidates,
             "csp_candidates": self._csp_candidates,
+            "earnings_in_view": earnings_in_view,
+            "assignment_risk": assignment_risk,
+            "expiration_calendar": expiration_calendar,
+            "recent_closes": recent_closes,
+            "workflow": workflow,
         }

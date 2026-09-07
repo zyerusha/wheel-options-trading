@@ -174,6 +174,40 @@ class TestDetection(unittest.TestCase):
         )
 
 
+class TestMinProfitCaptured(unittest.TestCase):
+    def test_out_of_the_money_short_reads_100_optimistic(self):
+        # No intrinsic value -> est_close_cost 0 -> the formula's optimistic
+        # ceiling. Not "fully realized" -- time value may still be there.
+        rows = _positions(
+            [tx("2025-06-01", STO, "-MU250801P90", -1, 1.50, 150.0, row_id=1)],
+            prices={"MU": 120.0},
+        )
+        self.assertEqual(rows[0]["min_profit_captured_pct"], 100.0)
+        self.assertEqual(rows[0]["est_close_cost"], 0.0)
+
+    def test_deep_in_the_money_short_goes_negative(self):
+        # strike 90, price 70 -> intrinsic $20/sh -> $2000 to close vs $150 credit.
+        rows = _positions(
+            [tx("2025-06-01", STO, "-MU250801P90", -1, 1.50, 150.0, row_id=1)],
+            prices={"MU": 70.0},
+        )
+        self.assertEqual(rows[0]["est_close_cost"], 2000.0)
+        self.assertLess(rows[0]["min_profit_captured_pct"], 0)
+
+    def test_no_price_leaves_it_null(self):
+        rows = _positions([tx("2025-06-01", STO, "-MU250801P90", -1, 1.50, 150.0, row_id=1)])
+        self.assertIsNone(rows[0]["min_profit_captured_pct"])
+        self.assertIsNone(rows[0]["est_close_cost"])
+
+    def test_long_leg_is_null(self):
+        rows = _positions(
+            [tx("2025-06-01", BTO, "-MU250801P90", 1, 1.50, -150.0, row_id=1)],
+            prices={"MU": 70.0},
+        )
+        self.assertEqual(rows[0]["type"], "LP")
+        self.assertIsNone(rows[0]["min_profit_captured_pct"])
+
+
 class TestCombine(unittest.TestCase):
     def test_combine_prefixes_cycle_id_and_sorts(self):
         payloads = {

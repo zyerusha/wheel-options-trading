@@ -47,6 +47,8 @@ from wheel.api import (  # noqa: E402
     looks_like_export,
     looks_like_multi_account_export,
 )
+from wheel import exporter  # noqa: E402
+from wheel.closed_lots import looks_like_closed_lots  # noqa: E402
 from wheel.positions import discover_position_snapshots, looks_like_position_snapshot  # noqa: E402
 
 PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -174,7 +176,13 @@ def _write_uploads(target_dir: str, files: list[tuple[str, bytes]], written: lis
             "Download a per-account History_for_Account_*.csv export instead."
         )
 
-    unrecognized = [path for path in resolved if not looks_like_export(path) and not looks_like_position_snapshot(path)]
+    unrecognized = [
+        path
+        for path in resolved
+        if not looks_like_export(path)
+        and not looks_like_position_snapshot(path)
+        and not looks_like_closed_lots(path)
+    ]
     if unrecognized:
         names = ", ".join(os.path.basename(path) for path in unrecognized)
         raise DatasetError(f"not a recognized Fidelity export: {names}")
@@ -449,6 +457,16 @@ class Handler(BaseHTTPRequestHandler):
         with open(path, "rb") as handle:
             self._send(200, handle.read(), content_type)
 
+    def _send_csv(self, text: str, filename: str) -> None:
+        body = text.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     # ---- routes ----
 
     def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
@@ -492,6 +510,8 @@ class Handler(BaseHTTPRequestHandler):
                         "reconciliation": payload["reconciliation"],
                     }
                 )
+            elif route.startswith("/api/export/") and route.endswith(".csv"):
+                self._handle_export(route[len("/api/export/") : -len(".csv")], parse_qs(parsed.query))
             elif route == "/api/datasets":
                 self._send_json(self._dataset_listing())
             elif route == "/api/accounts":
@@ -528,6 +548,43 @@ class Handler(BaseHTTPRequestHandler):
 
             traceback.print_exc()
             self._send_json({"error": str(error), "type": type(error).__name__}, 500)
+
+    # ---- CSV export ----
+
+    def _handle_export(self, name: str, query: dict) -> None:
+        """``/api/export/<name>.csv`` -- flat CSV of one payload list, honouring
+        the same ``?account=&tickers=&start=&end=&status=`` filters as
+        ``/api/dashboard`` (except the trade log, which is filter-independent)."""
+        self._sync_registry()
+        filters = Filters.from_query(query)
+        account_id = (query.get("account") or [None])[0]
+        try:
+            payload = self.registry.build(account_id, filters)
+        except KeyError:
+            self._send_json({"error": f"unknown account {account_id!r}"}, 404)
+            return
+
+        if name == "cycles":
+            text = exporter.rows_to_csv(payload.get("cycles") or [], exporter.CYCLE_COLUMNS)
+        elif name == "tickers":
+            text = exporter.rows_to_csv(payload.get("tickers") or [], exporter.TICKER_COLUMNS)
+        elif name == "trade-log":
+            only = (query.get("wheel") or [None])[0]
+            wheels = (payload.get("trade_log") or {}).get("wheels") or []
+            text = exporter.rows_to_csv(
+                exporter.flatten_trade_log(wheels, only), exporter.TRADE_LOG_COLUMNS
+            )
+        elif name == "closed-lots":
+            lots = (payload.get("realized_gains") or {}).get("lots")
+            if not lots:
+                self._send_json({"error": "no closed-lots export is loaded"}, 404)
+                return
+            text = exporter.rows_to_csv(lots, exporter.CLOSED_LOT_COLUMNS)
+        else:
+            self._send_json({"error": f"unknown export {name!r}"}, 404)
+            return
+
+        self._send_csv(text, f"wheel-{name}.csv")
 
     # ---- dataset endpoints ----
 
@@ -646,11 +703,14 @@ class Handler(BaseHTTPRequestHandler):
         self.registry.refresh(force=True)
         history_count = sum(1 for path in resolved if looks_like_export(path))
         position_count = sum(1 for path in resolved if looks_like_position_snapshot(path))
+        closed_lot_count = sum(1 for path in resolved if looks_like_closed_lots(path))
         parts = [f"Loaded into '{account_id}'"]
         if history_count:
             parts.append(f"{history_count} transaction export(s)")
         if position_count:
             parts.append(f"{position_count} position snapshot(s)")
+        if closed_lot_count:
+            parts.append(f"{closed_lot_count} closed-lots export(s)")
         return " · ".join(parts)
 
     def _handle_select(self) -> None:
