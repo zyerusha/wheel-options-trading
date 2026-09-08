@@ -132,14 +132,16 @@ from wheel import expiration as expiration_mod
 from wheel import taxes as taxes_mod
 from wheel import workflow as workflow_mod
 from wheel.closed_lots import (
+    ClosedLot,
     ClosedLotsFormatError,
     discover_closed_lots,
     parse_closed_lots,
-    realized_totals,
+    realized_by_underlying,
 )
 from wheel.api import (
     Dashboard,
     Filters,
+    build_cycles,
     csp_star_score,
     discover_exports,
     discover_multi_account_exports,
@@ -853,40 +855,59 @@ class AccountRegistry:
         return payload
 
     def _realized_gains(self, account_id: str | None) -> dict[str, Any] | None:
-        """Reconcile the wheel engine's option P/L against any Fidelity
+        """Cross-check the wheel engine's option P/L against any Fidelity
         closed-lots export found loose in ``.`` / ``data/``. ``None`` when none
-        is present.
+        is present, or when this account is not the one the export covers.
 
-        The engine side is rebuilt scoped to the export's own coverage window
-        (a closed-lots export is a *period* report, not all-time), so the two
-        figures are measured over the same span; a leg that straddles the window
-        edge still drifts a little, which is what the "investigate" band and the
-        notes are for. Not account-tagged, so ``account_id=None`` reconciles the
-        whole book.
+        A closed-lots export is one account's period report. For each file the
+        owning account is recovered by best fit (``taxes.best_fit_account``),
+        then that account's engine option P/L -- built over its full history and
+        measured the way the export measures it (``taxes.comparable_option_pl``:
+        windowed by disposition date, assignment excluded) -- is what the file
+        is reconciled against. ``account_id=None`` (the combined view) shows
+        every file; a single-account view shows only the files that belong to
+        it.
         """
         paths = discover_closed_lots()
         if not paths:
             return None
-        lots: list = []
+        files: list[list[ClosedLot]] = []
         for path in paths:
             try:
-                lots.extend(parse_closed_lots(path).lots)
+                lots = parse_closed_lots(path).lots
             except ClosedLotsFormatError:
                 continue
-        if not lots:
+            if lots:
+                files.append(lots)
+        if not files:
             return None
 
-        totals = realized_totals(lots)
-        window = Filters(
-            start=date.fromisoformat(totals["coverage_start"]) if totals["coverage_start"] else None,
-            end=date.fromisoformat(totals["coverage_end"]) if totals["coverage_end"] else None,
+        engine_option_pl: dict[str, float | None] = {}
+        shown_lots: list[ClosedLot] = []
+        for lots in files:
+            start, end = taxes_mod.disposition_window(lots)
+            per_account = {
+                aid: taxes_mod.comparable_option_pl(
+                    build_cycles(
+                        [t for t in dash.transactions if end is None or t.event_date <= end]
+                    )[0],
+                    start,
+                    end,
+                )
+                for aid, dash in self._accounts.items()
+            }
+            owner = taxes_mod.best_fit_account(per_account, lots)
+            if owner is None or (account_id is not None and account_id != owner):
+                continue
+            shown_lots.extend(lots)
+            for ticker in realized_by_underlying(lots):
+                engine_option_pl[ticker] = per_account[owner].get(ticker)
+
+        if not shown_lots:
+            return None
+        return taxes_mod.reconcile(
+            engine_option_pl, shown_lots, window=taxes_mod.disposition_window(shown_lots)
         )
-        if account_id is None:
-            payloads = {aid: dash.build(window) for aid, dash in self._accounts.items()}
-            ticker_rows = _combine_tickers(payloads)
-        else:
-            ticker_rows = self.get(account_id).build(window)["tickers"]
-        return taxes_mod.reconcile(ticker_rows, lots)
 
     # ---- combined aggregation ----
 
