@@ -39,6 +39,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Sequence
 
 from wheel.parser import _num, _parse_date
+from wheel.paths import DATA_DIR as _DATA_DIR
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SPY_LEGACY_CACHE_NAME = "spy_daily_closes.csv"
@@ -79,8 +80,8 @@ def yahoo_chart_url(ticker: str, *, period2: int | None = None) -> str:
 
 def _default_cache_path(ticker: str) -> str:
     if ticker.upper() == "SPY":
-        return os.path.join(PROJECT_ROOT, "data", _SPY_LEGACY_CACHE_NAME)
-    return os.path.join(PROJECT_ROOT, "data", "prices", f"{ticker.upper()}.csv")
+        return os.path.join(_DATA_DIR, _SPY_LEGACY_CACHE_NAME)
+    return os.path.join(_DATA_DIR, "prices", f"{ticker.upper()}.csv")
 
 
 # --------------------------------------------------------------------------
@@ -297,7 +298,7 @@ def price_on_or_before(points: Sequence[PricePoint], day: date) -> PricePoint | 
 # stay as hand-maintained per-field overrides on top of what's fetched here.
 # --------------------------------------------------------------------------
 
-_FUNDAMENTALS_CACHE_PATH = os.path.join(PROJECT_ROOT, "data", "fundamentals_cache.json")
+_FUNDAMENTALS_CACHE_PATH = os.path.join(_DATA_DIR, "fundamentals_cache.json")
 _QUOTE_URL = "https://query2.finance.yahoo.com/v7/finance/quote"
 _CRUMB_URL = "https://query2.finance.yahoo.com/v1/test/getcrumb"
 _COOKIE_URL = "https://fc.yahoo.com/"

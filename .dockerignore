@@ -1,0 +1,39 @@
+# Personal data (defense in depth; the Dockerfile only COPYs wheel/ anyway).
+data/
+sandbox/
+output/
+
+# VCS / CI
+.git/
+.gitignore
+.github/
+
+# Tests & docs
+tests/
+docs/
+
+# Markdown (README etc.) -- not needed in the runtime image
+*.md
+
+# Python caches / virtualenvs
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Editor / OS cruft
+.vscode/
+.idea/
+.DS_Store
+
+# Docker artifacts (docker-entrypoint.sh is deliberately NOT ignored -- it is COPYed)
+Dockerfile
+.dockerignore
+docker-compose.yml
+.env
+.env.example

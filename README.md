@@ -33,6 +33,69 @@ python -m wheel.serve --csv export1.csv export2.csv
 python -m wheel.serve --port 9000 --no-browser
 ```
 
+## Docker
+
+The dashboard ships as a small, standard-library-only image. Your trade data
+never goes into the image; you bind-mount a local folder at run time.
+
+### Pull
+
+```bash
+docker pull ghcr.io/zyerusha/wheel-options-trading:latest
+```
+
+### Run (bind-mount your data folder)
+
+```powershell
+# Windows PowerShell
+docker run --rm -p 8765:8765 -v "${PWD}\data:/app/data" ghcr.io/zyerusha/wheel-options-trading:latest
+```
+
+```bash
+# macOS / Linux
+docker run --rm -p 8765:8765 -v "$PWD/data:/app/data" ghcr.io/zyerusha/wheel-options-trading:latest
+```
+
+Then open http://localhost:8765. The mounted folder must already contain at
+least one broker CSV export (or a Portfolio Positions file), otherwise the
+container prints a message and exits.
+
+On Linux, if your user is not uid 1000, match it so uploads stay writable:
+
+```bash
+docker run --rm -p 8765:8765 --user "$(id -u):$(id -g)" -v "$PWD/data:/app/data" ghcr.io/zyerusha/wheel-options-trading:latest
+```
+
+### Build locally / Compose
+
+```bash
+docker build -t wheel-trading:local .
+
+cp .env.example .env      # edit WHEEL_DATA_DIR / WHEEL_PORT
+docker compose up --build
+```
+
+### Cloud (`$PORT` honored, binds `0.0.0.0`, `WHEEL_DATA_DIR` relocatable)
+
+```bash
+docker run --rm -e PORT=8080 -e WHEEL_DATA_DIR=/data -p 8080:8080 -v /some/data:/data ghcr.io/zyerusha/wheel-options-trading:latest
+```
+
+### Push to the registry
+
+```bash
+docker tag wheel-trading:local ghcr.io/zyerusha/wheel-options-trading:latest
+docker push ghcr.io/zyerusha/wheel-options-trading:latest
+```
+
+Tagging a release (`git tag v0.1.0 && git push origin v0.1.0`) runs
+`.github/workflows/docker-publish.yml`, which builds `linux/amd64` + `linux/arm64`
+and pushes `:0.1.0`, `:0.1`, `:sha-…`, and `:latest` to GHCR.
+
+Running locally without Docker is unchanged: `python -m wheel.serve` still binds
+`127.0.0.1:8765` and opens a browser. The new `--host 0.0.0.0` flag is what the
+container uses.
+
 ## Data
 
 ### Fidelity
@@ -355,8 +418,10 @@ Capital is estimated because the supporting shares predate the available export 
 | `wheel/accounts.py`    | Account discovery and the Combined view        |
 | `wheel/api.py`         | JSON payload assembly                          |
 | `wheel/serve.py`       | HTTP server                                    |
+| `wheel/paths.py`       | Resolves the data directory (`WHEEL_DATA_DIR`) |
 | `wheel/static/`        | Dashboard (Dashboard / Planner / Realized Gains / Trade Log tabs) |
 | `tests/`               | Tests                                          |
+| `Dockerfile` `docker-compose.yml` `docker-entrypoint.sh` | Container packaging (see [Docker](#docker)) |
 | `docs/DESIGN.md`       | Detailed design and accounting rules           |
 
 For the detailed implementation decisions, edge cases, validation results, and accounting model, see [docs/DESIGN.md](docs/DESIGN.md).

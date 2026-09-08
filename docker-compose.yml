@@ -1,0 +1,21 @@
+services:
+  wheel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: wheel-trading:local
+    container_name: wheel-trading
+    ports:
+      # host port (WHEEL_PORT) -> the container's fixed internal 8765.
+      # $PORT is a *cloud* override (Cloud Run etc.), not used with Compose.
+      - "${WHEEL_PORT:-8765}:8765"
+    volumes:
+      # LEFT = a host path (your local data folder). RIGHT is fixed.
+      - "${WHEEL_DATA_DIR:-./data}:/app/data"
+    environment:
+      WHEEL_HOST: "0.0.0.0"
+      WHEEL_DATA_DIR: "/app/data"
+    restart: unless-stopped
+    # Linux hosts whose user is not uid 1000: uncomment so the bind mount
+    # stays writable for uploads / caches.
+    # user: "${WHEEL_UID:-1000}:${WHEEL_GID:-1000}"

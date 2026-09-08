@@ -71,6 +71,7 @@ from wheel.parser import (
     company_name_from_description,
     parse_exports,
 )
+from wheel.paths import DISCOVERY_DIRS
 from wheel.positions import (
     EQUITY,
     discover_position_snapshots,
@@ -86,7 +87,7 @@ from wheel.reference import (
     sector_of,
 )
 
-EXPORT_DIRS = (".", "data")
+EXPORT_DIRS = DISCOVERY_DIRS
 
 
 # --------------------------------------------------------------------------

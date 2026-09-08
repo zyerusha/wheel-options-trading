@@ -13,3 +13,6 @@ __pycache__/
 venv/
 env/
 sandbox/
+
+# Local Docker env overrides (.env.example is committed)
+.env

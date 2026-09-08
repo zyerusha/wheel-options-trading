@@ -28,6 +28,8 @@ import os
 from datetime import date
 from typing import Sequence
 
+from wheel.paths import DISCOVERY_DIRS
+
 # --------------------------------------------------------------------------
 # Sectors -- deliberately coarse, one bucket per ticker. ETFs and funds get a
 # descriptive category rather than a GICS sector.
@@ -125,7 +127,7 @@ def sector_is_fund(ticker: str) -> bool:
 # Earnings dates
 # --------------------------------------------------------------------------
 
-EARNINGS_DIRS = (".", "data")
+EARNINGS_DIRS = DISCOVERY_DIRS
 
 
 def load_earnings(directories: Sequence[str] = EARNINGS_DIRS) -> dict[str, date]:

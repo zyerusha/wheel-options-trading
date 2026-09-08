@@ -147,6 +147,7 @@ from wheel.api import (
 )
 from wheel.insights import portfolio_insights
 from wheel.metrics import roi_and_annualized, time_weighted_average, weekly_ppd_series
+from wheel.paths import DATA_DIR
 from wheel.positions import discover_position_snapshots, latest_snapshot, latest_snapshot_per_account, load_snapshots
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -181,7 +182,7 @@ class AccountDir:
 
 
 def discover_account_dirs(
-    base_dir: str = "data", extra_dirs: Sequence[str] = (".",)
+    base_dir: str = DATA_DIR, extra_dirs: Sequence[str] = (".",)
 ) -> list[AccountDir]:
     """Every account: the implicit default bucket, plus one per subfolder.
 
@@ -487,7 +488,7 @@ def _resolve_account_number(account_dir: AccountDir, configured_number: str | No
 class AccountRegistry:
     """Discovers account folders and answers per-account or Combined queries."""
 
-    def __init__(self, base_dir: str = "data", extra_dirs: Sequence[str] = (".",)):
+    def __init__(self, base_dir: str = DATA_DIR, extra_dirs: Sequence[str] = (".",)):
         self.base_dir = base_dir
         self.extra_dirs = tuple(extra_dirs)
         self._lock = threading.Lock()

@@ -49,12 +49,15 @@ from wheel.api import (  # noqa: E402
 )
 from wheel import exporter  # noqa: E402
 from wheel.closed_lots import looks_like_closed_lots  # noqa: E402
+from wheel.paths import DATA_DIR  # noqa: E402
 from wheel.positions import discover_position_snapshots, looks_like_position_snapshot  # noqa: E402
 
 PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(PACKAGE_DIR, "static")
 PROJECT_ROOT = os.path.dirname(PACKAGE_DIR)
-UPLOAD_DIR = os.path.join(PROJECT_ROOT, "data")
+# Absolute: <repo>/data by default, or $WHEEL_DATA_DIR when set. All uploads and
+# market-data caches are written here; it is the volume mount point in Docker.
+UPLOAD_DIR = DATA_DIR
 
 MAX_UPLOAD_BYTES = 32 * 1024 * 1024
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._ -]")
@@ -774,6 +777,7 @@ def serve(
     port: int = 8765,
     open_browser: bool = True,
     reopen_browser: bool = False,
+    host: str = "127.0.0.1",
 ) -> None:
     if csv_path is None:
         csv_path = discover_exports()
@@ -802,8 +806,9 @@ def serve(
 
     Handler.state = state
     Handler.registry = registry
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    url = f"http://127.0.0.1:{port}/"
+    httpd = ThreadingHTTPServer((host, port), Handler)
+    display_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    url = f"http://{display_host}:{port}/"
 
     reconciliation = payload["reconciliation"]
     meta = payload["meta"]
@@ -845,6 +850,12 @@ def main() -> None:
         "Defaults to every export found in . and data/",
     )
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="interface to bind (default 127.0.0.1; use 0.0.0.0 to accept "
+        "connections from other machines or containers)",
+    )
     parser.add_argument("--no-browser", action="store_true", help="do not open a browser window")
     parser.add_argument(
         "--reopen-browser",
@@ -853,7 +864,13 @@ def main() -> None:
         "(by default, restarting within a few hours skips it -- see --no-browser to skip always)",
     )
     args = parser.parse_args()
-    serve(args.csv, args.port, open_browser=not args.no_browser, reopen_browser=args.reopen_browser)
+    serve(
+        args.csv,
+        args.port,
+        open_browser=not args.no_browser,
+        reopen_browser=args.reopen_browser,
+        host=args.host,
+    )
 
 
 if __name__ == "__main__":
