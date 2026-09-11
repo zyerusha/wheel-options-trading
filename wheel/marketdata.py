@@ -474,6 +474,46 @@ def parse_yahoo_quotes(text: str) -> dict[str, dict]:
     return out
 
 
+def get_last_prices(
+    tickers: Sequence[str],
+    *,
+    fetch: Callable[[Sequence[str]], str] | None = None,
+) -> tuple[dict[str, float | None], list[str]]:
+    """Live last-trade price for each of ``tickers`` -- Yahoo's batched quote
+    endpoint's ``regularMarketPrice``, one HTTP round trip for the whole list
+    (the same endpoint :func:`get_fundamentals` uses for market cap etc.).
+
+    Unlike :func:`get_price_series`, this is never cached to disk or memoized
+    in-process: a live price is only ever "fresh right now," so there is
+    nothing meaningful to cache here. A caller that wants to avoid re-fetching
+    on every request (a long-lived Dashboard instance serving many page loads)
+    is responsible for its own short-TTL cache around this call.
+
+    Never raises. A fetch failure (network, auth, a malformed response) marks
+    every ticker ``None`` with one warning; a ticker present in the response
+    but missing ``regularMarketPrice`` (delisted, before its first trade,
+    Yahoo just doesn't have one) is ``None`` too, with no warning of its own.
+    Callers fall back to the last daily close for any ticker that comes back
+    ``None``.
+    """
+    tickers = sorted({t.upper() for t in tickers if t})
+    if not tickers:
+        return {}, []
+    fetch = fetch or fetch_yahoo_quotes
+    try:
+        quotes = parse_yahoo_quotes(fetch(tickers))
+    except MarketDataError as error:
+        return {t: None for t in tickers}, [
+            f"could not fetch last prices for {len(tickers)} ticker(s): {error}"
+        ]
+    out: dict[str, float | None] = {}
+    for ticker in tickers:
+        row = quotes.get(ticker)
+        price = row.get("regularMarketPrice") if row else None
+        out[ticker] = float(price) if isinstance(price, (int, float)) else None
+    return out, []
+
+
 def _fundamentals_from_quote(ticker: str, row: dict, as_of: date) -> Fundamentals:
     name = row.get("longName") or row.get("shortName")
     cap = row.get("marketCap")

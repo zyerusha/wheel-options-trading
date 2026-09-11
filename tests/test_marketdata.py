@@ -25,6 +25,7 @@ from wheel.marketdata import (  # noqa: E402
     _most_recent_session_day,
     _sessions_elapsed,
     get_fundamentals,
+    get_last_prices,
     get_price_series,
     load_cache,
     parse_yahoo_chart,
@@ -388,6 +389,55 @@ class TestParseYahooQuotes(unittest.TestCase):
     def test_error_payload_raises(self):
         with self.assertRaises(MarketDataError):
             parse_yahoo_quotes('{"finance": {"error": "nope"}}')
+
+
+class TestGetLastPrices(unittest.TestCase):
+    def test_returns_regular_market_price_per_ticker(self):
+        text = _quote_payload(
+            [{"symbol": "MU", "regularMarketPrice": 210.5}, {"symbol": "IVV", "regularMarketPrice": 580.25}]
+        )
+        prices, warnings = get_last_prices(["mu", "ivv"], fetch=lambda tickers: text)
+        self.assertEqual(prices, {"MU": 210.5, "IVV": 580.25})
+        self.assertEqual(warnings, [])
+
+    def test_ticker_missing_from_the_response_is_none(self):
+        text = _quote_payload([{"symbol": "MU", "regularMarketPrice": 210.5}])
+        prices, warnings = get_last_prices(["mu", "qqq"], fetch=lambda tickers: text)
+        self.assertEqual(prices, {"MU": 210.5, "QQQ": None})
+        self.assertEqual(warnings, [])
+
+    def test_row_present_but_no_regular_market_price_is_none(self):
+        text = _quote_payload([{"symbol": "MU"}])
+        prices, warnings = get_last_prices(["mu"], fetch=lambda tickers: text)
+        self.assertEqual(prices, {"MU": None})
+
+    def test_fetch_failure_marks_every_ticker_none_with_one_warning(self):
+        def failing_fetch(tickers):
+            raise MarketDataError("boom")
+
+        prices, warnings = get_last_prices(["mu", "ivv"], fetch=failing_fetch)
+        self.assertEqual(prices, {"MU": None, "IVV": None})
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("boom", warnings[0])
+
+    def test_empty_ticker_list_never_calls_fetch(self):
+        def unexpected_fetch(tickers):
+            raise AssertionError("should never fetch for an empty ticker list")
+
+        prices, warnings = get_last_prices([], fetch=unexpected_fetch)
+        self.assertEqual(prices, {})
+        self.assertEqual(warnings, [])
+
+    def test_tickers_are_deduplicated_and_uppercased_before_fetching(self):
+        seen = []
+
+        def fetch(tickers):
+            seen.append(tickers)
+            return _quote_payload([{"symbol": "MU", "regularMarketPrice": 210.5}])
+
+        prices, _ = get_last_prices(["mu", "MU", "Mu"], fetch=fetch)
+        self.assertEqual(seen, [["MU"]])
+        self.assertEqual(prices, {"MU": 210.5})
 
 
 class TestLeverageKind(unittest.TestCase):

@@ -23,6 +23,7 @@
   --pos: #2a78d6;
   --neg: #e34948;
   --mid: #f0efec;
+  --target: #7c3aed;
 
   --good: #0ca30c;
   --warning: #fab219;
@@ -56,6 +57,7 @@
     --pos: #3987e5;
     --neg: #e66767;
     --mid: #383835;
+    --target: #a78bfa;
     --success-text: #0ca30c;
     --closed-bg: #4a2b25;
     --noactivity-bg: #4a4325;
@@ -81,6 +83,7 @@
   --pos: #3987e5;
   --neg: #e66767;
   --mid: #383835;
+  --target: #a78bfa;
   --success-text: #0ca30c;
   --closed-bg: #4a2b25;
   --noactivity-bg: #4a4325;
@@ -951,24 +954,12 @@ th.sortable:hover {
   outline: none;
 }
 
-/* The one actionable figure in the covered-call / cash-secured-put candidate
-   tables -- same violet, same weight in both. */
-#cc-candidates-table td.cc-target,
-#csp-candidates-table td.cc-target {
+/* The one actionable/key figure, wherever it appears -- candidate tables,
+   the Open Positions target column, the Trade Log's target-price summary
+   cell, and the wheel-targets banner. Same violet everywhere via --target. */
+.cc-target {
   font-weight: 700;
-  color: #7c3aed; /* violet */
-}
-
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme='light']) #cc-candidates-table td.cc-target,
-  :root:not([data-theme='light']) #csp-candidates-table td.cc-target {
-    color: #a78bfa; /* lighter violet for dark backgrounds */
-  }
-}
-
-:root[data-theme='dark'] #cc-candidates-table td.cc-target,
-:root[data-theme='dark'] #csp-candidates-table td.cc-target {
-  color: #a78bfa;
+  color: var(--target);
 }
 
 /* Sub-100-share rows carry no CC target -- the "—" shouldn't read as an
@@ -1271,6 +1262,24 @@ tr.detail > td {
   transition: opacity 0.15s;
 }
 
+/* Background live-price refresh: a small pulsing dot in the header instead
+   of dimming the whole page -- the periodic poll shouldn't read as "the
+   dashboard just froze," only a user-initiated load (account/filter change)
+   dims via .loading above. */
+.live-indicator {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--pos);
+  animation: live-indicator-pulse 1s ease-in-out infinite;
+}
+
+@keyframes live-indicator-pulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
+}
+
 /* ---------------- responsive layout ---------------- */
 
 @media (max-width: 720px) {
@@ -1527,24 +1536,20 @@ tr.detail > td {
 }
 
 /* The value at the end of the line -- purple, the same key-figure colour as the
-   "Target price" columns. Shared: the Break-even chart's current break-even and
-   the PPD chart's current "$x/d". */
+   "Target price" columns (--target). Shared: the Break-even chart's current
+   break-even/target and the PPD chart's current "$x/d". */
 #chart-tradelog-breakeven .chart-endpoint-value,
 #chart-tradelog-ppd .chart-endpoint-value {
-  fill: #7c3aed;
+  fill: var(--target);
   font-weight: 700;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme='light']) #chart-tradelog-breakeven .chart-endpoint-value,
-  :root:not([data-theme='light']) #chart-tradelog-ppd .chart-endpoint-value {
-    fill: #a78bfa;
-  }
-}
-
-:root[data-theme='dark'] #chart-tradelog-breakeven .chart-endpoint-value,
-:root[data-theme='dark'] #chart-tradelog-ppd .chart-endpoint-value {
-  fill: #a78bfa;
+/* The Break-even line's own endpoint value: colored to match its line
+   (blue, --series-1) rather than the shared violet "key figure" treatment
+   above -- the chart now also has a violet Target line ending nearby, so
+   the two endpoints need to read as two different series, not one. */
+#chart-tradelog-breakeven .chart-endpoint-value.be-value {
+  fill: var(--series-1);
 }
 
 /* Under-water / above-water badge on the Break-even chart: a red warning when
@@ -1564,6 +1569,12 @@ tr.detail > td {
 
 #chart-tradelog-breakeven .be-water-above {
   fill: var(--good);
+}
+
+/* Distance-to-target badge: violet in both states (the Target line's own
+   color) -- unlike break-even, sitting below target isn't a danger signal. */
+#chart-tradelog-breakeven .target-water-badge {
+  fill: var(--target);
 }
 
 .tradelog-ppd .ti-head {

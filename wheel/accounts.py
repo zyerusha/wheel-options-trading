@@ -923,6 +923,7 @@ class AccountRegistry:
         combined_portfolio = _combine_portfolio(payloads, capital_series)
         combined_trade_log = _combine_trade_log(payloads)
         combined_hedges = _combine_open_hedges(payloads)
+        combined_wheel_targets = _combine_wheel_targets(payloads)
         combined_open_positions = _combine_open_positions(payloads)
         combined_cc_candidates = _combine_cc_candidates(payloads)
         combined_csp_candidates = _combine_csp_candidates(
@@ -981,6 +982,7 @@ class AccountRegistry:
             "wheel_return": combined_wheel_return,
             "trade_log": combined_trade_log,
             "open_hedges": combined_hedges,
+            "wheel_targets": combined_wheel_targets,
             "open_positions": combined_open_positions,
             "cc_candidates": combined_cc_candidates,
             "csp_candidates": combined_csp_candidates,
@@ -1087,6 +1089,21 @@ def _combine_open_hedges(payloads: dict[str, dict]) -> list[dict]:
             )
     hedges.sort(key=lambda hedge: hedge["days_to_expiry"])
     return hedges
+
+
+def _combine_wheel_targets(payloads: dict[str, dict]) -> list[dict]:
+    """Every account's wheel price targets in one list, ``cycle_id``
+    account-prefixed to match the combined timeline / Trade Log; the wheel
+    closest to its target reads first, same ordering each account already uses.
+    """
+    rows: list[dict] = []
+    for account_id, payload in payloads.items():
+        for row in payload.get("wheel_targets") or []:
+            rows.append(
+                {**row, "account_id": account_id, "cycle_id": f"{account_id}:{row['cycle_id']}"}
+            )
+    rows.sort(key=lambda r: (abs(r["gap_pct"]) if r["gap_pct"] is not None else float("inf"), r["underlying"]))
+    return rows
 
 
 def _combine_open_positions(payloads: dict[str, dict]) -> list[dict]:

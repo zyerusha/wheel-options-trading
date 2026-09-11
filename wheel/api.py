@@ -12,6 +12,7 @@ import math
 import os
 import re
 import statistics
+import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
@@ -292,12 +293,12 @@ _LP_IN_NAME = re.compile(r"\bL\.?\s?P\.?\b", re.IGNORECASE)
 
 
 def _csp_ticker_verdict(
-    ticker: str, name: str | None, last_close: float | None, fund: dict | None
+    ticker: str, name: str | None, last_price: float | None, fund: dict | None
 ) -> tuple[str | None, list[str]]:
     """``(exclude_reason, unvetted_notes)`` for one candidate ticker.
 
     A non-``None`` reason drops the row outright: a leveraged/inverse ETF, a
-    closed-end / mutual fund, an ``LP`` in the name, a last close outside
+    closed-end / mutual fund, an ``LP`` in the name, a last price outside
     ``$10-$350``, or a *known* sub-$1B cap / sub-1M volume. Ordinary ETFs and
     ADRs of operating companies are allowed. ``unvetted_notes`` lists what we
     simply don't know (missing cap, missing volume, unknown security type) --
@@ -318,8 +319,8 @@ def _csp_ticker_verdict(
         return "leveraged/inverse ETF", []
     if kind is None and sector_is_fund(ticker):
         return "closed-end / mutual fund, not common stock", []
-    if last_close is not None and not (CSP_PRICE_MIN <= last_close <= CSP_PRICE_MAX):
-        return f"last close ${last_close:,.2f} outside ${CSP_PRICE_MIN:.0f}-${CSP_PRICE_MAX:.0f}", []
+    if last_price is not None and not (CSP_PRICE_MIN <= last_price <= CSP_PRICE_MAX):
+        return f"last price ${last_price:,.2f} outside ${CSP_PRICE_MIN:.0f}-${CSP_PRICE_MAX:.0f}", []
     if cap is not None and not is_etf and cap < CSP_MIN_MARKET_CAP_B:
         return f"market cap ${cap:.2f}B < ${CSP_MIN_MARKET_CAP_B:.0f}B", []
     if vol is not None and vol < CSP_MIN_AVG_VOL_M:
@@ -332,8 +333,8 @@ def _csp_ticker_verdict(
         notes.append("market cap unknown")
     if vol is None:
         notes.append("10d volume unknown")
-    if last_close is None:
-        notes.append("last close unknown")
+    if last_price is None:
+        notes.append("last price unknown")
     return None, notes
 
 
@@ -466,6 +467,11 @@ class Filters:
 # Serialization helpers
 # --------------------------------------------------------------------------
 
+# Wheel target price: how far past the bare CC floor / how deep OTM the CSP
+# entry cushion should sit. See _cc_target / _target_explanation.
+WHEEL_TARGET_CC_CUSHION_PCT = 2.0
+WHEEL_TARGET_CSP_OTM_PCT = 93.0
+
 
 def _money(value: float | None) -> float | None:
     return round(value, 2) if value is not None else None
@@ -473,6 +479,40 @@ def _money(value: float | None) -> float | None:
 
 def _iso(value: date | None) -> str | None:
     return value.isoformat() if value else None
+
+
+def _cc_target(floor: float, cushion_pct: float = WHEEL_TARGET_CC_CUSHION_PCT) -> float:
+    """A profitable-exit target: the CC floor (same one ``target_cc_strike``
+    uses), marked up by a cushion so it reads as "worthwhile", not merely
+    "breakeven-safe", then rounded up to the next $0.50 (real strikes sit on
+    0.50-or-wider increments)."""
+    return _money(math.ceil(round(floor * (1 + cushion_pct / 100), 4) / 0.5) * 0.5)
+
+
+def _target_explanation(
+    phase: str | None,
+    target_price: float | None,
+    *,
+    floor_value: float | None = None,
+    cushion_pct: float | None = None,
+    otm_pct: float | None = None,
+    current_price: float | None = None,
+) -> str | None:
+    """Plain-English math behind ``target_price``, generated once here so
+    every UI surface (Dashboard banner, Open Positions column, Trade Log
+    summary) shows the exact same explanation instead of re-deriving it."""
+    if phase == "cc":
+        return (
+            f"Profitable exit target: floor ${floor_value:.2f} (highest of cost basis, "
+            f"breakeven, wheel breakeven), +{cushion_pct:g}% cushion, "
+            f"rounded up to $0.50 increments = ${target_price:.2f}."
+        )
+    if phase == "csp":
+        return (
+            f"Preferred entry target: {otm_pct:g}% of last close ${current_price:.2f}, "
+            f"rounded down to $0.50 increments = ${target_price:.2f}."
+        )
+    return None
 
 
 def _capital_point(point) -> dict[str, Any]:
@@ -1006,9 +1046,11 @@ def _trade_log_entry(
         # divides a tiny denominator into noise.
         if shares_running >= 1.0 - 1e-9:
             row["running_break_even"] = _money(-running / shares_running)
+            row["running_target"] = _cc_target(-running / shares_running)
             last_break_even_idx = idx
         else:
             row["running_break_even"] = None
+            row["running_target"] = None
 
     held_lots = [lot for lot in cycle.share_lots if lot.remaining > 1e-9]
     known = [lot for lot in held_lots if lot.basis_known and lot.basis_per_share is not None]
@@ -1075,6 +1117,42 @@ def _trade_log_entry(
     if break_even_price is not None and break_even_price <= 0:
         break_even_price = None
 
+    # Target price: a profitable-exit floor (CC phase, holding shares) or a
+    # preferred-entry cushion off the last close (CSP phase, no shares yet).
+    #
+    # Deliberately NOT including current_price/last_close in the CC floor,
+    # unlike _build_cc_candidates' target_cc_strike (a strike-selection floor,
+    # which must sit at/above market so a fresh call isn't instantly ITM).
+    # This is a different question -- "has the wheel reached a worthwhile
+    # price" -- and current_price is exactly the value being asked about: if
+    # it were one of the max() candidates, the target would sit ~cushion%
+    # above whatever the price already is, so price could never actually
+    # cross it. Anchoring only to the historical cost figures (cost basis,
+    # position breakeven, wheel breakeven) gives a fixed line the price can
+    # genuinely close in on and pass.
+    target_floor = None
+    if shares_held > 1e-9:
+        floors = [v for v in (cost_basis, break_even, break_even_price) if v is not None]
+        target_floor = max(floors) if floors else None
+        target_price = _cc_target(target_floor) if target_floor is not None else None
+        target_phase = "cc" if target_price is not None else None
+    elif current_price is not None:
+        target_price = _money(
+            math.floor(round(current_price * (WHEEL_TARGET_CSP_OTM_PCT / 100), 4) / 0.5) * 0.5
+        )
+        target_phase = "csp"
+    else:
+        target_price = None
+        target_phase = None
+    target_explanation = _target_explanation(
+        target_phase,
+        target_price,
+        floor_value=target_floor,
+        cushion_pct=WHEEL_TARGET_CC_CUSHION_PCT,
+        otm_pct=WHEEL_TARGET_CSP_OTM_PCT,
+        current_price=current_price,
+    )
+
     # If the wheel still holds shares, pin the last share-holding row of the
     # ledger exactly to the summary's Break-even price. The running figure above
     # is a per-row sum of already cent-rounded cash flows, so after dozens of
@@ -1087,6 +1165,7 @@ def _trade_log_entry(
     # summary's dash is only about the present.
     if last_break_even_idx is not None and shares_held > 1e-9:
         rows[last_break_even_idx]["running_break_even"] = _money(break_even_price)
+        rows[last_break_even_idx]["running_target"] = target_price
 
     dollars_to_break_even = (
         shares_held * (break_even_price - current_price)
@@ -1150,6 +1229,10 @@ def _trade_log_entry(
         "current_price": _money(current_price),
         "break_even_price": _money(break_even_price),
         "dollars_to_break_even": _money(dollars_to_break_even),
+        "target_price": target_price,
+        "target_phase": target_phase,  # "cc" | "csp" | None
+        "target_explanation": target_explanation,
+        "target_cushion_pct": WHEEL_TARGET_CC_CUSHION_PCT,
         "pl_bridge": pl_bridge,
         "insights": wheel_insights(
             cycle,
@@ -1383,6 +1466,9 @@ def _open_position_row(
     prev_close: float | None,
     cost_basis: float | None,
     wheel_breakeven: float | None,
+    target_price: float | None = None,
+    target_phase: str | None = None,
+    target_explanation: str | None = None,
 ) -> dict[str, Any]:
     """One open option leg -- a short covered call / cash-secured put, or a long
     put / call (a protective hedge or a directional punt) -- framed the way the
@@ -1400,6 +1486,12 @@ def _open_position_row(
     at-expiry break-even. ``wheel_breakeven`` is the whole cycle's campaign
     break-even price (the Trade Log's "Break-even price"), passed in from the
     already-built Trade Log and ``None`` for a cycle holding no shares yet.
+
+    Despite the field name, ``last_close`` is the *live* last-trade price when
+    Dashboard._current_prices() had one (falling back to the latest completed
+    session's close otherwise) -- kept as ``last_close`` throughout this
+    module and the JSON payload for API stability, not because it's still
+    literally a close.
 
     ``moneyness_pct`` is signed so positive means the strike is out-of-the-money
     and negative means in-the-money, measured against ``last_close`` -- a raw
@@ -1489,6 +1581,9 @@ def _open_position_row(
         "net_premium": _money(net_premium),
         "breakeven": _money(breakeven),
         "wheel_breakeven": _money(wheel_breakeven),
+        "target_price": _money(target_price),
+        "target_phase": target_phase,
+        "target_explanation": target_explanation,
         "moneyness_pct": round(moneyness_pct, 2) if moneyness_pct is not None else None,
         "in_the_money": in_the_money,
         "last_close": _money(last_close),
@@ -1582,6 +1677,15 @@ def _reconciliation(
 # Dataset
 # --------------------------------------------------------------------------
 
+# How long Dashboard._current_prices() trusts its own in-memory live-quote
+# fetch before re-fetching. Long enough that a burst of requests (Combined's
+# six-plus per-account builds, a user clicking through filters) shares one
+# fetch; short enough that a live price left open in a browser tab all
+# session doesn't read stale minutes into the close. Matches the frontend's
+# LIVE_PRICE_POLL_MS (wheel/static/app.js) so its periodic poll actually
+# lands a fresh quote each time instead of re-reading this cache.
+_LIVE_PRICE_TTL_SECONDS = 15.0
+
 
 class Dashboard:
     """Parses one or more exports once, then answers filtered queries.
@@ -1655,16 +1759,27 @@ class Dashboard:
                 ]
         self._net_worth = self._build_net_worth()
         self._benchmark = self._build_benchmark()
-        # Lazily populated on the first build() call and reused after that --
-        # get_price_series() does disk I/O and a freshness check even when it
-        # skips the network fetch, and build() runs once per filter change
-        # from the frontend, so re-fetching every ticker on every call would
-        # multiply that cost by however many times the user adjusts a filter.
+        # Lazily populated on the first build() call and reused for
+        # _LIVE_PRICE_TTL_SECONDS at a time, not once per Dashboard instance --
+        # this Dashboard object is reused for the registry's whole lifetime
+        # (many page loads over hours or days), and a live price actually
+        # moves through the session, unlike a daily close. The TTL keeps
+        # repeated filter changes / Combined's six-plus per-account builds
+        # from each paying for their own fetch, without freezing the mark at
+        # whatever it was on the first request after the last data-file-
+        # triggered rebuild.
         self._price_cache: dict[str, float | None] | None = None
+        self._price_cache_at: float = 0.0
         # Prior trading day's close per ticker, filled in beside _price_cache --
         # the "Last Close %" column of the Open option positions table.
         self._prev_closes: dict[str, float | None] = {}
         self._price_warnings: list[str] = []
+        # The _price_cache_at generation the price-derived caches below were
+        # last built against -- see the comment further down where they're
+        # declared for why this exists (in short: _current_prices() now
+        # refreshes on its own TTL, and these must not go on quietly reusing
+        # a mark from several refreshes ago just because they're non-None).
+        self._price_marked_at: float | None = None
         # Lazily built on the first build() call too -- it needs current_prices,
         # which needs the same network fetch _price_cache above is guarding
         # against repeating, so it can't be computed any earlier than that.
@@ -1683,7 +1798,12 @@ class Dashboard:
         self._company_names = {
             ticker: votes.most_common(1)[0][0] for ticker, votes in name_votes.items()
         }
-        # Filter-independent (built from all_cycles), so cached after first build().
+        # Filter-independent (built from all_cycles), so cached across build()
+        # calls that land within the same _current_prices() TTL window --
+        # invalidated (see build()) whenever that refreshes, since every one
+        # of these is marked to current_prices and would otherwise go on
+        # showing the first live price this Dashboard instance ever fetched,
+        # forever, no matter how many refreshes _current_prices() itself does.
         self._trade_log: dict[str, Any] | None = None
         self._open_hedges: list[dict[str, Any]] | None = None
         self._open_positions: list[dict[str, Any]] | None = None
@@ -1693,24 +1813,31 @@ class Dashboard:
     # ---- market data ----
 
     def _current_prices(self) -> dict[str, float | None]:
-        """Latest close for every ticker this dashboard holds open shares in.
+        """Live last-trade price for every ticker this dashboard holds open
+        shares or an open option leg in, falling back to the latest completed
+        session's close for any ticker the live quote can't answer.
 
-        Computed once per Dashboard instance, not once per build() -- see the
-        comment in __init__. A ticker whose fetch fails yields ``None`` for
-        that ticker only (wheel.marketdata never raises), which flows through
-        to that cycle's stock_unrealized_pl as "unavailable," not a crash.
+        Cached for ``_LIVE_PRICE_TTL_SECONDS``, not once per Dashboard
+        instance -- see the comment in __init__. A ticker whose every fetch
+        fails yields ``None`` for that ticker only (wheel.marketdata never
+        raises), which flows through to that cycle's stock_unrealized_pl as
+        "unavailable," not a crash.
 
-        Two passes so the common case pays nothing for threads: first resolve
-        every ticker that a fresh cache or the in-process memo can answer
-        without network (``local_only=True``), then fan the genuine misses --
-        typically only the first page load after a trading session closes --
-        out across a thread pool, since each is an independent network round
-        trip (its own URL, its own cache file under ``data/prices/``). A cold
-        pull of a few dozen tickers one at a time turned a single-digit-second
-        page load into a multi-second one; spinning the pool up when there is
-        nothing to fetch was itself costing ~1.5s per Combined build.
+        Two passes for the daily-close series so the common case pays nothing
+        for threads: first resolve every ticker that a fresh cache or the
+        in-process memo can answer without network (``local_only=True``),
+        then fan the genuine misses -- typically only the first build after a
+        trading session closes -- out across a thread pool, since each is an
+        independent network round trip (its own URL, its own cache file under
+        ``data/prices/``). A cold pull of a few dozen tickers one at a time
+        turned a single-digit-second page load into a multi-second one;
+        spinning the pool up when there is nothing to fetch was itself
+        costing ~1.5s per Combined build. The live quotes on top of that are
+        one extra batched HTTP round trip for the whole ticker list, not
+        per-ticker.
         """
-        if self._price_cache is not None:
+        now = time.monotonic()
+        if self._price_cache is not None and now - self._price_cache_at < _LIVE_PRICE_TTL_SECONDS:
             return self._price_cache
 
         # Every ticker with open shares *or* an open option leg -- the latter so a
@@ -1724,14 +1851,16 @@ class Dashboard:
                 or any(leg.is_open for leg in cycle.legs)
             }
         )
-        prices: dict[str, float | None] = {}
         prev: dict[str, float | None] = {}
         warnings: list[str] = []
         misses: list[str] = []
 
         def _record(ticker: str, points) -> None:
-            prices[ticker] = points[-1].close if points else None
-            prev[ticker] = points[-2].close if points and len(points) >= 2 else None
+            # The latest *completed* session's close (see wheel.marketdata's
+            # session-aware staleness) -- "prev" now that the live quote below
+            # is the actual current mark, and the fallback current mark itself
+            # when no live quote is available for this ticker.
+            prev[ticker] = points[-1].close if points else None
 
         for ticker in tickers:
             local = marketdata.get_price_series(ticker, local_only=True)
@@ -1748,7 +1877,15 @@ class Dashboard:
                     warnings.extend(ticker_warnings)
                     _record(ticker, points)
 
+        live, live_warnings = marketdata.get_last_prices(tickers)
+        warnings.extend(live_warnings)
+        prices: dict[str, float | None] = {
+            ticker: live.get(ticker) if live.get(ticker) is not None else prev.get(ticker)
+            for ticker in tickers
+        }
+
         self._price_cache = prices
+        self._price_cache_at = now
         self._prev_closes = prev
         self._price_warnings = warnings
         return prices
@@ -1761,10 +1898,15 @@ class Dashboard:
         this account is no longer in, so they aren't in ``_current_prices``'s
         set. Fetch warnings append to ``self._price_warnings``.
 
+        * ``last`` -- the live last-trade price when the quote fetch answers
+          for this ticker, falling back to its latest completed session's
+          close otherwise (see :func:`wheel.marketdata.get_last_prices`).
         * ``vol_annual_pct`` -- stdev of the last ~30 daily log returns,
           annualized (x sqrt(252)); "how much premium is on the table."
         * ``price_position`` -- where the last close sits in the trailing
           ~1y range, 0 (at the low) to 1 (at the high); flags a falling knife.
+          Computed off the daily-close series, not the live price -- a shape
+          stat, not a precise current-price readout.
         """
         out: dict[str, dict[str, float | None]] = {}
         misses: list[str] = []
@@ -1806,6 +1948,12 @@ class Dashboard:
                 for ticker, (points, warns) in zip(misses, pool.map(marketdata.get_price_series, misses)):
                     self._price_warnings.extend(warns)
                     _compute(ticker, points)
+
+        live, live_warnings = marketdata.get_last_prices(tickers)
+        self._price_warnings.extend(live_warnings)
+        for ticker, price in live.items():
+            if price is not None and ticker in out:
+                out[ticker]["last"] = price
         return out
 
     def _fundamentals(self, tickers: Sequence[str]) -> dict[str, dict[str, Any]]:
@@ -2326,6 +2474,7 @@ class Dashboard:
         """
         through = self.last_date or date.today()
         wheel_breakeven = {w["cycle_id"]: w.get("break_even_price") for w in wheels}
+        wheel_target = {w["cycle_id"]: w for w in wheels}
         rows: list[dict[str, Any]] = []
         for cycle in self.all_cycles:
             held = [
@@ -2355,6 +2504,9 @@ class Dashboard:
                         prev_close=prev_closes.get(cycle.underlying),
                         cost_basis=cost_basis,
                         wheel_breakeven=wheel_breakeven.get(cycle.cycle_id),
+                        target_price=wheel_target.get(cycle.cycle_id, {}).get("target_price"),
+                        target_phase=wheel_target.get(cycle.cycle_id, {}).get("target_phase"),
+                        target_explanation=wheel_target.get(cycle.cycle_id, {}).get("target_explanation"),
                     )
                 )
         rows.sort(key=lambda r: (r["underlying"], r["expiration"] or "", r["strike"] or 0.0))
@@ -2675,6 +2827,37 @@ class Dashboard:
         rows.sort(key=lambda r: (-r["stars"], -(r["net_realized_pl"] or 0.0)))
         return rows
 
+    def _build_wheel_targets_banner(self, wheels: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Running wheels with a target price to aim for right now, for the
+        Dashboard's price-target banner. ``target_price`` / ``target_phase`` /
+        ``target_explanation`` are already computed once, in ``_trade_log_entry``
+        -- this just filters to open wheels that have one and sorts the wheel
+        closest to its target first (same "surface what needs attention" spirit
+        as the open-hedge banner).
+        """
+        rows: list[dict[str, Any]] = []
+        for w in wheels:
+            if not w.get("is_wheel") or not w.get("is_open") or w.get("target_price") is None:
+                continue
+            last_close = w.get("current_price")
+            target_price = w["target_price"]
+            gap_pct = 100.0 * (target_price - last_close) / last_close if last_close else None
+            rows.append(
+                {
+                    "cycle_id": w["cycle_id"],
+                    "underlying": w["underlying"],
+                    "name": w.get("name"),
+                    "phase": w.get("target_phase"),
+                    "target_price": target_price,
+                    "target_explanation": w.get("target_explanation"),
+                    "last_close": last_close,
+                    "shares_held": w.get("shares_held"),
+                    "gap_pct": round(gap_pct, 2) if gap_pct is not None else None,
+                }
+            )
+        rows.sort(key=lambda r: (abs(r["gap_pct"]) if r["gap_pct"] is not None else float("inf"), r["underlying"]))
+        return rows
+
     # ---- query ----
 
     def build(self, filters: Filters | None = None) -> dict[str, Any]:
@@ -2749,6 +2932,21 @@ class Dashboard:
         # not `capital_cycles`, so a filtered-out ticker's dividends and
         # unrealized gains don't leak into the figures on screen.
         current_prices = self._current_prices()
+        if self._price_marked_at != self._price_cache_at:
+            # A newer live-price fetch landed since these were last built (or
+            # this is the first build ever) -- every mark below is stale, not
+            # just whichever of these happens to still be None. Without this,
+            # _current_prices() refreshing every _LIVE_PRICE_TTL_SECONDS did
+            # nothing observable: these six are what the frontend actually
+            # renders, and an `is None` guard alone means "built once, kept
+            # forever" regardless of how often the live price underneath it
+            # moves on.
+            self._wheel_return = None
+            self._trade_log = None
+            self._open_hedges = None
+            self._open_positions = None
+            self._cc_candidates = None
+            self._csp_candidates = None
         dividends = dividends_by_cycle(cycles, transactions)
         if self._wheel_return is None:
             self._wheel_return = self._build_wheel_return(current_prices)
@@ -2767,6 +2965,7 @@ class Dashboard:
         if self._csp_candidates is None:
             _wheels = (self._trade_log or {}).get("wheels", [])
             self._csp_candidates = self._build_csp_candidates(_wheels, sector_exposure(_wheels))
+        self._price_marked_at = self._price_cache_at
         earnings_in_view = self._build_earnings_in_view(
             self._open_positions or [], (self._trade_log or {}).get("wheels", []), through
         )
@@ -2955,6 +3154,7 @@ class Dashboard:
             "wheel_return": self._wheel_return,
             "trade_log": self._trade_log,
             "open_hedges": self._open_hedges,
+            "wheel_targets": self._build_wheel_targets_banner((self._trade_log or {}).get("wheels", [])),
             "open_positions": self._open_positions,
             "cc_candidates": self._cc_candidates,
             "csp_candidates": self._csp_candidates,

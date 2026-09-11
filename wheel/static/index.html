@@ -14,6 +14,12 @@
           <div class="subtitle" id="subtitle">Loading…</div>
         </div>
         <div class="top-actions">
+          <span
+            id="live-indicator"
+            class="live-indicator"
+            title="Refreshing live prices…"
+            hidden
+          ></span>
           <button
             id="present-toggle"
             title="Presentation mode: hide controls, enlarge the headline figures"
@@ -158,6 +164,41 @@
         </section>
 
         <div id="notices"></div>
+
+        <section
+          class="card"
+          id="wheel-targets-card"
+          style="margin-bottom: var(--gap)"
+          hidden
+        >
+          <header>
+            <h2>Wheel price targets</h2>
+          </header>
+
+          <ul class="hint-list">
+            <li>
+              Click a heading to sort
+            </li>
+            <li>
+              <strong>Wheel</strong>: click the id to open that wheel's Trade
+              Log
+            </li>
+            <li>
+              <strong>Type</strong>: CC, holding shares -- a profitable exit
+              floor + cushion; CSP, no shares yet -- a preferred entry price
+              below last close
+            </li>
+            <li>
+              <strong>Gap to Target</strong>: for CC only, how far last price
+              is from the exit target (green once at or past it); a CSP row
+              shows its fixed entry cushion, not a progress signal
+            </li>
+          </ul>
+
+          <div style="overflow-x: auto">
+            <table id="wheel-targets-table"></table>
+          </div>
+        </section>
 
         <section id="hedge-banner" aria-label="Open hedges" hidden></section>
 
@@ -631,6 +672,11 @@
               still held minus all cycle income
             </li>
             <li>
+              <strong>Target Price</strong>: holding shares, a profitable
+              exit floor + cushion; no shares yet, a preferred entry price
+              below last close
+            </li>
+            <li>
               <strong>ITM/OTM %</strong>: strike vs. last close; green is the
               cushion (short) or intrinsic value (long)
             </li>
@@ -944,11 +990,13 @@
           </div>
 
           <div id="tradelog-breakeven" class="tradelog-ppd" hidden>
-            <div class="ti-head">Break-even over time</div>
+            <div class="ti-head">Wheel profit over time</div>
 
             <div class="chart-scroll">
               <svg id="chart-tradelog-breakeven" role="img"></svg>
             </div>
+
+            <div class="legend" id="legend-tradelog-breakeven"></div>
           </div>
 
           <div id="tradelog-ppd" class="tradelog-ppd" hidden>
