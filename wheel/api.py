@@ -467,10 +467,13 @@ class Filters:
 # Serialization helpers
 # --------------------------------------------------------------------------
 
-# Wheel target price: how far past the bare CC floor / how deep OTM the CSP
-# entry cushion should sit. See _cc_target / _target_explanation.
-WHEEL_TARGET_CC_CUSHION_PCT = 2.0
-WHEEL_TARGET_CSP_OTM_PCT = 93.0
+# Wheel target economics: how far past the CC strike floor the profitable-exit
+# cushion sits, and how deep OTM the CSP entry cushion should sit. See
+# _profit_target / _cc_strike_floor / _preferred_csp_entry_explanation below --
+# three distinct concepts (profitability threshold, market-facing strike
+# floor, preferred entry), never blended into one number.
+PROFIT_TARGET_CUSHION_PCT = 2.0
+CSP_ENTRY_OTM_PCT = 93.0
 
 
 def _money(value: float | None) -> float | None:
@@ -481,38 +484,88 @@ def _iso(value: date | None) -> str | None:
     return value.isoformat() if value else None
 
 
-def _cc_target(floor: float, cushion_pct: float = WHEEL_TARGET_CC_CUSHION_PCT) -> float:
-    """A profitable-exit target: the CC floor (same one ``target_cc_strike``
-    uses), marked up by a cushion so it reads as "worthwhile", not merely
-    "breakeven-safe", then rounded up to the next $0.50 (real strikes sit on
-    0.50-or-wider increments)."""
-    return _money(math.ceil(round(floor * (1 + cushion_pct / 100), 4) / 0.5) * 0.5)
+def _round_up_half(value: float) -> float:
+    """Real strikes sit on 0.50-or-wider increments; round up so a floor
+    stays a floor (never below what it's built from)."""
+    return math.ceil(round(value / 0.5, 4)) * 0.5
 
 
-def _target_explanation(
-    phase: str | None,
-    target_price: float | None,
-    *,
-    floor_value: float | None = None,
-    cushion_pct: float | None = None,
-    otm_pct: float | None = None,
-    current_price: float | None = None,
-) -> str | None:
-    """Plain-English math behind ``target_price``, generated once here so
-    every UI surface (Dashboard banner, Open Positions column, Trade Log
-    summary) shows the exact same explanation instead of re-deriving it."""
-    if phase == "cc":
-        return (
-            f"Profitable exit target: floor ${floor_value:.2f} (highest of cost basis, "
-            f"breakeven, wheel breakeven), +{cushion_pct:g}% cushion, "
-            f"rounded up to $0.50 increments = ${target_price:.2f}."
-        )
-    if phase == "csp":
-        return (
-            f"Preferred entry target: {otm_pct:g}% of last close ${current_price:.2f}, "
-            f"rounded down to $0.50 increments = ${target_price:.2f}."
-        )
-    return None
+def _cc_strike_floor_candidates(
+    cost_basis: float | None,
+    position_breakeven: float | None,
+    wheel_breakeven: float | None,
+    current_price: float | None,
+) -> list[tuple[str, float]]:
+    """The non-``None`` inputs to the CC strike floor, labeled, in the order
+    the formula's own docstring names them -- shared by the floor computation
+    and its explanation so the two can never disagree about which candidates
+    actually took part in the ``max()``."""
+    candidates = [
+        ("cost basis", cost_basis),
+        ("breakeven", position_breakeven),
+        ("wheel breakeven", wheel_breakeven),
+        ("last close", current_price),
+    ]
+    return [(label, value) for label, value in candidates if value is not None]
+
+
+def _cc_strike_floor(
+    cost_basis: float | None,
+    position_breakeven: float | None,
+    wheel_breakeven: float | None,
+    current_price: float | None,
+) -> float | None:
+    """The lowest strike worth writing a call at right now: the greatest of
+    whichever of cost basis / position breakeven / wheel breakeven / current
+    price are known, rounded up to the next $0.50. A floor, not a
+    recommendation -- it says nothing about where the premium is richest.
+    The one shared implementation of this formula: `_build_cc_candidates`'
+    `target_cc_strike` and the wheel-level `cc_strike_floor` both call it."""
+    candidates = _cc_strike_floor_candidates(cost_basis, position_breakeven, wheel_breakeven, current_price)
+    if not candidates:
+        return None
+    return _money(_round_up_half(max(value for _, value in candidates)))
+
+
+def _profit_target(floor: float, cushion_pct: float = PROFIT_TARGET_CUSHION_PCT) -> float:
+    """A profitable-exit target: a floor (see `_cc_strike_floor`), marked up
+    by a cushion so it reads as "worthwhile", not merely "breakeven-safe",
+    then rounded up to the next $0.50."""
+    return _money(_round_up_half(floor * (1 + cushion_pct / 100)))
+
+
+def _profit_target_explanation(floor: float, target: float) -> str:
+    return (
+        f"Profitable exit target: floor ${floor:.2f} (highest of cost basis, "
+        f"breakeven, wheel breakeven), +{PROFIT_TARGET_CUSHION_PCT:g}% cushion, "
+        f"rounded up to $0.50 increments = ${target:.2f}."
+    )
+
+
+def _preferred_csp_entry_explanation(current_price: float, entry: float) -> str:
+    return (
+        f"Preferred entry target: {CSP_ENTRY_OTM_PCT:g}% of last close ${current_price:.2f}, "
+        f"rounded down to $0.50 increments = ${entry:.2f}."
+    )
+
+
+def _cc_strike_floor_explanation(
+    strike: float,
+    cost_basis: float | None,
+    position_breakeven: float | None,
+    wheel_breakeven: float | None,
+    current_price: float | None,
+) -> str:
+    """Only names the candidates that actually took part in the `max()` --
+    never states a value for one that was `None` and excluded from it."""
+    candidates = _cc_strike_floor_candidates(cost_basis, position_breakeven, wheel_breakeven, current_price)
+    parts = ", ".join(f"{label} ${value:.2f}" for label, value in candidates)
+    return (
+        f"CC TO EXIT: highest of {parts}, rounded up to $0.50 increments "
+        f"= ${strike:.2f}. The lowest strike worth writing a call at right now "
+        f"-- a floor, not a recommendation; it says nothing about where the "
+        f"premium is richest."
+    )
 
 
 def _capital_point(point) -> dict[str, Any]:
@@ -1028,11 +1081,38 @@ def _trade_log_entry(
     running = 0.0
     shares_running = 0.0
     last_break_even_idx = None
+    # FIFO cost-basis replay, mirroring the engine's own _sell_shares_fifo: a
+    # queue of [remaining, basis_price] lots in acquisition order, so a running
+    # "cost basis of shares held right now" can build up (and step down on a
+    # sale/call-away) the same way the summary's cost_basis does from
+    # cycle.share_lots -- just recomputed at every row instead of only today.
+    # An unpriced acquisition (basis_price None) tracks its shares for the
+    # count but is excluded from the weighted average, same as an unknown-
+    # basis lot is excluded from the summary's cost_basis.
+    lot_queue: list[list[float | None]] = []
     for idx, row in enumerate(rows):
         running += row.get("net_cash_flow") or 0.0
         row["running_cash_flow"] = _money(running)
         if row["type"] in _SHARE_ROW_TYPES:
-            shares_running += row.get("signed_quantity") or 0.0
+            qty = row.get("signed_quantity") or 0.0
+            shares_running += qty
+            if qty > 0:
+                lot_queue.append([qty, row.get("price")])
+            elif qty < 0:
+                to_remove = -qty
+                while to_remove > 1e-9 and lot_queue:
+                    lot_remaining, lot_price = lot_queue[0]
+                    take = min(lot_remaining, to_remove)
+                    lot_queue[0][0] -= take
+                    to_remove -= take
+                    if lot_queue[0][0] <= 1e-9:
+                        lot_queue.pop(0)
+        known_lots = [(r, p) for r, p in lot_queue if p is not None and r > 1e-9]
+        known_shares = sum(r for r, _ in known_lots)
+        running_cost_basis = (
+            sum(r * p for r, p in known_lots) / known_shares if known_shares > 1e-9 else None
+        )
+        row["running_cost_basis"] = _money(running_cost_basis)
         # Break-even after this fill: the price at which, if every share on the
         # book right now were sold, the campaign's cash (premium in/out, share
         # cost, sales, dividends -- the Cumulative cash flow column) would net to
@@ -1045,12 +1125,27 @@ def _trade_log_entry(
         # a whole share: a break-even on fractional DRIP dust is meaningless and
         # divides a tiny denominator into noise.
         if shares_running >= 1.0 - 1e-9:
-            row["running_break_even"] = _money(-running / shares_running)
-            row["running_target"] = _cc_target(-running / shares_running)
+            row_be = -running / shares_running
+            # <= 0 means premium/gains already banked exceed what's still held
+            # -- there is no price left to reach (an insight covers it), not a
+            # negative stock price. Same guard the summary's break_even_price
+            # already applies; this row-level figure never had it.
+            row["running_break_even"] = _money(row_be) if row_be > 0 else None
+            # Profit Target's floor is the higher of running cost basis and
+            # running break-even -- same two-way max the summary's
+            # profit_target uses (see below), so the line this builds
+            # shouldn't jump against the pinned final point the way a
+            # break-even-only floor did. Never negative/zero: enough banked
+            # premium to push the floor at or below $0 means there's no price
+            # left to reach yet at this row (an insight covers it at the
+            # summary level), not a negative target.
+            floor_candidates = [v for v in (running_cost_basis, row_be) if v is not None]
+            row_floor = max(floor_candidates) if floor_candidates else None
+            row["running_profit_target"] = _profit_target(row_floor) if row_floor and row_floor > 0 else None
             last_break_even_idx = idx
         else:
             row["running_break_even"] = None
-            row["running_target"] = None
+            row["running_profit_target"] = None
 
     held_lots = [lot for lot in cycle.share_lots if lot.remaining > 1e-9]
     known = [lot for lot in held_lots if lot.basis_known and lot.basis_per_share is not None]
@@ -1117,41 +1212,38 @@ def _trade_log_entry(
     if break_even_price is not None and break_even_price <= 0:
         break_even_price = None
 
-    # Target price: a profitable-exit floor (CC phase, holding shares) or a
-    # preferred-entry cushion off the last close (CSP phase, no shares yet).
-    #
-    # Deliberately NOT including current_price/last_close in the CC floor,
-    # unlike _build_cc_candidates' target_cc_strike (a strike-selection floor,
-    # which must sit at/above market so a fresh call isn't instantly ITM).
-    # This is a different question -- "has the wheel reached a worthwhile
-    # price" -- and current_price is exactly the value being asked about: if
-    # it were one of the max() candidates, the target would sit ~cushion%
-    # above whatever the price already is, so price could never actually
-    # cross it. Anchoring only to the historical cost figures (cost basis,
-    # position breakeven, wheel breakeven) gives a fixed line the price can
-    # genuinely close in on and pass.
-    target_floor = None
+    # Three distinct, phase-gated concepts -- never blended into one number:
+    #   wheel_phase == "cc"  (holding shares): profit_target (a stable,
+    #     cost-basis-anchored profitable-exit threshold -- deliberately NOT
+    #     including current_price/last_close, so it stays a fixed line price
+    #     can actually close in on and cross) and cc_strike_floor (the
+    #     lowest strike worth writing a call at *right now*, reusing
+    #     _build_cc_candidates' target_cc_strike formula exactly, current
+    #     price included -- a market-facing floor, not a recommendation).
+    #   wheel_phase == "csp" (no shares yet): preferred_csp_entry (a
+    #     cushion off today's last close for a fresh put).
+    wheel_phase = None
+    profit_target = profit_target_explanation = None
+    preferred_csp_entry = preferred_csp_entry_explanation = None
+    cc_strike_floor = cc_strike_floor_explanation = None
     if shares_held > 1e-9:
-        floors = [v for v in (cost_basis, break_even, break_even_price) if v is not None]
-        target_floor = max(floors) if floors else None
-        target_price = _cc_target(target_floor) if target_floor is not None else None
-        target_phase = "cc" if target_price is not None else None
+        wheel_phase = "cc"
+        floor = _cc_strike_floor(cost_basis, break_even, break_even_price, None)
+        if floor is not None:
+            profit_target = _profit_target(floor)
+            profit_target_explanation = _profit_target_explanation(floor, profit_target)
+        strike_floor = _cc_strike_floor(cost_basis, break_even, break_even_price, current_price)
+        if strike_floor is not None:
+            cc_strike_floor = strike_floor
+            cc_strike_floor_explanation = _cc_strike_floor_explanation(
+                strike_floor, cost_basis, break_even, break_even_price, current_price
+            )
     elif current_price is not None:
-        target_price = _money(
-            math.floor(round(current_price * (WHEEL_TARGET_CSP_OTM_PCT / 100), 4) / 0.5) * 0.5
+        wheel_phase = "csp"
+        preferred_csp_entry = _money(
+            math.floor(round(current_price * (CSP_ENTRY_OTM_PCT / 100), 4) / 0.5) * 0.5
         )
-        target_phase = "csp"
-    else:
-        target_price = None
-        target_phase = None
-    target_explanation = _target_explanation(
-        target_phase,
-        target_price,
-        floor_value=target_floor,
-        cushion_pct=WHEEL_TARGET_CC_CUSHION_PCT,
-        otm_pct=WHEEL_TARGET_CSP_OTM_PCT,
-        current_price=current_price,
-    )
+        preferred_csp_entry_explanation = _preferred_csp_entry_explanation(current_price, preferred_csp_entry)
 
     # If the wheel still holds shares, pin the last share-holding row of the
     # ledger exactly to the summary's Break-even price. The running figure above
@@ -1165,7 +1257,8 @@ def _trade_log_entry(
     # summary's dash is only about the present.
     if last_break_even_idx is not None and shares_held > 1e-9:
         rows[last_break_even_idx]["running_break_even"] = _money(break_even_price)
-        rows[last_break_even_idx]["running_target"] = target_price
+        rows[last_break_even_idx]["running_profit_target"] = profit_target
+        rows[last_break_even_idx]["running_cost_basis"] = _money(cost_basis)
 
     dollars_to_break_even = (
         shares_held * (break_even_price - current_price)
@@ -1229,10 +1322,14 @@ def _trade_log_entry(
         "current_price": _money(current_price),
         "break_even_price": _money(break_even_price),
         "dollars_to_break_even": _money(dollars_to_break_even),
-        "target_price": target_price,
-        "target_phase": target_phase,  # "cc" | "csp" | None
-        "target_explanation": target_explanation,
-        "target_cushion_pct": WHEEL_TARGET_CC_CUSHION_PCT,
+        "wheel_phase": wheel_phase,  # "cc" | "csp" | None -- current snapshot only
+        "profit_target": profit_target,
+        "profit_target_explanation": profit_target_explanation,
+        "profit_target_cushion_pct": PROFIT_TARGET_CUSHION_PCT,
+        "preferred_csp_entry": preferred_csp_entry,
+        "preferred_csp_entry_explanation": preferred_csp_entry_explanation,
+        "cc_strike_floor": cc_strike_floor,
+        "cc_strike_floor_explanation": cc_strike_floor_explanation,
         "pl_bridge": pl_bridge,
         "insights": wheel_insights(
             cycle,
@@ -1466,9 +1563,13 @@ def _open_position_row(
     prev_close: float | None,
     cost_basis: float | None,
     wheel_breakeven: float | None,
-    target_price: float | None = None,
-    target_phase: str | None = None,
-    target_explanation: str | None = None,
+    wheel_phase: str | None = None,
+    profit_target: float | None = None,
+    profit_target_explanation: str | None = None,
+    preferred_csp_entry: float | None = None,
+    preferred_csp_entry_explanation: str | None = None,
+    cc_strike_floor: float | None = None,
+    cc_strike_floor_explanation: str | None = None,
 ) -> dict[str, Any]:
     """One open option leg -- a short covered call / cash-secured put, or a long
     put / call (a protective hedge or a directional punt) -- framed the way the
@@ -1581,9 +1682,13 @@ def _open_position_row(
         "net_premium": _money(net_premium),
         "breakeven": _money(breakeven),
         "wheel_breakeven": _money(wheel_breakeven),
-        "target_price": _money(target_price),
-        "target_phase": target_phase,
-        "target_explanation": target_explanation,
+        "wheel_phase": wheel_phase,
+        "profit_target": _money(profit_target),
+        "profit_target_explanation": profit_target_explanation,
+        "preferred_csp_entry": _money(preferred_csp_entry),
+        "preferred_csp_entry_explanation": preferred_csp_entry_explanation,
+        "cc_strike_floor": _money(cc_strike_floor),
+        "cc_strike_floor_explanation": cc_strike_floor_explanation,
         "moneyness_pct": round(moneyness_pct, 2) if moneyness_pct is not None else None,
         "in_the_money": in_the_money,
         "last_close": _money(last_close),
@@ -2504,9 +2609,19 @@ class Dashboard:
                         prev_close=prev_closes.get(cycle.underlying),
                         cost_basis=cost_basis,
                         wheel_breakeven=wheel_breakeven.get(cycle.cycle_id),
-                        target_price=wheel_target.get(cycle.cycle_id, {}).get("target_price"),
-                        target_phase=wheel_target.get(cycle.cycle_id, {}).get("target_phase"),
-                        target_explanation=wheel_target.get(cycle.cycle_id, {}).get("target_explanation"),
+                        wheel_phase=wheel_target.get(cycle.cycle_id, {}).get("wheel_phase"),
+                        profit_target=wheel_target.get(cycle.cycle_id, {}).get("profit_target"),
+                        profit_target_explanation=wheel_target.get(cycle.cycle_id, {}).get(
+                            "profit_target_explanation"
+                        ),
+                        preferred_csp_entry=wheel_target.get(cycle.cycle_id, {}).get("preferred_csp_entry"),
+                        preferred_csp_entry_explanation=wheel_target.get(cycle.cycle_id, {}).get(
+                            "preferred_csp_entry_explanation"
+                        ),
+                        cc_strike_floor=wheel_target.get(cycle.cycle_id, {}).get("cc_strike_floor"),
+                        cc_strike_floor_explanation=wheel_target.get(cycle.cycle_id, {}).get(
+                            "cc_strike_floor_explanation"
+                        ),
                     )
                 )
         rows.sort(key=lambda r: (r["underlying"], r["expiration"] or "", r["strike"] or 0.0))
@@ -2607,21 +2722,11 @@ class Dashboard:
             meets_threshold = shares >= 100 - 1e-9
             cost_basis = wheel.get("cost_basis_per_share")
             last_close = wheel.get("current_price")
-            floors = [
-                value
-                for value in (
-                    cost_basis,
-                    wheel.get("break_even_per_share"),
-                    wheel.get("break_even_price"),
-                    last_close,
-                )
-                if value is not None
-            ]
-            if meets_threshold and floors:
-                # ceil to the next $0.50; round first to shake off float noise.
-                target = _money(math.ceil(round(max(floors) / 0.5, 4)) * 0.5)
-            else:
-                target = None
+            target = (
+                _cc_strike_floor(cost_basis, wheel.get("break_even_per_share"), wheel.get("break_even_price"), last_close)
+                if meets_threshold
+                else None
+            )
             # Total unrealized gain/loss on the shares vs. their raw average
             # cost basis (not a break-even -- premium already banked is not
             # netted in here), marked to the last close.
@@ -2828,28 +2933,40 @@ class Dashboard:
         return rows
 
     def _build_wheel_targets_banner(self, wheels: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Running wheels with a target price to aim for right now, for the
-        Dashboard's price-target banner. ``target_price`` / ``target_phase`` /
-        ``target_explanation`` are already computed once, in ``_trade_log_entry``
-        -- this just filters to open wheels that have one and sorts the wheel
-        closest to its target first (same "surface what needs attention" spirit
-        as the open-hedge banner).
+        """Running wheels with a phase-specific target to aim for right now,
+        for the Dashboard's price-target banner. ``profit_target`` /
+        ``preferred_csp_entry`` / ``cc_strike_floor`` (plus their
+        explanations) are already computed once, in ``_trade_log_entry`` --
+        this just filters to open wheels with a known phase and sorts the
+        wheel closest to its phase-appropriate target first (same "surface
+        what needs attention" spirit as the open-hedge banner). ``gap_pct``
+        is against whichever of profit_target/preferred_csp_entry applies to
+        that wheel's phase -- a sort key only, not a stand-in "primary value"
+        field (the frontend still picks between the two full fields itself).
         """
         rows: list[dict[str, Any]] = []
         for w in wheels:
-            if not w.get("is_wheel") or not w.get("is_open") or w.get("target_price") is None:
+            if not w.get("is_wheel") or not w.get("is_open") or w.get("wheel_phase") is None:
                 continue
             last_close = w.get("current_price")
-            target_price = w["target_price"]
-            gap_pct = 100.0 * (target_price - last_close) / last_close if last_close else None
+            primary = w.get("profit_target") if w.get("wheel_phase") == "cc" else w.get("preferred_csp_entry")
+            gap_pct = (
+                100.0 * (primary - last_close) / last_close
+                if primary is not None and last_close
+                else None
+            )
             rows.append(
                 {
                     "cycle_id": w["cycle_id"],
                     "underlying": w["underlying"],
                     "name": w.get("name"),
-                    "phase": w.get("target_phase"),
-                    "target_price": target_price,
-                    "target_explanation": w.get("target_explanation"),
+                    "wheel_phase": w.get("wheel_phase"),
+                    "profit_target": w.get("profit_target"),
+                    "profit_target_explanation": w.get("profit_target_explanation"),
+                    "preferred_csp_entry": w.get("preferred_csp_entry"),
+                    "preferred_csp_entry_explanation": w.get("preferred_csp_entry_explanation"),
+                    "cc_strike_floor": w.get("cc_strike_floor"),
+                    "cc_strike_floor_explanation": w.get("cc_strike_floor_explanation"),
                     "last_close": last_close,
                     "shares_held": w.get("shares_held"),
                     "gap_pct": round(gap_pct, 2) if gap_pct is not None else None,

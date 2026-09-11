@@ -58,6 +58,9 @@ const state = {
   cspCandSort: { key: 'stars', dir: -1 },
   // Wheel price targets table (Dashboard): which column sorts it, and direction.
   wheelTargetsSort: { key: 'gap_pct', dir: 1 },
+  // Same table, mirrored on the Planner tab under Open option positions --
+  // sorts independently of the Dashboard copy above.
+  wheelTargetsSortPlanner: { key: 'gap_pct', dir: 1 },
   // "Target price for CSP" column: the user-set % of last price (rounded down to
   // $0.50) shown as a conservative strike floor. Editable in that card, kept in
   // localStorage so it survives a reload. Default 93 (~7% out of the money).
@@ -4482,17 +4485,48 @@ function renderHedgeBanner() {
 
 /* ------------------------------------------------- table: wheel price targets
  *
- * One row per running wheel with a target price -- `data.wheel_targets`,
+ * One row per running wheel with a phase-specific target -- `data.wheel_targets`,
  * built by `_build_wheel_targets_banner` in wheel/api.py. Same look and sort
  * behavior as the Planner tab's tables (Open option positions, CC/CSP
  * candidates): sortable `<th>`s, `.op-row`/`.num`/`.left` cell classes, the
- * same violet `.cc-target` treatment and `wheelLink` jump-to-Trade-Log.
+ * same `wheelLink` jump-to-Trade-Log.
+ *
+ * Three separate target-related columns: CC TO EXIT (cc_strike_floor, a
+ * direct backend field) and CSP TO ENTER (csp_entry_target, computed here
+ * client-side from the same adjustable % slider as the CSP candidates
+ * table -- see cspEntryTarget) are floors/entry cushions -- violet
+ * `.cc-target`, neutral, not a "met/not met" signal. Profit Target is the
+ * one real pass/fail threshold, so it's colored green/red by whether last
+ * price has reached it (same comparison Gap to Target already makes), not
+ * violet.
  */
+// CSP TO ENTER: the user-adjustable target % of last price, rounded down to
+// the nearest $0.50 -- the same live formula as the CSP candidates table's
+// Target column (renderCspCandidates), so the Dashboard and Open Positions
+// tables track the same slider instead of the fixed 93% backend default
+// (preferred_csp_entry / preferred_csp_entry_explanation still carry that
+// fixed default for the Trade Log summary cell, untouched here).
+function cspEntryTarget(lastClose, pct) {
+  return lastClose && lastClose > 0 ? Math.floor((lastClose * (pct / 100)) / 0.5) * 0.5 : null;
+}
+
+function cspEntryTargetTooltip(lastClose, pct, value) {
+  return formula([
+    `CSP entry target = ${pct}% of last price, rounded down to $0.50`,
+    `= ${pct}% × ${money(lastClose, { cents: true })}`,
+    `= ${money(value, { cents: true })}`,
+    '',
+    'A conservative entry floor; edit the % on Cash for Cash-Secured Puts.',
+  ]);
+}
+
 const WHEEL_TARGETS_COLUMNS = [
   { key: 'underlying', label: 'Symbol', left: true },
-  { key: 'phase', label: 'Type', left: true },
-  { key: 'target_price', label: 'Target Price' },
+  { key: 'wheel_phase', label: 'Type', left: true },
+  { key: 'cc_strike_floor', label: 'CC TO EXIT' },
+  { key: 'csp_entry_target', label: 'CSP TO ENTER' },
   { key: 'last_close', label: 'Last Price' },
+  { key: 'profit_target', label: 'Profit Target' },
   { key: 'gap_pct', label: 'Gap to Target' },
   { key: 'shares_held', label: 'Shares Held' },
   { key: 'cycle_id', label: 'Wheel', left: true },
@@ -4505,33 +4539,51 @@ function wheelTargetsRow(row) {
   if (row.name) symCell.title = row.name;
   tr.appendChild(symCell);
 
-  const typeLabel = row.phase === 'csp' ? 'CSP' : 'CC';
+  const typeLabel = row.wheel_phase === 'csp' ? 'CSP' : 'CC';
   const typeCell = el('td', { class: 'left' });
   typeCell.appendChild(
     el(
       'span',
       {
         class: 'badge op-type op-type-' + typeLabel,
-        title: row.phase === 'csp' ? 'Preferred entry target' : 'Profitable exit target',
+        title: row.wheel_phase === 'csp' ? 'Preferred CSP entry' : 'Profit target (wheel economics)',
       },
       typeLabel
     )
   );
   tr.appendChild(typeCell);
 
-  // Backend's already-computed number, tooltip included -- no formula
-  // reconstruction here, see target_explanation in wheel/api.py.
-  const targetCell = el('td', { class: 'num cc-target' }, money(row.target_price, { cents: true }));
-  if (row.target_explanation) targetCell.title = row.target_explanation;
-  tr.appendChild(targetCell);
+  // Backend's already-computed numbers, tooltips included -- no formula
+  // reconstruction here, see cc_strike_floor_explanation /
+  // preferred_csp_entry_explanation / profit_target_explanation in wheel/api.py.
+  const strikeFloorCell =
+    row.cc_strike_floor == null
+      ? el('td', { class: 'num' }, '—')
+      : el('td', { class: 'num cc-target' }, money(row.cc_strike_floor, { cents: true }));
+  if (row.cc_strike_floor_explanation) strikeFloorCell.title = row.cc_strike_floor_explanation;
+  tr.appendChild(strikeFloorCell);
+
+  const cspEntryCell =
+    row.csp_entry_target == null
+      ? el('td', { class: 'num' }, '—')
+      : el('td', { class: 'num cc-target' }, money(row.csp_entry_target, { cents: true }));
+  if (row.csp_entry_target != null) {
+    cspEntryCell.title = cspEntryTargetTooltip(row.last_close, state.cspTargetPct, row.csp_entry_target);
+  }
+  tr.appendChild(cspEntryCell);
 
   tr.appendChild(el('td', { class: 'num' }, money(row.last_close, { cents: true })));
 
-  // Only the CC-phase gap is a progress signal (last price closing in on a
-  // profitable exit); the CSP-phase gap is just the fixed OTM cushion by
-  // construction, not something that "improves" toward zero -- shown plain.
-  const gapTone = row.phase === 'cc' && typeof row.gap_pct === 'number' ? toneOf(-row.gap_pct) : '';
-  tr.appendChild(el('td', { class: 'num ' + gapTone }, signedPct(row.gap_pct)));
+  // Only the CC-phase gap is a met/not-met signal (last price closing in on
+  // a profitable exit); the CSP-phase entry is just the fixed OTM cushion by
+  // construction, not something to color pass/fail -- so this tone (and the
+  // matching Gap to Target column) is CC-only, same comparison as both.
+  const metTone = row.wheel_phase === 'cc' && typeof row.gap_pct === 'number' ? toneOf(-row.gap_pct) : '';
+  const profitTargetCell = el('td', { class: 'num ' + metTone }, money(row.profit_target, { cents: true }));
+  if (row.profit_target_explanation) profitTargetCell.title = row.profit_target_explanation;
+  tr.appendChild(profitTargetCell);
+
+  tr.appendChild(el('td', { class: 'num ' + metTone }, signedPct(row.gap_pct)));
 
   tr.appendChild(
     el('td', { class: 'num' }, row.shares_held ? Math.round(row.shares_held).toLocaleString('en-US') : '—')
@@ -4544,16 +4596,27 @@ function wheelTargetsRow(row) {
   return tr;
 }
 
-function renderWheelTargets() {
-  const table = $('wheel-targets-table');
+// Renders one instance of the table -- the Dashboard original or its Planner
+// mirror (see renderWheelTargetsAll) -- each keyed by its own table/card ids
+// and its own entry in `state` so the two copies can sort independently.
+function renderWheelTargets(
+  tableId = 'wheel-targets-table',
+  cardId = 'wheel-targets-card',
+  sortKey = 'wheelTargetsSort'
+) {
+  const table = $(tableId);
   if (!table) return;
-  const card = $('wheel-targets-card');
-  const rows = (state.data && state.data.wheel_targets) || [];
+  const card = $(cardId);
+  const rows = ((state.data && state.data.wheel_targets) || []).map((row) => ({
+    ...row,
+    csp_entry_target:
+      row.wheel_phase === 'csp' ? cspEntryTarget(row.last_close, state.cspTargetPct) : null,
+  }));
   if (card) card.hidden = rows.length === 0;
   clear(table);
   if (!rows.length) return;
 
-  const { key, dir } = state.wheelTargetsSort;
+  const { key, dir } = state[sortKey];
 
   const thead = el('thead');
   const headRow = el('tr');
@@ -4561,9 +4624,9 @@ function renderWheelTargets() {
     const th = el('th', { class: `sortable${column.left ? ' left' : ''}` }, column.label);
     if (key === column.key) th.textContent = column.label + (dir === 1 ? ' ▲' : ' ▼');
     th.addEventListener('click', () => {
-      if (state.wheelTargetsSort.key === column.key) state.wheelTargetsSort.dir *= -1;
-      else state.wheelTargetsSort = { key: column.key, dir: column.key === 'underlying' ? 1 : -1 };
-      renderWheelTargets();
+      if (state[sortKey].key === column.key) state[sortKey].dir *= -1;
+      else state[sortKey] = { key: column.key, dir: column.key === 'underlying' ? 1 : -1 };
+      renderWheelTargets(tableId, cardId, sortKey);
     });
     headRow.appendChild(th);
   }
@@ -4583,6 +4646,14 @@ function renderWheelTargets() {
   const tbody = el('tbody');
   for (const row of sorted) tbody.appendChild(wheelTargetsRow(row));
   table.appendChild(tbody);
+}
+
+// Renders both instances: the Dashboard original and its Planner mirror
+// (under Open option positions) -- call this, not renderWheelTargets()
+// directly, from anywhere the underlying data or the %-slider can change.
+function renderWheelTargetsAll() {
+  renderWheelTargets('wheel-targets-table', 'wheel-targets-card', 'wheelTargetsSort');
+  renderWheelTargets('wheel-targets-table-planner', 'wheel-targets-card-planner', 'wheelTargetsSortPlanner');
 }
 
 /** The same hedge card, scoped to the wheel on screen, under its Insights. */
@@ -5333,6 +5404,11 @@ function wireFilters() {
       state.cspTargetPct = clamped;
       writeStoredNumber('cspTargetPct', clamped);
       renderCspCash();
+      // CSP TO ENTER on the Wheel price targets tables (Dashboard + its
+      // Planner mirror) and Open Positions tracks this same slider (see
+      // cspEntryTarget), so keep them live-synced too.
+      renderWheelTargetsAll();
+      renderOpenPositions();
     };
     // Live while typing a valid number; snap the field to the clamped value on
     // blur / Enter.
@@ -6421,7 +6497,9 @@ const OPEN_POS_COLUMNS = [
   { key: 'underlying', label: 'Symbol', left: true },
   { key: 'type', label: 'Type', left: true },
   { key: 'strike', label: 'Strike' },
-  { key: 'target_price', label: 'Target Price' },
+  { key: 'cc_strike_floor', label: 'CC TO EXIT' },
+  { key: 'csp_entry_target', label: 'CSP TO ENTER' },
+  { key: 'profit_target', label: 'Profit Target' },
   { key: 'expiration', label: 'Expiration' },
   { key: 'cost_basis', label: 'Cost Basis' },
   { key: 'breakeven', label: 'Breakeven' },
@@ -6434,7 +6512,6 @@ const OPEN_POS_COLUMNS = [
   { key: 'cycle_id', label: 'Wheel', left: true },
   { key: 'days_to_earnings', label: 'Earnings' },
   { key: 'annualized_yield_pct', label: 'Ann. Yield' },
-  { key: 'min_profit_captured_pct', label: 'Min. Profit Captured (est.)' },
 ];
 
 function signedPct(value, digits = 2) {
@@ -6507,14 +6584,36 @@ function openPositionRow(row, isGroupStart, groupSize) {
 
   tr.appendChild(el('td', { class: 'num' }, money(row.strike, { cents: true })));
 
-  // Target price: the backend's already-computed number, tooltip included --
-  // no formula reconstruction here, see target_explanation in wheel/api.py.
-  const targetPriceCell =
-    row.target_price == null
+  // CC TO EXIT / CSP TO ENTER / Profit Target. CC TO EXIT and Profit Target
+  // are the backend's already-computed numbers (cc_strike_floor_explanation /
+  // profit_target_explanation in wheel/api.py); CSP TO ENTER is computed here
+  // client-side from the same adjustable % slider as the CSP candidates table
+  // (see cspEntryTarget). The first two are floors/entry cushions (violet,
+  // neutral); Profit Target is the one real pass/fail threshold, colored
+  // green/red by whether last price has reached it.
+  const strikeFloorCell =
+    row.cc_strike_floor == null
       ? el('td', { class: 'num' }, '—')
-      : el('td', { class: 'num cc-target' }, money(row.target_price, { cents: true }));
-  if (row.target_explanation) targetPriceCell.title = row.target_explanation;
-  tr.appendChild(targetPriceCell);
+      : el('td', { class: 'num cc-target' }, money(row.cc_strike_floor, { cents: true }));
+  if (row.cc_strike_floor_explanation) strikeFloorCell.title = row.cc_strike_floor_explanation;
+  tr.appendChild(strikeFloorCell);
+
+  const cspEntryCell =
+    row.csp_entry_target == null
+      ? el('td', { class: 'num' }, '—')
+      : el('td', { class: 'num cc-target' }, money(row.csp_entry_target, { cents: true }));
+  if (row.csp_entry_target != null) {
+    cspEntryCell.title = cspEntryTargetTooltip(row.last_close, state.cspTargetPct, row.csp_entry_target);
+  }
+  tr.appendChild(cspEntryCell);
+
+  const metTone =
+    row.wheel_phase === 'cc' && row.profit_target != null && row.last_close != null
+      ? toneOf(row.last_close - row.profit_target)
+      : '';
+  const profitTargetCell = el('td', { class: 'num ' + metTone }, money(row.profit_target, { cents: true }));
+  if (row.profit_target_explanation) profitTargetCell.title = row.profit_target_explanation;
+  tr.appendChild(profitTargetCell);
 
   // Expiration, with a warning glyph when the contract is inside a week.
   const nearExpiry =
@@ -6636,22 +6735,6 @@ function openPositionRow(row, isGroupStart, groupSize) {
     'Net premium ÷ (strike × 100 × contracts), scaled to a year over the contract\'s open→expiry span.';
   tr.appendChild(yieldCell);
 
-  const capturedCell = el('td', { class: 'num' });
-  if (row.min_profit_captured_pct === null || row.min_profit_captured_pct === undefined) {
-    capturedCell.textContent = '—';
-  } else {
-    const v = row.min_profit_captured_pct;
-    capturedCell.textContent = `${v.toFixed(0)}%`;
-    // Greener as it approaches 100; neutral / red once negative.
-    capturedCell.className = 'num ' + (v >= 80 ? 'pos' : v < 0 ? 'neg' : '');
-  }
-  capturedCell.title =
-    'Min. Profit Captured (est.): assumes the option can be bought back at intrinsic value only. ' +
-    'Intrinsic is the smallest a buy-to-close could cost, so this OVERSTATES what is really captured — ' +
-    'time value still on the option makes the real cost higher. An out-of-the-money short reads 100% ' +
-    '(no intrinsic left to buy back), which is not the same as fully realized.';
-  tr.appendChild(capturedCell);
-
   return tr;
 }
 
@@ -6659,7 +6742,11 @@ function renderOpenPositions() {
   const table = $('open-positions-table');
   if (!table) return;
   const card = $('open-positions-card');
-  const rows = (state.data && state.data.open_positions) || [];
+  const rows = ((state.data && state.data.open_positions) || []).map((row) => ({
+    ...row,
+    csp_entry_target:
+      row.wheel_phase === 'csp' ? cspEntryTarget(row.last_close, state.cspTargetPct) : null,
+  }));
   if (card) card.hidden = rows.length === 0;
   clear(table);
   if (!rows.length) return;
@@ -7154,11 +7241,9 @@ function renderCspCandidates(available) {
       cash_per_contract: row.last_close && row.last_close > 0 ? row.last_close * 100 : null,
       // A conservative CSP strike floor: the user's % of the last price, rounded
       // down to the nearest $0.50 (mirrors the CC candidates' "Target price for
-      // CC"). Editable in the card; default 93%.
-      target_csp_strike:
-        row.last_close && row.last_close > 0
-          ? Math.floor((row.last_close * (targetPct / 100)) / 0.5) * 0.5
-          : null,
+      // CC"). Editable in the card; default 93%. Same formula the Dashboard and
+      // Open Positions tables' CSP TO ENTER columns use (cspEntryTarget).
+      target_csp_strike: cspEntryTarget(row.last_close, targetPct),
     }))
     .filter((row) => row.contracts >= 1);
 
@@ -7451,6 +7536,28 @@ function drawTradeLogPpd(entry) {
   });
 }
 
+// The math behind one row's running_profit_target: the higher of running
+// cost basis and running break-even, cushioned -- same two-way floor
+// wheel/api.py's per-row loop uses, so this never re-derives which one wins,
+// only formats the numbers the backend already picked between. `fmt` lets
+// the chart (priceLabel) and the ledger table (perShare) share this one
+// source. This is the Profit Target concept only -- CC TO EXIT and
+// CSP TO ENTER have no historical per-row series.
+function runningProfitTargetFormulaLines(row, entry, fmt) {
+  const cb = row.running_cost_basis;
+  const be = row.running_break_even;
+  const cbKnown = typeof cb === 'number';
+  const beKnown = typeof be === 'number';
+  const usedCostBasis = cbKnown && (!beKnown || cb >= be);
+  const winner = usedCostBasis ? 'cost basis' : 'break-even';
+  const floorValue = usedCostBasis ? cb : be;
+  return [
+    `Profit Target = higher of cost basis and break-even, × (1 + ${entry.profit_target_cushion_pct}%), rounded up to $0.50`,
+    `cost basis ${cbKnown ? fmt(cb) : '—'}, break-even ${beKnown ? fmt(be) : '—'} → floor ${fmt(floorValue)} (${winner})`,
+    `× ${(1 + entry.profit_target_cushion_pct / 100).toFixed(2)} = ${fmt(row.running_profit_target)}`,
+  ];
+}
+
 /**
  * Break-even after every transaction, in ledger order -- the same
  * `running_break_even` column from the table above, drawn as a line so the
@@ -7474,10 +7581,12 @@ function drawTradeLogBreakeven(entry) {
   host.hidden = false;
 
   const be = rows.map((r) => r.running_break_even);
-  // Set alongside running_break_even server-side (wheel/api.py), so this is
-  // numeric everywhere `be` is -- except the rare case where the "now" pin
-  // couldn't compute a target for the very last row; handled as a gap below.
-  const target = rows.map((r) => r.running_target);
+  // Profit Target only -- set alongside running_break_even server-side
+  // (wheel/api.py), so this is numeric everywhere `be` is -- except the rare
+  // case where the "now" pin couldn't compute a target for the very last
+  // row; handled as a gap below. CC TO EXIT / CSP TO ENTER have
+  // no historical series, so there's nothing else to plot here.
+  const target = rows.map((r) => r.running_profit_target);
   const cur = typeof entry.current_price === 'number' ? entry.current_price : null;
 
   // A pathological opener (a token 1-share buy while big puts are sold) can
@@ -7583,14 +7692,13 @@ function drawTradeLogBreakeven(entry) {
     );
   }
 
-  // ---- distance to target ---------------------------------------------------
-  // Same $ + % readout, against the Target line instead of Break-even. Sitting
-  // below target isn't a danger signal the way under-water is -- the wheel is
-  // just still working toward it -- so this stays violet (the Target line's
-  // own color) in both states rather than borrowing break-even's red/green,
-  // with a distinct 🎯 once reached. Only drawn where a target exists (see the
-  // chart caveat: CSP-phase wheels have no historical target line, so no badge
-  // either). Stacks under the break-even badge when both are shown.
+  // ---- distance to profit target ---------------------------------------------------
+  // Same $ + % readout, against the Profit Target line instead of Break-even,
+  // and the same red/green treatment (reusing .be-water-under/.be-water-above):
+  // red while still short of it, green with a distinct 🎯 once reached. Only
+  // drawn where a target exists (see the chart caveat: CSP-phase wheels have
+  // no historical target line, so no badge either). Stacks under the
+  // break-even badge when both are shown.
   if (cur !== null && lastTargetIdx >= 0) {
     const targetVal = target[lastTargetIdx];
     const atTarget = cur >= targetVal;
@@ -7601,12 +7709,12 @@ function drawTradeLogBreakeven(entry) {
       svgEl(
         'text',
         {
-          class: 'be-water-badge target-water-badge',
+          class: `be-water-badge ${atTarget ? 'be-water-above' : 'be-water-under'}`,
           x: margin.left + 8,
           y: margin.top + (water !== null ? 36 : 18),
           'text-anchor': 'start',
         },
-        `${atTarget ? '🎯' : '↗'} ${money(tGapTotal)} (${pct(tGapPct)}) ${atTarget ? 'above' : 'below'} target`
+        `${atTarget ? '🎯' : '↗'} ${money(tGapTotal)} (${pct(tGapPct)}) ${atTarget ? 'above' : 'below'} profit target`
       )
     );
   }
@@ -7626,13 +7734,11 @@ function drawTradeLogBreakeven(entry) {
         'stroke-dasharray': '6 3',
       })
     );
-    // Two lines ("now" over the price) so the tag stays inside the right margin
-    // without clipping, cents and all.
+    // Just the price -- the legend below already labels this line "Now".
     const nowX = margin.left + plotWidth + 4;
-    const nowTag = svgEl('text', { class: 'be-now-label', 'text-anchor': 'start' });
-    nowTag.appendChild(svgEl('tspan', { x: nowX, y: cy - 3 }, 'now'));
-    nowTag.appendChild(svgEl('tspan', { x: nowX, y: cy + 9 }, priceLabel(cur)));
-    group.appendChild(nowTag);
+    group.appendChild(
+      svgEl('text', { class: 'be-now-label', x: nowX, y: cy + 4, 'text-anchor': 'start' }, priceLabel(cur))
+    );
   }
 
   group.appendChild(
@@ -7710,10 +7816,10 @@ function drawTradeLogBreakeven(entry) {
     )
   );
 
-  // ---- target line ---------------------------------------------------------
+  // ---- profit target line ---------------------------------------------------------
   // Only drawn where a target exists (the wheel's CC/share-holding history --
-  // see the chart caveat in the plan: the CSP-phase target is a current-state
-  // number, not something the ledger can reconstruct historically). Split into
+  // CSP TO ENTER and CC TO EXIT are current-state numbers, not
+  // something the ledger can reconstruct historically). Split into
   // contiguous segments so a stray gap can't corrupt the path.
   const targetColor = cssVar('--target');
   const targetSegments = [];
@@ -7753,13 +7859,10 @@ function drawTradeLogBreakeven(entry) {
       hit,
       `${r.type} · ${r.date}`,
       [
-        { label: 'Target after this fill', value: priceLabel(target[i]) },
+        { label: 'Profit Target after this fill', value: priceLabel(target[i]) },
         { label: 'Break-even after this fill', value: priceLabel(r.running_break_even) },
       ],
-      formula([
-        `Target = Break-even × (1 + ${entry.target_cushion_pct}%), rounded up to $0.50`,
-        `= ${priceLabel(r.running_break_even)} × 1.0${entry.target_cushion_pct / 100} → ${priceLabel(target[i])}`,
-      ])
+      formula(runningProfitTargetFormulaLines(r, entry, priceLabel))
     );
     group.appendChild(hit);
   });
@@ -7820,7 +7923,7 @@ function drawTradeLogBreakeven(entry) {
   svg.setAttribute(
     'aria-label',
     `Break-even after each of ${rows.length} transactions, ending at ${priceLabel(lastVal)}` +
-      (lastTargetIdx >= 0 ? `, with a target price line ending at ${priceLabel(target[lastTargetIdx])}` : '') +
+      (lastTargetIdx >= 0 ? `, with a profit target line ending at ${priceLabel(target[lastTargetIdx])}` : '') +
       (cur !== null
         ? `, with the stock now at ${priceLabel(cur)} (${water === 'under' ? 'under water' : 'above water'}).`
         : '.')
@@ -7838,7 +7941,7 @@ function drawTradeLogBreakeven(entry) {
     };
     legend.appendChild(swatchItem(lineColor, 'Break-even', priceLabel(lastVal)));
     if (lastTargetIdx >= 0) {
-      legend.appendChild(swatchItem(targetColor, 'Target', priceLabel(target[lastTargetIdx])));
+      legend.appendChild(swatchItem(targetColor, 'Profit Target', priceLabel(target[lastTargetIdx])));
     }
     if (cur !== null) {
       legend.appendChild(swatchItem(cssVar('--neg'), 'Now', priceLabel(cur)));
@@ -8028,22 +8131,51 @@ function renderTradeLogSummary(entry) {
       ]),
     })
   );
-  host.appendChild(
-    tradeLogCell(
-      entry.target_phase === 'csp' ? 'Target price (entry)' : 'Target price (exit)',
-      perShare(entry.target_price),
-      {
-        tone: entry.target_price != null ? 'cc-target' : undefined,
+  // Mirrors the Wheel price targets table exactly: CC TO EXIT and Profit
+  // Target in the CC phase (same backend fields as that table's row), CSP TO
+  // ENTER in the CSP phase (same live %-slider formula as that table's
+  // csp_entry_target, cspEntryTarget) -- so the numbers here always match the
+  // table, never a separately-derived figure.
+  if (entry.wheel_phase === 'cc') {
+    const metTone =
+      entry.profit_target != null && entry.current_price != null
+        ? toneOf(entry.current_price - entry.profit_target)
+        : undefined;
+    host.appendChild(
+      tradeLogCell('Profit Target', perShare(entry.profit_target), {
+        tone: metTone,
         foot:
-          entry.current_price === null || entry.target_price === null
+          entry.current_price === null || entry.profit_target === null
             ? null
             : `now ${perShare(entry.current_price)}, ${perShare(
-                Math.abs(entry.target_price - entry.current_price)
-              )} ${entry.current_price >= entry.target_price ? 'at/above target' : 'to go'}`,
-        help: formula([entry.target_explanation || 'Not enough data yet (no shares and no price).']),
-      }
-    )
-  );
+                Math.abs(entry.profit_target - entry.current_price)
+              )} ${entry.current_price >= entry.profit_target ? 'at/above' : 'to go'}`,
+        help: formula([entry.profit_target_explanation || 'Not enough data yet (no shares and no price).']),
+      })
+    );
+    if (entry.cc_strike_floor != null) {
+      host.appendChild(
+        tradeLogCell('CC TO EXIT', perShare(entry.cc_strike_floor), {
+          tone: 'cc-target',
+          // No foot line here (unlike Profit Target's "at/above" foot) -- a
+          // floor isn't something to read as "reached" or "close to"; the
+          // explanation tooltip already says it's a floor, not a recommendation.
+          help: formula([entry.cc_strike_floor_explanation || '']),
+        })
+      );
+    }
+  } else if (entry.wheel_phase === 'csp') {
+    const cspEntryValue = cspEntryTarget(entry.current_price, state.cspTargetPct);
+    host.appendChild(
+      tradeLogCell('CSP TO ENTER', perShare(cspEntryValue), {
+        tone: cspEntryValue != null ? 'cc-target' : undefined,
+        help:
+          cspEntryValue == null
+            ? formula(['Not enough data yet (no price).'])
+            : cspEntryTargetTooltip(entry.current_price, state.cspTargetPct, cspEntryValue),
+      })
+    );
+  }
   host.appendChild(
     tradeLogCell('Shares held', (entry.shares_held || 0).toLocaleString('en-US'), {
       help: formula([
@@ -8239,6 +8371,7 @@ function renderTradeLogTable(entry) {
     'Commissions',
     'Net cash flow',
     'Cumulative cash flow',
+    'Profit Target',
     'Break-even',
   ];
   const HEAD_HELP = {
@@ -8288,11 +8421,26 @@ function renderTradeLogTable(entry) {
       'Running sum of Net cash flow down the rows.',
       'A cash ledger, not a P&L figure.',
     ]),
+    'Profit Target': formula([
+      'The higher of running cost basis and running Break-even, cushioned',
+      '+X% and rounded up to $0.50 -- a profitable-exit floor, not just a',
+      'breakeven-safe one. Cost basis steps up on a purchase/assignment and',
+      'steps down on a sale/call-away; Break-even drifts as premium and',
+      'dividends come in -- whichever is higher at that row wins.',
+      'Not the market-facing CC TO EXIT or CSP TO ENTER shown',
+      'in the summary above (neither has a historical series).',
+      'Dash while under one share is on the book.',
+      "Last share-holding row is pinned to the wheel's current official",
+      'Profit Target (see the summary above) -- the exact figure, not this',
+      "column's running approximation of it.",
+      'Hover a cell for the exact math on that row.',
+    ]),
     'Break-even': formula([
       'Sell price that would zero the campaign here.',
       'Negative Cumulative cash flow ÷ shares held.',
       'Falls as premium and dividends come in.',
-      'Dash while under one share is on the book.',
+      'Dash while under one share is on the book, or once banked',
+      'premium/gains already exceed it -- not a negative price.',
       'Last share-holding row = Break-even price above.',
     ]),
   };
@@ -8332,8 +8480,22 @@ function renderTradeLogTable(entry) {
     return prefix + row.price;
   };
 
+  // Which row the backend pinned to the wheel's current official Profit
+  // Target (see wheel/api.py: the last share-holding row, when shares are
+  // still held) -- that row's Profit Target cell uses a different formula
+  // than the rest of the column, so its tooltip needs to say so explicitly.
+  let pinnedRowIdx = -1;
+  if (entry.shares_held > 1e-9) {
+    for (let i = entry.transactions.length - 1; i >= 0; i--) {
+      if (typeof entry.transactions[i].running_break_even === 'number') {
+        pinnedRowIdx = i;
+        break;
+      }
+    }
+  }
+
   const tbody = el('tbody');
-  for (const row of entry.transactions) {
+  entry.transactions.forEach((row, rowIndex) => {
     const tr = el('tr');
     // Row belongs to a position that is no longer active (a fully closed leg --
     // its open and its closes -- a sale, an expiry): grey the whole row.
@@ -8389,6 +8551,31 @@ function renderTradeLogTable(entry) {
       }
       tr.appendChild(td);
     });
+
+    // Profit Target: the higher of this row's running cost basis and running
+    // break-even, cushioned -- except the pinned row (see pinnedRowIdx
+    // above), which is snapped to the wheel's current official Profit Target
+    // (the exact cost basis / position breakeven / wheel breakeven figures,
+    // not this column's running approximation of them) and says so.
+    const isPinned = rowIndex === pinnedRowIdx;
+    const targetCell = el('td', { class: 'num' }, perShare(row.running_profit_target));
+    if (isPinned && entry.profit_target_explanation) {
+      setFormula(
+        targetCell,
+        formula([
+          "Pinned to the wheel's current official Profit Target (see the",
+          'summary above) -- the exact figure, not this column\'s running',
+          'approximation of it:',
+          '',
+          entry.profit_target_explanation,
+        ])
+      );
+    } else if (typeof row.running_profit_target === 'number') {
+      setFormula(targetCell, formula(runningProfitTargetFormulaLines(row, entry, perShare)));
+    }
+    if (targetCell.title) targetCell.style.cursor = 'help';
+    tr.insertBefore(targetCell, tr.lastElementChild);
+
     // Leg-class badge (CSP / CC / LP / LC), same look as the Open option
     // positions "Type" column. Blank for stock, dividend and expiry rows.
     const codeCell = el('td', { class: 'left' });
@@ -8406,7 +8593,7 @@ function renderTradeLogTable(entry) {
     }
     tr.insertBefore(codeCell, tr.children[1]);
     tbody.appendChild(tr);
-  }
+  });
   table.appendChild(tbody);
 
   // Brief key to the row shading (each sample carries the style it names).
@@ -8558,7 +8745,7 @@ function render() {
 
   renderNotices(meta, reconciliation);
   renderTiles(portfolio, reconciliation);
-  renderWheelTargets();
+  renderWheelTargetsAll();
   renderHedgeBanner();
   renderDashboardInsights();
   renderNetWorth(net_worth, benchmark, wheel_return, wheel_state);

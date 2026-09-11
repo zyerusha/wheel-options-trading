@@ -822,13 +822,31 @@ th {
 }
 
 /* Wide data tables: let multi-word headers wrap to two/three lines instead of
-   forcing a horizontal scrollbar. Planner headers all read left-aligned. */
+   forcing a horizontal scrollbar. Planner headers all read left-aligned.
+   word-break/overflow-wrap are pinned to their never-split-a-word defaults --
+   a header may overflow its column before a word is ever broken mid-word. */
 #open-positions-table th,
 #cc-candidates-table th,
 #csp-candidates-table th {
   white-space: normal;
   line-height: 1.15;
   max-width: 10ch;
+  vertical-align: bottom;
+  text-align: left;
+  word-break: keep-all;
+  overflow-wrap: normal;
+}
+
+/* Same treatment on the Trade Log ledger, whose long headers (Initial CSP
+   collateral, Cumulative cash flow, ...) were the widest offender -- a wider
+   cap than the Planner tables (there's room) so every word (Contracts,
+   Commissions) still wraps only at a space, never mid-word. */
+#tradelog-table th {
+  white-space: normal;
+  line-height: 1.15;
+  max-width: 14ch;
+  word-break: keep-all;
+  overflow-wrap: normal;
   vertical-align: bottom;
   text-align: left;
 }
@@ -1569,12 +1587,6 @@ tr.detail > td {
 
 #chart-tradelog-breakeven .be-water-above {
   fill: var(--good);
-}
-
-/* Distance-to-target badge: violet in both states (the Target line's own
-   color) -- unlike break-even, sitting below target isn't a danger signal. */
-#chart-tradelog-breakeven .target-water-badge {
-  fill: var(--target);
 }
 
 .tradelog-ppd .ti-head {

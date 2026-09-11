@@ -184,14 +184,27 @@
               Log
             </li>
             <li>
-              <strong>Type</strong>: CC, holding shares -- a profitable exit
-              floor + cushion; CSP, no shares yet -- a preferred entry price
-              below last close
+              <strong>Type</strong>: CC, holding shares; CSP, no shares yet
+            </li>
+            <li>
+              <strong>CC TO EXIT</strong>: holding shares only -- the lowest
+              strike worth writing a call at right now, reacting to the
+              current price. A floor, not a recommendation.
+            </li>
+            <li>
+              <strong>CSP TO ENTER</strong>: no shares yet only -- a
+              preferred entry price below last close, tracking the same %
+              slider as Cash for Cash-Secured Puts
+            </li>
+            <li>
+              <strong>Profit Target</strong>: holding shares only -- a
+              stable profitable-exit threshold (cost/breakeven economics +
+              cushion), never reacts to price. Green once last price has
+              reached it, red while still short.
             </li>
             <li>
               <strong>Gap to Target</strong>: for CC only, how far last price
-              is from the exit target (green once at or past it); a CSP row
-              shows its fixed entry cushion, not a progress signal
+              is from the Profit Target; a CSP row is blank here
             </li>
           </ul>
 
@@ -672,9 +685,19 @@
               still held minus all cycle income
             </li>
             <li>
-              <strong>Target Price</strong>: holding shares, a profitable
-              exit floor + cushion; no shares yet, a preferred entry price
-              below last close
+              <strong>CC TO EXIT</strong>: holding shares only -- the lowest
+              strike worth writing a call at right now, reacting to the
+              current price. A floor, not a recommendation.
+            </li>
+            <li>
+              <strong>CSP TO ENTER</strong>: no shares yet only -- a
+              preferred entry price below last close, tracking the same %
+              slider as Cash for Cash-Secured Puts
+            </li>
+            <li>
+              <strong>Profit Target</strong>: holding shares only -- a
+              stable profitable-exit threshold that never reacts to price.
+              Green once last price has reached it, red while still short.
             </li>
             <li>
               <strong>ITM/OTM %</strong>: strike vs. last close; green is the
@@ -689,16 +712,40 @@
               <strong>Annualized Yield</strong>: net premium ÷ collateral, per
               year
             </li>
-            <li>
-              <strong>Min. Profit Captured (est.)</strong>: intrinsic-only
-              estimate — intrinsic is the smallest a buy-to-close could cost, so
-              this can overstate; time value still on the option makes the real
-              cost higher
-            </li>
           </ul>
 
           <div style="overflow-x: auto">
             <table id="open-positions-table"></table>
+          </div>
+        </section>
+
+        <section
+          class="card"
+          id="wheel-targets-card-planner"
+          style="margin-bottom: var(--gap)"
+          hidden
+        >
+          <header>
+            <h2>Wheel price targets</h2>
+          </header>
+
+          <ul class="hint-list">
+            <li>
+              Same table as the Dashboard's Wheel price targets, mirrored
+              here next to Open option positions; see that card's hint list
+              above for what each column means.
+            </li>
+            <li>
+              Click a heading to sort
+            </li>
+            <li>
+              <strong>Wheel</strong>: click the id to open that wheel's Trade
+              Log
+            </li>
+          </ul>
+
+          <div style="overflow-x: auto">
+            <table id="wheel-targets-table-planner"></table>
           </div>
         </section>
 
