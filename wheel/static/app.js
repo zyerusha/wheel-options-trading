@@ -5441,15 +5441,25 @@ function switchTab(name) {
   state.activeTab = name;
   renderTabs();
   if (name === 'tradelog') renderTradeLog();
-  // Re-render the Planner on show: its SVG expiration calendar sizes itself to
-  // the container width, which reads as 0 (-> a too-narrow fallback) while the
-  // tab is still `hidden`, so the first paint during load() comes out wrong.
+  // Re-render immediately from whatever's already in state.data so the tab
+  // never paints blank or mis-sized while the load() below is still in
+  // flight: the SVG expiration calendar sizes itself to the container width,
+  // which reads as 0 (-> a too-narrow fallback) while the tab is still
+  // `hidden`, so the first paint during load() comes out wrong.
   try {
     if (name === 'planner' && state.data) renderPlanner();
     if (name === 'realized' && state.data) renderRealizedGains();
   } catch (error) {
     console.error('tab render failed:', error);
   }
+  // Also refetch on every tab change, not just on an account/filter switch.
+  // An account switch's own load() runs asynchronously, so a tab entered
+  // while it's still in flight would otherwise render off whatever *older*
+  // state.data happens to be sitting around above -- a different account's
+  // data than the one now selected. load() re-renders every tab once the
+  // fetch actually lands, so this guarantees the tab settles on data that
+  // matches the current filters even if the render just above didn't.
+  load();
   // A new top-level view -- don't leave the reader parked wherever the old
   // (often much taller) page was scrolled.
   const tabs = document.querySelector('nav.tabs');
