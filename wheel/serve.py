@@ -820,13 +820,6 @@ def serve(
         registry.set_default_dashboard(state.get())  # fail fast on a bad file, before binding the port
 
     accounts = registry.list_accounts()
-    if not accounts:
-        raise SystemExit(
-            "No broker export or Portfolio Positions file found in this folder, data/, "
-            "or any data/<account>/ subfolder. Put a CSV there, or pass one with --csv."
-        )
-
-    payload = registry.build(_preferred_account(registry))
 
     Handler.state = state
     Handler.registry = registry
@@ -834,23 +827,37 @@ def serve(
     display_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     url = f"http://{display_host}:{port}/"
 
-    reconciliation = payload["reconciliation"]
-    meta = payload["meta"]
-    print(f"  source        {meta['source'] or '(none in project root/data -- see accounts below)'}")
-    if meta["combined"]:
+    # No broker export anywhere yet -- a brand-new checkout, or a fresh
+    # Docker volume with nothing uploaded. The old behavior was to refuse to
+    # even bind the port; now the server starts anyway and the dashboard
+    # itself walks the user through exporting from Fidelity and adding the
+    # first CSV (see the #no-data-banner in index.html / refreshAccounts()
+    # in app.js) -- registry.build() has nothing to build yet, so it's
+    # skipped rather than raising.
+    if not accounts:
+        print(f"  source        (none yet -- {UPLOAD_DIR})")
+        print("  No broker export or Portfolio Positions file found. The dashboard")
+        print("  will walk you through adding your first Fidelity CSV once it's open.")
+        print(f"\n  Dashboard on  {url}\n  Ctrl-C to stop.\n")
+    else:
+        payload = registry.build(_preferred_account(registry))
+        reconciliation = payload["reconciliation"]
+        meta = payload["meta"]
+        print(f"  source        {meta['source'] or '(none in project root/data -- see accounts below)'}")
+        if meta["combined"]:
+            print(
+                f"  combined      {meta['rows_parsed']} rows -> {meta['rows_kept']} "
+                f"({meta['duplicates_removed']} duplicates merged)"
+            )
+        if len(accounts) > 1 or DEFAULT_ACCOUNT_ID not in {row["id"] for row in accounts}:
+            print(f"  accounts      {len(accounts)}: {', '.join(row['label'] for row in accounts)}")
+        print(f"  transactions  {meta['transactions_total']}")
+        print(f"  cycles        {len(payload['cycles'])} across {payload['portfolio']['tickers']} tickers")
         print(
-            f"  combined      {meta['rows_parsed']} rows -> {meta['rows_kept']} "
-            f"({meta['duplicates_removed']} duplicates merged)"
+            f"  cash check    {'BALANCED' if reconciliation['balanced'] else 'MISMATCH'} "
+            f"(delta {reconciliation['delta']})"
         )
-    if len(accounts) > 1 or DEFAULT_ACCOUNT_ID not in {row["id"] for row in accounts}:
-        print(f"  accounts      {len(accounts)}: {', '.join(row['label'] for row in accounts)}")
-    print(f"  transactions  {meta['transactions_total']}")
-    print(f"  cycles        {len(payload['cycles'])} across {payload['portfolio']['tickers']} tickers")
-    print(
-        f"  cash check    {'BALANCED' if reconciliation['balanced'] else 'MISMATCH'} "
-        f"(delta {reconciliation['delta']})"
-    )
-    print(f"\n  Dashboard on  {url}\n  Ctrl-C to stop.\n")
+        print(f"\n  Dashboard on  {url}\n  Ctrl-C to stop.\n")
 
     if open_browser and (reopen_browser or not _recently_opened(port)):
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()

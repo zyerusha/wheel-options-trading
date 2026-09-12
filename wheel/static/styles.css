@@ -1195,6 +1195,46 @@ tr.detail > td {
   padding-left: 18px;
 }
 
+/* Collapsible follow-up section inside a notice (multi-account setup) --
+   below the primary "export a CSV, drop it here" steps above it. */
+.notice details {
+  margin-top: 8px;
+}
+
+.notice summary {
+  cursor: pointer;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.notice details p {
+  margin: 6px 0;
+}
+
+.notice code {
+  background: var(--ghost);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+}
+
+.notice pre {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  background: var(--ghost);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  overflow-x: auto;
+}
+
+.notice pre code {
+  background: none;
+  padding: 0;
+}
+
 .empty {
   padding: 40px 12px;
   text-align: center;

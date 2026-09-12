@@ -143,6 +143,23 @@ The Planner and the covered-call candidates table show each holding's next earni
 { "MU": "2026-09-30", "WFC": "2026-10-13" }
 ```
 
+### Fundamentals (Cash-Secured Put candidate filtering)
+
+The Cash for Cash-Secured Puts table only suggests names that are actually reasonable to wheel — common stock or an ordinary ETF, $10–$350 last price, $1B+ market cap (ETFs skip the cap check), 1M+ 10-day average volume. These are fetched automatically where available; to override a ticker or fill in one that wasn't found, add `data/fundamentals.json`:
+
+```json
+{
+  "MU": { "type": "common", "market_cap_b": 118.4, "avg_vol_10d_m": 12.3 },
+  "IVV": { "type": "etf", "market_cap_b": null, "avg_vol_10d_m": 4.8 }
+}
+```
+
+* **`type`** — `"common"` or `"etf"` pass the filter (an ADR of an operating company is fine too — anything not in the excluded list below). Excluded outright: `leveraged_etf`, `inverse_etf`, `fund`, `mutual_fund`, `closed_end_fund`, `cef`, `mlp`, `lp`, `note`, `etn`.
+* **`market_cap_b`** — market cap in billions of dollars. Not checked for `"etf"` (that's AUM, not cap). `null` for an ETF, or any ticker whose cap genuinely isn't known.
+* **`avg_vol_10d_m`** — 10-day average volume in millions of shares.
+
+A ticker missing here, or a `null` field, doesn't get dropped — the candidate row still shows, flagged **unvetted** with a note on what's unknown (hover the `?`).
+
 ### Multiple Accounts
 
 Organize `data/` into one subfolder per account:
@@ -167,7 +184,7 @@ An account switcher appears at the top of the dashboard whenever more than one a
 
 Fidelity's "all accounts" Positions download lists every linked account in a single file — often more accounts than there are folders under `data/`, since not every account needs its own transaction-history folder. Any account number the dashboard finds that no folder claims gets its own tab automatically (Net Worth and holdings only — there's no transaction history to show for it). No config needed for that part.
 
-An optional `data/accounts.json` covers four things that auto-discovery can't:
+An optional `data/accounts.json` covers five things that auto-discovery can't:
 
 ```json
 {
@@ -177,7 +194,10 @@ An optional `data/accounts.json` covers four things that auto-discovery can't:
   },
   "ignore": ["Fidelity Go account"],
   "default_account": "ira",
-  "default_range": "ytd"
+  "default_range": "ytd",
+  "opening_balances": {
+    "taxable": { "date": "2025-01-02", "balance": 50000 }
+  }
 }
 ```
 
@@ -185,6 +205,7 @@ An optional `data/accounts.json` covers four things that auto-discovery can't:
 * **`ignore`** — hides an account everywhere (its own tab and Combined), by account number or by its `Account name` exactly as Fidelity reports it (case-insensitive).
 * **`default_account`** — which account tab the dashboard opens to, instead of Combined. Use an id from `/api/accounts` (a folder name, or an auto-discovered slug like `roth-ira`).
 * **`default_range`** — which date-range preset the dashboard opens to, instead of All. One of `all`, `ytd`, `1y`, `3y`, `5y`, a specific calendar year (`year:2025`), or a bare day count — the same presets the filter row's dropdown offers.
+* **`opening_balances`** — a manual starting point for the Net Worth **S&P 500 benchmark** comparison, keyed by folder the same way as `folders`. That comparison needs two Positions snapshots on different dates to measure a return between; until you've collected a second one, an entry here ("the account was worth this much on this date," from a statement or your own records) stands in for the missing earlier snapshot — and even once you have several, an entry *earlier* than your oldest snapshot stretches the comparison further back than your export history alone allows. Never used for anything but that one comparison — Total value, Capital deployed, and every other current-state figure still come only from real Positions data.
 
 Transaction history is never split by account this way — no column to split it on — so it stays wholly attributed to whichever folder it's found in.
 

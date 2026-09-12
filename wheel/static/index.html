@@ -112,6 +112,70 @@
       </section>
 
       <div id="tab-dashboard">
+        <div class="notice" id="no-data-banner" role="status" hidden>
+          <strong>No data yet</strong>
+          <ul>
+            <li>
+              Export your Fidelity transaction history:
+              <strong>Accounts &amp; Trade → Portfolio → Activity &amp; Orders → Download</strong>
+            </li>
+            <li>
+              Then either drop the CSV into the <code>data/</code> folder and
+              refresh this page, or use <strong>Add Fidelity CSVs</strong>
+              below and press <strong>Load</strong>
+            </li>
+            <li>
+              A Fidelity <strong>Portfolio Positions</strong> export
+              (Portfolio → Positions → Download) also unlocks the Net Worth
+              &amp; Benchmark section once transaction history is loaded
+            </li>
+          </ul>
+
+          <details open>
+            <summary>Tracking more than one account?</summary>
+            <p>
+              Give each account its own subfolder under <code>data/</code>
+              and drop that account's own exports in it. Files left directly
+              in <code>data/</code> (the layout above) count as one more,
+              implicit account. An account switcher appears automatically
+              once more than one account is found.
+            </p>
+            <pre>data/
+  ira/
+    History_for_Account_2025.csv
+    Portfolio_Positions_Aug-03-2026.csv
+  taxable/
+    History_for_Account_2025.csv
+    Portfolio_Positions_Aug-03-2026.csv</pre>
+            <p>
+              Each account shows by its own Fidelity account name once a
+              Positions export is on file for it, or by its folder name
+              until then.
+            </p>
+            <p>
+              Optional <code>data/accounts.json</code> lets you set names,
+              defaults, and a couple of other things by hand:
+            </p>
+            <pre>{
+  "default_account": "ira",
+  "default_range": "ytd",
+  "folders": { "ira": "Z12345678", "taxable": "Z98765432" },
+  "ignore": ["Fidelity Go account"],
+  "opening_balances": {
+    "ira": { "date": "2024-01-01", "balance": 613000 },
+    "taxable": { "date": "2026-01-01", "balance": 247000 }
+  }
+}</pre>
+            <ul>
+              <li><code>default_account</code> — account tab shown by default, instead of Combined</li>
+              <li><code>default_range</code> — date range shown by default, instead of All (e.g. <code>ytd</code>, <code>1y</code>, <code>year:2025</code>)</li>
+              <li><code>folders</code> — maps a <code>data/</code> folder name to its account number</li>
+              <li><code>ignore</code> — hides an account, by number or name</li>
+              <li><code>opening_balances</code> — a starting balance and date for the Net Worth S&amp;P 500 benchmark, if your oldest Positions export doesn't go back far enough</li>
+            </ul>
+          </details>
+        </div>
+
         <section class="source" aria-label="Data source">
           <div class="field source-list">
             <label id="dataset-label">

@@ -27,6 +27,13 @@ def _resolve_data_dir() -> str:
 
 DATA_DIR = _resolve_data_dir()  # always absolute
 
+# Created eagerly, at import time: a fresh Docker bind mount or a first-ever
+# run of the app has nothing here yet, and both the upload endpoint and a
+# plain directory listing need it to already exist rather than erroring or
+# silently finding nothing. exist_ok -- every other run just confirms it's
+# already there.
+os.makedirs(DATA_DIR, exist_ok=True)
+
 
 def _discovery_dirs() -> tuple[str, ...]:
     # "." first (back-compat with running from a folder of exports), then the

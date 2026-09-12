@@ -5171,11 +5171,29 @@ let defaultAccountApplied = false;
 let defaultRangeToApply = null;
 let defaultRangeApplied = false;
 
+// Optimistic until the first /api/accounts response actually says otherwise
+// -- a fresh checkout or an empty Docker data/ volume has zero accounts, and
+// load() must not keep hammering /api/dashboard (which has nothing to build
+// yet) every 15s on the background poll. Flips back to true the moment an
+// upload succeeds (loadSelectedSource() re-runs refreshAccounts() itself).
+let hasAnyAccounts = true;
+
+function renderNoDataBanner(empty) {
+  const banner = $('no-data-banner');
+  if (banner) banner.hidden = !empty;
+  if (empty) {
+    $('subtitle').textContent = 'No data yet: see below to add your first export.';
+    $('subtitle').title = '';
+  }
+}
+
 async function refreshAccounts() {
   try {
     const response = await fetch('/api/accounts');
     if (!response.ok) return;
     const listing = await response.json();
+    hasAnyAccounts = (listing.accounts || []).length > 0;
+    renderNoDataBanner(!hasAnyAccounts);
     if (!defaultAccountApplied) {
       if (listing.default_account) state.account = listing.default_account;
       defaultRangeToApply = listing.default_range || null;
@@ -5548,6 +5566,13 @@ function updateExportLinks() {
 }
 
 async function load({ background = false } = {}) {
+  // Nothing to fetch yet -- the #no-data-banner is already telling the user
+  // what to do. Without this, the 15s background poll would keep hitting
+  // /api/dashboard (which has no account to build) and stack up "Could not
+  // load data" notices forever. loadSelectedSource() flips hasAnyAccounts
+  // back on via its own refreshAccounts() call right before it calls load()
+  // again, so a successful upload recovers on its own.
+  if (!hasAnyAccounts) return;
   const generation = ++loadGeneration;
   // The very first load() attempt gets one shot at applying
   // data/accounts.json's default_range, win or lose -- marked spent right
