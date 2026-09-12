@@ -19,6 +19,14 @@ WORKDIR /app
 # on the fly instead of leaving it in the image layer.
 RUN apk upgrade --no-cache
 
+# The base image bundles pip for `pip install`-based images; this one never
+# runs pip (stdlib-only, nothing to install), so it's dead weight that only
+# adds pip's own CVEs to every scan. Delete its package dir + console
+# scripts rather than `pip uninstall`, which can't reliably remove itself.
+RUN rm -rf /usr/local/lib/python3.*/site-packages/pip \
+           /usr/local/lib/python3.*/site-packages/pip-*.dist-info \
+ && rm -f /usr/local/bin/pip /usr/local/bin/pip3 /usr/local/bin/pip3.*
+
 # Non-root runtime user, fixed uid/gid so a bind-mounted host dir owned by
 # uid 1000 stays writable for uploads + market-data caches. Alpine's busybox
 # ships addgroup/adduser, not Debian's groupadd/useradd.
