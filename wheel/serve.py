@@ -397,6 +397,18 @@ class DashboardState:
         return dashboard
 
 
+# The browser closing a tab, navigating away, or (per resetSelectionState's
+# own account-switch dedupe note) superseding an in-flight fetch with a newer
+# one all abort the socket mid-response. That's a client hanging up, not a
+# server fault: nothing to fix, and the socket is already dead so there is no
+# response left to send. Caught separately from `except Exception` so it gets
+# one quiet log line instead of a traceback plus a doomed second write
+# attempt at an error body (which is what used to happen: `_send_json`'s own
+# `self.wfile.write` inside the generic handler's error path would raise the
+# same exception again, this time unhandled).
+_CLIENT_DISCONNECTED = (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)
+
+
 class Handler(BaseHTTPRequestHandler):
     state: DashboardState = None  # injected by serve() -- owns the "default" account's active files
     registry: AccountRegistry = None  # injected by serve() -- every account, "default" included
@@ -528,6 +540,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
             else:
                 self._send_json({"error": "not found", "path": route}, 404)
+        except _CLIENT_DISCONNECTED:
+            sys.stderr.write(f"  {self.command} {route} -> client disconnected\n")
         except Exception as error:  # pragma: no cover - surfaced to the browser
             import traceback
 
@@ -545,7 +559,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "not found", "path": route}, 404)
         except DatasetError as error:
             # A rejected dataset is a user-fixable problem, not a server fault.
-            self._send_json({"error": str(error), "active": self.state.csv_path}, 400)
+            # This write has the same client-gone-mid-response risk as the
+            # generic handler below, but a raise here wouldn't reach that
+            # sibling `except` clause (a new exception from inside one
+            # `except` block isn't matched against the others), hence its own
+            # guard.
+            try:
+                self._send_json({"error": str(error), "active": self.state.csv_path}, 400)
+            except _CLIENT_DISCONNECTED:
+                sys.stderr.write(f"  {self.command} {route} -> client disconnected\n")
+        except _CLIENT_DISCONNECTED:
+            sys.stderr.write(f"  {self.command} {route} -> client disconnected\n")
         except Exception as error:  # pragma: no cover - surfaced to the browser
             import traceback
 

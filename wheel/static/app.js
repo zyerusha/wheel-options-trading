@@ -185,6 +185,28 @@ function tickerLink(symbol) {
 }
 
 /**
+ * The specific contract behind an Open option positions row (CSP/CC/LP/LC),
+ * as TradingView's own compact options symbol: root + YYMMDD + C/P + strike,
+ * e.g. "TLT250711C85.5". Loading that symbol takes TradingView straight to
+ * this contract's own chart, expiry/strike/right already resolved -- the
+ * options-chain equivalent of the plain ticker link above. `null` when the
+ * row is missing any of the four pieces (a synthesized no-contract row).
+ *
+ * A whole-dollar strike needs its trailing ".0" spelled out -- confirmed
+ * against real contracts: "LNC260918P42.5" resolved, but "IWM260918C297"
+ * and "SPCX260918P139" (both integer strikes, otherwise identical shape)
+ * came back "this symbol doesn't exist." Trimming the decimal for a clean
+ * number apparently isn't how TradingView's own symbol index stores it.
+ */
+function tradingViewOptionSymbol(row) {
+  if (!row.underlying || !row.expiration || !row.right || row.strike == null) return null;
+  const [y, m, d] = row.expiration.split('-');
+  const strike = Math.round(row.strike * 100) / 100;
+  const strikeStr = Number.isInteger(strike) ? `${strike}.0` : String(strike);
+  return `${row.underlying}${y.slice(2)}${m}${d}${row.right}${strikeStr}`;
+}
+
+/**
  * The CSP/covered-call vs. hedge breakdown behind an `option_realized_pl`
  * figure -- works on a portfolio, cycle, or ticker-row object alike, since
  * all three carry the same three fields (wheel/metrics.py: `option_realized_pl
@@ -6674,9 +6696,22 @@ function openPositionRow(row, isGroupStart, groupSize) {
   if (row.type == null) {
     typeCell.appendChild(document.createTextNode('—'));
   } else {
-    typeCell.appendChild(
-      el('span', { class: 'badge op-type op-type-' + row.type, title: OP_TYPE_LABEL[row.type] || row.type }, row.type)
-    );
+    const optionSymbol = tradingViewOptionSymbol(row);
+    const label = OP_TYPE_LABEL[row.type] || row.type;
+    const badge = optionSymbol
+      ? el(
+          'a',
+          {
+            class: 'badge op-type op-type-' + row.type,
+            href: `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(optionSymbol)}`,
+            target: '_blank',
+            rel: 'noopener noreferrer',
+            title: `${label}. Click to open this contract on TradingView.`,
+          },
+          row.type
+        )
+      : el('span', { class: 'badge op-type op-type-' + row.type, title: label }, row.type);
+    typeCell.appendChild(badge);
   }
 
   const strikeCell = el('td', { class: 'num' }, money(row.strike, { cents: true }));

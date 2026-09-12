@@ -1046,6 +1046,21 @@ th.sortable:hover {
   border-color: var(--series-4);
 }
 
+/* A Type badge rendered as an `<a>` -- this row's specific contract, linking
+   out to its own TradingView chart -- only when the row carries a full
+   strike/expiration/right (see tradingViewOptionSymbol). A plain `<span>`
+   badge (no contract to link to) is untouched by this rule. */
+a.badge.op-type {
+  text-decoration: none;
+  cursor: pointer;
+}
+
+a.badge.op-type:hover,
+a.badge.op-type:focus-visible {
+  background: var(--ghost);
+  outline: none;
+}
+
 /* ---------------- expandable cycle rows ---------------- */
 
 tr.cycle-row {
