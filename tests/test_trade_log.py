@@ -320,6 +320,33 @@ class TestTransactionRows(unittest.TestCase):
         )
         self.assertAlmostEqual(wheel["cc_strike_floor"], expected, places=2)
 
+    def test_cc_strike_floor_never_below_profit_target(self):
+        # Regression: cc_strike_floor used to compare cost basis / breakeven /
+        # wheel breakeven against the current price with no cushion, while
+        # profit_target cushioned that same floor by +2% -- so whenever the
+        # price hadn't rallied past cost basis, CC TO EXIT (cc_strike_floor)
+        # came out *below* Profit Target. A call struck there and assigned
+        # would lock in a below-target exit, defeating the point of a floor.
+        # Price sits below cost basis here so the price term never dominates.
+        for price in (85.0, 91.9, 92.0):
+            rows = _trade_log(
+                [tx("2025-07-18", BUY_STOCK, "BFH", 100, 92.0, -100 * 92.0, row_id=1)],
+                prices={"BFH": price},
+            )
+            (wheel,) = rows["wheels"]
+            self.assertGreaterEqual(wheel["cc_strike_floor"], wheel["profit_target"])
+
+    def test_cc_strike_floor_applies_the_same_cushion_as_profit_target(self):
+        # Cost basis $92 cushioned +2% = $93.84, rounded up to $94.00 -- both
+        # figures land on it when the price (here $85) doesn't dominate.
+        rows = _trade_log(
+            [tx("2025-07-18", BUY_STOCK, "BFH", 100, 92.0, -100 * 92.0, row_id=1)],
+            prices={"BFH": 85.0},
+        )
+        (wheel,) = rows["wheels"]
+        self.assertAlmostEqual(wheel["profit_target"], 94.0, places=2)
+        self.assertAlmostEqual(wheel["cc_strike_floor"], 94.0, places=2)
+
     def test_crox_style_price_rally_case(self):
         # A plain share buy (no premium banked yet) at ~$95.43, price now
         # ~$112.48 -- reproduces the real CROX numbers that exposed the

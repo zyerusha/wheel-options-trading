@@ -669,6 +669,12 @@
           <ul class="hint-list">
             <li>
               Open short calls (CC) and puts (CSP), plus long hedges (LP/LC)
+              -- plus one row for a wheel with a current phase but no open
+              contract at all (e.g. assigned shares with no call written
+              yet); Strike, Expiration, ITM/OTM %, Qty, Net Premium and
+              Annualized Yield read as "-" there since they need an actual
+              contract. Last Price % and Breakeven still show (a wheel's own
+              daily move and raw cost basis need no contract either)
             </li>
             <li>Amber rows are longs; premium paid, not received</li>
             <li>Click a heading to sort</li>
@@ -700,6 +706,14 @@
               Green once last price has reached it, red while still short.
             </li>
             <li>
+              <strong>Gap to Target</strong>: for CC only, how far last price
+              is from the Profit Target; a CSP row is blank here
+            </li>
+            <li>
+              <strong>Shares Held</strong>: currently held from this wheel,
+              net of any sold or called away
+            </li>
+            <li>
               <strong>ITM/OTM %</strong>: strike vs. last close; green is the
               cushion (short) or intrinsic value (long)
             </li>
@@ -716,36 +730,6 @@
 
           <div style="overflow-x: auto">
             <table id="open-positions-table"></table>
-          </div>
-        </section>
-
-        <section
-          class="card"
-          id="wheel-targets-card-planner"
-          style="margin-bottom: var(--gap)"
-          hidden
-        >
-          <header>
-            <h2>Wheel price targets</h2>
-          </header>
-
-          <ul class="hint-list">
-            <li>
-              Same table as the Dashboard's Wheel price targets, mirrored
-              here next to Open option positions; see that card's hint list
-              above for what each column means.
-            </li>
-            <li>
-              Click a heading to sort
-            </li>
-            <li>
-              <strong>Wheel</strong>: click the id to open that wheel's Trade
-              Log
-            </li>
-          </ul>
-
-          <div style="overflow-x: auto">
-            <table id="wheel-targets-table-planner"></table>
           </div>
         </section>
 

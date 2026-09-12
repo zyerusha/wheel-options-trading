@@ -58,9 +58,6 @@ const state = {
   cspCandSort: { key: 'stars', dir: -1 },
   // Wheel price targets table (Dashboard): which column sorts it, and direction.
   wheelTargetsSort: { key: 'gap_pct', dir: 1 },
-  // Same table, mirrored on the Planner tab under Open option positions --
-  // sorts independently of the Dashboard copy above.
-  wheelTargetsSortPlanner: { key: 'gap_pct', dir: 1 },
   // "Target price for CSP" column: the user-set % of last price (rounded down to
   // $0.50) shown as a conservative strike floor. Editable in that card, kept in
   // localStorage so it survives a reload. Default 93 (~7% out of the money).
@@ -4596,17 +4593,10 @@ function wheelTargetsRow(row) {
   return tr;
 }
 
-// Renders one instance of the table -- the Dashboard original or its Planner
-// mirror (see renderWheelTargetsAll) -- each keyed by its own table/card ids
-// and its own entry in `state` so the two copies can sort independently.
-function renderWheelTargets(
-  tableId = 'wheel-targets-table',
-  cardId = 'wheel-targets-card',
-  sortKey = 'wheelTargetsSort'
-) {
-  const table = $(tableId);
+function renderWheelTargets() {
+  const table = $('wheel-targets-table');
   if (!table) return;
-  const card = $(cardId);
+  const card = $('wheel-targets-card');
   const rows = ((state.data && state.data.wheel_targets) || []).map((row) => ({
     ...row,
     csp_entry_target:
@@ -4616,7 +4606,7 @@ function renderWheelTargets(
   clear(table);
   if (!rows.length) return;
 
-  const { key, dir } = state[sortKey];
+  const { key, dir } = state.wheelTargetsSort;
 
   const thead = el('thead');
   const headRow = el('tr');
@@ -4624,9 +4614,9 @@ function renderWheelTargets(
     const th = el('th', { class: `sortable${column.left ? ' left' : ''}` }, column.label);
     if (key === column.key) th.textContent = column.label + (dir === 1 ? ' ▲' : ' ▼');
     th.addEventListener('click', () => {
-      if (state[sortKey].key === column.key) state[sortKey].dir *= -1;
-      else state[sortKey] = { key: column.key, dir: column.key === 'underlying' ? 1 : -1 };
-      renderWheelTargets(tableId, cardId, sortKey);
+      if (state.wheelTargetsSort.key === column.key) state.wheelTargetsSort.dir *= -1;
+      else state.wheelTargetsSort = { key: column.key, dir: column.key === 'underlying' ? 1 : -1 };
+      renderWheelTargets();
     });
     headRow.appendChild(th);
   }
@@ -4646,14 +4636,6 @@ function renderWheelTargets(
   const tbody = el('tbody');
   for (const row of sorted) tbody.appendChild(wheelTargetsRow(row));
   table.appendChild(tbody);
-}
-
-// Renders both instances: the Dashboard original and its Planner mirror
-// (under Open option positions) -- call this, not renderWheelTargets()
-// directly, from anywhere the underlying data or the %-slider can change.
-function renderWheelTargetsAll() {
-  renderWheelTargets('wheel-targets-table', 'wheel-targets-card', 'wheelTargetsSort');
-  renderWheelTargets('wheel-targets-table-planner', 'wheel-targets-card-planner', 'wheelTargetsSortPlanner');
 }
 
 /** The same hedge card, scoped to the wheel on screen, under its Insights. */
@@ -5404,10 +5386,10 @@ function wireFilters() {
       state.cspTargetPct = clamped;
       writeStoredNumber('cspTargetPct', clamped);
       renderCspCash();
-      // CSP TO ENTER on the Wheel price targets tables (Dashboard + its
-      // Planner mirror) and Open Positions tracks this same slider (see
-      // cspEntryTarget), so keep them live-synced too.
-      renderWheelTargetsAll();
+      // CSP TO ENTER on the Wheel price targets and Open Positions tables
+      // tracks this same slider (see cspEntryTarget), so keep them
+      // live-synced too.
+      renderWheelTargets();
       renderOpenPositions();
     };
     // Live while typing a valid number; snap the field to the clamped value on
@@ -6488,10 +6470,21 @@ function renderDashboardInsights() {
  *
  * One sortable row per open covered call / cash-secured put across every
  * wheel -- `data.open_positions`, built by `_build_open_positions` in
- * wheel/api.py. Filter-independent (an open contract needs watching whatever
- * date window is on screen), so it is not redrawn on filter changes beyond
- * the single render() pass. Symbols stay alphabetical and their rows stay
- * contiguous; a column click re-orders the rows *within* each symbol group.
+ * wheel/api.py -- plus one row for a wheel with a current phase but no open
+ * leg at all right now (e.g. assigned shares with no covered call written
+ * yet), synthesized server-side by `_no_contract_open_position_row`. Fields
+ * that genuinely need a contract (strike, expiration, moneyness, yield,
+ * collateral, quantity, premium, ...) are `null` there; every cell below
+ * already reads that as its own "no value" case, so no extra branching is
+ * needed here beyond the Type badge and Qty, which otherwise have no null
+ * case of their own. Two fields that look contract-specific but aren't are
+ * filled anyway: Last Price % (the ticker's own daily move) and, in the CC
+ * phase, Breakeven (cost basis, since no call written means no premium to
+ * net against it).
+ * Filter-independent (an open contract needs watching whatever date window
+ * is on screen), so it is not redrawn on filter changes beyond the single
+ * render() pass. Symbols stay alphabetical and their rows stay contiguous; a
+ * column click re-orders the rows *within* each symbol group.
  */
 const OPEN_POS_COLUMNS = [
   { key: 'underlying', label: 'Symbol', left: true },
@@ -6500,10 +6493,12 @@ const OPEN_POS_COLUMNS = [
   { key: 'cc_strike_floor', label: 'CC TO EXIT' },
   { key: 'csp_entry_target', label: 'CSP TO ENTER' },
   { key: 'profit_target', label: 'Profit Target' },
+  { key: 'gap_pct', label: 'Gap to Target' },
   { key: 'expiration', label: 'Expiration' },
   { key: 'cost_basis', label: 'Cost Basis' },
   { key: 'breakeven', label: 'Breakeven' },
   { key: 'wheel_breakeven', label: 'Wheel Breakeven' },
+  { key: 'shares_held', label: 'Shares Held' },
   { key: 'moneyness_pct', label: 'ITM/OTM (%)' },
   { key: 'last_close', label: 'Last Price' },
   { key: 'last_close_pct', label: 'Last Price %' },
@@ -6549,6 +6544,12 @@ function positionBreakevenMath(row) {
   if (row.type === 'LC' && row.strike != null) {
     return `${fmt(row.strike)} strike + ${fmt(row.breakeven - row.strike)} cost/share = ${be} breakeven, profit above it`;
   }
+  // No open leg at all (a synthesized row -- see _no_contract_open_position_row):
+  // shares held with no call written yet, so this leg's premium is zero and
+  // the breakeven is just the raw cost basis.
+  if (row.type == null && row.wheel_phase === 'cc' && row.cost_basis != null) {
+    return `${fmt(row.cost_basis)} cost basis, no call written yet (no premium collected) = ${be} breakeven`;
+  }
   return '';
 }
 
@@ -6576,10 +6577,17 @@ function openPositionRow(row, isGroupStart, groupSize) {
   }
   tr.appendChild(symCell);
 
+  // No `type` at all means no open contract on this wheel right now (a
+  // synthesized row -- see _no_contract_open_position_row): a plain dash,
+  // not a badge with nothing to label.
   const typeCell = el('td', { class: 'left' });
-  typeCell.appendChild(
-    el('span', { class: 'badge op-type op-type-' + row.type, title: OP_TYPE_LABEL[row.type] || row.type }, row.type)
-  );
+  if (row.type == null) {
+    typeCell.appendChild(document.createTextNode('—'));
+  } else {
+    typeCell.appendChild(
+      el('span', { class: 'badge op-type op-type-' + row.type, title: OP_TYPE_LABEL[row.type] || row.type }, row.type)
+    );
+  }
   tr.appendChild(typeCell);
 
   tr.appendChild(el('td', { class: 'num' }, money(row.strike, { cents: true })));
@@ -6614,6 +6622,11 @@ function openPositionRow(row, isGroupStart, groupSize) {
   const profitTargetCell = el('td', { class: 'num ' + metTone }, money(row.profit_target, { cents: true }));
   if (row.profit_target_explanation) profitTargetCell.title = row.profit_target_explanation;
   tr.appendChild(profitTargetCell);
+
+  // Same figure and tone as the Profit Target cell above -- how far last
+  // price sits from it, CC-phase only (a CSP row has no Profit Target to gap
+  // against).
+  tr.appendChild(el('td', { class: 'num ' + metTone }, signedPct(row.gap_pct)));
 
   // Expiration, with a warning glyph when the contract is inside a week.
   const nearExpiry =
@@ -6694,6 +6707,10 @@ function openPositionRow(row, isGroupStart, groupSize) {
     wheelStatus;
   tr.appendChild(wheelBeCell);
 
+  tr.appendChild(
+    el('td', { class: 'num' }, row.shares_held ? Math.round(row.shares_held).toLocaleString('en-US') : '—')
+  );
+
   // OTM is favorable for a short (it expires worthless, you keep the premium);
   // ITM is favorable for a long (it has intrinsic value). Same number, opposite
   // "good" side -- so the tone is keyed to side, not to the raw sign.
@@ -6717,7 +6734,7 @@ function openPositionRow(row, isGroupStart, groupSize) {
   tr.appendChild(el('td', { class: 'num' }, money(row.last_close, { cents: true })));
   tr.appendChild(el('td', { class: 'num ' + toneOf(row.last_close_pct) }, signedPct(row.last_close_pct)));
 
-  tr.appendChild(el('td', { class: 'num' }, row.signed_contracts));
+  tr.appendChild(el('td', { class: 'num' }, row.signed_contracts == null ? '—' : row.signed_contracts));
   tr.appendChild(el('td', { class: 'num ' + toneOf(row.net_premium) }, money(row.net_premium, { cents: true, sign: true })));
 
   const wheelCell = el('td', { class: 'left op-wheel' });
@@ -8745,7 +8762,7 @@ function render() {
 
   renderNotices(meta, reconciliation);
   renderTiles(portfolio, reconciliation);
-  renderWheelTargetsAll();
+  renderWheelTargets();
   renderHedgeBanner();
   renderDashboardInsights();
   renderNetWorth(net_worth, benchmark, wheel_return, wheel_state);
