@@ -136,19 +136,28 @@ class TestUnrealizedPl(unittest.TestCase):
 
 
 class TestTargetPrice(unittest.TestCase):
+    # target_cc_strike is `_cc_strike_floor`: the higher of the cushioned
+    # Profit Target floor (+2%, same cushion `_profit_target` applies to
+    # cost basis / breakeven / wheel breakeven) and the last close, rounded
+    # up to $0.50 -- never the raw, uncushioned max of those alone, so this
+    # can never come out below the wheel's own Profit Target (see
+    # test_trade_log.py's CC-strike-floor tests for that guarantee directly).
+
     def test_target_is_the_greatest_of_cost_basis_break_evens_and_last_close(self):
         # premium already banked pulls both break-evens below cost basis;
-        # last close sits below cost basis too, so cost basis wins
+        # last close sits below cost basis too, so cost basis wins -- cushioned
+        # +2% = 102.0, already on the $0.50 grid
         rows = _candidates([_wheel("MU-1", "MU", shares=100, cost=100.0, be=92.0, whlbe=88.0, last=95.0)])
-        self.assertEqual(rows[0]["target_cc_strike"], 100.0)
+        self.assertEqual(rows[0]["target_cc_strike"], 102.0)
 
     def test_target_never_dips_below_a_break_even_that_sits_above_cost(self):
-        # a loss elsewhere in the cycle lifted the wheel break-even past cost
+        # a loss elsewhere in the cycle lifted the wheel break-even past cost;
+        # 105 cushioned +2% = 107.1, rounded up to 107.5
         rows = _candidates([_wheel("MU-1", "MU", shares=100, cost=100.0, be=101.0, whlbe=105.0, last=90.0)])
-        self.assertEqual(rows[0]["target_cc_strike"], 105.0)
+        self.assertEqual(rows[0]["target_cc_strike"], 107.5)
 
     def test_target_never_dips_below_the_last_close(self):
-        # stock has run well past every cost figure -- don't write a call under market
+        # stock has run well past every cushioned cost figure -- don't write a call under market
         rows = _candidates([_wheel("MU-1", "MU", shares=100, cost=90.0, be=85.0, whlbe=80.0, last=120.0)])
         self.assertEqual(rows[0]["target_cc_strike"], 120.0)
 
@@ -162,18 +171,22 @@ class TestTargetPrice(unittest.TestCase):
         self.assertIsNone(rows[0]["target_cc_strike"])
 
     def test_target_ignores_a_missing_break_even(self):
+        # 50 cushioned +2% = 51.0, already on the $0.50 grid
         rows = _candidates([_wheel("MU-1", "MU", shares=100, cost=50.0, be=None, whlbe=48.0, last=45.0)])
-        self.assertEqual(rows[0]["target_cc_strike"], 50.0)
+        self.assertEqual(rows[0]["target_cc_strike"], 51.0)
 
     def test_target_is_rounded_up_to_the_next_half_dollar(self):
+        # 175.12 cushioned +2% = 178.6224, rounded up to 179.0
         rows = _candidates([_wheel("MU-1", "MU", shares=100, cost=175.12, be=170.0, whlbe=168.0, last=174.0)])
-        self.assertEqual(rows[0]["target_cc_strike"], 175.5)
+        self.assertEqual(rows[0]["target_cc_strike"], 179.0)
 
     def test_target_already_on_a_half_dollar_is_unchanged(self):
-        rows = _candidates([_wheel("MU-1", "MU", shares=100, cost=180.0, be=1.0, whlbe=1.0, last=1.0)])
-        self.assertEqual(rows[0]["target_cc_strike"], 180.0)
-        rows = _candidates([_wheel("MU-1", "MU", shares=100, cost=180.5, be=1.0, whlbe=1.0, last=1.0)])
-        self.assertEqual(rows[0]["target_cc_strike"], 180.5)
+        # cushioned floor lands exactly on the $0.50 grid -- rounding must not
+        # bump it further: 250 * 1.02 = 255.0, 300 * 1.02 = 306.0
+        rows = _candidates([_wheel("MU-1", "MU", shares=100, cost=250.0, be=1.0, whlbe=1.0, last=1.0)])
+        self.assertEqual(rows[0]["target_cc_strike"], 255.0)
+        rows = _candidates([_wheel("MU-1", "MU", shares=100, cost=300.0, be=1.0, whlbe=1.0, last=1.0)])
+        self.assertEqual(rows[0]["target_cc_strike"], 306.0)
 
 
 class TestSectorAndEarnings(unittest.TestCase):

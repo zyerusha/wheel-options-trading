@@ -49,12 +49,15 @@ from wheel.api import (  # noqa: E402
 )
 from wheel import exporter  # noqa: E402
 from wheel.closed_lots import looks_like_closed_lots  # noqa: E402
+from wheel.paths import DATA_DIR  # noqa: E402
 from wheel.positions import discover_position_snapshots, looks_like_position_snapshot  # noqa: E402
 
 PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(PACKAGE_DIR, "static")
 PROJECT_ROOT = os.path.dirname(PACKAGE_DIR)
-UPLOAD_DIR = os.path.join(PROJECT_ROOT, "data")
+# Absolute: <repo>/data by default, or $WHEEL_DATA_DIR when set. All uploads and
+# market-data caches are written here; it is the volume mount point in Docker.
+UPLOAD_DIR = DATA_DIR
 
 MAX_UPLOAD_BYTES = 32 * 1024 * 1024
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._ -]")
@@ -394,6 +397,18 @@ class DashboardState:
         return dashboard
 
 
+# The browser closing a tab, navigating away, or (per resetSelectionState's
+# own account-switch dedupe note) superseding an in-flight fetch with a newer
+# one all abort the socket mid-response. That's a client hanging up, not a
+# server fault: nothing to fix, and the socket is already dead so there is no
+# response left to send. Caught separately from `except Exception` so it gets
+# one quiet log line instead of a traceback plus a doomed second write
+# attempt at an error body (which is what used to happen: `_send_json`'s own
+# `self.wfile.write` inside the generic handler's error path would raise the
+# same exception again, this time unhandled).
+_CLIENT_DISCONNECTED = (ConnectionAbortedError, ConnectionResetError, BrokenPipeError)
+
+
 class Handler(BaseHTTPRequestHandler):
     state: DashboardState = None  # injected by serve() -- owns the "default" account's active files
     registry: AccountRegistry = None  # injected by serve() -- every account, "default" included
@@ -480,6 +495,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_file("app.js", "application/javascript; charset=utf-8")
             elif route == "/styles.css":
                 self._send_file("styles.css", "text/css; charset=utf-8")
+            elif route == "/wheel-strategy.png":
+                self._send_file("wheel-strategy.png", "image/png")
             elif route == "/api/dashboard":
                 self._sync_registry()
                 query = parse_qs(parsed.query)
@@ -525,6 +542,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
             else:
                 self._send_json({"error": "not found", "path": route}, 404)
+        except _CLIENT_DISCONNECTED:
+            sys.stderr.write(f"  {self.command} {route} -> client disconnected\n")
         except Exception as error:  # pragma: no cover - surfaced to the browser
             import traceback
 
@@ -542,7 +561,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"error": "not found", "path": route}, 404)
         except DatasetError as error:
             # A rejected dataset is a user-fixable problem, not a server fault.
-            self._send_json({"error": str(error), "active": self.state.csv_path}, 400)
+            # This write has the same client-gone-mid-response risk as the
+            # generic handler below, but a raise here wouldn't reach that
+            # sibling `except` clause (a new exception from inside one
+            # `except` block isn't matched against the others), hence its own
+            # guard.
+            try:
+                self._send_json({"error": str(error), "active": self.state.csv_path}, 400)
+            except _CLIENT_DISCONNECTED:
+                sys.stderr.write(f"  {self.command} {route} -> client disconnected\n")
+        except _CLIENT_DISCONNECTED:
+            sys.stderr.write(f"  {self.command} {route} -> client disconnected\n")
         except Exception as error:  # pragma: no cover - surfaced to the browser
             import traceback
 
@@ -774,6 +803,7 @@ def serve(
     port: int = 8765,
     open_browser: bool = True,
     reopen_browser: bool = False,
+    host: str = "127.0.0.1",
 ) -> None:
     if csv_path is None:
         csv_path = discover_exports()
@@ -792,36 +822,44 @@ def serve(
         registry.set_default_dashboard(state.get())  # fail fast on a bad file, before binding the port
 
     accounts = registry.list_accounts()
-    if not accounts:
-        raise SystemExit(
-            "No broker export or Portfolio Positions file found in this folder, data/, "
-            "or any data/<account>/ subfolder. Put a CSV there, or pass one with --csv."
-        )
-
-    payload = registry.build(_preferred_account(registry))
 
     Handler.state = state
     Handler.registry = registry
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    url = f"http://127.0.0.1:{port}/"
+    httpd = ThreadingHTTPServer((host, port), Handler)
+    display_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    url = f"http://{display_host}:{port}/"
 
-    reconciliation = payload["reconciliation"]
-    meta = payload["meta"]
-    print(f"  source        {meta['source'] or '(none in project root/data -- see accounts below)'}")
-    if meta["combined"]:
+    # No broker export anywhere yet -- a brand-new checkout, or a fresh
+    # Docker volume with nothing uploaded. The old behavior was to refuse to
+    # even bind the port; now the server starts anyway and the dashboard
+    # itself walks the user through exporting from Fidelity and adding the
+    # first CSV (see the #no-data-banner in index.html / refreshAccounts()
+    # in app.js) -- registry.build() has nothing to build yet, so it's
+    # skipped rather than raising.
+    if not accounts:
+        print(f"  source        (none yet -- {UPLOAD_DIR})")
+        print("  No broker export or Portfolio Positions file found. The dashboard")
+        print("  will walk you through adding your first Fidelity CSV once it's open.")
+        print(f"\n  Dashboard on  {url}\n  Ctrl-C to stop.\n")
+    else:
+        payload = registry.build(_preferred_account(registry))
+        reconciliation = payload["reconciliation"]
+        meta = payload["meta"]
+        print(f"  source        {meta['source'] or '(none in project root/data -- see accounts below)'}")
+        if meta["combined"]:
+            print(
+                f"  combined      {meta['rows_parsed']} rows -> {meta['rows_kept']} "
+                f"({meta['duplicates_removed']} duplicates merged)"
+            )
+        if len(accounts) > 1 or DEFAULT_ACCOUNT_ID not in {row["id"] for row in accounts}:
+            print(f"  accounts      {len(accounts)}: {', '.join(row['label'] for row in accounts)}")
+        print(f"  transactions  {meta['transactions_total']}")
+        print(f"  cycles        {len(payload['cycles'])} across {payload['portfolio']['tickers']} tickers")
         print(
-            f"  combined      {meta['rows_parsed']} rows -> {meta['rows_kept']} "
-            f"({meta['duplicates_removed']} duplicates merged)"
+            f"  cash check    {'BALANCED' if reconciliation['balanced'] else 'MISMATCH'} "
+            f"(delta {reconciliation['delta']})"
         )
-    if len(accounts) > 1 or DEFAULT_ACCOUNT_ID not in {row["id"] for row in accounts}:
-        print(f"  accounts      {len(accounts)}: {', '.join(row['label'] for row in accounts)}")
-    print(f"  transactions  {meta['transactions_total']}")
-    print(f"  cycles        {len(payload['cycles'])} across {payload['portfolio']['tickers']} tickers")
-    print(
-        f"  cash check    {'BALANCED' if reconciliation['balanced'] else 'MISMATCH'} "
-        f"(delta {reconciliation['delta']})"
-    )
-    print(f"\n  Dashboard on  {url}\n  Ctrl-C to stop.\n")
+        print(f"\n  Dashboard on  {url}\n  Ctrl-C to stop.\n")
 
     if open_browser and (reopen_browser or not _recently_opened(port)):
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
@@ -845,6 +883,12 @@ def main() -> None:
         "Defaults to every export found in . and data/",
     )
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="interface to bind (default 127.0.0.1; use 0.0.0.0 to accept "
+        "connections from other machines or containers)",
+    )
     parser.add_argument("--no-browser", action="store_true", help="do not open a browser window")
     parser.add_argument(
         "--reopen-browser",
@@ -853,7 +897,13 @@ def main() -> None:
         "(by default, restarting within a few hours skips it -- see --no-browser to skip always)",
     )
     args = parser.parse_args()
-    serve(args.csv, args.port, open_browser=not args.no_browser, reopen_browser=args.reopen_browser)
+    serve(
+        args.csv,
+        args.port,
+        open_browser=not args.no_browser,
+        reopen_browser=args.reopen_browser,
+        host=args.host,
+    )
 
 
 if __name__ == "__main__":

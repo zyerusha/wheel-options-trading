@@ -10,7 +10,7 @@ from datetime import date
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.test_engine import tx  # noqa: E402
-from wheel.api import Dashboard, _trade_log_entry  # noqa: E402
+from wheel.api import Dashboard, _cc_strike_floor, _profit_target, _trade_log_entry  # noqa: E402
 from wheel.engine import build_cycles  # noqa: E402
 from wheel.parser import ASSIGNED, BTC, BTO, BUY_STOCK, EXPIRED, OTHER, SELL_STOCK, STC, STO  # noqa: E402
 
@@ -265,6 +265,183 @@ class TestTransactionRows(unittest.TestCase):
         # Flat again -> the closing row has no break-even, matching the summary.
         self.assertIsNone(txns[-1]["running_break_even"])
         self.assertIsNone(wheel["break_even_price"])
+
+    # ---- Profit Target / CC Strike Floor / Preferred CSP Entry split -------
+
+    def _cc_phase_fixture(self, price):
+        """STO put -> assigned 100 sh @ $100 (banked $300) -> STO covered call
+        still open (+$150). cost_basis=100, break_even/break_even_price=95.5,
+        so the profit-target floor is cost_basis (100) regardless of price."""
+        return _trade_log(
+            [
+                tx("2025-01-02", STO, "-MU250117P100", -1, 3.0, 300.0, row_id=1),
+                tx("2025-01-17", ASSIGNED, "-MU250117P100", 1, None, 0.0, row_id=2, as_of="2025-01-17"),
+                tx("2025-01-20", STO, "-MU250221C105", -1, 1.5, 150.0, row_id=3),
+            ],
+            prices={"MU": price},
+        )
+
+    def test_profit_target_stable_under_a_price_rally(self):
+        expected = _profit_target(100.0)  # cost_basis dominates the floor here
+        for price in (92.0, 150.0, 500.0):
+            (wheel,) = self._cc_phase_fixture(price)["wheels"]
+            self.assertAlmostEqual(wheel["profit_target"], expected, places=2)
+
+    def test_profit_target_formula_excludes_current_price(self):
+        for price in (92.0, 150.0, 500.0):
+            (wheel,) = self._cc_phase_fixture(price)["wheels"]
+            floor = max(
+                v
+                for v in (
+                    wheel["cost_basis_per_share"],
+                    wheel["break_even_per_share"],
+                    wheel["break_even_price"],
+                )
+                if v is not None
+            )
+            self.assertAlmostEqual(wheel["profit_target"], _profit_target(floor), places=2)
+
+    def test_cc_strike_floor_available_with_an_open_cc(self):
+        # This wheel holds shares AND already has an open covered call (the
+        # STO call above is never bought back) -- unlike _build_cc_candidates'
+        # target_cc_strike, which would exclude a wheel like this one entirely
+        # (its cc_cycle_ids filter), cc_strike_floor is still populated: it's
+        # useful for planning the *next* roll of an already-open call.
+        (wheel,) = self._cc_phase_fixture(92.0)["wheels"]
+        self.assertIsNotNone(wheel["cc_strike_floor"])
+
+    def test_cc_strike_floor_matches_shared_helper(self):
+        (wheel,) = self._cc_phase_fixture(92.0)["wheels"]
+        expected = _cc_strike_floor(
+            wheel["cost_basis_per_share"],
+            wheel["break_even_per_share"],
+            wheel["break_even_price"],
+            92.0,
+        )
+        self.assertAlmostEqual(wheel["cc_strike_floor"], expected, places=2)
+
+    def test_cc_strike_floor_never_below_profit_target(self):
+        # Regression: cc_strike_floor used to compare cost basis / breakeven /
+        # wheel breakeven against the current price with no cushion, while
+        # profit_target cushioned that same floor by +2% -- so whenever the
+        # price hadn't rallied past cost basis, CC TO EXIT (cc_strike_floor)
+        # came out *below* Profit Target. A call struck there and assigned
+        # would lock in a below-target exit, defeating the point of a floor.
+        # Price sits below cost basis here so the price term never dominates.
+        for price in (85.0, 91.9, 92.0):
+            rows = _trade_log(
+                [tx("2025-07-18", BUY_STOCK, "BFH", 100, 92.0, -100 * 92.0, row_id=1)],
+                prices={"BFH": price},
+            )
+            (wheel,) = rows["wheels"]
+            self.assertGreaterEqual(wheel["cc_strike_floor"], wheel["profit_target"])
+
+    def test_cc_strike_floor_applies_the_same_cushion_as_profit_target(self):
+        # Cost basis $92 cushioned +2% = $93.84, rounded up to $94.00 -- both
+        # figures land on it when the price (here $85) doesn't dominate.
+        rows = _trade_log(
+            [tx("2025-07-18", BUY_STOCK, "BFH", 100, 92.0, -100 * 92.0, row_id=1)],
+            prices={"BFH": 85.0},
+        )
+        (wheel,) = rows["wheels"]
+        self.assertAlmostEqual(wheel["profit_target"], 94.0, places=2)
+        self.assertAlmostEqual(wheel["cc_strike_floor"], 94.0, places=2)
+
+    def test_crox_style_price_rally_case(self):
+        # A plain share buy (no premium banked yet) at ~$95.43, price now
+        # ~$112.48 -- reproduces the real CROX numbers that exposed the
+        # original "stuck target" problem: Profit Target stays low/stable,
+        # CC Strike Floor tracks the current price, and they differ.
+        rows = _trade_log(
+            [tx("2025-07-18", BUY_STOCK, "CROX", 290, 95.43, -290 * 95.43, row_id=1)],
+            prices={"CROX": 112.48},
+        )
+        (wheel,) = rows["wheels"]
+        self.assertAlmostEqual(wheel["profit_target"], 97.5, places=2)
+        self.assertAlmostEqual(wheel["cc_strike_floor"], 112.5, places=2)
+        self.assertNotAlmostEqual(wheel["profit_target"], wheel["cc_strike_floor"], places=2)
+
+    def test_csp_preferred_entry_formula(self):
+        rows = _trade_log(
+            [tx("2025-01-02", STO, "-MU250117P100", -1, 3.0, 300.0, row_id=1)],
+            prices={"MU": 120.0},
+        )
+        (wheel,) = rows["wheels"]
+        self.assertEqual(wheel["wheel_phase"], "csp")
+        self.assertAlmostEqual(wheel["preferred_csp_entry"], 111.5, places=2)  # floor(120*0.93 -> $0.50)
+
+    def test_csp_phase_has_no_cc_strike_floor(self):
+        rows = _trade_log(
+            [tx("2025-01-02", STO, "-MU250117P100", -1, 3.0, 300.0, row_id=1)],
+            prices={"MU": 120.0},
+        )
+        (wheel,) = rows["wheels"]
+        self.assertIsNone(wheel["cc_strike_floor"])
+
+    def test_cc_phase_has_no_preferred_csp_entry(self):
+        (wheel,) = self._cc_phase_fixture(92.0)["wheels"]
+        self.assertEqual(wheel["wheel_phase"], "cc")
+        self.assertIsNone(wheel["preferred_csp_entry"])
+
+    def test_historical_running_profit_target_unchanged(self):
+        # Same fixture/expectations as test_running_break_even_progression_
+        # and_final_row -- confirms the renamed running_profit_target field
+        # still builds off running_break_even the same way, and the pin still
+        # lands exactly on the summary's profit_target.
+        rows = _trade_log(
+            [
+                tx("2025-01-02", STO, "-MU250117P100", -1, 3.0, 300.0, row_id=1),
+                tx("2025-01-17", ASSIGNED, "-MU250117P100", 1, None, 0.0, row_id=2, as_of="2025-01-17"),
+                tx("2025-01-20", STO, "-MU250221C105", -1, 1.5, 150.0, row_id=3),
+            ],
+            prices={"MU": 92.0},
+        )
+        (wheel,) = rows["wheels"]
+        txns = wheel["transactions"]
+        by_type = {r["type"]: r for r in txns}
+        self.assertIsNone(by_type["Sell Put"]["running_profit_target"])
+        self.assertAlmostEqual(
+            by_type["Shares Assigned"]["running_profit_target"], _profit_target(100.0), places=2
+        )
+        last_with_target = [r for r in txns if r["running_profit_target"] is not None][-1]
+        self.assertAlmostEqual(last_with_target["running_profit_target"], wheel["profit_target"], places=2)
+
+    def test_phase_transitions_csp_to_cc_and_back_to_csp(self):
+        """Same underlying's story told at three snapshots: CSP-only, then CC
+        after assignment, then flat again once the call is called away (which
+        closes the cycle) -- wheel_phase switches correctly at each snapshot,
+        never blending a prior phase's fields into the current one."""
+        all_txns = [
+            tx("2025-11-17", STO, "-MU251121P230", -1, 4.00, 399.33, row_id=1),
+            tx("2025-11-21", ASSIGNED, "-MU251121P230", 1, None, 0.0, row_id=2, as_of="2025-11-20"),
+            tx("2025-11-24", STO, "-MU251128C235", -1, 2.00, 199.33, row_id=3),
+            tx("2025-12-01", ASSIGNED, "-MU251128C235", 1, None, 0.0, row_id=4, as_of="2025-11-28"),
+        ]
+
+        # Stage 1: CSP only, no shares yet.
+        (wheel1,) = _trade_log(all_txns[:1], prices={"MU": 240.0})["wheels"]
+        self.assertEqual(wheel1["wheel_phase"], "csp")
+        self.assertAlmostEqual(wheel1["preferred_csp_entry"], 223.0, places=2)  # floor(240*0.93 -> $0.50)
+        self.assertIsNone(wheel1["profit_target"])
+        self.assertIsNone(wheel1["cc_strike_floor"])
+
+        # Stage 2: assigned, holding shares, no CC written yet.
+        (wheel2,) = _trade_log(all_txns[:2], prices={"MU": 232.0})["wheels"]
+        self.assertEqual(wheel2["wheel_phase"], "cc")
+        self.assertIsNotNone(wheel2["profit_target"])
+        self.assertIsNotNone(wheel2["cc_strike_floor"])
+        self.assertIsNone(wheel2["preferred_csp_entry"])
+
+        # Stage 3: CC written and called away -- cycle closes, flat again.
+        # wheel_phase reports "csp" for this now-closed cycle too (is_open
+        # marks it terminal separately) -- not a new behavior, the pre-split
+        # target_price/target_phase worked the same way here.
+        (wheel3,) = _trade_log(all_txns, prices={"MU": 236.0})["wheels"]
+        self.assertFalse(wheel3["is_open"])
+        self.assertEqual(wheel3["wheel_phase"], "csp")
+        self.assertIsNotNone(wheel3["preferred_csp_entry"])
+        self.assertIsNone(wheel3["profit_target"])
+        self.assertIsNone(wheel3["cc_strike_floor"])
 
     def test_pl_bridge_sums_to_mark_to_market(self):
         rows = _trade_log(

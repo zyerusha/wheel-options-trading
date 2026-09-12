@@ -22,8 +22,10 @@ from wheel.marketdata import (  # noqa: E402
     PricePoint,
     _default_cache_path,
     _leverage_kind,
+    _most_recent_session_day,
     _sessions_elapsed,
     get_fundamentals,
+    get_last_prices,
     get_price_series,
     load_cache,
     parse_yahoo_chart,
@@ -34,23 +36,17 @@ from wheel.marketdata import (  # noqa: E402
 )
 
 
-def _yahoo_payload(rows: list[tuple[str, float | None]]) -> str:
+def _yahoo_payload(rows: list[tuple[str, float | None]], meta: dict | None = None) -> str:
     """Build a minimal Yahoo chart JSON body from (date, close) rows."""
     timestamps = [int(datetime(*map(int, d.split("-")), tzinfo=timezone.utc).timestamp()) for d, _ in rows]
     closes = [c for _, c in rows]
-    return json.dumps(
-        {
-            "chart": {
-                "result": [
-                    {
-                        "timestamp": timestamps,
-                        "indicators": {"quote": [{"close": closes}]},
-                    }
-                ],
-                "error": None,
-            }
-        }
-    )
+    result: dict = {
+        "timestamp": timestamps,
+        "indicators": {"quote": [{"close": closes}]},
+    }
+    if meta is not None:
+        result["meta"] = meta
+    return json.dumps({"chart": {"result": [result], "error": None}})
 
 
 YAHOO_SAMPLE = _yahoo_payload(
@@ -88,6 +84,36 @@ class TestParseYahooChart(unittest.TestCase):
         text = json.dumps({"chart": {"result": None, "error": {"code": "Not Found"}}})
         with self.assertRaises(MarketDataError):
             parse_yahoo_chart(text)
+
+    def test_null_last_close_is_filled_from_meta_regular_market_price(self):
+        """Yahoo sometimes hasn't posted the most recent session's close bar
+        yet even though ``meta.regularMarketPrice`` already has it -- that
+        must not be treated the same as a genuine holiday gap.
+        """
+        text = _yahoo_payload(
+            [("2026-01-02", 471.50), ("2026-01-05", 474.25), ("2026-01-06", None)],
+            meta={"regularMarketPrice": 148.18},
+        )
+        points = parse_yahoo_chart(text)
+        self.assertEqual([p.day for p in points], [date(2026, 1, 2), date(2026, 1, 5), date(2026, 1, 6)])
+        self.assertEqual(points[-1].close, 148.18)
+
+    def test_null_last_close_without_meta_price_is_still_skipped(self):
+        text = _yahoo_payload([("2026-01-02", 471.50), ("2026-01-06", None)])
+        points = parse_yahoo_chart(text)
+        self.assertEqual(len(points), 1)
+
+    def test_null_middle_close_is_unaffected_by_meta_fallback(self):
+        """Only a null *last* bar is a candidate for the meta fallback -- a
+        null bar earlier in the range is a real gap (e.g. a holiday) and
+        stays skipped even when meta carries a price.
+        """
+        text = _yahoo_payload(
+            [("2026-01-02", 471.50), ("2026-01-05", None), ("2026-01-06", 475.00)],
+            meta={"regularMarketPrice": 148.18},
+        )
+        points = parse_yahoo_chart(text)
+        self.assertEqual([p.day for p in points], [date(2026, 1, 2), date(2026, 1, 6)])
 
 
 class TestPriceOnOrBefore(unittest.TestCase):
@@ -242,6 +268,34 @@ class TestGetPriceSeries(unittest.TestCase):
             self.assertEqual(points[-1].close, 100.0)
 
 
+class TestMostRecentSessionDay(unittest.TestCase):
+    """These use fixed dates known to fall on a given weekday (2026-08-24 is
+    a Monday) so the assertions don't depend on when the suite runs.
+    """
+
+    def test_midday_wednesday_resolves_to_tuesday(self):
+        now = datetime(2026, 8, 26, 11, 0)  # Wed, before close
+        self.assertEqual(_most_recent_session_day(now), date(2026, 8, 25))
+
+    def test_evening_wednesday_resolves_to_wednesday(self):
+        now = datetime(2026, 8, 26, 17, 0)  # Wed, after close
+        self.assertEqual(_most_recent_session_day(now), date(2026, 8, 26))
+
+    def test_early_monday_rolls_back_over_the_weekend(self):
+        now = datetime(2026, 8, 24, 9, 0)  # Mon, before close
+        self.assertEqual(_most_recent_session_day(now), date(2026, 8, 21))
+
+    def test_evening_monday_stays_on_monday(self):
+        now = datetime(2026, 8, 24, 18, 0)  # Mon, after close
+        self.assertEqual(_most_recent_session_day(now), date(2026, 8, 24))
+
+    def test_saturday_resolves_to_friday_regardless_of_hour(self):
+        before_close = datetime(2026, 8, 29, 9, 0)  # Sat
+        after_close = datetime(2026, 8, 29, 18, 0)  # Sat
+        self.assertEqual(_most_recent_session_day(before_close), date(2026, 8, 28))
+        self.assertEqual(_most_recent_session_day(after_close), date(2026, 8, 28))
+
+
 class TestSessionsElapsed(unittest.TestCase):
     def test_same_day_is_zero(self):
         d = date(2026, 8, 26)
@@ -335,6 +389,55 @@ class TestParseYahooQuotes(unittest.TestCase):
     def test_error_payload_raises(self):
         with self.assertRaises(MarketDataError):
             parse_yahoo_quotes('{"finance": {"error": "nope"}}')
+
+
+class TestGetLastPrices(unittest.TestCase):
+    def test_returns_regular_market_price_per_ticker(self):
+        text = _quote_payload(
+            [{"symbol": "MU", "regularMarketPrice": 210.5}, {"symbol": "IVV", "regularMarketPrice": 580.25}]
+        )
+        prices, warnings = get_last_prices(["mu", "ivv"], fetch=lambda tickers: text)
+        self.assertEqual(prices, {"MU": 210.5, "IVV": 580.25})
+        self.assertEqual(warnings, [])
+
+    def test_ticker_missing_from_the_response_is_none(self):
+        text = _quote_payload([{"symbol": "MU", "regularMarketPrice": 210.5}])
+        prices, warnings = get_last_prices(["mu", "qqq"], fetch=lambda tickers: text)
+        self.assertEqual(prices, {"MU": 210.5, "QQQ": None})
+        self.assertEqual(warnings, [])
+
+    def test_row_present_but_no_regular_market_price_is_none(self):
+        text = _quote_payload([{"symbol": "MU"}])
+        prices, warnings = get_last_prices(["mu"], fetch=lambda tickers: text)
+        self.assertEqual(prices, {"MU": None})
+
+    def test_fetch_failure_marks_every_ticker_none_with_one_warning(self):
+        def failing_fetch(tickers):
+            raise MarketDataError("boom")
+
+        prices, warnings = get_last_prices(["mu", "ivv"], fetch=failing_fetch)
+        self.assertEqual(prices, {"MU": None, "IVV": None})
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("boom", warnings[0])
+
+    def test_empty_ticker_list_never_calls_fetch(self):
+        def unexpected_fetch(tickers):
+            raise AssertionError("should never fetch for an empty ticker list")
+
+        prices, warnings = get_last_prices([], fetch=unexpected_fetch)
+        self.assertEqual(prices, {})
+        self.assertEqual(warnings, [])
+
+    def test_tickers_are_deduplicated_and_uppercased_before_fetching(self):
+        seen = []
+
+        def fetch(tickers):
+            seen.append(tickers)
+            return _quote_payload([{"symbol": "MU", "regularMarketPrice": 210.5}])
+
+        prices, _ = get_last_prices(["mu", "MU", "Mu"], fetch=fetch)
+        self.assertEqual(seen, [["MU"]])
+        self.assertEqual(prices, {"MU": 210.5})
 
 
 class TestLeverageKind(unittest.TestCase):

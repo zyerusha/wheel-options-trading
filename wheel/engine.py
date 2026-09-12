@@ -1023,7 +1023,18 @@ class WheelEngine:
         synthetic: bool,
         cycle: Cycle | None = None,
     ) -> str:
-        """Sell ``shares`` FIFO, recording realized stock P/L where basis is known."""
+        """Sell ``shares`` FIFO, recording realized stock P/L where basis is known.
+
+        Exception: when one open lot's remaining size exactly matches the
+        shares being disposed, that lot is closed outright ahead of the FIFO
+        order instead of splitting the sale across it and an older lot. A
+        covered call covers a whole round lot (100 shares = 1 contract); when
+        a lot of that exact size is sitting open, an assignment reads as
+        "that lot, called away," not a few shares skimmed off two different
+        purchases. Ties (more than one lot the exact size) still resolve
+        oldest-first, keeping this a narrow exception to FIFO rather than a
+        general specific-lot scheme.
+        """
         lots = [lot for lot in self._share_lots.get(underlying, []) if lot.remaining > 1e-9]
         available = sum(lot.remaining for lot in lots)
 
@@ -1042,6 +1053,10 @@ class WheelEngine:
                 "cost basis unknown, stock P/L excluded"
             )
             lots.append(lot)
+
+        exact = next((lot for lot in lots if abs(lot.remaining - shares) < 1e-6), None)
+        if exact is not None:
+            lots = [exact] + [lot for lot in lots if lot is not exact]
 
         remaining = shares
         realized = 0.0

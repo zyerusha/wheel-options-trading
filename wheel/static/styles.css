@@ -23,6 +23,7 @@
   --pos: #2a78d6;
   --neg: #e34948;
   --mid: #f0efec;
+  --target: #7c3aed;
 
   --good: #0ca30c;
   --warning: #fab219;
@@ -56,6 +57,7 @@
     --pos: #3987e5;
     --neg: #e66767;
     --mid: #383835;
+    --target: #a78bfa;
     --success-text: #0ca30c;
     --closed-bg: #4a2b25;
     --noactivity-bg: #4a4325;
@@ -81,6 +83,7 @@
   --pos: #3987e5;
   --neg: #e66767;
   --mid: #383835;
+  --target: #a78bfa;
   --success-text: #0ca30c;
   --closed-bg: #4a2b25;
   --noactivity-bg: #4a4325;
@@ -335,12 +338,26 @@ button.primary {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  max-width: 620px;
 }
 
+/* Status has only a few options (open/closed/expired), so stack them in a
+   single column instead of wrapping a row -- unlike Ticker, which can have
+   dozens and needs the row to wrap. */
+#status-chips {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+#status-chips .chip {
+  text-align: center;
+}
+
+/* No width/height cap: the Filters card's Ticker field already grows to
+   fill the card's own width (flex: 1 1 320px, see index.html), so letting
+   this stretch the rest of the way fits far more chips per row than the old
+   620px cap did -- usually enough that the old max-height: 74px scrollbar
+   was never needed in the first place. */
 #ticker-chips {
-  max-height: 74px;
-  overflow-y: auto;
   padding: 2px;
 }
 
@@ -819,13 +836,31 @@ th {
 }
 
 /* Wide data tables: let multi-word headers wrap to two/three lines instead of
-   forcing a horizontal scrollbar. Planner headers all read left-aligned. */
+   forcing a horizontal scrollbar. Planner headers all read left-aligned.
+   word-break/overflow-wrap are pinned to their never-split-a-word defaults --
+   a header may overflow its column before a word is ever broken mid-word. */
 #open-positions-table th,
 #cc-candidates-table th,
 #csp-candidates-table th {
   white-space: normal;
   line-height: 1.15;
   max-width: 10ch;
+  vertical-align: bottom;
+  text-align: left;
+  word-break: keep-all;
+  overflow-wrap: normal;
+}
+
+/* Same treatment on the Trade Log ledger, whose long headers (Initial CSP
+   collateral, Cumulative cash flow, ...) were the widest offender -- a wider
+   cap than the Planner tables (there's room) so every word (Contracts,
+   Commissions) still wraps only at a space, never mid-word. */
+#tradelog-table th {
+  white-space: normal;
+  line-height: 1.15;
+  max-width: 14ch;
+  word-break: keep-all;
+  overflow-wrap: normal;
   vertical-align: bottom;
   text-align: left;
 }
@@ -951,24 +986,28 @@ th.sortable:hover {
   outline: none;
 }
 
-/* The one actionable figure in the covered-call / cash-secured-put candidate
-   tables -- same violet, same weight in both. */
-#cc-candidates-table td.cc-target,
-#csp-candidates-table td.cc-target {
+/* Symbol cell's ticker, linking out to its TradingView chart in a new tab.
+   Blends into the plain ticker-cell text until hovered/focused, unlike
+   .wheel-link's always-underlined in-app navigation. */
+.ticker-link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.ticker-link:hover,
+.ticker-link:focus-visible {
+  color: var(--series-1);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  outline: none;
+}
+
+/* The one actionable/key figure, wherever it appears -- candidate tables,
+   the Open Positions target column, the Trade Log's target-price summary
+   cell, and the wheel-targets banner. Same violet everywhere via --target. */
+.cc-target {
   font-weight: 700;
-  color: #7c3aed; /* violet */
-}
-
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme='light']) #cc-candidates-table td.cc-target,
-  :root:not([data-theme='light']) #csp-candidates-table td.cc-target {
-    color: #a78bfa; /* lighter violet for dark backgrounds */
-  }
-}
-
-:root[data-theme='dark'] #cc-candidates-table td.cc-target,
-:root[data-theme='dark'] #csp-candidates-table td.cc-target {
-  color: #a78bfa;
+  color: var(--target);
 }
 
 /* Sub-100-share rows carry no CC target -- the "—" shouldn't read as an
@@ -1005,6 +1044,21 @@ th.sortable:hover {
 .badge.op-type-LC {
   color: var(--series-4);
   border-color: var(--series-4);
+}
+
+/* A Type badge rendered as an `<a>` -- this row's specific contract, linking
+   out to its own TradingView chart -- only when the row carries a full
+   strike/expiration/right (see tradingViewOptionSymbol). A plain `<span>`
+   badge (no contract to link to) is untouched by this rule. */
+a.badge.op-type {
+  text-decoration: none;
+  cursor: pointer;
+}
+
+a.badge.op-type:hover,
+a.badge.op-type:focus-visible {
+  background: var(--ghost);
+  outline: none;
 }
 
 /* ---------------- expandable cycle rows ---------------- */
@@ -1141,6 +1195,46 @@ tr.detail > td {
   padding-left: 18px;
 }
 
+/* Collapsible follow-up section inside a notice (multi-account setup) --
+   below the primary "export a CSV, drop it here" steps above it. */
+.notice details {
+  margin-top: 8px;
+}
+
+.notice summary {
+  cursor: pointer;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.notice details p {
+  margin: 6px 0;
+}
+
+.notice code {
+  background: var(--ghost);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+}
+
+.notice pre {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  background: var(--ghost);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  overflow-x: auto;
+}
+
+.notice pre code {
+  background: none;
+  padding: 0;
+}
+
 .empty {
   padding: 40px 12px;
   text-align: center;
@@ -1269,6 +1363,24 @@ tr.detail > td {
 .loading {
   opacity: 0.45;
   transition: opacity 0.15s;
+}
+
+/* Background live-price refresh: a small pulsing dot in the header instead
+   of dimming the whole page -- the periodic poll shouldn't read as "the
+   dashboard just froze," only a user-initiated load (account/filter change)
+   dims via .loading above. */
+.live-indicator {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--pos);
+  animation: live-indicator-pulse 1s ease-in-out infinite;
+}
+
+@keyframes live-indicator-pulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
 }
 
 /* ---------------- responsive layout ---------------- */
@@ -1527,24 +1639,20 @@ tr.detail > td {
 }
 
 /* The value at the end of the line -- purple, the same key-figure colour as the
-   "Target price" columns. Shared: the Break-even chart's current break-even and
-   the PPD chart's current "$x/d". */
+   "Target price" columns (--target). Shared: the Break-even chart's current
+   break-even/target and the PPD chart's current "$x/d". */
 #chart-tradelog-breakeven .chart-endpoint-value,
 #chart-tradelog-ppd .chart-endpoint-value {
-  fill: #7c3aed;
+  fill: var(--target);
   font-weight: 700;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme='light']) #chart-tradelog-breakeven .chart-endpoint-value,
-  :root:not([data-theme='light']) #chart-tradelog-ppd .chart-endpoint-value {
-    fill: #a78bfa;
-  }
-}
-
-:root[data-theme='dark'] #chart-tradelog-breakeven .chart-endpoint-value,
-:root[data-theme='dark'] #chart-tradelog-ppd .chart-endpoint-value {
-  fill: #a78bfa;
+/* The Break-even line's own endpoint value: colored to match its line
+   (blue, --series-1) rather than the shared violet "key figure" treatment
+   above -- the chart now also has a violet Target line ending nearby, so
+   the two endpoints need to read as two different series, not one. */
+#chart-tradelog-breakeven .chart-endpoint-value.be-value {
+  fill: var(--series-1);
 }
 
 /* Under-water / above-water badge on the Break-even chart: a red warning when

@@ -42,9 +42,10 @@ from typing import Sequence
 
 from wheel.fileio import find_line, peek_text
 from wheel.parser import _num, parse_occ_symbol
+from wheel.paths import DISCOVERY_DIRS
 
 POSITION_HEADER_KEY = "account number"
-POSITION_DIRS = (".", "data")
+POSITION_DIRS = DISCOVERY_DIRS
 
 CASH = "CASH"
 EQUITY = "EQUITY"

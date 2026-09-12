@@ -27,9 +27,10 @@ from typing import Sequence
 
 from wheel.fileio import peek_text
 from wheel.parser import _num, _parse_date, parse_occ_symbol
+from wheel.paths import DISCOVERY_DIRS
 
 CLOSED_LOTS_HEADER_KEY = "symbol(cusip)"
-CLOSED_LOTS_DIRS = (".", "data")
+CLOSED_LOTS_DIRS = DISCOVERY_DIRS
 
 _FILENAME_DATE_RE = re.compile(r"([A-Za-z]{3}-\d{2}-\d{4})")
 _DESC_TICKER_RE = re.compile(r"\(([A-Z][A-Z0-9.\-]{0,9})\)")

@@ -14,6 +14,12 @@
           <div class="subtitle" id="subtitle">Loading…</div>
         </div>
         <div class="top-actions">
+          <span
+            id="live-indicator"
+            class="live-indicator"
+            title="Refreshing live prices…"
+            hidden
+          ></span>
           <button
             id="present-toggle"
             title="Presentation mode: hide controls, enlarge the headline figures"
@@ -69,7 +75,107 @@
         ></div>
       </section>
 
+      <!--
+        Date range applies to the one shared data fetch every tab reads from
+        (load() refetches on every tab switch too), so the control lives here
+        -- a sibling of the tab panels, not inside any one of them -- and
+        stays reachable no matter which tab is active. Ticker/Status/Reset
+        live in their own card on the Dashboard tab (below) -- Reset there
+        deliberately leaves this date range alone; see resetSelectionState().
+      -->
+      <section class="filters" aria-label="Filters: date range">
+        <div class="field">
+          <label for="preset">Date range</label>
+          <select id="preset">
+            <option value="all">All history</option>
+            <option value="10">Last 10 days</option>
+            <option value="30">Last 30 days</option>
+            <option value="60">Last 60 days</option>
+            <option value="90">Last 90 days</option>
+            <option value="ytd">Year to date</option>
+            <option value="1y">1 year</option>
+            <option value="3y">3 years</option>
+            <option value="5y">5 years</option>
+            <option value="custom">Custom…</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="start">From</label>
+          <input type="date" id="start" />
+        </div>
+
+        <div class="field">
+          <label for="end">To</label>
+          <input type="date" id="end" />
+        </div>
+      </section>
+
       <div id="tab-dashboard">
+        <div class="notice" id="no-data-banner" role="status" hidden>
+          <strong>No data yet</strong>
+          <ul>
+            <li>
+              Export your Fidelity transaction history:
+              <strong>Accounts &amp; Trade → Portfolio → Activity &amp; Orders → Download</strong>
+            </li>
+            <li>
+              Then either drop the CSV into the <code>data/</code> folder and
+              refresh this page, or use <strong>Add Fidelity CSVs</strong>
+              below and press <strong>Load</strong>
+            </li>
+            <li>
+              A Fidelity <strong>Portfolio Positions</strong> export
+              (Portfolio → Positions → Download) also unlocks the Net Worth
+              &amp; Benchmark section once transaction history is loaded
+            </li>
+          </ul>
+
+          <details open>
+            <summary>Tracking more than one account?</summary>
+            <p>
+              Give each account its own subfolder under <code>data/</code>
+              and drop that account's own exports in it. Files left directly
+              in <code>data/</code> (the layout above) count as one more,
+              implicit account. An account switcher appears automatically
+              once more than one account is found.
+            </p>
+            <pre>data/
+  ira/
+    History_for_Account_2025.csv
+    Portfolio_Positions_Aug-03-2026.csv
+  taxable/
+    History_for_Account_2025.csv
+    Portfolio_Positions_Aug-03-2026.csv</pre>
+            <p>
+              Each account shows by its own Fidelity account name once a
+              Positions export is on file for it, or by its folder name
+              until then.
+            </p>
+            <p>
+              Optional <code>data/accounts.json</code> lets you set names,
+              defaults, and a couple of other things by hand:
+            </p>
+            <pre>{
+  "default_account": "ira",
+  "default_range": "ytd",
+  "folders": { "ira": "Z12345678", "taxable": "Z98765432" },
+  "ignore": ["Fidelity Go account"],
+  "opening_balances": {
+    "ira": { "date": "2024-01-01", "balance": 613000 },
+    "taxable": { "date": "2026-01-01", "balance": 247000 }
+  }
+}</pre>
+            <ul>
+              <li><code>default_account</code> — account tab shown by default, instead of Combined</li>
+              <li><code>default_range</code> — date range shown by default, instead of All (e.g. <code>ytd</code>, <code>1y</code>, <code>year:2025</code>)</li>
+              <li><code>folders</code> — maps a <code>data/</code> folder name to its account number</li>
+              <li><code>ignore</code> — hides an account, by number or name</li>
+              <li><code>opening_balances</code> — a starting balance and date for the Net Worth S&amp;P 500 benchmark, if your oldest Positions export doesn't go back far enough</li>
+            </ul>
+          </details>
+        </div>
+
         <section class="source" aria-label="Data source">
           <div class="field source-list">
             <label id="dataset-label">
@@ -104,60 +210,59 @@
           ></div>
         </section>
 
-        <section class="filters" aria-label="Filters">
-          <div class="field">
-            <label for="preset">Date range</label>
-            <select id="preset">
-              <option value="all">All history</option>
-              <option value="10">Last 10 days</option>
-              <option value="30">Last 30 days</option>
-              <option value="60">Last 60 days</option>
-              <option value="90">Last 90 days</option>
-              <option value="ytd">Year to date</option>
-              <option value="1y">1 year</option>
-              <option value="3y">3 years</option>
-              <option value="5y">5 years</option>
-              <option value="custom">Custom…</option>
-            </select>
-          </div>
+        <section
+          class="card"
+          id="ticker-status-card"
+          style="margin-bottom: var(--gap)"
+        >
+          <header>
+            <h2>Filters</h2>
+          </header>
 
-          <div class="field">
-            <label for="start">From</label>
-            <input type="date" id="start" />
-          </div>
+          <div style="display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start">
+            <div class="field" style="flex: 1 1 320px">
+              <label id="ticker-label">Ticker</label>
+              <div
+                class="chip-row"
+                id="ticker-chips"
+                role="group"
+                aria-labelledby="ticker-label"
+              ></div>
+            </div>
 
-          <div class="field">
-            <label for="end">To</label>
-            <input type="date" id="end" />
-          </div>
+            <div class="field">
+              <label id="status-label">Status</label>
+              <div
+                class="chip-row"
+                id="status-chips"
+                role="group"
+                aria-labelledby="status-label"
+              ></div>
+            </div>
 
-          <div class="field">
-            <label id="status-label">Status</label>
-            <div
-              class="chip-row"
-              id="status-chips"
-              role="group"
-              aria-labelledby="status-label"
-            ></div>
-          </div>
-
-          <div class="field" style="flex: 1 1 320px">
-            <label id="ticker-label">Ticker</label>
-            <div
-              class="chip-row"
-              id="ticker-chips"
-              role="group"
-              aria-labelledby="ticker-label"
-            ></div>
-          </div>
-
-          <div class="field">
-            <label>&nbsp;</label>
-            <button id="reset">Reset</button>
+            <div class="field">
+              <label>&nbsp;</label>
+              <button id="reset">Reset</button>
+            </div>
           </div>
         </section>
 
         <div id="notices"></div>
+
+        <section
+          class="card"
+          id="wheel-targets-card"
+          style="margin-bottom: var(--gap)"
+          hidden
+        >
+          <header>
+            <h2>Wheel price targets</h2>
+          </header>
+
+           <div style="overflow-x: auto">
+            <table id="wheel-targets-table"></table>
+          </div>
+        </section>
 
         <section id="hedge-banner" aria-label="Open hedges" hidden></section>
 
@@ -598,6 +703,17 @@
           what expires soon, and what the cash can do next.
         </p>
 
+        <details class="card" style="margin-bottom: var(--gap)">
+          <summary style="cursor: pointer; font-size: 14px; font-weight: 640">
+            How to manage the wheel
+          </summary>
+          <img
+            src="/wheel-strategy.png"
+            alt="Wheel strategy flowchart. Step 1, sell puts: find a stock meeting the selection criteria, sell a put at 30%+ annualized ROI with expiration timed to the day of the week (main trading window 9AM-12PM), immediately set a buy-to-close good-till-cancelled at 50% of the premium, then check the account daily -- if the buy-to-close fills, repeat; if assigned instead, move to step 2. Step 2, sell calls: sell a call timed the same way, at the assigned put's strike if ROI is 30-150% annualized, or above it if ROI exceeds 150%; if ROI is too low, hold for recovery or sell the stock as a last resort, checking daily until conditions justify selling a call. Once a call is sold, immediately set a buy-to-close at 80% of the premium for the first 24 hours and 90% after; if the stock then gets called away, go back to step 1, otherwise keep checking daily."
+            style="max-width: 100%; margin-top: 12px; border-radius: 8px; border: 1px solid var(--border)"
+          />
+        </details>
+
         <div id="earnings-in-view" class="planner-earnings" hidden></div>
 
         <section id="assignment-risk" aria-label="Assignment risk" hidden></section>
@@ -614,41 +730,18 @@
 
           <ul class="hint-list">
             <li>
-              Open short calls (CC) and puts (CSP), plus long hedges (LP/LC)
+              A full account snapshot: open short calls (CC) and puts (CSP),
+              long hedges (LP/LC), plus one row for any position with no
+              open contract right now -- shares held with nothing written
+              against them (assigned shares, a plain buy-and-hold lot) or a
+              wheel between phases awaiting its next entry. Strike,
+              Expiration, ITM/OTM %, Qty, Net Premium and Annualized Yield
+              read as "-" there since they need an actual contract. Last
+              Price % and Breakeven still show (a position's own daily move
+              and raw cost basis need no contract either)
             </li>
             <li>Amber rows are longs; premium paid, not received</li>
-            <li>Click a heading to sort</li>
-            <li>
-              <strong>⚠</strong> next to Expiration: under 8 days to expiry
-            </li>
-            <li>
-              <strong>Wheel</strong>: click the id to open that wheel's Trade
-              Log
-            </li>
-            <li><strong>Breakeven</strong>: this contract alone</li>
-            <li>
-              <strong>Wheel Breakeven</strong>: whole cycle: cost of shares
-              still held minus all cycle income
-            </li>
-            <li>
-              <strong>ITM/OTM %</strong>: strike vs. last close; green is the
-              cushion (short) or intrinsic value (long)
-            </li>
-            <li>
-              <strong>Earnings</strong>: next report date; within 14 days the
-              cell turns amber with a ⚠ (override in
-              <code>data/earnings.json</code>)
-            </li>
-            <li>
-              <strong>Annualized Yield</strong>: net premium ÷ collateral, per
-              year
-            </li>
-            <li>
-              <strong>Min. Profit Captured (est.)</strong>: intrinsic-only
-              estimate — intrinsic is the smallest a buy-to-close could cost, so
-              this can overstate; time value still on the option makes the real
-              cost higher
-            </li>
+            <li>Click a heading to sort, or hover one for its exact math</li>
           </ul>
 
           <div style="overflow-x: auto">
@@ -705,38 +798,28 @@
 
           <ul class="hint-list">
             <li>
-              Positions holding shares with no covered call written against
-              them; 100+ share lots lead the table, smaller lots are listed
-              after for visibility with Target and Qty blank
+              Shares held with no covered call written against them; 100+
+              share lots lead the table, smaller lots follow with Target and
+              Qty blank
             </li>
             <li>
-              <strong>Target price for CC</strong>: the greatest of the share
-              cost basis, the position breakeven, the wheel breakeven, and the
-              last close — never below any of them — rounded up to the next
-              $0.50
-            </li>
-            <li>
-              Write the call at or above it: an assignment then sells the stock
-              for at least what it cost, keeps every premium already collected,
-              and is never below the current market
-            </li>
-            <li>
-              It's a floor, not a pick — it doesn't say where the premium is
-              richest
+              <strong>Target price for CC</strong>: floor strike, rounded up
+              to the next $0.50 — the greatest of cost basis, breakeven,
+              wheel breakeven, and last close, so an assignment never loses
+              money. A floor, not a pick for richest premium
             </li>
             <li>
               <strong>Current Wheel</strong>: click the id to jump to that
               wheel's Trade Log
             </li>
             <li>
-              <strong>Earnings</strong>: next report date, fetched from Yahoo;
-              within 14 days the date turns amber with a ⚠ — think twice before
-              writing a call into an earnings print. Override in
-              <code>data/earnings.json</code>
+              <strong>Earnings</strong>: next report date (Yahoo); amber ⚠
+              within 14 days — think twice before writing into an earnings
+              print. Override in <code>data/earnings.json</code>
             </li>
             <li>
-              <strong>Sector</strong>: for diversification; best-effort static
-              map, blank if unknown
+              <strong>Sector</strong>: for diversification; best-effort,
+              blank if unknown
             </li>
           </ul>
 
@@ -944,11 +1027,13 @@
           </div>
 
           <div id="tradelog-breakeven" class="tradelog-ppd" hidden>
-            <div class="ti-head">Break-even over time</div>
+            <div class="ti-head">Wheel profit over time</div>
 
             <div class="chart-scroll">
               <svg id="chart-tradelog-breakeven" role="img"></svg>
             </div>
+
+            <div class="legend" id="legend-tradelog-breakeven"></div>
           </div>
 
           <div id="tradelog-ppd" class="tradelog-ppd" hidden>

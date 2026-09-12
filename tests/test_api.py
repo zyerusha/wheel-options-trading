@@ -79,12 +79,17 @@ class TestCurrentPrices(unittest.TestCase):
                     return [], [f"could not fetch {ticker} prices"]
                 return [PricePoint(day=date(2026, 1, 1), close={"MU": 210.5, "IVV": 580.0}[ticker])], []
 
+            # No live quote for any ticker -> falls back to the daily-close
+            # series above, so the expected figures are unchanged.
             original = api_module.marketdata.get_price_series
+            original_last = api_module.marketdata.get_last_prices
             api_module.marketdata.get_price_series = fake_get_price_series
+            api_module.marketdata.get_last_prices = lambda tickers, **kwargs: ({}, [])
             try:
                 prices = dashboard._current_prices()
             finally:
                 api_module.marketdata.get_price_series = original
+                api_module.marketdata.get_last_prices = original_last
 
             self.assertEqual(prices, {"MU": 210.5, "QQQ": None, "IVV": 580.0})
             self.assertEqual(len(dashboard._price_warnings), 1)
@@ -100,14 +105,17 @@ class TestCurrentPrices(unittest.TestCase):
                 return [PricePoint(day=date(2026, 1, 1), close=210.5)], []
 
             original = api_module.marketdata.get_price_series
+            original_last = api_module.marketdata.get_last_prices
             api_module.marketdata.get_price_series = fake_get_price_series
+            api_module.marketdata.get_last_prices = lambda tickers, **kwargs: ({}, [])
             try:
                 dashboard._current_prices()
                 dashboard._current_prices()
             finally:
                 api_module.marketdata.get_price_series = original
+                api_module.marketdata.get_last_prices = original_last
 
-            self.assertEqual(calls, ["MU"])  # fetched once, not once per call
+            self.assertEqual(calls, ["MU"])  # fetched once, not once per call (within the TTL)
 
     def test_tickers_are_fetched_concurrently_not_one_at_a_time(self):
         """Regression guard for the sequential-fetch slowdown: N tickers that
@@ -130,13 +138,16 @@ class TestCurrentPrices(unittest.TestCase):
                 return [PricePoint(day=date(2026, 1, 1), close=100.0)], []
 
             original = api_module.marketdata.get_price_series
+            original_last = api_module.marketdata.get_last_prices
             api_module.marketdata.get_price_series = slow_get_price_series
+            api_module.marketdata.get_last_prices = lambda tickers, **kwargs: ({}, [])
             try:
                 start = time.time()
                 prices = dashboard._current_prices()
                 elapsed = time.time() - start
             finally:
                 api_module.marketdata.get_price_series = original
+                api_module.marketdata.get_last_prices = original_last
 
             self.assertEqual(len(prices), len(tickers))
             # Sequential would take ~= len(tickers) * delay (1.2s); parallel
@@ -167,6 +178,145 @@ class TestCurrentPrices(unittest.TestCase):
             finally:
                 api_module.marketdata.get_price_series = original
             self.assertEqual(prices, {})
+
+    def test_live_quote_wins_over_the_daily_close_when_both_are_available(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dashboard = _dashboard_with_held_shares(tmp, ["MU"])
+
+            original = api_module.marketdata.get_price_series
+            original_last = api_module.marketdata.get_last_prices
+            api_module.marketdata.get_price_series = (
+                lambda ticker, **kw: ([PricePoint(day=date(2026, 1, 1), close=210.5)], [])
+            )
+            api_module.marketdata.get_last_prices = lambda tickers, **kw: ({"MU": 214.02}, [])
+            try:
+                prices = dashboard._current_prices()
+            finally:
+                api_module.marketdata.get_price_series = original
+                api_module.marketdata.get_last_prices = original_last
+
+            # The live quote is the mark; the daily close becomes "prev" (the
+            # "Last Close %" / day-change comparison point), not the mark itself.
+            self.assertEqual(prices, {"MU": 214.02})
+            self.assertEqual(dashboard._prev_closes, {"MU": 210.5})
+
+    def test_missing_live_quote_falls_back_to_the_daily_close(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dashboard = _dashboard_with_held_shares(tmp, ["MU"])
+
+            original = api_module.marketdata.get_price_series
+            original_last = api_module.marketdata.get_last_prices
+            api_module.marketdata.get_price_series = (
+                lambda ticker, **kw: ([PricePoint(day=date(2026, 1, 1), close=210.5)], [])
+            )
+            # e.g. the quote endpoint's crumb auth failed -- no live price at all.
+            api_module.marketdata.get_last_prices = lambda tickers, **kw: ({}, ["auth failed"])
+            try:
+                prices = dashboard._current_prices()
+            finally:
+                api_module.marketdata.get_price_series = original
+                api_module.marketdata.get_last_prices = original_last
+
+            self.assertEqual(prices, {"MU": 210.5})
+            self.assertIn("auth failed", dashboard._price_warnings)
+
+    def test_cache_expires_after_the_live_price_ttl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dashboard = _dashboard_with_held_shares(tmp, ["MU"])
+            calls = []
+
+            def fake_get_last_prices(tickers, **kw):
+                calls.append(1)
+                return {"MU": 100.0 + len(calls)}, []
+
+            original = api_module.marketdata.get_price_series
+            original_last = api_module.marketdata.get_last_prices
+            api_module.marketdata.get_price_series = (
+                lambda ticker, **kw: ([PricePoint(day=date(2026, 1, 1), close=99.0)], [])
+            )
+            api_module.marketdata.get_last_prices = fake_get_last_prices
+            try:
+                first = dashboard._current_prices()
+                dashboard._price_cache_at -= api_module._LIVE_PRICE_TTL_SECONDS + 1
+                second = dashboard._current_prices()
+            finally:
+                api_module.marketdata.get_price_series = original
+                api_module.marketdata.get_last_prices = original_last
+
+            self.assertEqual(len(calls), 2)  # re-fetched once the TTL elapsed
+            self.assertNotEqual(first, second)
+
+
+class TestBuildRefreshesOnLivePrice(unittest.TestCase):
+    """Regression coverage for a bug where _current_prices() refreshed on its
+    TTL exactly as designed, but every price-derived table build() actually
+    returns (open_positions, cc_candidates, trade_log, ...) stayed frozen at
+    whatever they were built from on the Dashboard's very first build() call
+    -- each was guarded by a plain ``is None`` memo with no path back to
+    ``None`` once set, so a live price ticking underneath was invisible on
+    screen no matter how often the frontend polled.
+    """
+
+    def test_cc_candidate_last_close_updates_once_the_live_price_ttl_elapses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dashboard = _dashboard_with_held_shares(tmp, ["MU"])
+
+            prices = [100.0]
+
+            def fake_get_last_prices(tickers, **kw):
+                return {"MU": prices[0]}, []
+
+            # A real clock backdated by hand (dashboard._price_cache_at -= N)
+            # can coincidentally land both builds' *new* _price_cache_at on
+            # the same time.monotonic() tick when the test runs fast enough
+            # -- real usage never hits this (a refetch only ever happens
+            # after TTL seconds of real time), but the test needs a clock it
+            # fully controls to not depend on that timing.
+            clock = [1_000_000.0]
+            original = api_module.marketdata.get_price_series
+            original_last = api_module.marketdata.get_last_prices
+            original_monotonic = api_module.time.monotonic
+            api_module.marketdata.get_price_series = (
+                lambda ticker, **kw: ([PricePoint(day=date(2026, 1, 1), close=90.0)], [])
+            )
+            api_module.marketdata.get_last_prices = fake_get_last_prices
+            api_module.time.monotonic = lambda: clock[0]
+            try:
+                first = dashboard.build()
+                first_row = next(r for r in first["cc_candidates"] if r["underlying"] == "MU")
+                self.assertEqual(first_row["last_close"], 100.0)
+
+                prices[0] = 105.0
+                clock[0] += api_module._LIVE_PRICE_TTL_SECONDS + 1
+                second = dashboard.build()
+                second_row = next(r for r in second["cc_candidates"] if r["underlying"] == "MU")
+                self.assertEqual(second_row["last_close"], 105.0)
+            finally:
+                api_module.marketdata.get_price_series = original
+                api_module.marketdata.get_last_prices = original_last
+                api_module.time.monotonic = original_monotonic
+
+    def test_a_second_build_within_the_ttl_does_not_recompute(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dashboard = _dashboard_with_held_shares(tmp, ["MU"])
+
+            original = api_module.marketdata.get_price_series
+            original_last = api_module.marketdata.get_last_prices
+            api_module.marketdata.get_price_series = (
+                lambda ticker, **kw: ([PricePoint(day=date(2026, 1, 1), close=90.0)], [])
+            )
+            api_module.marketdata.get_last_prices = lambda tickers, **kw: ({"MU": 100.0}, [])
+            try:
+                dashboard.build()
+                first_positions = dashboard._open_positions
+                dashboard.build()
+                # Same object, not just an equal one -- proves the second
+                # build() short-circuited on the unchanged price generation
+                # rather than rebuilding from scratch.
+                self.assertIs(dashboard._open_positions, first_positions)
+            finally:
+                api_module.marketdata.get_price_series = original
+                api_module.marketdata.get_last_prices = original_last
 
 
 class TestCapitalThroughExtendsToPositionsSnapshot(unittest.TestCase):
@@ -331,6 +481,52 @@ class TestCapitalPointSharesSplit(unittest.TestCase):
             self.assertAlmostEqual(last["idle_stock"] + last["call_stock"], last["stock"], places=2)
             self.assertAlmostEqual(last["idle_stock"], 0.0, places=2)
             self.assertAlmostEqual(last["call_stock"], 23000.0, places=2)
+
+
+class TestOpenPositionsIsAFullSnapshot(unittest.TestCase):
+    """`Dashboard.build()`'s `open_positions` must show every currently-held
+    position, not just legged wheels -- a plain buy-and-hold lot (never
+    wheeled, no option ever written on it) gets a synthetic no-contract row
+    too, same as an assigned-but-uncovered wheel does. Regression coverage
+    for the `build()` merge step that used to gate the synthetic row on
+    `is_wheel` + a computed `wheel_phase`, which a buy-and-hold lot never has.
+    """
+
+    def test_buy_and_hold_lot_gets_a_no_contract_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "History.csv")
+            _write_history_csv(
+                path,
+                [
+                    '09/01/2025,"YOU BOUGHT (PAGS) PAGSEGURO DIGITAL LTD",PAGS,'
+                    '"PAGSEGURO DIGITAL LTD",Cash,100,10.00,0,0,,-1000.00,9000.00,09/01/2025',
+                ],
+            )
+            data = Dashboard(path, position_paths=[]).build()
+            rows = [r for r in data["open_positions"] if r["underlying"] == "PAGS"]
+
+            self.assertEqual(len(rows), 1)
+            self.assertIsNone(rows[0]["type"])
+            self.assertAlmostEqual(rows[0]["shares_held"], 100.0, places=4)
+            self.assertAlmostEqual(rows[0]["breakeven"], 10.0, places=2)
+
+    def test_wheeled_position_still_gets_a_row_when_legless(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "History.csv")
+            _write_history_csv(
+                path,
+                [
+                    '11/17/2025,"YOU SOLD OPENING TRANSACTION PUT (MU) ...",-MU251121P230,'
+                    '"PUT ...",Cash,-1,4.00,0,0,,399.33,10000.00,11/17/2025',
+                    '11/21/2025,"ASSIGNED PUT as of Nov-20-2025",-MU251121P230,"PUT ...",Cash,1,,0,0,,0.00,9700.00,11/21/2025',
+                ],
+            )
+            data = Dashboard(path, position_paths=[]).build()
+            rows = [r for r in data["open_positions"] if r["underlying"] == "MU"]
+
+            self.assertEqual(len(rows), 1)
+            self.assertIsNone(rows[0]["type"])
+            self.assertAlmostEqual(rows[0]["shares_held"], 100.0, places=4)
 
 
 if __name__ == "__main__":

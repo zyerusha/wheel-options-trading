@@ -39,6 +39,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Sequence
 
 from wheel.parser import _num, _parse_date
+from wheel.paths import DATA_DIR as _DATA_DIR
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _SPY_LEGACY_CACHE_NAME = "spy_daily_closes.csv"
@@ -79,8 +80,8 @@ def yahoo_chart_url(ticker: str, *, period2: int | None = None) -> str:
 
 def _default_cache_path(ticker: str) -> str:
     if ticker.upper() == "SPY":
-        return os.path.join(PROJECT_ROOT, "data", _SPY_LEGACY_CACHE_NAME)
-    return os.path.join(PROJECT_ROOT, "data", "prices", f"{ticker.upper()}.csv")
+        return os.path.join(_DATA_DIR, _SPY_LEGACY_CACHE_NAME)
+    return os.path.join(_DATA_DIR, "prices", f"{ticker.upper()}.csv")
 
 
 # --------------------------------------------------------------------------
@@ -114,11 +115,19 @@ def parse_yahoo_chart(text: str) -> list[PricePoint]:
     UTC depending on DST, i.e. still the same calendar date -- so resolving
     it via ``date.fromtimestamp(..., tz=timezone.utc)`` never shifts the
     trading day.
+
+    Yahoo sometimes leaves the most recent session's close bar ``null`` for a
+    while after that session has actually ended (rather than only for a real
+    holiday), even though ``meta.regularMarketPrice`` already carries that
+    session's final print. Dropping the bar in that case silently regresses
+    "today's close" to the prior session, so when only the *last* bar is null,
+    ``regularMarketPrice`` fills it in instead of skipping it.
     """
     try:
         result = json.loads(text)["chart"]["result"][0]
         timestamps = result["timestamp"]
         closes = result["indicators"]["quote"][0]["close"]
+        meta = result.get("meta") or {}
     except (json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
         raise MarketDataError(f"unrecognized Yahoo Finance chart response: {error}") from error
 
@@ -127,6 +136,14 @@ def parse_yahoo_chart(text: str) -> list[PricePoint]:
         for ts, close in zip(timestamps, closes)
         if close is not None
     ]
+
+    if timestamps and closes[-1] is None:
+        last_price = meta.get("regularMarketPrice")
+        if last_price is not None:
+            last_day = datetime.fromtimestamp(timestamps[-1], tz=timezone.utc).date()
+            if not points or points[-1].day < last_day:
+                points.append(PricePoint(day=last_day, close=float(last_price)))
+
     points.sort(key=lambda point: point.day)
     return points
 
@@ -166,13 +183,16 @@ def save_cache(points: Sequence[PricePoint], cache_path: str) -> None:
 # --------------------------------------------------------------------------
 
 
-# Per-process, per-day memo of resolved series, keyed by cache-file path. A
+# Per-process, per-session memo of resolved series, keyed by cache-file path. A
 # long-lived server builds the dashboard once per account (six-plus times for
 # the Combined view) and every build asks for the same tickers; without this
 # each build re-reads every cache file and, on a stale day, re-fetches every
-# ticker once per account. The memo is only trusted for the current calendar
-# date, so tomorrow's first build still refreshes. Bypassed entirely when a
-# caller injects ``fetch``/``cache_path`` (tests), so it never leaks across them.
+# ticker once per account. The memo is only trusted for the current
+# _most_recent_session_day(), not the raw calendar date, so it can't paper
+# over a session that closes while the process keeps running -- the first
+# build after the close still refreshes once, and tomorrow's first build
+# does too. Bypassed entirely when a caller injects ``fetch``/``cache_path``
+# (tests), so it never leaks across them.
 _SERIES_MEMO: dict[str, tuple[date, list["PricePoint"]]] = {}
 
 
@@ -196,6 +216,37 @@ def _sessions_elapsed(last_day: date, today: date) -> int:
         if day.weekday() < 5:
             sessions += 1
     return sessions
+
+
+# 4pm is used as a same-day proxy for "the regular session has closed" --
+# this machine's local clock, not a real US/Eastern lookup (the project is
+# stdlib-only and Windows has no bundled IANA tz database for zoneinfo), so
+# it only holds when the box is on US Eastern time, which is already an
+# existing assumption throughout this module (Yahoo's bar dates are compared
+# against ``date.today()`` with no timezone conversion at all).
+_MARKET_CLOSE_LOCAL_HOUR = 16
+
+
+def _most_recent_session_day(now: datetime) -> date:
+    """The last regular session whose close should be treated as final by ``now``.
+
+    Before the session-aware fix, staleness was checked against the raw
+    calendar date: a dashboard opened mid-session would fetch once, cache
+    whatever intraday print Yahoo returned *as if it were the close*, and --
+    because that cache file now had an entry dated "today" -- never refresh
+    again for the rest of the day, even hours after the real close posted.
+    Resolving "today" to the most recently *completed* session instead means
+    an intraday fetch never gets written down as a same-day cache hit in the
+    first place: the cache stays pinned to the prior session's close until
+    the market has actually closed, at which point the next load fetches
+    once more and that becomes the new, correct, final entry.
+    """
+    day = now.date()
+    if now.hour < _MARKET_CLOSE_LOCAL_HOUR:
+        day -= timedelta(days=1)
+    while day.weekday() >= 5:
+        day -= timedelta(days=1)
+    return day
 
 
 def get_price_series(
@@ -233,26 +284,32 @@ def get_price_series(
     ``fetch`` and ``cache_path`` default to Yahoo Finance and this ticker's
     own cache file (see :func:`yahoo_chart_url`, :func:`_default_cache_path`)
     when omitted; tests inject both to avoid any real network access.
+
+    Staleness (and the memo) are keyed off :func:`_most_recent_session_day`,
+    not the raw calendar date -- a cache already dated "today" from an
+    intraday fetch is still stale until that session has actually closed, so
+    a same-day snapshot never gets mistaken for the close for the rest of
+    the day. See that function's docstring for why.
     """
     memoable = fetch is None and cache_path is None and not force_refresh
     path = cache_path or _default_cache_path(ticker)
     fetch = fetch or (lambda: fetch_yahoo_chart(yahoo_chart_url(ticker)))
-    today = date.today()
+    session_day = _most_recent_session_day(datetime.now())
 
     if memoable:
         memo = _SERIES_MEMO.get(path)
-        if memo is not None and memo[0] == today:
+        if memo is not None and memo[0] == session_day:
             return list(memo[1]), []
 
     cached = load_cache(path)
     stale = (
         force_refresh
         or not cached
-        or _sessions_elapsed(cached[-1].day, today) > max_age_days
+        or _sessions_elapsed(cached[-1].day, session_day) > max_age_days
     )
     if not stale:
         if memoable:
-            _SERIES_MEMO[path] = (today, cached)
+            _SERIES_MEMO[path] = (session_day, cached)
         return cached, []
 
     if local_only:
@@ -272,7 +329,7 @@ def get_price_series(
 
     save_cache(points, path)
     if memoable:
-        _SERIES_MEMO[path] = (today, points)
+        _SERIES_MEMO[path] = (session_day, points)
     return points, []
 
 
@@ -297,7 +354,7 @@ def price_on_or_before(points: Sequence[PricePoint], day: date) -> PricePoint | 
 # stay as hand-maintained per-field overrides on top of what's fetched here.
 # --------------------------------------------------------------------------
 
-_FUNDAMENTALS_CACHE_PATH = os.path.join(PROJECT_ROOT, "data", "fundamentals_cache.json")
+_FUNDAMENTALS_CACHE_PATH = os.path.join(_DATA_DIR, "fundamentals_cache.json")
 _QUOTE_URL = "https://query2.finance.yahoo.com/v7/finance/quote"
 _CRUMB_URL = "https://query2.finance.yahoo.com/v1/test/getcrumb"
 _COOKIE_URL = "https://fc.yahoo.com/"
@@ -415,6 +472,46 @@ def parse_yahoo_quotes(text: str) -> dict[str, dict]:
         if symbol:
             out[symbol] = row
     return out
+
+
+def get_last_prices(
+    tickers: Sequence[str],
+    *,
+    fetch: Callable[[Sequence[str]], str] | None = None,
+) -> tuple[dict[str, float | None], list[str]]:
+    """Live last-trade price for each of ``tickers`` -- Yahoo's batched quote
+    endpoint's ``regularMarketPrice``, one HTTP round trip for the whole list
+    (the same endpoint :func:`get_fundamentals` uses for market cap etc.).
+
+    Unlike :func:`get_price_series`, this is never cached to disk or memoized
+    in-process: a live price is only ever "fresh right now," so there is
+    nothing meaningful to cache here. A caller that wants to avoid re-fetching
+    on every request (a long-lived Dashboard instance serving many page loads)
+    is responsible for its own short-TTL cache around this call.
+
+    Never raises. A fetch failure (network, auth, a malformed response) marks
+    every ticker ``None`` with one warning; a ticker present in the response
+    but missing ``regularMarketPrice`` (delisted, before its first trade,
+    Yahoo just doesn't have one) is ``None`` too, with no warning of its own.
+    Callers fall back to the last daily close for any ticker that comes back
+    ``None``.
+    """
+    tickers = sorted({t.upper() for t in tickers if t})
+    if not tickers:
+        return {}, []
+    fetch = fetch or fetch_yahoo_quotes
+    try:
+        quotes = parse_yahoo_quotes(fetch(tickers))
+    except MarketDataError as error:
+        return {t: None for t in tickers}, [
+            f"could not fetch last prices for {len(tickers)} ticker(s): {error}"
+        ]
+    out: dict[str, float | None] = {}
+    for ticker in tickers:
+        row = quotes.get(ticker)
+        price = row.get("regularMarketPrice") if row else None
+        out[ticker] = float(price) if isinstance(price, (int, float)) else None
+    return out, []
 
 
 def _fundamentals_from_quote(ticker: str, row: dict, as_of: date) -> Fundamentals:

@@ -1,0 +1,4 @@
+# Shell scripts must keep LF endings so they run inside Linux containers,
+# even when checked out on Windows.
+*.sh text eol=lf
+docker-entrypoint.sh text eol=lf
