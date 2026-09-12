@@ -338,12 +338,26 @@ button.primary {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
-  max-width: 620px;
 }
 
+/* Status has only a few options (open/closed/expired), so stack them in a
+   single column instead of wrapping a row -- unlike Ticker, which can have
+   dozens and needs the row to wrap. */
+#status-chips {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+#status-chips .chip {
+  text-align: center;
+}
+
+/* No width/height cap: the Filters card's Ticker field already grows to
+   fill the card's own width (flex: 1 1 320px, see index.html), so letting
+   this stretch the rest of the way fits far more chips per row than the old
+   620px cap did -- usually enough that the old max-height: 74px scrollbar
+   was never needed in the first place. */
 #ticker-chips {
-  max-height: 74px;
-  overflow-y: auto;
   padding: 2px;
 }
 

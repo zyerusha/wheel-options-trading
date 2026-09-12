@@ -483,5 +483,51 @@ class TestCapitalPointSharesSplit(unittest.TestCase):
             self.assertAlmostEqual(last["call_stock"], 23000.0, places=2)
 
 
+class TestOpenPositionsIsAFullSnapshot(unittest.TestCase):
+    """`Dashboard.build()`'s `open_positions` must show every currently-held
+    position, not just legged wheels -- a plain buy-and-hold lot (never
+    wheeled, no option ever written on it) gets a synthetic no-contract row
+    too, same as an assigned-but-uncovered wheel does. Regression coverage
+    for the `build()` merge step that used to gate the synthetic row on
+    `is_wheel` + a computed `wheel_phase`, which a buy-and-hold lot never has.
+    """
+
+    def test_buy_and_hold_lot_gets_a_no_contract_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "History.csv")
+            _write_history_csv(
+                path,
+                [
+                    '09/01/2025,"YOU BOUGHT (PAGS) PAGSEGURO DIGITAL LTD",PAGS,'
+                    '"PAGSEGURO DIGITAL LTD",Cash,100,10.00,0,0,,-1000.00,9000.00,09/01/2025',
+                ],
+            )
+            data = Dashboard(path, position_paths=[]).build()
+            rows = [r for r in data["open_positions"] if r["underlying"] == "PAGS"]
+
+            self.assertEqual(len(rows), 1)
+            self.assertIsNone(rows[0]["type"])
+            self.assertAlmostEqual(rows[0]["shares_held"], 100.0, places=4)
+            self.assertAlmostEqual(rows[0]["breakeven"], 10.0, places=2)
+
+    def test_wheeled_position_still_gets_a_row_when_legless(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "History.csv")
+            _write_history_csv(
+                path,
+                [
+                    '11/17/2025,"YOU SOLD OPENING TRANSACTION PUT (MU) ...",-MU251121P230,'
+                    '"PUT ...",Cash,-1,4.00,0,0,,399.33,10000.00,11/17/2025',
+                    '11/21/2025,"ASSIGNED PUT as of Nov-20-2025",-MU251121P230,"PUT ...",Cash,1,,0,0,,0.00,9700.00,11/21/2025',
+                ],
+            )
+            data = Dashboard(path, position_paths=[]).build()
+            rows = [r for r in data["open_positions"] if r["underlying"] == "MU"]
+
+            self.assertEqual(len(rows), 1)
+            self.assertIsNone(rows[0]["type"])
+            self.assertAlmostEqual(rows[0]["shares_held"], 100.0, places=4)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

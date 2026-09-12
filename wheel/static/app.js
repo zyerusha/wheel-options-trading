@@ -3637,8 +3637,8 @@ function cycleFormulas(cycle) {
 }
 
 const CYCLE_STATUS_MEANING = {
-  ACTIVE: 'ACTIVE: something is still open; a short leg, a long hedge, or shares held.',
-  NO_ACTIVITY: 'NO ACTIVITY: flat right now, but still within the same calendar year as the latest trade in the book; another put or call on this ticker would resume this wheel.',
+  ACTIVE: 'ACTIVE: something is still open -- a short leg, a long hedge, or shares held.',
+  NO_ACTIVITY: 'NO ACTIVITY: flat, but still this calendar year -- another trade here would resume this wheel.',
   CLOSED: 'CLOSED: terminal. The year has turned since the last trade, or the stock was called away.',
 };
 
@@ -3731,11 +3731,13 @@ function renderCycles(cycles) {
       const tag = el('span', { class: 'badge DIRECTIONAL' }, isHold ? 'buy & hold' : 'directional');
       setFormula(
         tag,
-        (isHold
-          ? 'Shares only, no option has ever been written against them. Selling a covered call makes it a wheel. '
-          : 'Long options only; no cash-secured put, covered call, shares or assignment. ') +
-          'P&L counts toward every total, but the wheel-return ratios (Wheel ROC, PPD, ' +
-          'Net Option Yield) are withheld and show as a dash.'
+        formula([
+          isHold
+            ? 'Buy & hold: shares only, no call ever written (a covered call would make it a wheel)'
+            : 'Directional: long options only -- no CSP, CC, shares, or assignment',
+          '',
+          'Counts toward every total; Wheel ROC / PPD / Net Option Yield show as a dash.',
+        ])
       );
       statusCell.appendChild(tag);
     }
@@ -4427,7 +4429,7 @@ function buildHedgeRow(h, { showAccount = true } = {}) {
   main.appendChild(el('span', { class: 'hedge-chip' }, h.headline));
   const acct = showAccount && h.account_id ? h.account_id + ' · ' : '';
   main.appendChild(
-    el('span', { class: 'hedge-title' }, `${acct}${h.underlying} · ${h.label} · exp ${h.expiry}`)
+    el('span', { class: 'hedge-title' }, `${acct}${h.underlying} · ${h.label} · exp ${longDate(h.expiry)}`)
   );
   row.appendChild(main);
 
@@ -5229,14 +5231,15 @@ async function loadSelectedSource() {
 /* ------------------------------------------------------------------ filters */
 
 /**
- * Back to the unfiltered view: no ticker/status selection, nothing expanded,
- * the preset select reset to match. Shared by the account switcher, a new
- * upload, and the Reset button. A ticker or status picked under one account
- * may not exist under another, so those always clear. The date range is
- * kept by default -- an account switch should not silently jump the chart
- * back to "All time" -- but a fresh upload or the Reset button pass
- * `keepDateRange: false` since there the old range may not even apply
- * (upload) or the user explicitly asked to clear everything (Reset).
+ * Back to the unfiltered view: no ticker/status selection, nothing expanded.
+ * Shared by the account switcher, a new upload, and the Reset button (the
+ * Ticker/Status card on the Dashboard tab). A ticker or status picked under
+ * one account may not exist under another, so those always clear. The date
+ * range -- its own control, shared across every tab, separate from this
+ * card -- is kept by default; only a fresh upload passes
+ * `keepDateRange: false`, since the old range may not even apply to the
+ * newly-loaded data. Reset leaves the date range exactly as the reader set
+ * it: it is a Ticker/Status reset, not an "undo everything" button.
  */
 function resetSelectionState({ keepDateRange = true } = {}) {
   state.tickers.clear();
@@ -5339,8 +5342,12 @@ function wireFilters() {
     $('preset').value = 'custom';
     load();
   });
+  // Ticker/Status live in their own Dashboard card, separate from the
+  // shared Date range control above the tabs -- Reset clears just those two
+  // (and the Trade Log's expanded-wheel state), leaving the date range as
+  // the reader set it.
   $('reset').addEventListener('click', () => {
-    resetSelectionState({ keepDateRange: false });
+    resetSelectionState();
     load();
   });
 
@@ -5793,12 +5800,14 @@ function renderAssignmentRiskBody(card, data) {
       data.potential_shortfall === null ? '—' : money(data.potential_shortfall)
     )
   );
-  if (data.soonest_itm_expiry) figures.appendChild(fig('Soonest ITM expiry', dayLabel(data.soonest_itm_expiry)));
-  figures.title =
-    'Assignment obligation is the total strike value of the in-the-money puts. Cash available is the ' +
-    'whole cash balance — it already includes the cash reserved as put collateral — so this is a ' +
-    'solvency check, not a figure of extra cash required. Potential shortfall is what an all-at-once ' +
-    'assignment would overdraw (normally $0).';
+  if (data.soonest_itm_expiry) figures.appendChild(fig('Soonest ITM expiry', longDate(data.soonest_itm_expiry)));
+  figures.title = formula([
+    'Assignment obligation = total strike value of the in-the-money puts',
+    'Cash available = whole cash balance (already includes put collateral --',
+    'this is a solvency check, not extra cash required)',
+    'Potential shortfall = what an all-at-once assignment would overdraw',
+    '(normally $0)',
+  ]);
   card.appendChild(figures);
 
   if (!puts.length && !calls.length) return;
@@ -5813,7 +5822,7 @@ function renderAssignmentRiskBody(card, data) {
         `${r.underlying} CSP`,
         money(r.strike, { cents: true }),
         r.contracts,
-        dayLabel(r.expiration),
+        longDate(r.expiration),
         r.moneyness_pct === null ? '—' : `${Math.abs(r.moneyness_pct).toFixed(1)}%`,
         `${money(r.obligation)} cash`,
       ])
@@ -5825,7 +5834,7 @@ function renderAssignmentRiskBody(card, data) {
         `${r.underlying} CC${r.shares_tracked ? '' : ' ~'}`,
         money(r.strike, { cents: true }),
         r.contracts,
-        dayLabel(r.expiration),
+        longDate(r.expiration),
         r.moneyness_pct === null ? '—' : `${Math.abs(r.moneyness_pct).toFixed(1)}%`,
         `${r.shares_at_risk_of_call} sh called`,
       ])
@@ -5865,7 +5874,7 @@ function renderWorkflowBody(host, data) {
       head.appendChild(
         document.createTextNode(
           ` ${leg.type} ${leg.strike != null ? money(leg.strike, { cents: true }) : ''}` +
-            (leg.expiration ? ` · ${dayLabel(leg.expiration)}` : '')
+            (leg.expiration ? ` · ${longDate(leg.expiration)}` : '')
         )
       );
       li.appendChild(head);
@@ -6468,19 +6477,21 @@ function renderDashboardInsights() {
 
 /* -------------------------------------------------- open option positions
  *
- * One sortable row per open covered call / cash-secured put across every
- * wheel -- `data.open_positions`, built by `_build_open_positions` in
- * wheel/api.py -- plus one row for a wheel with a current phase but no open
- * leg at all right now (e.g. assigned shares with no covered call written
- * yet), synthesized server-side by `_no_contract_open_position_row`. Fields
- * that genuinely need a contract (strike, expiration, moneyness, yield,
- * collateral, quantity, premium, ...) are `null` there; every cell below
- * already reads that as its own "no value" case, so no extra branching is
- * needed here beyond the Type badge and Qty, which otherwise have no null
- * case of their own. Two fields that look contract-specific but aren't are
- * filled anyway: Last Price % (the ticker's own daily move) and, in the CC
- * phase, Breakeven (cost basis, since no call written means no premium to
- * net against it).
+ * A full account snapshot: one sortable row per open covered call /
+ * cash-secured put across every wheel -- `data.open_positions`, built by
+ * `_build_open_positions` in wheel/api.py -- plus one row for any position
+ * with no open leg at all right now, synthesized server-side by
+ * `_no_contract_open_position_row`: a wheel with a current phase but no
+ * contract yet (e.g. assigned shares with no covered call written), or
+ * simply shares held with nothing written against them (a plain
+ * buy-and-hold lot). Fields that genuinely need a contract (strike,
+ * expiration, moneyness, yield, collateral, quantity, premium, ...) are
+ * `null` there; every cell below already reads that as its own "no value"
+ * case, so no extra branching is needed here beyond the Type badge and Qty,
+ * which otherwise have no null case of their own. Two fields that look
+ * contract-specific but aren't are filled anyway: Last Price % (the
+ * ticker's own daily move) and, while shares are held, Breakeven (cost
+ * basis, since no call written means no premium to net against it).
  * Filter-independent (an open contract needs watching whatever date window
  * is on screen), so it is not redrawn on filter changes beyond the single
  * render() pass. Symbols stay alphabetical and their rows stay contiguous; a
@@ -6489,25 +6500,67 @@ function renderDashboardInsights() {
 const OPEN_POS_COLUMNS = [
   { key: 'underlying', label: 'Symbol', left: true },
   { key: 'type', label: 'Type', left: true },
-  { key: 'strike', label: 'Strike' },
   { key: 'cc_strike_floor', label: 'CC TO EXIT' },
   { key: 'csp_entry_target', label: 'CSP TO ENTER' },
+  { key: 'last_close', label: 'Last Price' },
+  { key: 'last_close_pct', label: 'Last Price %' },
   { key: 'profit_target', label: 'Profit Target' },
   { key: 'gap_pct', label: 'Gap to Target' },
-  { key: 'expiration', label: 'Expiration' },
   { key: 'cost_basis', label: 'Cost Basis' },
   { key: 'breakeven', label: 'Breakeven' },
   { key: 'wheel_breakeven', label: 'Wheel Breakeven' },
-  { key: 'shares_held', label: 'Shares Held' },
-  { key: 'moneyness_pct', label: 'ITM/OTM (%)' },
-  { key: 'last_close', label: 'Last Price' },
-  { key: 'last_close_pct', label: 'Last Price %' },
+  { key: 'strike', label: 'Strike' },
   { key: 'signed_contracts', label: 'Qty' },
   { key: 'net_premium', label: 'Net Premium' },
+  { key: 'expiration', label: 'Expiration' },
+  { key: 'moneyness_pct', label: 'ITM/OTM (%)' },
+  { key: 'shares_held', label: 'Shares Held' },
+  { key: 'annualized_yield_pct', label: 'Ann. Yield' },
   { key: 'cycle_id', label: 'Wheel', left: true },
   { key: 'days_to_earnings', label: 'Earnings' },
-  { key: 'annualized_yield_pct', label: 'Ann. Yield' },
 ];
+
+// Header tooltips, one per column that isn't self-explanatory from its raw
+// value. Kept short: the exact per-row math already lives in each cell's own
+// title (see cc_strike_floor_explanation, positionBreakevenMath, etc.) --
+// these just say what the column means and, where there's a real formula
+// behind it, spell that out too.
+const OPEN_POS_HEAD_HELP = {
+  cc_strike_floor: formula([
+    'Holding shares only: lowest strike worth writing a call at right now.',
+    'A floor, not a recommendation; it reacts to the current price.',
+  ]),
+  csp_entry_target: formula([
+    'No shares yet only: preferred entry price below last close.',
+    'Same % slider as Cash for Cash-Secured Puts.',
+  ]),
+  profit_target: formula([
+    'Holding shares only: a stable profitable-exit threshold.',
+    'Does not react to price; green once last price reaches it, red while still short.',
+  ]),
+  gap_pct: formula([
+    'CC rows only: distance from last price to the Profit Target.',
+    'Gap % = (Last Price - Profit Target) / Profit Target',
+    'Blank on a CSP row.',
+  ]),
+  breakeven: formula(['This contract alone.']),
+  wheel_breakeven: formula([
+    'Whole cycle:',
+    'Wheel Breakeven = Cost Basis - Banked/share (premium, realized P/L, dividends)',
+  ]),
+  expiration: formula(['⚠ marks a contract under 8 days from expiry.']),
+  moneyness_pct: formula([
+    'Strike vs. last close.',
+    'Green is the cushion (short) or the intrinsic value (long).',
+  ]),
+  shares_held: formula(['Currently held from this wheel, net of any shares sold or called away.']),
+  annualized_yield_pct: formula(['Ann. Yield = Net Premium / Collateral x (365 / days open)']),
+  cycle_id: formula(["Click the id to open that wheel's Trade Log."]),
+  days_to_earnings: formula([
+    'Next report date; within 14 days the cell turns amber with ⚠.',
+    'Override in data/earnings.json.',
+  ]),
+};
 
 function signedPct(value, digits = 2) {
   if (value === null || value === undefined || Number.isNaN(value)) return '—';
@@ -6524,43 +6577,59 @@ const OP_TYPE_LABEL = {
   LC: 'Long call, protective hedge or directional (premium paid)',
 };
 
-// The break-even math, spelled out with this row's own numbers, per type.
+// The break-even math, spelled out with this row's own numbers, per type --
+// same 3-line formula/substitution/result shape as cspEntryTargetTooltip.
 // Derived from breakeven itself (rather than a separately-carried
 // premium/share field) since breakeven already encodes it: e.g. a CSP's
 // breakeven is strike - premium/share, so premium/share = strike - breakeven.
+// Returns a lines array for the caller to join with formula(); [] when there's
+// nothing to explain.
 function positionBreakevenMath(row) {
-  if (row.breakeven === null || row.breakeven === undefined) return '';
+  if (row.breakeven === null || row.breakeven === undefined) return [];
   const be = money(row.breakeven, { cents: true });
   const fmt = (n) => money(n, { cents: true });
   if (row.type === 'CSP' && row.strike != null) {
-    return `${fmt(row.strike)} strike - ${fmt(row.strike - row.breakeven)} premium/share = ${be} breakeven`;
+    return ['Breakeven = strike - premium/share', `= ${fmt(row.strike)} - ${fmt(row.strike - row.breakeven)}`, `= ${be}`];
   }
   if (row.type === 'CC' && row.cost_basis != null) {
-    return `${fmt(row.cost_basis)} cost basis - ${fmt(row.cost_basis - row.breakeven)} premium/share = ${be} breakeven`;
+    return ['Breakeven = cost basis - premium/share', `= ${fmt(row.cost_basis)} - ${fmt(row.cost_basis - row.breakeven)}`, `= ${be}`];
   }
   if (row.type === 'LP' && row.strike != null) {
-    return `${fmt(row.strike)} strike - ${fmt(row.strike - row.breakeven)} cost/share = ${be} breakeven, profit below it`;
+    return [
+      'Breakeven = strike - cost/share (profit below it)',
+      `= ${fmt(row.strike)} - ${fmt(row.strike - row.breakeven)}`,
+      `= ${be}`,
+    ];
   }
   if (row.type === 'LC' && row.strike != null) {
-    return `${fmt(row.strike)} strike + ${fmt(row.breakeven - row.strike)} cost/share = ${be} breakeven, profit above it`;
+    return [
+      'Breakeven = strike + cost/share (profit above it)',
+      `= ${fmt(row.strike)} + ${fmt(row.breakeven - row.strike)}`,
+      `= ${be}`,
+    ];
   }
   // No open leg at all (a synthesized row -- see _no_contract_open_position_row):
   // shares held with no call written yet, so this leg's premium is zero and
   // the breakeven is just the raw cost basis.
   if (row.type == null && row.wheel_phase === 'cc' && row.cost_basis != null) {
-    return `${fmt(row.cost_basis)} cost basis, no call written yet (no premium collected) = ${be} breakeven`;
+    return ['Breakeven = cost basis (no call written yet, no premium collected)', `= ${be}`];
   }
-  return '';
+  return [];
 }
 
 // Wheel breakeven = cost basis - (banked P/L per share). Read backwards from
 // the two numbers already on screen (Cost Basis column, Wheel Breakeven cell)
 // rather than re-deriving the banked total, which the row doesn't carry.
+// Returns a lines array, same convention as positionBreakevenMath.
 function wheelBreakevenMath(row) {
-  if (row.wheel_breakeven == null || row.cost_basis == null) return '';
+  if (row.wheel_breakeven == null || row.cost_basis == null) return [];
   const fmt = (n) => money(n, { cents: true });
   const bankedPerShare = row.cost_basis - row.wheel_breakeven;
-  return `${fmt(row.cost_basis)} cost basis - ${fmt(bankedPerShare)} banked/share (premium, realized P/L, dividends) = ${fmt(row.wheel_breakeven)} wheel breakeven`;
+  return [
+    'Wheel breakeven = cost basis - banked/share (premium, realized P/L, dividends)',
+    `= ${fmt(row.cost_basis)} - ${fmt(bankedPerShare)}`,
+    `= ${fmt(row.wheel_breakeven)}`,
+  ];
 }
 
 function openPositionRow(row, isGroupStart, groupSize) {
@@ -6575,7 +6644,6 @@ function openPositionRow(row, isGroupStart, groupSize) {
     if (groupSize > 1) bits.push(`${groupSize} open positions`);
     if (bits.length) symCell.title = bits.join(' · ');
   }
-  tr.appendChild(symCell);
 
   // No `type` at all means no open contract on this wheel right now (a
   // synthesized row -- see _no_contract_open_position_row): a plain dash,
@@ -6588,9 +6656,8 @@ function openPositionRow(row, isGroupStart, groupSize) {
       el('span', { class: 'badge op-type op-type-' + row.type, title: OP_TYPE_LABEL[row.type] || row.type }, row.type)
     );
   }
-  tr.appendChild(typeCell);
 
-  tr.appendChild(el('td', { class: 'num' }, money(row.strike, { cents: true })));
+  const strikeCell = el('td', { class: 'num' }, money(row.strike, { cents: true }));
 
   // CC TO EXIT / CSP TO ENTER / Profit Target. CC TO EXIT and Profit Target
   // are the backend's already-computed numbers (cc_strike_floor_explanation /
@@ -6604,7 +6671,6 @@ function openPositionRow(row, isGroupStart, groupSize) {
       ? el('td', { class: 'num' }, '—')
       : el('td', { class: 'num cc-target' }, money(row.cc_strike_floor, { cents: true }));
   if (row.cc_strike_floor_explanation) strikeFloorCell.title = row.cc_strike_floor_explanation;
-  tr.appendChild(strikeFloorCell);
 
   const cspEntryCell =
     row.csp_entry_target == null
@@ -6613,7 +6679,6 @@ function openPositionRow(row, isGroupStart, groupSize) {
   if (row.csp_entry_target != null) {
     cspEntryCell.title = cspEntryTargetTooltip(row.last_close, state.cspTargetPct, row.csp_entry_target);
   }
-  tr.appendChild(cspEntryCell);
 
   const metTone =
     row.wheel_phase === 'cc' && row.profit_target != null && row.last_close != null
@@ -6621,20 +6686,21 @@ function openPositionRow(row, isGroupStart, groupSize) {
       : '';
   const profitTargetCell = el('td', { class: 'num ' + metTone }, money(row.profit_target, { cents: true }));
   if (row.profit_target_explanation) profitTargetCell.title = row.profit_target_explanation;
-  tr.appendChild(profitTargetCell);
 
   // Same figure and tone as the Profit Target cell above -- how far last
   // price sits from it, CC-phase only (a CSP row has no Profit Target to gap
   // against).
-  tr.appendChild(el('td', { class: 'num ' + metTone }, signedPct(row.gap_pct)));
+  const gapCell = el('td', { class: 'num ' + metTone }, signedPct(row.gap_pct));
 
-  // Expiration, with a warning glyph when the contract is inside a week.
+  // Expiration, formatted the same as the Earnings column (longDate: "Sep
+  // 19, 2026") plus the weekday and days-left, with a warning glyph when the
+  // contract is inside a week.
   const nearExpiry =
     row.days_to_expiry !== null && row.days_to_expiry !== undefined && row.days_to_expiry < 8;
   const expCell = el('td', { class: 'num' + (nearExpiry ? ' op-near-expiry' : '') });
   if (row.expiration) {
     const dow = parseDay(row.expiration).toLocaleDateString('en-US', { weekday: 'short' });
-    expCell.appendChild(document.createTextNode(`${row.expiration} · ${dow} · ${row.days_to_expiry}d`));
+    expCell.appendChild(document.createTextNode(`${longDate(row.expiration)} · ${dow} · ${row.days_to_expiry}d`));
     if (nearExpiry) {
       expCell.appendChild(
         el(
@@ -6647,7 +6713,6 @@ function openPositionRow(row, isGroupStart, groupSize) {
   } else {
     expCell.appendChild(document.createTextNode('—'));
   }
-  tr.appendChild(expCell);
 
   // Average per-share cost basis of the cycle's currently-held shares -- what
   // the CC break-even (cost_basis - premium/share) is built from. Blank for a
@@ -6658,7 +6723,6 @@ function openPositionRow(row, isGroupStart, groupSize) {
     row.cost_basis === null || row.cost_basis === undefined ? '—' : money(row.cost_basis, { cents: true })
   );
   costBasisCell.title = 'Average cost basis per share of the wheel\'s currently-held shares.';
-  tr.appendChild(costBasisCell);
 
   // The two break-even cells carry different signals. Position break-even is
   // this trade alone: last price vs. its own break-even, with a short put/call
@@ -6690,25 +6754,36 @@ function openPositionRow(row, isGroupStart, groupSize) {
   const wheelTone = wheelUnderwater === null ? '' : wheelUnderwater ? 'neg' : 'pos';
   const wheelStatus =
     wheelUnderwater === null
-      ? ''
+      ? null
       : wheelUnderwater
-        ? ', whole wheel underwater (last price below the wheel break-even)'
-        : ', whole wheel in profit (last price above the wheel break-even)';
+        ? 'Whole wheel underwater (last price below the wheel break-even).'
+        : 'Whole wheel in profit (last price above the wheel break-even).';
+  // Appends the shared wheel-status caveat as its own trailing line, blank
+  // line first -- same "formula, then a blank line, then one caveat" shape
+  // as cspEntryTargetTooltip -- instead of the old single run-on sentence.
+  const withWheelStatus = (lines) => (wheelStatus ? [...lines, '', wheelStatus] : lines);
 
   const beCell = el('td', { class: 'num ' + positionTone }, money(row.breakeven, { cents: true }));
-  beCell.title = positionBreakevenMath(row) + wheelStatus;
-  tr.appendChild(beCell);
+  const beLines = positionBreakevenMath(row);
+  if (beLines.length) beCell.title = formula(withWheelStatus(beLines));
 
   const wheelBeCell = el('td', { class: 'num ' + wheelTone }, money(row.wheel_breakeven, { cents: true }));
-  wheelBeCell.title =
-    (wheelBreakevenMath(row) ||
-      'The whole wheel: raw cost of shares still held, less every dollar the cycle has banked ' +
-        '(premium, realized P/L, dividends). A dash when the cycle holds no shares yet.') +
-    wheelStatus;
-  tr.appendChild(wheelBeCell);
+  const wheelBeLines = wheelBreakevenMath(row);
+  wheelBeCell.title = formula(
+    withWheelStatus(
+      wheelBeLines.length
+        ? wheelBeLines
+        : [
+            'The whole wheel: cost of shares still held, less everything banked',
+            '(premium, realized P/L, dividends). A dash with no shares held.',
+          ]
+    )
+  );
 
-  tr.appendChild(
-    el('td', { class: 'num' }, row.shares_held ? Math.round(row.shares_held).toLocaleString('en-US') : '—')
+  const sharesHeldCell = el(
+    'td',
+    { class: 'num' },
+    row.shares_held ? Math.round(row.shares_held).toLocaleString('en-US') : '—'
   );
 
   // OTM is favorable for a short (it expires worthless, you keep the premium);
@@ -6729,28 +6804,51 @@ function openPositionRow(row, isGroupStart, groupSize) {
   moneyness.title = isLong
     ? 'Strike vs. last price. In-the-money (green) is where a long put/call has intrinsic value.'
     : 'Strike vs. last price. Positive = out-of-the-money cushion; negative = in-the-money (assignment risk).';
-  tr.appendChild(moneyness);
 
-  tr.appendChild(el('td', { class: 'num' }, money(row.last_close, { cents: true })));
-  tr.appendChild(el('td', { class: 'num ' + toneOf(row.last_close_pct) }, signedPct(row.last_close_pct)));
+  const lastCloseCell = el('td', { class: 'num' }, money(row.last_close, { cents: true }));
+  const lastClosePctCell = el('td', { class: 'num ' + toneOf(row.last_close_pct) }, signedPct(row.last_close_pct));
 
-  tr.appendChild(el('td', { class: 'num' }, row.signed_contracts == null ? '—' : row.signed_contracts));
-  tr.appendChild(el('td', { class: 'num ' + toneOf(row.net_premium) }, money(row.net_premium, { cents: true, sign: true })));
+  const qtyCell = el('td', { class: 'num' }, row.signed_contracts == null ? '—' : row.signed_contracts);
+  const netPremiumCell = el(
+    'td',
+    { class: 'num ' + toneOf(row.net_premium) },
+    money(row.net_premium, { cents: true, sign: true })
+  );
 
   const wheelCell = el('td', { class: 'left op-wheel' });
   wheelCell.appendChild(
     row.cycle_id ? wheelLink(row.cycle_id, row.underlying) : document.createTextNode('—')
   );
-  tr.appendChild(wheelCell);
 
   // Next earnings date -- same amber-within-14-days treatment as the
   // Covered-call / CSP candidate tables.
-  tr.appendChild(earningsCell(row).cell);
+  const earningsTd = earningsCell(row).cell;
 
   const yieldCell = el('td', { class: 'num ' + toneOf(row.annualized_yield_pct) }, pct(row.annualized_yield_pct));
   yieldCell.title =
     'Net premium ÷ (strike × 100 × contracts), scaled to a year over the contract\'s open→expiry span.';
+
+  // Appended in the same order as OPEN_POS_COLUMNS.
+  tr.appendChild(symCell);
+  tr.appendChild(typeCell);
+  tr.appendChild(strikeFloorCell);
+  tr.appendChild(cspEntryCell);
+  tr.appendChild(lastCloseCell);
+  tr.appendChild(lastClosePctCell);
+  tr.appendChild(profitTargetCell);
+  tr.appendChild(gapCell);
+  tr.appendChild(costBasisCell);
+  tr.appendChild(beCell);
+  tr.appendChild(wheelBeCell);
+  tr.appendChild(strikeCell);
+  tr.appendChild(qtyCell);
+  tr.appendChild(netPremiumCell);
+  tr.appendChild(expCell);
+  tr.appendChild(moneyness);
+  tr.appendChild(sharesHeldCell);
   tr.appendChild(yieldCell);
+  tr.appendChild(wheelCell);
+  tr.appendChild(earningsTd);
 
   return tr;
 }
@@ -6775,6 +6873,7 @@ function renderOpenPositions() {
   for (const column of OPEN_POS_COLUMNS) {
     const th = el('th', { class: `sortable${column.left ? ' left' : ''}` }, column.label);
     if (key === column.key) th.textContent = column.label + (dir === 1 ? ' ▲' : ' ▼');
+    setFormula(th, OPEN_POS_HEAD_HELP[column.key]);
     th.addEventListener('click', () => {
       if (state.openPosSort.key === column.key) state.openPosSort.dir *= -1;
       else state.openPosSort = { key: column.key, dir: column.key === 'underlying' ? 1 : -1 };

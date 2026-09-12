@@ -554,17 +554,27 @@ def _profit_target(floor: float, cushion_pct: float = PROFIT_TARGET_CUSHION_PCT)
 
 
 def _profit_target_explanation(floor: float, target: float) -> str:
+    """Same 4-part shape as `_cc_strike_floor_explanation`: a formula line,
+    the substitution, the result, then a one-line caveat."""
     return (
-        f"Profitable exit target: floor ${floor:.2f} (highest of cost basis, "
-        f"breakeven, wheel breakeven), +{PROFIT_TARGET_CUSHION_PCT:g}% cushion, "
-        f"rounded up to $0.50 increments = ${target:.2f}."
+        f"Profit Target = highest of cost basis, breakeven, wheel breakeven, "
+        f"+{PROFIT_TARGET_CUSHION_PCT:g}%, rounded up to $0.50\n"
+        f"= ${floor:.2f} + {PROFIT_TARGET_CUSHION_PCT:g}%\n"
+        f"= ${target:.2f}\n\n"
+        f"A profitable-exit threshold; never reacts to price."
     )
 
 
 def _preferred_csp_entry_explanation(current_price: float, entry: float) -> str:
+    """Same shape as the client's live cspEntryTargetTooltip (app.js) --
+    this fixed-93% figure isn't shown anywhere in the UI right now (every
+    surface uses the adjustable client-side version instead), but is kept
+    in the same format in case a future surface reads it."""
     return (
-        f"Preferred entry target: {CSP_ENTRY_OTM_PCT:g}% of last close ${current_price:.2f}, "
-        f"rounded down to $0.50 increments = ${entry:.2f}."
+        f"Preferred CSP entry = {CSP_ENTRY_OTM_PCT:g}% of last close, rounded down to $0.50\n"
+        f"= {CSP_ENTRY_OTM_PCT:g}% × ${current_price:.2f}\n"
+        f"= ${entry:.2f}\n\n"
+        f"A conservative entry floor."
     )
 
 
@@ -574,25 +584,22 @@ def _cc_strike_floor_explanation(
     position_breakeven: float | None,
     wheel_breakeven: float | None,
     current_price: float | None,
-    cushion_pct: float = PROFIT_TARGET_CUSHION_PCT,
 ) -> str:
-    """Only names the fundamentals that actually fed the cushioned floor --
-    never states a value for one that was `None` and excluded from it."""
-    fundamentals = _cc_strike_floor_fundamentals(cost_basis, position_breakeven, wheel_breakeven)
-    parts = ", ".join(f"{label} ${value:.2f}" for label, value in fundamentals)
-    floor = max(value for _, value in fundamentals) if fundamentals else None
-    cushioned = _round_up_half(floor * (1 + cushion_pct / 100)) if floor is not None else None
-    floor_text = (
-        f"profit-target floor ${cushioned:.2f} (highest of {parts}, +{cushion_pct:g}% cushion)"
-        if cushioned is not None
-        else "no cost basis / breakeven known"
-    )
-    price_text = f"last close ${current_price:.2f}" if current_price is not None else "no last close known"
+    """Short and simple, like the client's CSP TO ENTER tooltip
+    (cspEntryTargetTooltip in app.js) -- not a line-by-line accounting of
+    every input. Profit Target is the one figure worth naming, since it's
+    already the adjacent column and its own tooltip has the cost basis /
+    breakeven / wheel breakeven math behind it; repeating that here would
+    just be the same numbers twice."""
+    floor = _profit_target_floor(cost_basis, position_breakeven, wheel_breakeven)
+    profit_target = _profit_target(floor) if floor is not None else None
+    target_text = f"${profit_target:.2f}" if profit_target is not None else "n/a"
+    price_text = f"${current_price:.2f}" if current_price is not None else "n/a"
     return (
-        f"CC TO EXIT: the higher of the {floor_text} and {price_text}, rounded up to $0.50 "
-        f"increments = ${strike:.2f}. The lowest strike worth writing a call at right now "
-        f"-- a floor, not a recommendation; it says nothing about where the "
-        f"premium is richest."
+        f"CC TO EXIT = higher of Profit Target and last price, rounded up to $0.50\n"
+        f"= higher of {target_text} and {price_text}\n"
+        f"= ${strike:.2f}\n\n"
+        f"A floor, not a recommendation."
     )
 
 
@@ -1741,27 +1748,29 @@ def _no_contract_open_position_row(
     today: date,
     prev_close: float | None,
 ) -> dict[str, Any]:
-    """A wheel with a current phase -- holding shares awaiting a call, or
-    ready for a fresh CSP entry -- but no open option leg right now (e.g.
-    assigned shares with no covered call written yet). Shaped exactly like
-    `_open_position_row`'s return so the merged Open option positions table
-    needs no special-casing beyond the null checks it already makes for
-    missing target fields. Wheel-level fields (cost basis, wheel breakeven,
-    shares held) come straight off ``wheel``, the same Trade Log wheel dict
-    `_build_open_positions` already draws its real leg rows' wheel-level
-    fields from; ``gap_pct`` is the one figure only the Wheel price targets
-    banner computes, so it's passed in rather than redone here.
+    """A position with no open option leg right now: shares held with
+    nothing written against them (a wheel awaiting a call, a plain
+    buy-and-hold lot, assigned shares never covered), or a wheel with a
+    current phase but no leg at all (e.g. between cycles, ready for a fresh
+    CSP entry). Shaped exactly like `_open_position_row`'s return so the
+    merged Open option positions table needs no special-casing beyond the
+    null checks it already makes for missing target fields. Wheel-level
+    fields (cost basis, wheel breakeven, shares held) come straight off
+    ``wheel``, the same Trade Log wheel dict `_build_open_positions` already
+    draws its real leg rows' wheel-level fields from; ``gap_pct`` is the one
+    figure only the Wheel price targets banner computes (so it's `None` for
+    a position with no phase target), passed in rather than redone here.
 
     Two fields that look leg-specific are filled anyway because they aren't:
     ``last_close_pct`` is the ticker's own daily move, unrelated to any
     contract, computed the same way `_open_position_row` computes it. And
-    when the phase is CC (shares held, no call written), ``breakeven`` is the
-    raw cost basis -- `_open_position_row`'s own CC formula, cost basis minus
-    this leg's premium/share, with that premium at its natural zero since
-    there is no leg. Every other leg-specific field (strike, expiration,
-    moneyness, yield, collateral, quantity, premium, ...) has no such
-    contract-free reading and stays `None`, read by the frontend as the "no
-    current contract" dash.
+    while shares are held, ``breakeven`` is the raw cost basis --
+    `_open_position_row`'s own CC formula, cost basis minus this leg's
+    premium/share, with that premium at its natural zero since there is no
+    leg. Every other leg-specific field (strike, expiration, moneyness,
+    yield, collateral, quantity, premium, ...) has no such contract-free
+    reading and stays `None`, read by the frontend as the "no current
+    contract" dash.
     """
     earnings_date = (earnings_row or {}).get("earnings_date")
     current_price = wheel.get("current_price")
@@ -1771,7 +1780,8 @@ def _no_contract_open_position_row(
         else None
     )
     cost_basis = wheel.get("cost_basis_per_share")
-    breakeven = cost_basis if wheel.get("wheel_phase") == "cc" and cost_basis is not None else None
+    shares_held = wheel.get("shares_held") or 0.0
+    breakeven = cost_basis if shares_held > 1e-9 and cost_basis is not None else None
     return {
         "cycle_id": wheel["cycle_id"],
         "underlying": wheel["underlying"],
@@ -3210,22 +3220,32 @@ class Dashboard:
             _row["earnings_date"] = _ed
             _row["days_to_earnings"] = (date.fromisoformat(_ed) - _today).days if _ed else None
 
-        # Fold Gap to Target / Shares Held (the Wheel price targets banner's
-        # own columns) onto every Open option positions row, and synthesize a
-        # row -- strike, expiration and every other leg-specific field left
-        # blank -- for any wheel with a current phase but no open leg at all,
-        # so the Planner table can show it too. `self._open_positions` itself
-        # gets only the two extra keys, in place: it was already consumed
-        # above by the candidates/earnings builders and still feeds
+        # Fold Gap to Target (the Wheel price targets banner's own column)
+        # and Shares Held onto every Open option positions row, and
+        # synthesize a row -- strike, expiration and every other
+        # leg-specific field left blank -- for any position with no open leg
+        # at all, so the table is a full account snapshot rather than just
+        # the legged rows: a wheel with a current phase (awaiting a call, or
+        # ready for a fresh CSP entry) AND a plain position that's simply
+        # holding shares with nothing written against them (a buy-and-hold
+        # lot, or a wheel between phases) both get a row, distinguishable
+        # from a real leg by their blank Type/Strike/Expiration. `wheels`
+        # already covers every currently-open position: a closed cycle has
+        # sold out of its shares, so `shares_held` is 0 and it is excluded
+        # by the same check `_build_cc_candidates` uses. `self._open_positions`
+        # itself gets only the two extra keys, in place: it was already
+        # consumed above by the candidates/earnings builders and still feeds
         # assignment_risk / expiration_calendar / workflow below, none of
         # which expect a legless row, so the synthetic rows are appended only
         # to the payload copy built at the end of this method, not here.
-        wheel_targets_banner = self._build_wheel_targets_banner((self._trade_log or {}).get("wheels", []))
+        _wheels = (self._trade_log or {}).get("wheels", [])
+        _wheels_by_cycle = {w["cycle_id"]: w for w in _wheels}
+        wheel_targets_banner = self._build_wheel_targets_banner(_wheels)
         _wt_by_cycle = {w["cycle_id"]: w for w in wheel_targets_banner}
         for _row in self._open_positions or []:
             _wt = _wt_by_cycle.get(_row["cycle_id"])
             _row["gap_pct"] = _wt.get("gap_pct") if _wt else None
-            _row["shares_held"] = _wt.get("shares_held") if _wt else None
+            _row["shares_held"] = (_wheels_by_cycle.get(_row["cycle_id"]) or {}).get("shares_held")
         _legged_cycles = {row["cycle_id"] for row in self._open_positions or []}
         _open_positions_for_payload = (self._open_positions or []) + [
             _no_contract_open_position_row(
@@ -3235,8 +3255,9 @@ class Dashboard:
                 _today,
                 self._prev_closes.get(w["underlying"]),
             )
-            for w in (self._trade_log or {}).get("wheels", [])
-            if w["cycle_id"] in _wt_by_cycle and w["cycle_id"] not in _legged_cycles
+            for w in _wheels
+            if w["cycle_id"] not in _legged_cycles
+            and (w["cycle_id"] in _wt_by_cycle or (w.get("shares_held") or 0.0) > 1e-9)
         ]
         assignment_risk = assignment_mod.assignment_risk(
             self._open_positions or [], self._net_worth

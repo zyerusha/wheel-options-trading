@@ -75,6 +75,42 @@
         ></div>
       </section>
 
+      <!--
+        Date range applies to the one shared data fetch every tab reads from
+        (load() refetches on every tab switch too), so the control lives here
+        -- a sibling of the tab panels, not inside any one of them -- and
+        stays reachable no matter which tab is active. Ticker/Status/Reset
+        live in their own card on the Dashboard tab (below) -- Reset there
+        deliberately leaves this date range alone; see resetSelectionState().
+      -->
+      <section class="filters" aria-label="Filters: date range">
+        <div class="field">
+          <label for="preset">Date range</label>
+          <select id="preset">
+            <option value="all">All history</option>
+            <option value="10">Last 10 days</option>
+            <option value="30">Last 30 days</option>
+            <option value="60">Last 60 days</option>
+            <option value="90">Last 90 days</option>
+            <option value="ytd">Year to date</option>
+            <option value="1y">1 year</option>
+            <option value="3y">3 years</option>
+            <option value="5y">5 years</option>
+            <option value="custom">Custom…</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="start">From</label>
+          <input type="date" id="start" />
+        </div>
+
+        <div class="field">
+          <label for="end">To</label>
+          <input type="date" id="end" />
+        </div>
+      </section>
+
       <div id="tab-dashboard">
         <section class="source" aria-label="Data source">
           <div class="field source-list">
@@ -110,56 +146,40 @@
           ></div>
         </section>
 
-        <section class="filters" aria-label="Filters">
-          <div class="field">
-            <label for="preset">Date range</label>
-            <select id="preset">
-              <option value="all">All history</option>
-              <option value="10">Last 10 days</option>
-              <option value="30">Last 30 days</option>
-              <option value="60">Last 60 days</option>
-              <option value="90">Last 90 days</option>
-              <option value="ytd">Year to date</option>
-              <option value="1y">1 year</option>
-              <option value="3y">3 years</option>
-              <option value="5y">5 years</option>
-              <option value="custom">Custom…</option>
-            </select>
-          </div>
+        <section
+          class="card"
+          id="ticker-status-card"
+          style="margin-bottom: var(--gap)"
+        >
+          <header>
+            <h2>Filters</h2>
+          </header>
 
-          <div class="field">
-            <label for="start">From</label>
-            <input type="date" id="start" />
-          </div>
+          <div style="display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-start">
+            <div class="field" style="flex: 1 1 320px">
+              <label id="ticker-label">Ticker</label>
+              <div
+                class="chip-row"
+                id="ticker-chips"
+                role="group"
+                aria-labelledby="ticker-label"
+              ></div>
+            </div>
 
-          <div class="field">
-            <label for="end">To</label>
-            <input type="date" id="end" />
-          </div>
+            <div class="field">
+              <label id="status-label">Status</label>
+              <div
+                class="chip-row"
+                id="status-chips"
+                role="group"
+                aria-labelledby="status-label"
+              ></div>
+            </div>
 
-          <div class="field">
-            <label id="status-label">Status</label>
-            <div
-              class="chip-row"
-              id="status-chips"
-              role="group"
-              aria-labelledby="status-label"
-            ></div>
-          </div>
-
-          <div class="field" style="flex: 1 1 320px">
-            <label id="ticker-label">Ticker</label>
-            <div
-              class="chip-row"
-              id="ticker-chips"
-              role="group"
-              aria-labelledby="ticker-label"
-            ></div>
-          </div>
-
-          <div class="field">
-            <label>&nbsp;</label>
-            <button id="reset">Reset</button>
+            <div class="field">
+              <label>&nbsp;</label>
+              <button id="reset">Reset</button>
+            </div>
           </div>
         </section>
 
@@ -175,40 +195,7 @@
             <h2>Wheel price targets</h2>
           </header>
 
-          <ul class="hint-list">
-            <li>
-              Click a heading to sort
-            </li>
-            <li>
-              <strong>Wheel</strong>: click the id to open that wheel's Trade
-              Log
-            </li>
-            <li>
-              <strong>Type</strong>: CC, holding shares; CSP, no shares yet
-            </li>
-            <li>
-              <strong>CC TO EXIT</strong>: holding shares only -- the lowest
-              strike worth writing a call at right now, reacting to the
-              current price. A floor, not a recommendation.
-            </li>
-            <li>
-              <strong>CSP TO ENTER</strong>: no shares yet only -- a
-              preferred entry price below last close, tracking the same %
-              slider as Cash for Cash-Secured Puts
-            </li>
-            <li>
-              <strong>Profit Target</strong>: holding shares only -- a
-              stable profitable-exit threshold (cost/breakeven economics +
-              cushion), never reacts to price. Green once last price has
-              reached it, red while still short.
-            </li>
-            <li>
-              <strong>Gap to Target</strong>: for CC only, how far last price
-              is from the Profit Target; a CSP row is blank here
-            </li>
-          </ul>
-
-          <div style="overflow-x: auto">
+           <div style="overflow-x: auto">
             <table id="wheel-targets-table"></table>
           </div>
         </section>
@@ -668,64 +655,18 @@
 
           <ul class="hint-list">
             <li>
-              Open short calls (CC) and puts (CSP), plus long hedges (LP/LC)
-              -- plus one row for a wheel with a current phase but no open
-              contract at all (e.g. assigned shares with no call written
-              yet); Strike, Expiration, ITM/OTM %, Qty, Net Premium and
-              Annualized Yield read as "-" there since they need an actual
-              contract. Last Price % and Breakeven still show (a wheel's own
-              daily move and raw cost basis need no contract either)
+              A full account snapshot: open short calls (CC) and puts (CSP),
+              long hedges (LP/LC), plus one row for any position with no
+              open contract right now -- shares held with nothing written
+              against them (assigned shares, a plain buy-and-hold lot) or a
+              wheel between phases awaiting its next entry. Strike,
+              Expiration, ITM/OTM %, Qty, Net Premium and Annualized Yield
+              read as "-" there since they need an actual contract. Last
+              Price % and Breakeven still show (a position's own daily move
+              and raw cost basis need no contract either)
             </li>
             <li>Amber rows are longs; premium paid, not received</li>
-            <li>Click a heading to sort</li>
-            <li>
-              <strong>⚠</strong> next to Expiration: under 8 days to expiry
-            </li>
-            <li>
-              <strong>Wheel</strong>: click the id to open that wheel's Trade
-              Log
-            </li>
-            <li><strong>Breakeven</strong>: this contract alone</li>
-            <li>
-              <strong>Wheel Breakeven</strong>: whole cycle: cost of shares
-              still held minus all cycle income
-            </li>
-            <li>
-              <strong>CC TO EXIT</strong>: holding shares only -- the lowest
-              strike worth writing a call at right now, reacting to the
-              current price. A floor, not a recommendation.
-            </li>
-            <li>
-              <strong>CSP TO ENTER</strong>: no shares yet only -- a
-              preferred entry price below last close, tracking the same %
-              slider as Cash for Cash-Secured Puts
-            </li>
-            <li>
-              <strong>Profit Target</strong>: holding shares only -- a
-              stable profitable-exit threshold that never reacts to price.
-              Green once last price has reached it, red while still short.
-            </li>
-            <li>
-              <strong>Gap to Target</strong>: for CC only, how far last price
-              is from the Profit Target; a CSP row is blank here
-            </li>
-            <li>
-              <strong>Shares Held</strong>: currently held from this wheel,
-              net of any sold or called away
-            </li>
-            <li>
-              <strong>ITM/OTM %</strong>: strike vs. last close; green is the
-              cushion (short) or intrinsic value (long)
-            </li>
-            <li>
-              <strong>Earnings</strong>: next report date; within 14 days the
-              cell turns amber with a ⚠ (override in
-              <code>data/earnings.json</code>)
-            </li>
-            <li>
-              <strong>Annualized Yield</strong>: net premium ÷ collateral, per
-              year
-            </li>
+            <li>Click a heading to sort, or hover one for its exact math</li>
           </ul>
 
           <div style="overflow-x: auto">
@@ -782,38 +723,28 @@
 
           <ul class="hint-list">
             <li>
-              Positions holding shares with no covered call written against
-              them; 100+ share lots lead the table, smaller lots are listed
-              after for visibility with Target and Qty blank
+              Shares held with no covered call written against them; 100+
+              share lots lead the table, smaller lots follow with Target and
+              Qty blank
             </li>
             <li>
-              <strong>Target price for CC</strong>: the greatest of the share
-              cost basis, the position breakeven, the wheel breakeven, and the
-              last close — never below any of them — rounded up to the next
-              $0.50
-            </li>
-            <li>
-              Write the call at or above it: an assignment then sells the stock
-              for at least what it cost, keeps every premium already collected,
-              and is never below the current market
-            </li>
-            <li>
-              It's a floor, not a pick — it doesn't say where the premium is
-              richest
+              <strong>Target price for CC</strong>: floor strike, rounded up
+              to the next $0.50 — the greatest of cost basis, breakeven,
+              wheel breakeven, and last close, so an assignment never loses
+              money. A floor, not a pick for richest premium
             </li>
             <li>
               <strong>Current Wheel</strong>: click the id to jump to that
               wheel's Trade Log
             </li>
             <li>
-              <strong>Earnings</strong>: next report date, fetched from Yahoo;
-              within 14 days the date turns amber with a ⚠ — think twice before
-              writing a call into an earnings print. Override in
-              <code>data/earnings.json</code>
+              <strong>Earnings</strong>: next report date (Yahoo); amber ⚠
+              within 14 days — think twice before writing into an earnings
+              print. Override in <code>data/earnings.json</code>
             </li>
             <li>
-              <strong>Sector</strong>: for diversification; best-effort static
-              map, blank if unknown
+              <strong>Sector</strong>: for diversification; best-effort,
+              blank if unknown
             </li>
           </ul>
 
