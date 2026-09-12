@@ -495,6 +495,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_file("app.js", "application/javascript; charset=utf-8")
             elif route == "/styles.css":
                 self._send_file("styles.css", "text/css; charset=utf-8")
+            elif route == "/wheel-strategy.png":
+                self._send_file("wheel-strategy.png", "image/png")
             elif route == "/api/dashboard":
                 self._sync_registry()
                 query = parse_qs(parsed.query)

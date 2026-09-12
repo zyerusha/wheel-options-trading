@@ -703,6 +703,17 @@
           what expires soon, and what the cash can do next.
         </p>
 
+        <details class="card" style="margin-bottom: var(--gap)">
+          <summary style="cursor: pointer; font-size: 14px; font-weight: 640">
+            How to manage the wheel
+          </summary>
+          <img
+            src="/wheel-strategy.png"
+            alt="Wheel strategy flowchart. Step 1, sell puts: find a stock meeting the selection criteria, sell a put at 30%+ annualized ROI with expiration timed to the day of the week, immediately set a buy-to-close good-till-cancelled at 50% of the premium, then check the account daily -- if the buy-to-close fills, repeat; if assigned instead, move to step 2. Step 2, sell calls: sell a call timed the same way, at the assigned put's strike if ROI is 30-150% annualized or above it if ROI exceeds 150%, otherwise hold for recovery or sell the stock as a last resort; immediately set a buy-to-close at 80% of the premium for the first 24 hours and 90% after; if the stock gets called away, go back to step 1, otherwise keep checking daily."
+            style="max-width: 100%; margin-top: 12px; border-radius: 8px; border: 1px solid var(--border)"
+          />
+        </details>
+
         <div id="earnings-in-view" class="planner-earnings" hidden></div>
 
         <section id="assignment-risk" aria-label="Assignment risk" hidden></section>
