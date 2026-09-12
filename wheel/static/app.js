@@ -165,6 +165,26 @@ function setFormula(node, text) {
 }
 
 /**
+ * A ticker rendered as a real link to its TradingView chart, opened in a new
+ * tab -- shared by every table's Symbol column (Open option positions, Wheel
+ * price targets, CC/CSP candidates). Plain `<a>`, not a click handler, so the
+ * usual new-tab gestures (middle-click, cmd/ctrl-click) work for free.
+ */
+function tickerLink(symbol) {
+  return el(
+    'a',
+    {
+      class: 'ticker-link',
+      href: `https://www.tradingview.com/chart/?symbol=${encodeURIComponent(symbol)}`,
+      target: '_blank',
+      rel: 'noopener noreferrer',
+      title: `Open ${symbol} on TradingView`,
+    },
+    symbol
+  );
+}
+
+/**
  * The CSP/covered-call vs. hedge breakdown behind an `option_realized_pl`
  * figure -- works on a portfolio, cycle, or ticker-row object alike, since
  * all three carry the same three fields (wheel/metrics.py: `option_realized_pl
@@ -4534,8 +4554,9 @@ const WHEEL_TARGETS_COLUMNS = [
 function wheelTargetsRow(row) {
   const tr = el('tr', { class: 'op-row' });
 
-  const symCell = el('td', { class: 'left ticker-cell' }, row.underlying);
+  const symCell = el('td', { class: 'left ticker-cell' });
   if (row.name) symCell.title = row.name;
+  symCell.appendChild(tickerLink(row.underlying));
   tr.appendChild(symCell);
 
   const typeLabel = row.wheel_phase === 'csp' ? 'CSP' : 'CC';
@@ -6638,11 +6659,12 @@ function openPositionRow(row, isGroupStart, groupSize) {
     class: 'op-row' + (isGroupStart ? ' op-group-start' : '') + (isLong ? ' op-long' : ''),
   });
 
-  const symCell = el('td', { class: 'left ticker-cell' }, isGroupStart ? row.underlying : '');
+  const symCell = el('td', { class: 'left ticker-cell' });
   if (isGroupStart) {
     const bits = [row.name].filter(Boolean);
     if (groupSize > 1) bits.push(`${groupSize} open positions`);
     if (bits.length) symCell.title = bits.join(' · ');
+    symCell.appendChild(tickerLink(row.underlying));
   }
 
   // No `type` at all means no open contract on this wheel right now (a
@@ -7024,8 +7046,9 @@ function renderCcCandidates() {
     const tr = el('tr', {
       class: 'op-row' + (row.meets_threshold ? '' : ' cc-below-100'),
     });
-    const symCell = el('td', { class: 'left ticker-cell' }, row.underlying);
+    const symCell = el('td', { class: 'left ticker-cell' });
     if (row.name) symCell.title = row.name;
+    symCell.appendChild(tickerLink(row.underlying));
     tr.appendChild(symCell);
 
     const targetCell = el('td', { class: 'num cc-target' }, money(row.target_cc_strike, { cents: true }));
@@ -7403,8 +7426,9 @@ function renderCspCandidates(available) {
     const { cell: earnCell } = earningsCell(row);
     const tr = el('tr', { class: 'op-row' });
 
-    const symCell = el('td', { class: 'left ticker-cell' }, row.underlying);
+    const symCell = el('td', { class: 'left ticker-cell' });
     if (row.name) symCell.title = row.name;
+    symCell.appendChild(tickerLink(row.underlying));
     const unvetted = (row.vetting && row.vetting.unvetted) || [];
     if (unvetted.length) {
       const flag = el('sup', { class: 'unvetted-flag' }, '?');

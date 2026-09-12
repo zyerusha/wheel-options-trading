@@ -986,6 +986,22 @@ th.sortable:hover {
   outline: none;
 }
 
+/* Symbol cell's ticker, linking out to its TradingView chart in a new tab.
+   Blends into the plain ticker-cell text until hovered/focused, unlike
+   .wheel-link's always-underlined in-app navigation. */
+.ticker-link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.ticker-link:hover,
+.ticker-link:focus-visible {
+  color: var(--series-1);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  outline: none;
+}
+
 /* The one actionable/key figure, wherever it appears -- candidate tables,
    the Open Positions target column, the Trade Log's target-price summary
    cell, and the wheel-targets banner. Same violet everywhere via --target. */
