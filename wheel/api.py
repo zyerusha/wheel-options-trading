@@ -2303,6 +2303,36 @@ class Dashboard:
             key=lambda snapshot: snapshot.as_of,
         )
 
+        timeline = [
+            {
+                "as_of": snapshot.as_of.date().isoformat(),
+                "total_value": _money(snapshot.total_value),
+                "cash_total": _money(snapshot.cash_total),
+            }
+            for snapshot in account_history
+        ]
+        # A configured opening balance (data/accounts.json's "opening_balances")
+        # that reaches earlier than any real snapshot -- same splice as
+        # _build_benchmark()'s `series`, so the Capital deployed chart's
+        # Cash + Unrealized shading has a starting point to draw from too, not
+        # just the growth-over-time comparison. Booked entirely as cash, since
+        # a single manual balance carries no real cash/equity split, and
+        # flagged `estimated` so the frontend can render it distinctly (the
+        # same dashed/faded "this figure is a guess" treatment already used
+        # for an estimated capital band) rather than silently blending a
+        # guess in among real, itemized Positions data.
+        if account_history and self.opening_balance and self.opening_balance[0] < account_history[0].as_of.date():
+            opening_day, opening_value = self.opening_balance
+            timeline.insert(
+                0,
+                {
+                    "as_of": opening_day.isoformat(),
+                    "total_value": _money(opening_value),
+                    "cash_total": _money(opening_value),
+                    "estimated": True,
+                },
+            )
+
         return {
             "available": True,
             "warnings": warnings,
@@ -2334,14 +2364,7 @@ class Dashboard:
                 }
                 for row in latest.rows
             ],
-            "timeline": [
-                {
-                    "as_of": snapshot.as_of.date().isoformat(),
-                    "total_value": _money(snapshot.total_value),
-                    "cash_total": _money(snapshot.cash_total),
-                }
-                for snapshot in account_history
-            ],
+            "timeline": timeline,
         }
 
     def _build_benchmark(self) -> dict[str, Any]:

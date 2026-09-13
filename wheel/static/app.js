@@ -20,33 +20,22 @@ const SVG_NS = 'http://www.w3.org/2000/svg';
 // behavior.
 const COMBINED_ACCOUNT_ID = 'combined';
 
-// A single persisted numeric preference (localStorage), clamped to [min, max];
-// falls back to `fallback` when unset, unparseable, or storage is unavailable.
-function readStoredNumber(key, fallback, min, max) {
-  try {
-    const raw = window.localStorage.getItem(key);
-    const n = raw === null ? NaN : parseFloat(raw);
-    if (Number.isFinite(n)) return Math.min(max, Math.max(min, n));
-  } catch (err) {
-    /* private mode / storage disabled -- use the default */
-  }
-  return fallback;
-}
-
-function writeStoredNumber(key, value) {
-  try {
-    window.localStorage.setItem(key, String(value));
-  } catch (err) {
-    /* nothing to do -- the in-memory state still holds this session */
-  }
-}
-
+// Every field below this line that isn't marked "view-only, never saved" is
+// part of the reader's saved settings -- see the "persisted settings"
+// section (buildConfigSnapshot/applyConfigSnapshot) below, which reads and
+// writes these same paths against data/config.json. The literal values here
+// are just the fallback for a first run with nothing saved yet; they're
+// overwritten by applyConfigSnapshot() before the first render, so a
+// reload always resumes wherever the reader left off instead of flashing
+// these defaults first.
 const state = {
   data: null,
   tickers: new Set(),
   statuses: new Set(),
   start: null,
   end: null,
+  // view-only: which cards/rows are expanded, never saved (nothing to resume
+  // -- collapsed is the natural state right after data loads).
   expanded: new Set(),
   cycleSort: { key: 'net_realized_pl', dir: -1 },
   // Open option positions table: within each symbol group (symbols stay
@@ -58,10 +47,10 @@ const state = {
   cspCandSort: { key: 'stars', dir: -1 },
   // Wheel price targets table (Dashboard): which column sorts it, and direction.
   wheelTargetsSort: { key: 'gap_pct', dir: 1 },
-  // "Target price for CSP" column: the user-set % of last price (rounded down to
-  // $0.50) shown as a conservative strike floor. Editable in that card, kept in
-  // localStorage so it survives a reload. Default 93 (~7% out of the money).
-  cspTargetPct: readStoredNumber('cspTargetPct', 93, 50, 100),
+  // "Target price for CSP" column: the user-set % of last price (rounded down
+  // to $0.50) shown as a conservative strike floor. Default 93 (~7% out of
+  // the money).
+  cspTargetPct: 93,
   // How the capital chart expresses its bands: 'value' (dollars) or 'share' (%
   // of the day's total). A view of one chart, not a filter -- it changes no data.
   capitalMode: 'value',
@@ -77,6 +66,10 @@ const state = {
   // three are in the payload (data.expiration_calendar.days/.weeks/.months), so
   // switching is a redraw, not a refetch.
   expCalGrain: 'day',
+  // Date-range preset the filter row's #preset select is showing -- kept
+  // alongside start/end (below) since "custom" carries no formula of its own
+  // to recompute them from; see applyPreset()/the config-apply boot sequence.
+  datePreset: 'all',
   // Which data/<account>/ folder is active, or COMBINED_ACCOUNT_ID for every
   // account aggregated without merging their cycles. Affects every chart and
   // table on the page, not just Net worth & benchmark.
@@ -84,10 +77,183 @@ const state = {
   // Top-level view: 'dashboard' (every analytics card) or 'tradelog' (one
   // wheel's transaction ledger). `tradeLogCycleId` is which wheel it shows;
   // `tradeLogTicker` (null = all) narrows the wheel list to one ticker.
+  // Neither is saved -- both name a specific wheel/cycle in the currently
+  // loaded data, which a future session's data may not even contain.
   activeTab: 'dashboard',
   tradeLogCycleId: null,
   tradeLogTicker: null,
+  // Tools tab: Capital projection card inputs.
+  projection: {
+    balanceSource: 'full_value',
+    manualBalance: 100000,
+    roiSource: 'wheel_roc',
+    manualRoiPct: 8,
+    taxRatePct: 34,
+    years: 5,
+    // Scroll-to-zoom view window for the chart, [lo, hi] or null for "fit the
+    // data." View-only, never saved -- a reload should re-fit, not reopen
+    // scrolled into whatever was last on screen.
+    xZoom: null,
+    yZoom: null,
+  },
 };
+
+/* ----------------------------------------------------- persisted settings
+ *
+ * data/config.json remembers the reader's last settings across a browser
+ * refresh -- everything `buildConfigSnapshot()` below reads off `state`
+ * (plus the theme, which lives on the document root, not in `state`).
+ * `loadConfig()` fetches it once at boot, `applyConfigSnapshot()` applies it
+ * before the first render (see boot() at the very bottom of this file), and
+ * `queueConfigSave()` -- a debounced POST back to /api/config, called from
+ * every handler that changes one of these fields -- keeps it current. A
+ * missing or unreadable file (a first run, or a hand-edit gone wrong) just
+ * means "nothing saved yet": every field already has a plain literal
+ * fallback sitting in `state` above, same as before this existed.
+ *
+ * Table column sorts (cycleSort/openPosSort/ccCandSort/cspCandSort/
+ * wheelTargetsSort) and the Trade Log's own wheel/ticker selection are
+ * deliberately left out -- the former for effort/value (many independent
+ * sort controls for comparatively little payoff), the latter because it
+ * names a specific wheel in the currently loaded data, which a future
+ * session's data may not even contain.
+ */
+
+function buildConfigSnapshot() {
+  return {
+    theme: document.documentElement.dataset.theme || null,
+    activeTab: state.activeTab,
+    account: state.account,
+    datePreset: state.datePreset,
+    dateStart: state.start,
+    dateEnd: state.end,
+    tickers: [...state.tickers],
+    statuses: [...state.statuses],
+    capitalMode: state.capitalMode,
+    timelineSort: state.timelineSort,
+    periodPlGranularity: state.periodPlGranularity,
+    expCalGrain: state.expCalGrain,
+    cspTargetPct: state.cspTargetPct,
+    projection: {
+      balanceSource: state.projection.balanceSource,
+      manualBalance: state.projection.manualBalance,
+      roiSource: state.projection.roiSource,
+      manualRoiPct: state.projection.manualRoiPct,
+      taxRatePct: state.projection.taxRatePct,
+      years: state.projection.years,
+    },
+  };
+}
+
+async function saveConfigNow() {
+  try {
+    await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(buildConfigSnapshot()),
+    });
+  } catch (error) {
+    // Non-fatal: the next change (or the next debounced call) tries again --
+    // losing one save to a flaky connection shouldn't surface as an error.
+  }
+}
+
+// `debounce` is declared further down in this file as a plain `function`
+// (hoisted), so it's already callable here despite the textual order.
+const queueConfigSave = debounce(saveConfigNow, 500);
+
+async function loadConfig() {
+  try {
+    const response = await fetch('/api/config');
+    if (!response.ok) return {};
+    const cfg = await response.json();
+    return cfg && typeof cfg === 'object' ? cfg : {};
+  } catch (error) {
+    return {};
+  }
+}
+
+/**
+ * Applies a fetched config.json onto `state`/the theme. Called once at boot,
+ * before the first render, so a reload resumes exactly where the reader left
+ * off instead of flashing the plain defaults in `state` above first. Every
+ * field is validated against the same set of values its own control
+ * accepts -- this file is machine-written, not hand-edited, but a stale
+ * field from an older version of the app (or a bad manual edit, since
+ * nothing stops someone from opening it) must not carry over a nonsense
+ * value; an invalid field is just skipped, leaving that one field's literal
+ * default in place.
+ */
+function applyConfigSnapshot(cfg) {
+  if (!cfg || typeof cfg !== 'object') return;
+
+  if (cfg.theme === 'dark' || cfg.theme === 'light') document.documentElement.dataset.theme = cfg.theme;
+  if (TAB_IDS.includes(cfg.activeTab)) state.activeTab = cfg.activeTab;
+  // `account` can't be validated against the real account list yet (that
+  // list itself is still an unfetched /api/accounts call away) -- it's
+  // applied optimistically and renderAccountChips() falls back to Combined
+  // the moment it turns out to be stale, the same way it already does for
+  // any other now-unknown account id.
+  if (typeof cfg.account === 'string' && cfg.account) state.account = cfg.account;
+  if (typeof cfg.datePreset === 'string') state.datePreset = cfg.datePreset;
+  if (typeof cfg.dateStart === 'string') state.start = cfg.dateStart;
+  if (typeof cfg.dateEnd === 'string') state.end = cfg.dateEnd;
+  if (Array.isArray(cfg.tickers)) state.tickers = new Set(cfg.tickers.filter((t) => typeof t === 'string'));
+  if (Array.isArray(cfg.statuses)) state.statuses = new Set(cfg.statuses.filter((s) => typeof s === 'string'));
+  if (cfg.capitalMode === 'value' || cfg.capitalMode === 'share') state.capitalMode = cfg.capitalMode;
+  if (cfg.timelineSort === 'time' || cfg.timelineSort === 'ticker') state.timelineSort = cfg.timelineSort;
+  if (cfg.periodPlGranularity === 'month' || cfg.periodPlGranularity === 'week') {
+    state.periodPlGranularity = cfg.periodPlGranularity;
+  }
+  if (EXP_CAL_GRAINS.includes(cfg.expCalGrain)) state.expCalGrain = cfg.expCalGrain;
+  if (Number.isFinite(cfg.cspTargetPct)) state.cspTargetPct = Math.min(100, Math.max(50, cfg.cspTargetPct));
+
+  const p = cfg.projection;
+  if (p && typeof p === 'object') {
+    if (['full_value', 'avg_capital', 'manual'].includes(p.balanceSource)) state.projection.balanceSource = p.balanceSource;
+    if (Number.isFinite(p.manualBalance)) state.projection.manualBalance = Math.max(0, p.manualBalance);
+    if (['wheel_roc', 'active_wheel_roc', 'manual'].includes(p.roiSource)) state.projection.roiSource = p.roiSource;
+    if (Number.isFinite(p.manualRoiPct)) state.projection.manualRoiPct = p.manualRoiPct;
+    if (Number.isFinite(p.taxRatePct)) state.projection.taxRatePct = Math.min(100, Math.max(0, p.taxRatePct));
+    if (Number.isFinite(p.years)) state.projection.years = Math.min(40, Math.max(1, Math.round(p.years)));
+  }
+}
+
+/**
+ * Visual sync for the handful of controls whose displayed state lives only
+ * in their own DOM attributes (aria-pressed/textContent), set nowhere else
+ * during a normal render -- normally fine, since they start out matching
+ * `state`'s own literal defaults, but a config-restored `state` needs them
+ * explicitly caught up once, at boot, before the first render. Every other
+ * restored field is already picked up naturally: the Capital projection
+ * inputs by `renderCapitalProjection()`, the date range by `applyPreset()`,
+ * tab visibility by `renderTabs()`, and so on.
+ */
+function syncViewControlsFromState() {
+  const capBtn = $('capital-mode');
+  if (capBtn) capBtn.setAttribute('aria-pressed', state.capitalMode === 'share' ? 'true' : 'false');
+
+  const timelineBtn = $('timeline-sort');
+  if (timelineBtn) {
+    const pressed = state.timelineSort === 'time';
+    timelineBtn.setAttribute('aria-pressed', pressed ? 'true' : 'false');
+    timelineBtn.textContent = pressed ? 'Sort by ticker' : 'Sort by time';
+  }
+
+  const periodBtn = $('period-pl-granularity');
+  if (periodBtn) {
+    const pressed = state.periodPlGranularity === 'week';
+    periodBtn.setAttribute('aria-pressed', pressed ? 'true' : 'false');
+    periodBtn.textContent = pressed ? 'Monthly' : 'Weekly';
+  }
+
+  const cspInput = $('csp-target-pct');
+  if (cspInput) cspInput.value = String(state.cspTargetPct);
+
+  $('start').value = state.start || '';
+  $('end').value = state.end || '';
+  $('preset').value = state.datePreset || 'all';
+}
 
 /* ---------------------------------------------------------------- utilities */
 
@@ -252,12 +418,20 @@ function smoothSeries(values, maxRadius = 4) {
   });
 }
 
-function niceTicks(min, max, count = 5) {
-  if (min === max) return [min];
-  const span = max - min;
+/** The "nice" step (1/2/2.5/5/10 x a power of ten) that lands closest to
+ * `span / count` ticks -- e.g. spans of $2.3M at count 5 picks $500k, not
+ * some arbitrary $460k. Shared by `niceTicks` below and the Capital
+ * projection chart's adaptive gridlines, which also want the step itself
+ * (to derive a finer minor tier from it), not just the resulting tick list. */
+function niceStep(span, count) {
   const raw = span / count;
   const magnitude = Math.pow(10, Math.floor(Math.log10(Math.abs(raw))));
-  const step = [1, 2, 2.5, 5, 10].map((m) => m * magnitude).find((s) => s >= raw) || magnitude * 10;
+  return [1, 2, 2.5, 5, 10].map((m) => m * magnitude).find((s) => s >= raw) || magnitude * 10;
+}
+
+function niceTicks(min, max, count = 5) {
+  if (min === max) return [min];
+  const step = niceStep(max - min, count);
   const ticks = [];
   for (let value = Math.ceil(min / step) * step; value <= max + 1e-9; value += step) {
     ticks.push(Math.abs(value) < step / 1e6 ? 0 : value);
@@ -356,7 +530,7 @@ function toggleChartCard(svg, hasData) {
   if (box) box.hidden = !hasData;
 }
 
-function frame(svg, { width, height, margin, yMin, yMax, yFormat = compactMoney }) {
+function frame(svg, { width, height, margin, yMin, yMax, yFormat = compactMoney, grid = true }) {
   clear(svg);
   svg.setAttribute('width', width);
   svg.setAttribute('height', height);
@@ -370,24 +544,29 @@ function frame(svg, { width, height, margin, yMin, yMax, yFormat = compactMoney 
   const group = svgEl('g');
   svg.appendChild(group);
 
-  for (const tick of niceTicks(yMin, yMax, 5)) {
-    const yPos = y(tick);
-    group.appendChild(
-      svgEl('line', {
-        class: 'grid-line',
-        x1: margin.left,
-        x2: margin.left + plotWidth,
-        y1: yPos,
-        y2: yPos,
-      })
-    );
-    group.appendChild(
-      svgEl(
-        'text',
-        { class: 'tick-label', x: margin.left - 8, y: yPos + 3.5, 'text-anchor': 'end' },
-        yFormat(tick)
-      )
-    );
+  // `grid: false` skips the default nice-number gridlines/labels for a
+  // caller that draws its own (e.g. the Capital projection chart's fixed
+  // $100k/$10k grid) -- it still gets the sized svg, `group` and `y` scale.
+  if (grid) {
+    for (const tick of niceTicks(yMin, yMax, 5)) {
+      const yPos = y(tick);
+      group.appendChild(
+        svgEl('line', {
+          class: 'grid-line',
+          x1: margin.left,
+          x2: margin.left + plotWidth,
+          y1: yPos,
+          y2: yPos,
+        })
+      );
+      group.appendChild(
+        svgEl(
+          'text',
+          { class: 'tick-label', x: margin.left - 8, y: yPos + 3.5, 'text-anchor': 'end' },
+          yFormat(tick)
+        )
+      );
+    }
   }
 
   return { group, plotWidth, plotHeight, y, margin };
@@ -691,19 +870,25 @@ function notDeployedByDate(points, netWorth) {
     let totalValue = 0;
     let cashTotal = 0;
     let anyKnown = false;
+    let estimated = false;
     for (const timeline of timelines) {
       const latest = lastSnapshotAtOrBefore(timeline, asOf);
       if (latest) {
         totalValue += latest.total_value;
         cashTotal += latest.cash_total || 0;
         anyKnown = true;
+        // A configured opening balance (data/accounts.json's "opening_balances",
+        // spliced into net_worth.timeline server-side -- see Dashboard._build_net_worth)
+        // rather than a real, itemized Positions snapshot -- flagged through so
+        // the chart can mark that one dot as a guess instead of a reading.
+        if (latest.estimated) estimated = true;
       }
     }
     if (!anyKnown) continue;
     const amount = totalValue - point.total;
     if (amount <= 1e-9) continue;
     const cash = Math.min(Math.max(cashTotal - point.put, 0), amount);
-    map.set(asOf, { amount, cash, unrealized: amount - cash });
+    map.set(asOf, { amount, cash, unrealized: amount - cash, estimated });
   }
   return map;
 }
@@ -793,6 +978,23 @@ function drawCapital(points, netWorth) {
     return;
   }
   toggleChartCard(svg, true);
+
+  // A configured opening balance (data/accounts.json's "opening_balances")
+  // can predate the account's first real trade -- `points` (capital_series)
+  // only ever covers actual trade activity, so there'd be no day for that
+  // dot to land on otherwise. Prepend a $0-committed day for it: true,
+  // nothing was in the wheel yet, so it reads as "all cash" once the Cash +
+  // Unrealized overlay below picks it up from net_worth.timeline.
+  const earliestEstimated = (netWorth && netWorth.available ? netWorth.timeline || [] : [])
+    .filter((snapshot) => snapshot.estimated)
+    .map((snapshot) => snapshot.as_of)
+    .sort()[0];
+  if (earliestEstimated && earliestEstimated < points[0].date) {
+    points = [
+      { date: earliestEstimated, put: 0, stock: 0, call: 0, long: 0, spread: 0, idle_stock: 0, call_stock: 0, total: 0 },
+      ...points,
+    ];
+  }
 
   const share = state.capitalMode === 'share';
   // Share mode's y-axis is 0-100% of that day's *committed* capital -- there
@@ -985,7 +1187,12 @@ function drawCapital(points, netWorth) {
       );
     }
 
-    // Dots: the real snapshot readings only, at each sub-band's true peak.
+    // Dots: real snapshot readings, at each sub-band's true peak -- except a
+    // dot flagged `estimated` (a configured opening balance standing in for
+    // a missing earlier snapshot, see notDeployedByDate()), which draws
+    // hollow with a dashed ring instead of solid-filled: the same "this
+    // figure is a guess" vocabulary the estimate capital band above uses,
+    // so a reader never mistakes a manual number for an itemized reading.
     for (const [date, nd] of notDeployed) {
       const point = points.find((p) => p.date === date);
       if (!point) continue;
@@ -999,9 +1206,10 @@ function drawCapital(points, netWorth) {
             cx: x(date),
             cy: y(stop.top),
             r: 4,
-            fill: stop.color,
-            stroke: surface,
-            'stroke-width': 2,
+            fill: nd.estimated ? surface : stop.color,
+            stroke: nd.estimated ? stop.color : surface,
+            'stroke-width': nd.estimated ? 1.5 : 2,
+            'stroke-dasharray': nd.estimated ? '2,1.5' : 'none',
           })
         );
       }
@@ -1054,10 +1262,11 @@ function drawCapital(points, netWorth) {
         { label: 'Total committed', value: money(point.total) },
       ];
       if (nd !== undefined) {
+        const tag = nd.estimated ? ' (estimated)' : '';
         rows.push(
-          { label: 'Cash', value: money(nd.cash), color: cssVar(NOT_DEPLOYED_COLOR) },
-          { label: 'Unrealized', value: money(nd.unrealized), color: cssVar(UNREALIZED_COLOR) },
-          { label: 'Total value', value: money(point.total + nd.amount) }
+          { label: 'Cash' + tag, value: money(nd.cash), color: cssVar(NOT_DEPLOYED_COLOR) },
+          { label: 'Unrealized' + tag, value: money(nd.unrealized), color: cssVar(UNREALIZED_COLOR) },
+          { label: 'Total value' + tag, value: money(point.total + nd.amount) }
         );
       }
       showTooltip(
@@ -1071,8 +1280,12 @@ function drawCapital(points, netWorth) {
           ...(nd !== undefined
             ? [
                 '',
-                'Total value (Positions snapshot only) = Total committed + Cash + Unrealized',
-                `= ${money(point.total)} + ${money(nd.cash)} + ${money(nd.unrealized)} = ${money(point.total + nd.amount)}`,
+                nd.estimated
+                  ? 'Total value here is a configured opening balance (data/accounts.json),'
+                  : 'Total value (Positions snapshot only) = Total committed + Cash + Unrealized',
+                nd.estimated
+                  ? '  standing in for a missing earlier snapshot, booked entirely as cash.'
+                  : `= ${money(point.total)} + ${money(nd.cash)} + ${money(nd.unrealized)} = ${money(point.total + nd.amount)}`,
               ]
             : []),
         ])
@@ -1110,7 +1323,15 @@ function drawCapital(points, netWorth) {
   if (share) {
     legend.appendChild(el('span', { class: 'legend-note' }, 'Switch to $ to add Cash and Unrealized.'));
   } else if (ndAnchors.length >= 2) {
-    legend.appendChild(el('span', { class: 'legend-note' }, `Dots = ${ndAnchors.length} snapshots; band between is interpolated.`));
+    const hasEstimate = ndAnchors.some((a) => a.estimated);
+    const note = hasEstimate
+      ? `Dots = ${ndAnchors.length} snapshots (the earliest is a configured opening balance, shown hollow); band between is interpolated.`
+      : `Dots = ${ndAnchors.length} snapshots; band between is interpolated.`;
+    legend.appendChild(el('span', { class: 'legend-note' }, note));
+  } else if (ndAnchors.length === 1 && ndAnchors[0].estimated) {
+    legend.appendChild(
+      el('span', { class: 'legend-note' }, 'The hollow dot is a configured opening balance, not a Positions snapshot.')
+    );
   }
 
   buildTable(
@@ -5118,19 +5339,25 @@ async function refreshDatasets() {
  * Single-select, unlike the ticker/status chips -- switching accounts changes
  * which dataset is loaded, so it reloads rather than filtering in place.
  */
+// id -> display label for every known account, refreshed on each accounts
+// listing. Used by `currentAccountIsRetirement()` (Capital projection) to
+// read the *current* selection's label without threading it through render().
+let accountLabelsById = {};
+
 function renderAccountChips(accounts) {
   const bar = $('accounts-bar');
   const host = $('account-chips');
   clear(host);
+  accountLabelsById = Object.fromEntries(accounts.map((a) => [a.id, a.label]));
 
   // The currently selected account may no longer exist (a folder removed,
   // an account ignored via a config edit, ...) -- fall back to Combined
   // rather than stay silently pointed at something gone, which would keep
   // sending a doomed ?account=<stale-id> on every future load(). Checked
   // against the known ids, not just "is the switcher shown": a single
-  // remaining account legitimately named via default_account must not be
-  // reset out from under a page that never had more than one to switch
-  // between in the first place.
+  // remaining account restored from data/config.json must not be reset out
+  // from under a page that never had more than one to switch between in the
+  // first place.
   const knownIds = new Set(accounts.map((a) => a.id));
   if (state.account !== COMBINED_ACCOUNT_ID && !knownIds.has(state.account)) {
     state.account = COMBINED_ACCOUNT_ID;
@@ -5153,6 +5380,7 @@ function renderAccountChips(accounts) {
       if (state.account === option.id) return;
       state.account = option.id;
       resetSelectionState();
+      queueConfigSave();
       renderAccountChips(accounts);
       load();
     });
@@ -5160,16 +5388,16 @@ function renderAccountChips(accounts) {
   }
 }
 
-// Applied at most once, on the page's first /api/accounts response -- a
-// later refreshAccounts() call (after an upload, say) must never yank the
-// user back to data/accounts.json's default_account/default_range if
-// they've since picked something else. default_range can't be applied here
-// yet -- applyPreset() needs state.data.meta, which only exists after the
-// first /api/dashboard response -- so this just remembers it for load() to
-// apply once that first response lands.
-let defaultAccountApplied = false;
-let defaultRangeToApply = null;
-let defaultRangeApplied = false;
+// The restored date-range preset (state.datePreset, from data/config.json --
+// see applyConfigSnapshot(), applied well before this ever runs) can't be
+// turned into concrete start/end dates until state.data.meta exists, since
+// applyPreset() needs the account's actual data range -- so load() applies
+// it once, right after its first successful response. Account/tickers/
+// statuses/etc. need no such deferral: they're already sitting in `state` by
+// the time refreshAccounts()/load() first run (see boot() at the bottom of
+// this file), and renderAccountChips() falls back to Combined on its own the
+// moment a restored account id turns out to be unknown.
+let configRangeApplied = false;
 
 // Optimistic until the first /api/accounts response actually says otherwise
 // -- a fresh checkout or an empty Docker data/ volume has zero accounts, and
@@ -5194,11 +5422,6 @@ async function refreshAccounts() {
     const listing = await response.json();
     hasAnyAccounts = (listing.accounts || []).length > 0;
     renderNoDataBanner(!hasAnyAccounts);
-    if (!defaultAccountApplied) {
-      if (listing.default_account) state.account = listing.default_account;
-      defaultRangeToApply = listing.default_range || null;
-      defaultAccountApplied = true;
-    }
     renderAccountChips(listing.accounts || []);
   } catch (error) {
     // Non-fatal: the dashboard still works against whatever account is active.
@@ -5391,16 +5614,22 @@ function wireFilters() {
 
   $('preset').addEventListener('change', (event) => {
     applyPreset(event.target.value);
+    state.datePreset = event.target.value;
+    queueConfigSave();
     if (event.target.value !== 'custom') load();
   });
   $('start').addEventListener('change', (event) => {
     state.start = event.target.value || null;
+    state.datePreset = 'custom';
     $('preset').value = 'custom';
+    queueConfigSave();
     load();
   });
   $('end').addEventListener('change', (event) => {
     state.end = event.target.value || null;
+    state.datePreset = 'custom';
     $('preset').value = 'custom';
+    queueConfigSave();
     load();
   });
   // Ticker/Status live in their own Dashboard card, separate from the
@@ -5409,6 +5638,7 @@ function wireFilters() {
   // the reader set it.
   $('reset').addEventListener('click', () => {
     resetSelectionState();
+    queueConfigSave();
     load();
   });
 
@@ -5417,6 +5647,7 @@ function wireFilters() {
     const on = event.currentTarget.getAttribute('aria-pressed') === 'true';
     event.currentTarget.setAttribute('aria-pressed', on ? 'false' : 'true');
     state.capitalMode = on ? 'value' : 'share';
+    queueConfigSave();
     if (state.data) drawCapital(state.data.capital_series, state.data.net_worth);
   });
 
@@ -5425,6 +5656,7 @@ function wireFilters() {
     event.currentTarget.setAttribute('aria-pressed', toTime ? 'true' : 'false');
     event.currentTarget.textContent = toTime ? 'Sort by ticker' : 'Sort by time';
     state.timelineSort = toTime ? 'time' : 'ticker';
+    queueConfigSave();
     if (state.data) drawTimeline(state.data.cycles, state.data.meta.through);
   });
 
@@ -5433,6 +5665,7 @@ function wireFilters() {
     event.currentTarget.setAttribute('aria-pressed', toWeekly ? 'true' : 'false');
     event.currentTarget.textContent = toWeekly ? 'Monthly' : 'Weekly';
     state.periodPlGranularity = toWeekly ? 'week' : 'month';
+    queueConfigSave();
     if (state.data) drawPeriodPl(state.data.period_pl || {});
   });
 
@@ -5441,6 +5674,7 @@ function wireFilters() {
     expCalBtn.addEventListener('click', () => {
       const i = EXP_CAL_GRAINS.indexOf(state.expCalGrain);
       state.expCalGrain = EXP_CAL_GRAINS[(i + 1) % EXP_CAL_GRAINS.length];
+      queueConfigSave();
       renderExpirationCalendar();
     });
   }
@@ -5452,7 +5686,7 @@ function wireFilters() {
       if (!Number.isFinite(n)) return;
       const clamped = Math.min(100, Math.max(50, n));
       state.cspTargetPct = clamped;
-      writeStoredNumber('cspTargetPct', clamped);
+      queueConfigSave();
       renderCspCash();
       // CSP TO ENTER on the Wheel price targets and Open Positions tables
       // tracks this same slider (see cspEntryTarget), so keep them
@@ -5501,6 +5735,7 @@ function wireFilters() {
       root.dataset.theme === 'dark' ||
       (!root.dataset.theme && window.matchMedia('(prefers-color-scheme: dark)').matches);
     root.dataset.theme = isDark ? 'light' : 'dark';
+    queueConfigSave();
     render(); // re-read CSS custom properties for the new mode
   });
 
@@ -5574,14 +5809,14 @@ async function load({ background = false } = {}) {
   // again, so a successful upload recovers on its own.
   if (!hasAnyAccounts) return;
   const generation = ++loadGeneration;
-  // The very first load() attempt gets one shot at applying
-  // data/accounts.json's default_range, win or lose -- marked spent right
-  // away (not only on success) so a later, unrelated load() (e.g. the user
-  // picking a filter after the first attempt merely failed on the network)
-  // is never mistaken for "the first response" and made to silently clobber
-  // whatever the user just chose.
-  const isFirstAttempt = !defaultRangeApplied;
-  defaultRangeApplied = true;
+  // The restored date-range preset (state.datePreset) gets one shot at being
+  // recomputed against the account's real data range, win or lose -- marked
+  // spent right away (not only on success) so a later, unrelated load()
+  // (e.g. the user picking a filter after the first attempt merely failed on
+  // the network) is never mistaken for "the first response" and made to
+  // silently clobber whatever the user just chose since.
+  const isFirstAttempt = !configRangeApplied;
+  configRangeApplied = true;
 
   const params = dashboardQuery();
 
@@ -5620,14 +5855,18 @@ async function load({ background = false } = {}) {
     }
   }
 
-  // data/accounts.json's default_range, applied once the very first
-  // dashboard response has told us meta.data_last_date -- applyPreset()
-  // needs it, so this can't happen any earlier than here. Runs as a second,
-  // independent load() rather than inline, so the loading-state add/remove
-  // above stays correctly paired for both fetches.
-  if (isFirstAttempt && succeeded && defaultRangeToApply) {
-    applyPreset(defaultRangeToApply);
-    $('preset').value = defaultRangeToApply;
+  // A named preset ("ytd", "1y", "year:2025", a bare day count) needs
+  // meta.data_last_date to turn into concrete start/end dates, which only
+  // exists after this first response -- so it gets recomputed once, here.
+  // "all" and "custom" need no recompute: their start/end, already restored
+  // into `state` at boot (see applyConfigSnapshot()), are exactly what the
+  // fetch above just used, so reloading for them would just refetch the same
+  // thing. Runs as a second, independent load() rather than inline, so the
+  // loading-state add/remove above stays correctly paired for both fetches.
+  const preset = state.datePreset;
+  if (isFirstAttempt && succeeded && preset && preset !== 'all' && preset !== 'custom') {
+    applyPreset(preset);
+    $('preset').value = preset;
     await load();
   }
 }
@@ -5680,7 +5919,7 @@ function tradeLogTickers() {
   return [...tickers].sort();
 }
 
-const TAB_IDS = ['dashboard', 'planner', 'realized', 'tradelog'];
+const TAB_IDS = ['dashboard', 'planner', 'realized', 'tradelog', 'tools'];
 
 function renderTabs() {
   TAB_IDS.forEach((name) => {
@@ -5694,6 +5933,7 @@ function renderTabs() {
 
 function switchTab(name) {
   state.activeTab = name;
+  queueConfigSave();
   renderTabs();
   if (name === 'tradelog') renderTradeLog();
   // Re-render immediately from whatever's already in state.data so the tab
@@ -5704,6 +5944,7 @@ function switchTab(name) {
   try {
     if (name === 'planner' && state.data) renderPlanner();
     if (name === 'realized' && state.data) renderRealizedGains();
+    if (name === 'tools' && state.data) renderCapitalProjection();
   } catch (error) {
     console.error('tab render failed:', error);
   }
@@ -5833,6 +6074,738 @@ function renderRealizedGains() {
   const note = $('realized-gains-note');
   if (note) note.textContent = hasData ? data.notes || '' : '';
   if (hasData) renderRealizedGainsBody(data);
+}
+
+/* ------------------------------------------------------- Capital projection
+ *
+ * Tools tab. Left of the red Today marker, the chart plots the account's real
+ * value (from Portfolio Positions snapshots, the same source the Net Worth &
+ * Benchmark chart uses) -- not modeled, an actual report of what happened.
+ * Right of Today it switches to a hypothetical "what if" model: today's
+ * balance compounds monthly at a fixed effective rate; a dashed gross
+ * (never-taxed) reference and the real account-value line's own continuation
+ * (which pays capital gains tax every March on its Jan-Dec earnings from the
+ * prior calendar year) both start from that same point.
+ */
+
+/**
+ * r_m = (1 + annual ROI)^(1/12) - 1, applied monthly from `startDate` (real
+ * "today") forward, to both a gross (never-taxed) and a net (taxed) running
+ * balance. At the close of every real December the net line's own earnings
+ * since the prior December are booked; that tax comes due 3 months later, in
+ * March, and is paid out of the net balance then -- so a calendar year's
+ * Jan/Feb still compound on the not-yet-taxed balance, exactly as the card's
+ * hint list describes. Because the clock starts at today rather than a
+ * January, the first calendar year is partial: its "earnings" only cover
+ * today through December, not a full year. A tax rate is never negative
+ * here: a down year owes nothing, but carries no credit forward either.
+ */
+function computeCapitalProjection({ balance, annualRoiPct, taxRatePct, years, startDate }) {
+  const months = Math.max(1, Math.round(years * 12));
+  const rm = Math.pow(1 + annualRoiPct / 100, 1 / 12) - 1;
+  const taxRate = taxRatePct / 100;
+  const pad = (n) => String(n).padStart(2, '0');
+  const startYear = startDate.getFullYear();
+  const startMonth = startDate.getMonth() + 1; // 1-12, the calendar month "today" falls in
+
+  let gross = balance;
+  let net = balance;
+  let prevDecBalance = balance;
+  let pendingTax = 0;
+  let pendingDueMonth = null;
+  const annualMap = new Map();
+  const ensureYear = (y) => {
+    if (!annualMap.has(y)) annualMap.set(y, { year: y, endGross: null, endNet: null, taxPaid: 0 });
+    return annualMap.get(y);
+  };
+
+  // Month 0 = today itself, at its real date (not rounded to the 1st) so it
+  // lines up exactly with the historical series and the vertical Today marker.
+  const rows = [{ month: 0, iso: localIso(startDate.getTime()), gross, net, taxPaid: 0 }];
+
+  for (let m = 1; m <= months; m += 1) {
+    gross *= 1 + rm;
+    net *= 1 + rm;
+    const monthsSinceJan = startMonth - 1 + m;
+    const calendarMonth = (monthsSinceJan % 12) + 1;
+    const calendarYear = startYear + Math.floor(monthsSinceJan / 12);
+
+    let taxPaid = 0;
+    if (calendarMonth === 3 && pendingDueMonth === m) {
+      taxPaid = pendingTax;
+      net -= taxPaid;
+      pendingTax = 0;
+      pendingDueMonth = null;
+      ensureYear(calendarYear).taxPaid = taxPaid;
+    }
+    if (calendarMonth === 12) {
+      const earnings = net - prevDecBalance;
+      pendingTax = Math.max(0, earnings) * taxRate;
+      pendingDueMonth = m + 3;
+      prevDecBalance = net;
+      const y = ensureYear(calendarYear);
+      y.endGross = gross;
+      y.endNet = net;
+    }
+
+    rows.push({ month: m, iso: `${calendarYear}-${pad(calendarMonth)}-01`, gross, net, taxPaid });
+  }
+
+  const annual = [...annualMap.values()].sort((a, b) => a.year - b.year);
+  return { rows, annual };
+}
+
+// Yearly x-axis for the projection chart -- plain calendar years (2026, 2027,
+// ...) at each January, rather than reusing `timeAxis`'s raw day-of-month
+// labels, which carry no year and get crowded/ambiguous over a span that now
+// runs from years of real history through years of future projection.
+const PROJECTION_YEAR_STEPS = [1, 2, 3, 5, 10, 15, 20, 25, 50];
+function projectionAxis(group, chartRows, x, yBase, plotWidth, margin) {
+  const first = chartRows[0];
+  const last = chartRows[chartRows.length - 1];
+  group.appendChild(
+    svgEl('line', { class: 'axis-line', x1: x(first.iso), x2: x(last.iso), y1: yBase, y2: yBase })
+  );
+
+  const firstYear = parseDay(first.iso).getFullYear();
+  const lastYear = parseDay(last.iso).getFullYear();
+  const maxLabels = Math.max(2, Math.floor(plotWidth / 60));
+  const totalYears = Math.max(1, lastYear - firstYear + 1);
+  const step =
+    PROJECTION_YEAR_STEPS.find((s) => Math.ceil(totalYears / s) <= maxLabels) ||
+    PROJECTION_YEAR_STEPS[PROJECTION_YEAR_STEPS.length - 1];
+
+  for (let yr = firstYear; yr <= lastYear; yr += 1) {
+    if ((yr - firstYear) % step !== 0) continue;
+    const xp = x(`${yr}-01-01`);
+    if (xp < margin.left - 1 || xp > margin.left + plotWidth + 1) continue;
+    group.appendChild(svgEl('text', { class: 'tick-label', x: xp, y: yBase + 16, 'text-anchor': 'middle' }, String(yr)));
+  }
+}
+
+// Current pixel<->data mapping for the projection chart, refreshed on every
+// draw and read back by `handleCapitalProjectionWheel` -- the wheel listener
+// is attached once (in `wireCapitalProjection`) to the SVG element, which the
+// per-render `clear()` never replaces, so it needs this out-of-band handle on
+// whatever geometry the most recent render actually used.
+let capitalProjectionGeom = null;
+
+const PROJ_ZOOM_IN = 0.85;
+const PROJ_ZOOM_OUT = 1 / 0.85;
+const PROJ_MIN_X_SPAN_MS = 20 * DAY_MS;
+
+// Below this pixel spacing a gridline tier reads as a smear, not a scale --
+// e.g. a fine-grained minor tier across a zoomed-out span. Shared floor for
+// both the dollar and time grids below; on top of picking an already-sane
+// adaptive step, it's a last-resort guard for extreme spans/tiny charts.
+const PROJ_MIN_GRID_PX = 4;
+
+/**
+ * Adaptive dollar gridlines for the projection chart, scaled to how far the
+ * reader has zoomed the y-axis (see `handleCapitalProjectionWheel`): a
+ * heavier, labeled "major" line at whatever round step (`niceStep`, the same
+ * 1/2/2.5/5/10-ladder every other chart's y-axis uses) lands close to 5
+ * across the visible span, plus a lighter, unlabeled "minor" line at a fifth
+ * of that. Zoomed out over a $2M+ span that's $500k major / $100k minor;
+ * zoomed into a $50k window it's $10k major / $2k minor -- always roughly
+ * the same number of lines on screen, never a fixed-step pile-up.
+ */
+function drawCapitalProjectionYGrid(group, { margin, plotWidth, plotHeight, yMin, yMax, y }) {
+  const majorStep = niceStep(yMax - yMin, 5);
+  const minorStep = majorStep / 5;
+
+  const drawTier = (step, cls, withLabel) => {
+    const count = (yMax - yMin) / step;
+    if (count <= 0 || plotHeight / count < PROJ_MIN_GRID_PX) return;
+    for (let v = Math.ceil(yMin / step) * step; v <= yMax + 1e-6; v += step) {
+      const yPos = y(v);
+      group.appendChild(
+        svgEl('line', { class: cls, x1: margin.left, x2: margin.left + plotWidth, y1: yPos, y2: yPos })
+      );
+      if (withLabel) {
+        group.appendChild(
+          svgEl('text', { class: 'tick-label', x: margin.left - 8, y: yPos + 3.5, 'text-anchor': 'end' }, compactMoney(v))
+        );
+      }
+    }
+  };
+  drawTier(minorStep, 'grid-line-minor', false);
+  drawTier(majorStep, 'grid-line', true);
+}
+
+// Ladder of "nice" calendar-aligned month steps -- every entry is a divisor
+// or multiple of 12, so `absoluteMonth % step === 0` always lands on the same
+// calendar month every year (quarters, half-years, whole years, ...) rather
+// than an arbitrary offset from wherever the visible window happens to start.
+const PROJ_MONTH_STEPS = [1, 2, 3, 6, 12, 24, 36, 60, 120, 240, 360, 600, 1200];
+
+/**
+ * Adaptive calendar gridlines for the projection chart's time axis: a
+ * heavier "major" line at whichever step off `PROJ_MONTH_STEPS` keeps the
+ * count near the target, and a lighter "minor" line one rung finer -- e.g.
+ * zoomed out over decades that's decade / year lines, zoomed into a couple of
+ * years it's year / quarter, and tight on a few months it's month-only (no
+ * rung below "month" to subdivide into). Text labels stay `projectionAxis`'s
+ * job; these are just the lines, density-guarded like the dollar grid above.
+ */
+function drawCapitalProjectionXGrid(group, { margin, plotWidth, plotHeight, x }, firstIso, lastIso) {
+  const first = parseDay(firstIso);
+  const last = parseDay(lastIso);
+  const firstAbs = first.getFullYear() * 12 + first.getMonth();
+  const lastAbs = last.getFullYear() * 12 + last.getMonth();
+  const totalMonths = lastAbs - firstAbs + 1;
+
+  const maxLabels = Math.max(2, Math.floor(plotWidth / 70));
+  const majorStep =
+    PROJ_MONTH_STEPS.find((s) => Math.ceil(totalMonths / s) <= maxLabels) || PROJ_MONTH_STEPS[PROJ_MONTH_STEPS.length - 1];
+  const minorStep = PROJ_MONTH_STEPS[Math.max(0, PROJ_MONTH_STEPS.indexOf(majorStep) - 1)];
+
+  const drawAt = (absMonth, cls) => {
+    const iso = `${Math.floor(absMonth / 12)}-${String((absMonth % 12) + 1).padStart(2, '0')}-01`;
+    const xp = x(iso);
+    if (xp < margin.left - 1 || xp > margin.left + plotWidth + 1) return;
+    group.appendChild(svgEl('line', { class: cls, x1: xp, x2: xp, y1: margin.top, y2: margin.top + plotHeight }));
+  };
+
+  const drawTier = (step, cls) => {
+    const count = Math.ceil(totalMonths / step);
+    if (plotWidth / count < PROJ_MIN_GRID_PX) return;
+    for (let i = Math.ceil(firstAbs / step) * step; i <= lastAbs; i += step) drawAt(i, cls);
+  };
+  if (minorStep < majorStep) drawTier(minorStep, 'grid-line-minor');
+  drawTier(majorStep, 'grid-line');
+}
+
+/**
+ * `historicalRows` ({iso, value}, real dates strictly before today) are the
+ * account's actual value from Positions snapshots -- see `renderCapitalProjection`.
+ * They're merged with the projected `rows` (from `computeCapitalProjection`)
+ * into one continuous account-value line: real readings, then today's own
+ * balance, then the hypothetical after-tax projection -- one color, because
+ * it is conceptually one line, just partly measured and partly modeled. The
+ * gross (no-tax) reference only exists going forward, since "no tax" is a
+ * hypothetical that doesn't apply to money that already changed hands.
+ *
+ * `state.projection.xZoom`/`yZoom` (each `[lo, hi]` or null) narrow the chart
+ * to a scrolled-in view of an axis; see `handleCapitalProjectionWheel`. Marks
+ * that would land outside the visible plot rect (a zoomed-in view no longer
+ * containing every point) are clipped to it, since raw SVG coordinates only
+ * clip at the element's own edge, not at an inner axis gutter.
+ */
+function drawCapitalProjection(rows, historicalRows, retirement) {
+  const svg = $('chart-capital-projection');
+  const legend = $('legend-capital-projection');
+  clear(legend);
+  if (!svg || !rows.length) return;
+
+  const netColor = cssVar('--series-1');
+  const grossColor = cssVar('--text-secondary');
+  const taxColor = cssVar('--neg');
+  const todayColor = cssVar('--critical');
+
+  const chartRows = [
+    ...historicalRows.map((h) => ({ iso: h.iso, net: h.value, gross: null, taxPaid: 0, historical: true, today: false })),
+    ...rows.map((r) => ({ iso: r.iso, net: r.net, gross: r.gross, taxPaid: r.taxPaid, historical: false, today: r.month === 0 })),
+  ];
+
+  const margin = { top: 24, right: 12, bottom: 30, left: 62 };
+  const width = chartWidth(svg);
+  const height = 300;
+
+  const proj = state.projection;
+  const values = chartRows.flatMap((r) => [r.net, r.gross]).filter((v) => v !== null);
+  const naturalYDomain = [0, Math.max(...values) * 1.1 || 1];
+  const [yMin, yMax] = proj.yZoom || naturalYDomain;
+
+  const { group, plotWidth, plotHeight, y } = frame(svg, { width, height, margin, yMin, yMax, grid: false });
+
+  const times = chartRows.map((r) => parseDay(r.iso).getTime());
+  const naturalXDomain = [times[0], times[times.length - 1]];
+  const [tMin, tMax] = proj.xZoom || naturalXDomain;
+  const x = (iso) =>
+    margin.left + (tMax === tMin ? plotWidth / 2 : ((parseDay(iso).getTime() - tMin) / (tMax - tMin)) * plotWidth);
+
+  capitalProjectionGeom = { margin, plotWidth, plotHeight, width, height, xDomain: [tMin, tMax], yDomain: [yMin, yMax], naturalXDomain, naturalYDomain };
+
+  // Fixed-step grid, drawn before the data marks so it sits behind them:
+  // dollars every $100k (heavier, labeled) and every $10k (lighter); years
+  // every January (heavier) and every calendar month (lighter). The $10k and
+  // month tiers self-skip once zoomed out far enough to pack them unreadably
+  // tight -- see `drawCapitalProjectionYGrid`/`XGrid`.
+  drawCapitalProjectionYGrid(group, { margin, plotWidth, plotHeight, yMin, yMax, y });
+  drawCapitalProjectionXGrid(group, { margin, plotWidth, plotHeight, x }, localIso(tMin), localIso(tMax));
+
+  // Marks are drawn into a clipped sub-group -- when zoomed in, a line
+  // segment running to an off-view point would otherwise be computed well
+  // outside the plot rect and could cross through the axis-label gutters.
+  const clipId = 'capital-projection-clip';
+  const defs = svgEl('defs');
+  const clipPath = svgEl('clipPath', { id: clipId });
+  clipPath.appendChild(svgEl('rect', { x: margin.left, y: margin.top, width: plotWidth, height: plotHeight }));
+  defs.appendChild(clipPath);
+  svg.appendChild(defs);
+  const marks = svgEl('g', { 'clip-path': `url(#${clipId})` });
+  group.appendChild(marks);
+
+  // The account-value line: real readings up to today, then the projected
+  // net (after-tax) balance.
+  marks.appendChild(
+    svgEl('path', {
+      d: 'M' + chartRows.map((r) => `${x(r.iso)},${y(r.net)}`).join('L'),
+      fill: 'none',
+      stroke: netColor,
+      'stroke-width': 2,
+      'stroke-linejoin': 'round',
+      'stroke-linecap': 'round',
+    })
+  );
+
+  // The no-tax hypothetical, today onward only -- meaningless (and identical
+  // to the net line) for an account where no tax applies in the first place.
+  if (!retirement) {
+    marks.appendChild(
+      svgEl('path', {
+        d: 'M' + rows.map((r) => `${x(r.iso)},${y(r.gross)}`).join('L'),
+        fill: 'none',
+        stroke: grossColor,
+        'stroke-width': 2,
+        'stroke-linejoin': 'round',
+        'stroke-linecap': 'round',
+        'stroke-dasharray': '5,4',
+      })
+    );
+  }
+
+  // A dot on every real reading (historical snapshot or today's own balance);
+  // pure future months get no dot of their own.
+  chartRows
+    .filter((r) => r.historical || r.today)
+    .forEach((r) => {
+      marks.appendChild(svgEl('circle', { cx: x(r.iso), cy: y(r.net), r: 3.5, fill: netColor }));
+    });
+
+  // Today: the line separating real history from the hypothetical.
+  const todayRow = chartRows.find((r) => r.today);
+  if (todayRow) {
+    const tx = x(todayRow.iso);
+    marks.appendChild(
+      svgEl('line', {
+        x1: tx,
+        x2: tx,
+        y1: margin.top,
+        y2: margin.top + plotHeight,
+        stroke: todayColor,
+        'stroke-width': 1.5,
+        'stroke-dasharray': '3,3',
+      })
+    );
+    marks.appendChild(
+      svgEl('text', { x: tx + 5, y: margin.top - 8, fill: todayColor, 'font-weight': 600, 'font-size': 11 }, 'Today')
+    );
+  }
+
+  // March tax-payment markers, on the net line, at the balance right after
+  // that March's payment came out.
+  const taxRows = chartRows.filter((r) => r.taxPaid > 0);
+  taxRows.forEach((r) => {
+    marks.appendChild(
+      svgEl('circle', {
+        cx: x(r.iso),
+        cy: y(r.net),
+        r: 5,
+        fill: taxColor,
+        stroke: cssVar('--surface-1'),
+        'stroke-width': 1.5,
+      })
+    );
+  });
+
+  projectionAxis(group, chartRows, x, margin.top + plotHeight, plotWidth, margin);
+
+  const netDot = group.appendChild(
+    svgEl('circle', { r: 5, fill: netColor, stroke: cssVar('--surface-1'), 'stroke-width': 2, opacity: 0 })
+  );
+  const grossDot = group.appendChild(
+    svgEl('circle', { r: 5, fill: grossColor, stroke: cssVar('--surface-1'), 'stroke-width': 2, opacity: 0 })
+  );
+
+  crosshairLayer(svg, group, { margin, plotWidth, plotHeight, width }, chartRows, (r) => x(r.iso), {
+    label: 'Actual account value up to today, projected gross vs. net (after-tax) balance after.',
+    onIndex: (index, at) => {
+      const row = chartRows[index];
+      netDot.setAttribute('cx', x(row.iso));
+      netDot.setAttribute('cy', y(row.net));
+      netDot.setAttribute('opacity', 1);
+      const showGross = !retirement && row.gross !== null;
+      grossDot.setAttribute('opacity', showGross ? 1 : 0);
+      if (showGross) {
+        grossDot.setAttribute('cx', x(row.iso));
+        grossDot.setAttribute('cy', y(row.gross));
+      }
+      const tooltipRows = [
+        {
+          label: row.historical ? 'Actual account value' : retirement ? 'Account balance (no tax)' : 'Net balance (after tax)',
+          value: money(row.net),
+          color: netColor,
+        },
+      ];
+      if (showGross) tooltipRows.push({ label: 'Gross balance (no tax)', value: money(row.gross), color: grossColor });
+      if (row.taxPaid > 0) tooltipRows.push({ label: 'Tax paid this March', value: money(row.taxPaid, { cents: true }), color: taxColor });
+      showTooltip(
+        at,
+        row.today ? 'Today' : longDate(row.iso),
+        tooltipRows,
+        row.taxPaid > 0
+          ? formula([
+              'Tax paid = capital gains tax rate x the net balance\'s Jan-Dec',
+              '  earnings from the prior calendar year',
+              `= ${money(row.taxPaid, { cents: true })}`,
+            ])
+          : null
+      );
+    },
+    onLeave: () => {
+      netDot.setAttribute('opacity', 0);
+      grossDot.setAttribute('opacity', 0);
+    },
+  });
+
+  const legendItem = (color, text, { dashed = false, dot = false } = {}) => {
+    const item = el('span');
+    const swatch = el('i', dot ? {} : { class: 'line' });
+    swatch.style.background = color;
+    if (dashed) swatch.style.opacity = '0.6';
+    if (dot) swatch.style.borderRadius = '50%';
+    item.appendChild(swatch);
+    item.appendChild(document.createTextNode(text));
+    legend.appendChild(item);
+  };
+  legendItem(netColor, 'Account value (actual to date, projected after)');
+  if (!retirement) legendItem(grossColor, 'Gross balance (no tax, hypothetical)', { dashed: true });
+  legendItem(todayColor, 'Today');
+  if (taxRows.length) legendItem(taxColor, 'March tax payment', { dot: true });
+
+  const zoomResetBtn = $('proj-zoom-reset');
+  if (zoomResetBtn) zoomResetBtn.hidden = !proj.xZoom && !proj.yZoom;
+
+  buildTable(
+    'capital-projection-table',
+    ['Month', 'Gross balance', 'Net balance', 'Tax paid'],
+    rows.map((r) => [
+      r.month === 0 ? 'Today' : longDate(r.iso),
+      money(r.gross),
+      money(r.net),
+      r.taxPaid > 0 ? money(r.taxPaid, { cents: true }) : '—',
+    ])
+  );
+}
+
+function renderCapitalProjectionSummary(annual) {
+  buildTable(
+    'capital-projection-summary',
+    ['Year', 'Ending gross balance', 'Ending net balance', 'Tax paid (that March)'],
+    annual.map((y) => [
+      String(y.year),
+      y.endGross === null ? '—' : money(y.endGross),
+      y.endNet === null ? '—' : money(y.endNet),
+      y.taxPaid > 0 ? money(y.taxPaid, { cents: true }) : '—',
+    ])
+  );
+}
+
+/**
+ * Best-effort only: there is no structured "this account is tax-advantaged"
+ * field anywhere in the data model (see wheel/accounts.py), just the display
+ * name the reader themselves gave the account/folder. "Combined" mixes
+ * accounts that may not all be retirement, so it never counts as one even if
+ * every account happens to match today -- only a single selected account can.
+ */
+function currentAccountIsRetirement() {
+  if (state.account === COMBINED_ACCOUNT_ID) return false;
+  const label = accountLabelsById[state.account] || '';
+  return /\b(ira|401k|403b|457b|roth|retirement)\b/i.test(label);
+}
+
+function renderCapitalProjection() {
+  const card = $('capital-projection-card');
+  if (!card) return;
+  const proj = state.projection;
+  const portfolio = (state.data && state.data.portfolio) || {};
+  const netWorth = state.data && state.data.net_worth;
+  const totals = netWorth && netWorth.available ? netWorth.combined || netWorth : null;
+  const totalValue = totals && totals.total_value !== null && totals.total_value !== undefined ? totals.total_value : null;
+  const avgCapital = portfolio.avg_capital !== null && portfolio.avg_capital !== undefined ? portfolio.avg_capital : null;
+
+  const balanceSourceSelect = $('proj-balance-source');
+  const balanceInput = $('proj-balance');
+  const balanceNote = $('proj-balance-note');
+  const roiSelect = $('proj-roi-source');
+  const manualInput = $('proj-roi-manual');
+  const roiNote = $('proj-roi-note');
+  const taxInput = $('proj-tax-rate');
+  const taxNote = $('proj-tax-note');
+  const yearsInput = $('proj-years');
+
+  if (balanceSourceSelect) balanceSourceSelect.value = proj.balanceSource;
+  if (yearsInput && document.activeElement !== yearsInput) yearsInput.value = String(proj.years);
+
+  // Beginning balance: manual entry, or auto-tracking either the account's
+  // full current value or its time-weighted average capital (same figure the
+  // Annualized Wheel ROC tile divides by) -- same auto/manual pattern as the
+  // ROI source below.
+  const autoBalance =
+    proj.balanceSource === 'full_value' ? totalValue : proj.balanceSource === 'avg_capital' ? avgCapital : null;
+  const usingAutoBalance = proj.balanceSource !== 'manual';
+  const autoBalanceAvailable = autoBalance !== null && autoBalance !== undefined;
+  const effectiveBalance = usingAutoBalance && autoBalanceAvailable ? autoBalance : proj.manualBalance;
+
+  if (balanceInput) {
+    balanceInput.disabled = usingAutoBalance && autoBalanceAvailable;
+    if (document.activeElement !== balanceInput) {
+      balanceInput.value = usingAutoBalance && autoBalanceAvailable ? String(Math.round(effectiveBalance)) : String(proj.manualBalance);
+    }
+  }
+  if (balanceNote) {
+    balanceNote.textContent =
+      usingAutoBalance && !autoBalanceAvailable
+        ? `No ${proj.balanceSource === 'full_value' ? 'account value' : 'time-weighted avg capital'} yet for this filter, using the manual entry instead.`
+        : '';
+  }
+
+  const autoPct =
+    proj.roiSource === 'wheel_roc'
+      ? portfolio.annualized_wheel_roc_pct
+      : proj.roiSource === 'active_wheel_roc'
+      ? portfolio.annualized_active_wheel_roc_pct
+      : null;
+  const usingAuto = proj.roiSource !== 'manual';
+  const autoAvailable = autoPct !== null && autoPct !== undefined;
+  const effectiveRoiPct = usingAuto && autoAvailable ? autoPct : proj.manualRoiPct;
+
+  // Auto mode with a live figure: the box itself shows that figure (read-only,
+  // it tracks the tile) rather than a separate line of text repeating it.
+  if (manualInput) {
+    manualInput.disabled = usingAuto && autoAvailable;
+    if (document.activeElement !== manualInput) {
+      manualInput.value = usingAuto && autoAvailable ? (Math.round(effectiveRoiPct * 100) / 100).toString() : String(proj.manualRoiPct);
+    }
+  }
+  if (roiNote) {
+    roiNote.textContent =
+      usingAuto && !autoAvailable
+        ? `No Annualized ${proj.roiSource === 'wheel_roc' ? 'Wheel' : 'Active Wheel'} ROC yet for this filter, using the manual entry instead.`
+        : '';
+  }
+
+  // A retirement account (best guess from its name -- see
+  // `currentAccountIsRetirement`) owes no annual capital gains tax, so the
+  // configured rate is overridden to 0 regardless of what the field shows.
+  const retirement = currentAccountIsRetirement();
+  const effectiveTaxRatePct = retirement ? 0 : proj.taxRatePct;
+  if (taxInput) {
+    taxInput.disabled = retirement;
+    if (!retirement && document.activeElement !== taxInput) taxInput.value = String(proj.taxRatePct);
+  }
+  if (taxNote) {
+    taxNote.textContent = retirement
+      ? `Not applied: "${accountLabelsById[state.account] || ''}" reads as a retirement account, so gains inside it are not taxed annually.`
+      : '';
+  }
+
+  const startDate = new Date();
+  const todayIso = localIso(startDate.getTime());
+  const benchmark = state.data && state.data.benchmark;
+  // Same source as the Net Worth & Benchmark chart's "Actual account value"
+  // line: real Positions-snapshot readings, not modeled. That chart itself
+  // ignores every filter (the backend builds it once from the account's
+  // whole snapshot history, before any date range is ever applied) -- this
+  // one instead honors the dashboard's selected date range's start, since a
+  // reader narrowing to "last year" or a specific year expects the
+  // projection's own history to begin there too, not further back. Ticker/
+  // status stay ignored: neither means anything against a whole-account
+  // value line.
+  const historicalRows =
+    benchmark && benchmark.available
+      ? (benchmark.series || [])
+          .filter(
+            (p) =>
+              p.actual_value !== null &&
+              p.actual_value !== undefined &&
+              p.as_of < todayIso &&
+              (!state.start || p.as_of >= state.start)
+          )
+          .map((p) => ({ iso: p.as_of, value: p.actual_value }))
+      : [];
+
+  const { rows, annual } = computeCapitalProjection({
+    balance: effectiveBalance,
+    annualRoiPct: effectiveRoiPct,
+    taxRatePct: effectiveTaxRatePct,
+    years: proj.years,
+    startDate,
+  });
+
+  drawCapitalProjection(rows, historicalRows, retirement);
+  renderCapitalProjectionSummary(annual);
+}
+
+/**
+ * Any of the six projection inputs (balance source/value, ROI source/value,
+ * tax rate, duration) can reshape the chart's whole time/dollar range, so a
+ * zoom window framed for the old numbers may no longer make sense against the
+ * new ones -- back to "fit the data" on every parameter change. Zooming
+ * itself (the wheel handler) is the only thing that ever sets a zoom, so it
+ * never fights this.
+ */
+function resetProjectionZoom() {
+  state.projection.xZoom = null;
+  state.projection.yZoom = null;
+}
+
+function wireCapitalProjection() {
+  const proj = state.projection;
+
+  const balanceSourceSelect = $('proj-balance-source');
+  if (balanceSourceSelect) {
+    balanceSourceSelect.addEventListener('change', () => {
+      proj.balanceSource = balanceSourceSelect.value;
+      queueConfigSave();
+      resetProjectionZoom();
+      renderCapitalProjection();
+    });
+  }
+
+  const balanceInput = $('proj-balance');
+  if (balanceInput) {
+    balanceInput.addEventListener('change', () => {
+      const n = parseFloat(balanceInput.value);
+      if (!Number.isFinite(n) || n < 0) return;
+      proj.manualBalance = n;
+      queueConfigSave();
+      resetProjectionZoom();
+      renderCapitalProjection();
+    });
+  }
+
+  const roiSelect = $('proj-roi-source');
+  if (roiSelect) {
+    roiSelect.addEventListener('change', () => {
+      proj.roiSource = roiSelect.value;
+      queueConfigSave();
+      resetProjectionZoom();
+      renderCapitalProjection();
+    });
+  }
+
+  const manualInput = $('proj-roi-manual');
+  if (manualInput) {
+    manualInput.addEventListener('change', () => {
+      const n = parseFloat(manualInput.value);
+      if (!Number.isFinite(n)) return;
+      proj.manualRoiPct = n;
+      queueConfigSave();
+      resetProjectionZoom();
+      renderCapitalProjection();
+    });
+  }
+
+  const taxInput = $('proj-tax-rate');
+  if (taxInput) {
+    taxInput.addEventListener('change', () => {
+      const n = parseFloat(taxInput.value);
+      if (!Number.isFinite(n)) return;
+      const clamped = Math.min(100, Math.max(0, n));
+      proj.taxRatePct = clamped;
+      queueConfigSave();
+      resetProjectionZoom();
+      renderCapitalProjection();
+    });
+  }
+
+  const yearsInput = $('proj-years');
+  if (yearsInput) {
+    yearsInput.addEventListener('change', () => {
+      const n = parseFloat(yearsInput.value);
+      if (!Number.isFinite(n)) return;
+      const clamped = Math.min(40, Math.max(1, Math.round(n)));
+      proj.years = clamped;
+      queueConfigSave();
+      resetProjectionZoom();
+      renderCapitalProjection();
+    });
+  }
+
+  const zoomResetBtn = $('proj-zoom-reset');
+  if (zoomResetBtn) {
+    zoomResetBtn.addEventListener('click', () => {
+      resetProjectionZoom();
+      renderCapitalProjection();
+    });
+  }
+
+  const projChart = $('chart-capital-projection');
+  if (projChart) projChart.addEventListener('wheel', handleCapitalProjectionWheel, { passive: false });
+}
+
+/**
+ * Scroll-to-zoom for the projection chart's axes: hovering the y-axis tick
+ * labels (the left gutter) and scrolling trims or restores how much of the
+ * dollar axis's top is shown -- the bottom is always $0, so a balance chart
+ * never has reason to zoom to a floating window away from it. Hovering the
+ * x-axis tick labels (the bottom gutter) zooms the time axis around the
+ * cursor's date instead, in both directions. Scrolling over the plot itself
+ * does nothing here (and isn't intercepted, so the page still scrolls
+ * normally). Reads `capitalProjectionGeom`, the geometry the most recent
+ * `drawCapitalProjection` call used, since this listener is attached once
+ * and outlives every individual render.
+ */
+function handleCapitalProjectionWheel(event) {
+  const geom = capitalProjectionGeom;
+  if (!geom) return;
+  const svg = $('chart-capital-projection');
+  const rect = svg.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+
+  const svgX = ((event.clientX - rect.left) / rect.width) * geom.width;
+  const svgY = ((event.clientY - rect.top) / rect.height) * geom.height;
+  const { margin, plotWidth, plotHeight } = geom;
+
+  const overYAxis = svgX < margin.left && svgY >= margin.top && svgY <= margin.top + plotHeight;
+  const overXAxis = svgY > margin.top + plotHeight && svgX >= margin.left && svgX <= margin.left + plotWidth;
+  if (!overYAxis && !overXAxis) return;
+
+  event.preventDefault();
+  const zoomIn = event.deltaY < 0;
+  const factor = zoomIn ? PROJ_ZOOM_IN : PROJ_ZOOM_OUT;
+  const proj = state.projection;
+
+  if (overYAxis) {
+    // The dollar axis always starts at $0 -- zooming only ever trims or
+    // restores the top, regardless of where on the axis the cursor sits.
+    const hi = geom.yDomain[1];
+    const natHi = geom.naturalYDomain[1];
+    const newHi = hi * factor;
+    if (!zoomIn && newHi >= natHi) {
+      proj.yZoom = null;
+    } else {
+      if (newHi < Math.max(50, natHi * 0.02)) return;
+      proj.yZoom = [0, newHi];
+    }
+  } else {
+    const [lo, hi] = geom.xDomain;
+    const span = hi - lo || 1;
+    const t = lo + ((svgX - margin.left) / plotWidth) * span;
+    let newLo = t - (t - lo) * factor;
+    let newHi = t + (hi - t) * factor;
+    const [natLo, natHi] = geom.naturalXDomain;
+    if (!zoomIn && newHi - newLo >= natHi - natLo) {
+      proj.xZoom = null;
+    } else {
+      if (newHi - newLo < PROJ_MIN_X_SPAN_MS) return;
+      proj.xZoom = [newLo, newHi];
+    }
+  }
+  renderCapitalProjection();
 }
 
 /**
@@ -8929,6 +9902,7 @@ function render() {
   renderChips('ticker-chips', meta.available_tickers, state.tickers, (value) => {
     if (state.tickers.has(value)) state.tickers.delete(value);
     else state.tickers.add(value);
+    queueConfigSave();
     load();
   });
   renderChips(
@@ -8938,6 +9912,7 @@ function render() {
     (value) => {
       if (state.statuses.has(value)) state.statuses.delete(value);
       else state.statuses.add(value);
+      queueConfigSave();
       load();
     },
     statusLabel
@@ -9158,6 +10133,7 @@ function render() {
   try {
     renderPlanner();
     renderRealizedGains();
+    renderCapitalProjection();
     updateExportLinks();
   } catch (error) {
     console.error('Planner/Realized-Gains render failed:', error);
@@ -9169,12 +10145,449 @@ function render() {
   if (state.activeTab === 'tradelog') renderTradeLog();
 }
 
-wireFilters();
-refreshDatasets();
-// load() must wait for refreshAccounts() to resolve data/accounts.json's
-// default_account (if any) into state.account -- firing both in parallel
-// would load "combined" first and only switch a moment later.
-refreshAccounts().then(load);
+/* ----------------------------------------------------------- table print */
+
+// Elements (`table` or `.card-subsection`-scoped filter shared below) that
+// belong directly to `root` (a .card or .card-subsection), not to a nested
+// .card-subsection -- so a card's own print button doesn't also grab its
+// subsections' tables, which get their own button instead.
+function ownScoped(root, selector) {
+  return Array.from(root.querySelectorAll(selector)).filter((node) => {
+    const sub = node.closest('.card-subsection');
+    return !sub || sub === root;
+  });
+}
+
+// The actual <table> elements to print for `root`, read live at print time
+// (a chart's table twin is only ever populated once its data has loaded).
+// Excludes a <table> nested inside another <table> -- buildTable() clears
+// and rebuilds *inside* whatever container id it's given, and a few tables
+// (e.g. capital-projection-summary) use a bare <table> as that container,
+// leaving the real, populated table sitting as a child of an empty outer
+// one of the same tag; cloning the outer one already brings the inner one
+// along, so counting both would print the same table twice. A legitimately
+// nested table -- e.g. a Wheel sequences row's expanded leg/spread detail,
+// sitting in a <td> of the outer cycles-table -- is excluded the same way,
+// for the same reason: it's already part of the outer table's clone.
+function ownTables(root) {
+  return ownScoped(root, 'table').filter((table) => !table.parentElement.closest('table'));
+}
+
+// `root`'s own chart(s) -- each an { svg, legend } pair -- read live at
+// print time. A chart lives in a .chart-scroll wrapper with a sibling
+// .legend div; both belong to root's direct chart, not a nested
+// subsection's, by the same ownScoped() rule as everything else here.
+function ownCharts(root) {
+  return ownScoped(root, '.chart-scroll')
+    .map((scroll) => ({
+      svg: scroll.querySelector('svg[id]'),
+      legend: scroll.parentElement ? scroll.parentElement.querySelector(':scope > .legend') : null,
+    }))
+    .filter((chart) => chart.svg);
+}
+
+// `root`'s own .tiles stat block(s), if any (e.g. Net worth & benchmark's
+// XIRR-vs-SPY tiles, Monthly cash flow's totals) -- part of what the card
+// visibly shows above its chart, not just the chart itself.
+function ownTiles(root) {
+  return ownScoped(root, '.tiles');
+}
+
+// What to actually print for `root`: its own tiles (if any) + chart(s), if
+// its table is a .table-twin (a genuine toggle counterpart to a chart, e.g.
+// Capital deployed or Realized P/L by ticker) -- since a picture of the
+// trend, with the same headline figures the card itself leads with, beats a
+// dump of the same numbers -- plus any other table `root` owns that isn't
+// that twin (Capital projection's always-shown summary table sits beside its
+// own monthly table twin; the chart swaps in for the twin, the summary table
+// still prints). A plain <table> or a .table-host (an always-shown table
+// with no chart alternative, e.g. Wheel price targets or the Trade Log
+// ledger) is never swapped out, even if the card happens to also draw an
+// unrelated supplementary chart elsewhere (the Trade Log's own
+// profit-over-time / PPD charts are just that: the ledger table is still the
+// thing to print).
+function ownPrintable(root) {
+  const hasTwin = ownScoped(root, '.table-twin').length > 0;
+  if (hasTwin) {
+    const charts = ownCharts(root);
+    if (charts.length) {
+      const standaloneTables = ownTables(root).filter((table) => !table.closest('.table-twin'));
+      return { kind: 'chart', tiles: ownTiles(root), charts, tables: standaloneTables };
+    }
+  }
+  return { kind: 'table', tables: ownTables(root) };
+}
+
+function printableHasContent(printable) {
+  return printable.kind === 'chart' ? printable.charts.length > 0 : printable.tables.length > 0;
+}
+
+// Whether `root` has anything to print, checked at startup before any data
+// has loaded: a chart's table twin (.table-twin) or an always-on table
+// container (.table-host, e.g. the Trade Log ledger) starts as an empty div
+// and only gains its <table> once render() runs, so that div's mere
+// presence -- not yet holding a <table> -- is what has to gate the button.
+// A card with only a chart and no table at all (e.g. Expiration calendar)
+// never had a button before this and still doesn't -- printing that chart
+// wasn't asked for, only swapping charts in for their table twins.
+function hasOwnTableHost(root) {
+  return ownScoped(root, 'table, .table-twin, .table-host').length > 0;
+}
+
+// Groups a header's non-heading children (CSV links, toggle buttons, ...)
+// into one .card-actions box, if they aren't already, so a newly added
+// button lands beside them at the header's right edge instead of spreading
+// out across it.
+function ensureActionsGroup(header) {
+  const existing = header.querySelector(':scope > .card-actions');
+  if (existing) return existing;
+  const heading = header.querySelector(':scope > h2, :scope > h3');
+  const actions = el('div', { class: 'card-actions' });
+  Array.from(header.children).forEach((child) => {
+    if (child !== heading) actions.appendChild(child);
+  });
+  header.appendChild(actions);
+  return actions;
+}
+
+// The account the print button should credit, matching the label the
+// account chips show (see renderAccountChips()) -- "Combined" for the
+// aggregate view, otherwise the reader's own name for that data/<account>/
+// folder.
+function currentAccountLabel() {
+  if (state.account === COMBINED_ACCOUNT_ID) return 'Combined';
+  return accountLabelsById[state.account] || state.account;
+}
+
+// The active Date range filter (top of the page, applies to every tab), in
+// the same words as its own <select> -- e.g. "Last 90 days", plus the actual
+// bounds once a preset has resolved to concrete dates (state.start/state.end;
+// null on either end means unbounded that direction, not "no filter" -- only
+// the 'all' preset leaves both null).
+function currentDateRangeLabel() {
+  const presetEl = $('preset');
+  const option = presetEl && presetEl.selectedIndex >= 0 ? presetEl.options[presetEl.selectedIndex] : null;
+  const label = option ? option.textContent.replace('…', '').trim() : '';
+  const bounds = state.start || state.end ? `${state.start || 'earliest'} to ${state.end || 'latest'}` : '';
+  if (label && bounds && label !== 'All history') return `${label} (${bounds})`;
+  return label || bounds || 'All history';
+}
+
+// Card/subsection titles that default to *excluded* from Print All -- the
+// deep-dive analytics charts (cumulative P/L, capital deployed, the Cash
+// Flow & P/L Analytics breakdowns, ticker/ROC/timeline views, wheel
+// sequences, the Realized-Gains cross-check, capital projection): useful on
+// screen, but not what a reader wants padding out a combined printout. Each
+// still has its own "Add to Print All" checkbox to opt back in; see
+// initTablePrintButtons().
+const PRINT_ALL_EXCLUDED_TITLES = new Set([
+  'Cumulative premium & realized P/L',
+  'Capital deployed',
+  'Net worth & benchmark',
+  'Where the wheel is right now',
+  'Monthly cash flow',
+  'Periodic P/L',
+  'Cash flow vs. wheel P/L gap',
+  'Wheel PPD by week',
+  'Realized P/L by ticker',
+  'Annualized Wheel ROC',
+  'Ticker efficiency: P/L vs. Annualized ROC',
+  'Wheel timelines',
+  'Wheel sequences',
+  'Closed lots',
+  'Per-ticker cross-check',
+  'Capital projection',
+]);
+
+// root (.card/.card-subsection) -> its "Add to Print All" checkbox, set by
+// initTablePrintButtons().
+const printAllCheckboxByRoot = new WeakMap();
+
+// Every card/subsection currently showing at least one table, checked in for
+// Print All, in document order (dashboard top-to-bottom, then Planner,
+// Realized Gains, Trade Log, Tools -- every tab's markup lives in the DOM at
+// once, only hidden). Feeds printAllTables(); a card conditionally hidden
+// for lack of data (its own `hidden` attribute, e.g. no net worth snapshots
+// yet) is skipped, but a section is never skipped just because its *tab*
+// isn't the active one.
+function collectPrintableSections() {
+  const sections = [];
+  document.querySelectorAll('.card, .card-subsection').forEach((root) => {
+    if (root.hidden) return;
+    const checkbox = printAllCheckboxByRoot.get(root);
+    if (checkbox && !checkbox.checked) return;
+    const header = root.querySelector(':scope > header');
+    if (!header) return;
+    const printable = ownPrintable(root);
+    if (!printableHasContent(printable)) return;
+    const heading = header.querySelector(':scope > h2, :scope > h3');
+    sections.push({ title: heading ? heading.textContent.trim() : 'Table', printable });
+  });
+  return sections;
+}
+
+// Builds the throwaway hidden iframe every print job runs through: links the
+// real stylesheet (not a hand-copied one) so a table's colors -- gain/loss
+// blue-and-red, the violet target figure, status badges, ... -- come out on
+// paper exactly as they read on screen, and pins data-theme to light
+// regardless of the page's current theme, since dark mode's palette is tuned
+// for a dark screen, not white paper. Calls `populate(idoc)` once the
+// stylesheet has actually loaded (async; printing before it lands would
+// flash an unstyled, colorless table), then prints and cleans up.
+function withPrintFrame(populate) {
+  const frame = el('iframe', { class: 'print-frame', 'aria-hidden': 'true' });
+  document.body.appendChild(frame);
+  const idoc = frame.contentDocument;
+  idoc.open();
+  idoc.write('<!doctype html><html><head></head><body></body></html>');
+  idoc.close();
+  idoc.documentElement.setAttribute('data-theme', 'light');
+
+  const link = idoc.createElement('link');
+  link.rel = 'stylesheet';
+  link.href = '/styles.css';
+
+  const finish = () => {
+    const override = idoc.createElement('style');
+    override.textContent = `
+      * {
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
+        color-adjust: exact;
+      }
+      @page { size: letter; margin: 0.5in; }
+      body { margin: 24px; background: #fff; }
+      h2 { font-size: 15px; margin: 0 0 2px; }
+      .print-account { font-size: 12px; color: var(--text-secondary); margin: 0 0 16px; }
+      table { margin-bottom: 22px; }
+      table:last-child { margin-bottom: 0; }
+      th { position: static; }
+      svg { max-width: 100%; margin-bottom: 12px; }
+      .legend { margin-bottom: 22px; }
+      .print-page { page-break-after: always; break-after: page; }
+      .print-page:last-child { page-break-after: auto; break-after: auto; }
+      .chart-page-fit { transform-origin: top left; }
+    `;
+    idoc.head.appendChild(override);
+
+    populate(idoc);
+
+    frame.contentWindow.focus();
+    frame.contentWindow.print();
+    setTimeout(() => frame.remove(), 1000);
+  };
+  // error still finishes -- plain black-on-white beats a silently stuck button.
+  link.addEventListener('load', finish);
+  link.addEventListener('error', finish);
+  idoc.head.appendChild(link);
+}
+
+// One printed page's content box in CSS px (96px/in is the CSS spec's fixed
+// print reference, not actual printer DPI) -- Letter, minus the @page margin
+// set in withPrintFrame()'s stylesheet, minus a ~5% safety margin for a
+// reader whose print dialog ends up on a slightly smaller sheet (A4) or
+// margin than assumed.
+const PRINT_PAGE_CONTENT_HEIGHT = Math.round((11 - 2 * 0.5) * 96 * 0.95);
+
+// Scales `inner`'s content down (never up) so it fits within `maxHeight`,
+// instead of spilling onto a second page -- only ever applied to a chart
+// page's tiles/chart/legend (see addPrintSection()); a table is left to
+// flow across pages on its own, per the ask that only tables should ever run
+// long. `box` is `inner`'s parent: transform doesn't shrink what an element
+// reserves in normal page flow, only how it paints, so the box that actually
+// has to end up one-page-tall gets an explicit height + clipping instead,
+// while `inner` (still its natural, larger size) is visually scaled down to
+// fit inside it.
+function fitToOnePage(box, inner, maxHeight) {
+  const naturalHeight = inner.scrollHeight;
+  if (naturalHeight <= maxHeight) return; // already fits -- leave both at their natural size
+  const scale = Math.max(maxHeight / naturalHeight, 0.15);
+  inner.style.transform = `scale(${scale})`;
+  inner.style.width = `${100 / scale}%`;
+  box.style.height = `${maxHeight}px`;
+  box.style.overflow = 'hidden';
+}
+
+// Appends one printable section (a heading, the account line, and its
+// chart(s) or table(s) -- see ownPrintable()) to the print document, each
+// wrapped so it starts its own page when there's more than one (see
+// .print-page above). A chart is cloned as-is (colors are already resolved,
+// literal values on its shapes, or CSS that the linked stylesheet + forced
+// light theme reproduce) and stretched to the page width in place of its
+// fixed on-screen pixel size; its legend comes along so a color still reads
+// as a series name on paper, not just a hue. The tiles/chart/legend block is
+// then shrunk, if it has to be, to keep the whole card on one page; a
+// standalone table appended after it (Capital projection's summary table) is
+// not, and is free to run onto another page if it's long.
+function addPrintSection(idoc, title, printable) {
+  const page = idoc.createElement('section');
+  page.className = 'print-page';
+  idoc.body.appendChild(page); // attached now, so scrollHeight below reads real layout
+
+  const h2 = idoc.createElement('h2');
+  h2.textContent = title;
+  page.appendChild(h2);
+
+  const account = idoc.createElement('div');
+  account.className = 'print-account';
+  account.textContent = `Account: ${currentAccountLabel()}`;
+  page.appendChild(account);
+
+  if (printable.kind === 'chart') {
+    const headerHeight = page.scrollHeight; // space the title/account line above already used
+    const box = idoc.createElement('div');
+    const inner = idoc.createElement('div');
+    inner.className = 'chart-page-fit';
+    box.appendChild(inner);
+    page.appendChild(box);
+
+    (printable.tiles || []).forEach((tiles) => inner.appendChild(idoc.importNode(tiles, true)));
+    printable.charts.forEach(({ svg, legend }) => {
+      const svgClone = idoc.importNode(svg, true);
+      svgClone.removeAttribute('width');
+      svgClone.removeAttribute('height');
+      svgClone.style.width = '100%';
+      svgClone.style.height = 'auto';
+      inner.appendChild(svgClone);
+      if (legend) inner.appendChild(idoc.importNode(legend, true));
+    });
+
+    fitToOnePage(box, inner, PRINT_PAGE_CONTENT_HEIGHT - headerHeight);
+  }
+  // A chart section can still carry its own standalone table alongside the
+  // chart (Capital projection's always-shown summary table beside its
+  // monthly table twin, which the chart above already replaced) -- appended
+  // outside the shrink-to-fit box above, so it flows and paginates normally.
+  printable.tables.forEach((table) => page.appendChild(idoc.importNode(table, true)));
+}
+
+// Opens the browser print dialog on just `title` + its chart or table(s) --
+// so an item buried in a long dashboard prints on its own, without the
+// surrounding cards, filters, or rest of the page.
+function printOne(title, printable) {
+  if (!printableHasContent(printable)) return;
+  withPrintFrame((idoc) => {
+    idoc.title = title;
+    addPrintSection(idoc, title, printable);
+  });
+}
+
+// Opens the browser print dialog on every printable card/subsection in the
+// app at once, one section per page (see collectPrintableSections()) -- the
+// same print flow as a single card's button, just walking every tab instead
+// of only the active one. Printing to "Save as PDF" turns this into one PDF
+// with every item on its own page.
+// Print All's opening page: the Performance card's headline tiles (and its
+// insights box, if one is showing) plus the account and date range this
+// report covers -- context a reader needs before the per-card pages that
+// follow, so it always leads the report regardless of where the Performance
+// card itself sits in the dashboard's document order.
+function buildOverviewSection(idoc) {
+  const page = idoc.createElement('section');
+  page.className = 'print-page';
+
+  const h2 = idoc.createElement('h2');
+  h2.textContent = 'Performance';
+  page.appendChild(h2);
+
+  const account = idoc.createElement('div');
+  account.className = 'print-account';
+  account.textContent = `Account: ${currentAccountLabel()}`;
+  page.appendChild(account);
+
+  const range = idoc.createElement('div');
+  range.className = 'print-account';
+  range.textContent = `Date range: ${currentDateRangeLabel()}`;
+  page.appendChild(range);
+
+  const subtitleEl = $('subtitle');
+  if (subtitleEl && subtitleEl.textContent) {
+    const subtitle = idoc.createElement('div');
+    subtitle.className = 'print-account';
+    subtitle.textContent = subtitleEl.textContent;
+    page.appendChild(subtitle);
+  }
+
+  const tiles = $('tiles');
+  if (tiles && tiles.children.length) page.appendChild(idoc.importNode(tiles, true));
+
+  const insights = $('dashboard-insights');
+  if (insights && !insights.hidden && insights.children.length) page.appendChild(idoc.importNode(insights, true));
+
+  idoc.body.appendChild(page);
+}
+
+function printAllTables() {
+  const sections = collectPrintableSections();
+  withPrintFrame((idoc) => {
+    idoc.title = 'Wheel Dashboard';
+    buildOverviewSection(idoc);
+    sections.forEach((section) => addPrintSection(idoc, section.title, section.printable));
+  });
+}
+
+// Adds a print button, top right of its header, to every card and
+// card-subsection that owns at least one table (a static table or a chart's
+// table twin) -- see hasOwnTableHost(). Runs once at startup: headers are
+// static markup, and later re-renders only ever replace a table's rows,
+// never the header or the table container itself.
+function initTablePrintButtons() {
+  document.querySelectorAll('.card, .card-subsection').forEach((root) => {
+    const header = root.querySelector(':scope > header');
+    if (!header) return;
+    if (!hasOwnTableHost(root)) return;
+    const heading = header.querySelector(':scope > h2, :scope > h3');
+    const title = heading ? heading.textContent.trim() : 'Table';
+    const actions = ensureActionsGroup(header);
+
+    const checkbox = el('input', {
+      type: 'checkbox',
+      class: 'print-all-check',
+      'aria-label': `Include "${title}" in Print All`,
+    });
+    checkbox.checked = !PRINT_ALL_EXCLUDED_TITLES.has(title);
+    printAllCheckboxByRoot.set(root, checkbox);
+    const checkboxLabel = el('label', {
+      class: 'print-all-label',
+      title: 'Include this table when using Print All (top right of the app)',
+    });
+    checkboxLabel.appendChild(checkbox);
+    checkboxLabel.appendChild(document.createTextNode('All'));
+    actions.appendChild(checkboxLabel);
+
+    const button = el(
+      'button',
+      { class: 'toggle print-btn', type: 'button', title: `Print ${title}`, 'aria-label': `Print ${title}` },
+      '⎙ Print'
+    );
+    button.addEventListener('click', () => printOne(title, ownPrintable(root)));
+    actions.appendChild(button);
+  });
+}
+
+initTablePrintButtons();
+$('print-all').addEventListener('click', printAllTables);
+
+/**
+ * Startup sequence. data/config.json (the reader's last settings -- theme,
+ * tab, account, filters, every box in the Tools tab, ...) is fetched and
+ * applied to `state`/the theme/the controls' own DOM before anything else
+ * happens, so the very first render already reflects it instead of
+ * flashing plain defaults first, then jumping. `refreshAccounts()` must
+ * still finish before `load()` fires -- it may reset a now-unknown restored
+ * account back to Combined (see renderAccountChips()) -- so those two stay
+ * sequential, same as before this existed.
+ */
+async function boot() {
+  const cfg = await loadConfig();
+  applyConfigSnapshot(cfg);
+  syncViewControlsFromState();
+  wireFilters();
+  wireCapitalProjection();
+  refreshDatasets();
+  refreshAccounts().then(load);
+}
+boot();
 
 // Live-price auto-refresh: re-poll while the tab is visible, on the same
 // cadence as the server's live-quote cache TTL (_LIVE_PRICE_TTL_SECONDS in

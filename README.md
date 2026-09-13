@@ -184,7 +184,7 @@ An account switcher appears at the top of the dashboard whenever more than one a
 
 Fidelity's "all accounts" Positions download lists every linked account in a single file — often more accounts than there are folders under `data/`, since not every account needs its own transaction-history folder. Any account number the dashboard finds that no folder claims gets its own tab automatically (Net Worth and holdings only — there's no transaction history to show for it). No config needed for that part.
 
-An optional `data/accounts.json` covers five things that auto-discovery can't:
+An optional `data/accounts.json` covers three things that auto-discovery can't:
 
 ```json
 {
@@ -193,8 +193,6 @@ An optional `data/accounts.json` covers five things that auto-discovery can't:
     "taxable": "Z98765432"
   },
   "ignore": ["Fidelity Go account"],
-  "default_account": "ira",
-  "default_range": "ytd",
   "opening_balances": {
     "taxable": { "date": "2025-01-02", "balance": 50000 }
   }
@@ -203,11 +201,21 @@ An optional `data/accounts.json` covers five things that auto-discovery can't:
 
 * **`folders`** — names a folder's account explicitly instead of leaving it to the "whichever snapshot was seen most recently" heuristic, which can pick the wrong one when a folder's own Positions file (or the shared "all accounts" download) lists several. Once named, that folder is filtered to just that account's rows — wherever they're found, including a shared download that physically lives in a different folder — and any other account in the same file is dropped with a warning rather than shown or blended in.
 * **`ignore`** — hides an account everywhere (its own tab and Combined), by account number or by its `Account name` exactly as Fidelity reports it (case-insensitive).
-* **`default_account`** — which account tab the dashboard opens to, instead of Combined. Use an id from `/api/accounts` (a folder name, or an auto-discovered slug like `roth-ira`).
-* **`default_range`** — which date-range preset the dashboard opens to, instead of All. One of `all`, `ytd`, `1y`, `3y`, `5y`, a specific calendar year (`year:2025`), or a bare day count — the same presets the filter row's dropdown offers.
 * **`opening_balances`** — a manual starting point for the Net Worth **S&P 500 benchmark** comparison, keyed by folder the same way as `folders`. That comparison needs two Positions snapshots on different dates to measure a return between; until you've collected a second one, an entry here ("the account was worth this much on this date," from a statement or your own records) stands in for the missing earlier snapshot — and even once you have several, an entry *earlier* than your oldest snapshot stretches the comparison further back than your export history alone allows. Never used for anything but that one comparison — Total value, Capital deployed, and every other current-state figure still come only from real Positions data.
 
 Transaction history is never split by account this way — no column to split it on — so it stays wholly attributed to whichever folder it's found in.
+
+#### Remembered settings (`data/config.json`)
+
+Which account tab and date range the dashboard opens to, along with every
+other filter, toggle, and number box (theme, active tab, ticker/status
+filters, the Capital projection card's inputs, ...), is *not* set in
+`accounts.json` — the app remembers your last-used settings itself, in
+`data/config.json`. It's created automatically the first time you change
+something in the UI, needs no setup, and every field falls back to a plain
+default if it's missing or unreadable — so it's safe to hand-edit or delete
+if you ever want to reset it. Unlike `accounts.json`, nothing here is meant
+to be configured by hand; it's just the last state the frontend saved.
 
 ## Wheel Model
 

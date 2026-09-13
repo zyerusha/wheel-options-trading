@@ -718,6 +718,14 @@ svg .grid-line {
   stroke-width: 1;
 }
 
+/* A second, lighter tier under `.grid-line` -- e.g. the Capital projection
+   chart's month/$10k lines under its year/$100k ones. */
+svg .grid-line-minor {
+  stroke: var(--gridline);
+  stroke-width: 0.5;
+  opacity: 0.55;
+}
+
 svg .tick-label {
   font-variant-numeric: tabular-nums;
 }
@@ -1992,6 +2000,36 @@ tr.detail > td {
   background: var(--ghost);
 }
 
+/* "Add to Print All" checkbox beside a card/subsection's own Print button. */
+.print-all-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.print-all-label input {
+  margin: 0;
+  cursor: pointer;
+}
+
+/* Off-screen host for a single-table print job (see printTables() in app.js).
+   Kept in the layout (not display: none) since some browsers refuse to print
+   from a display: none iframe. */
+.print-frame {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  width: 0;
+  height: 0;
+  border: 0;
+  visibility: hidden;
+}
+
 /* ---- Presentation mode: chrome-free, big headline figures ---------------- */
 
 body.presentation .source,
@@ -2008,7 +2046,8 @@ body.presentation #accounts-bar {
 }
 
 /* keep the Present button reachable so the mode can be left again */
-body.presentation #theme-toggle {
+body.presentation #theme-toggle,
+body.presentation #print-all {
   display: none;
 }
 
