@@ -888,7 +888,15 @@ function notDeployedByDate(points, netWorth) {
     const amount = totalValue - point.total;
     if (amount <= 1e-9) continue;
     const cash = Math.min(Math.max(cashTotal - point.put, 0), amount);
-    map.set(asOf, { amount, cash, unrealized: amount - cash, estimated });
+    // `totalValue` (this snapshot's real total account value) rides along too
+    // -- the day-to-day interpolation between two snapshots needs it to
+    // derive the not-deployed amount from *that day's own* committed capital,
+    // rather than interpolating cash/unrealized on their own and stacking
+    // them on top of a committed-capital figure that can jump independently
+    // in between (a CSP sold the day after a snapshot moves cash into
+    // collateral without changing total value at all -- see drawCapital()'s
+    // ndInterp).
+    map.set(asOf, { amount, cash, unrealized: amount - cash, estimated, totalValue });
   }
   return map;
 }
@@ -985,11 +993,22 @@ function drawCapital(points, netWorth) {
   // dot to land on otherwise. Prepend a $0-committed day for it: true,
   // nothing was in the wheel yet, so it reads as "all cash" once the Cash +
   // Unrealized overlay below picks it up from net_worth.timeline.
+  // net_worth.timeline (like benchmark.series) is built once from the whole
+  // account history and ignores the dashboard's date-range filter entirely
+  // -- so the opening balance's own date can predate the *selected* range's
+  // start even when it doesn't predate the full history. Prepending it
+  // regardless would silently widen the x-axis back past a range the reader
+  // explicitly chose to narrow to; `state.start` (set) wins over it, same as
+  // it already does for the Capital projection chart's history.
   const earliestEstimated = (netWorth && netWorth.available ? netWorth.timeline || [] : [])
     .filter((snapshot) => snapshot.estimated)
     .map((snapshot) => snapshot.as_of)
     .sort()[0];
-  if (earliestEstimated && earliestEstimated < points[0].date) {
+  if (
+    earliestEstimated &&
+    earliestEstimated < points[0].date &&
+    (!state.start || earliestEstimated >= state.start)
+  ) {
     points = [
       { date: earliestEstimated, put: 0, stock: 0, call: 0, long: 0, spread: 0, idle_stock: 0, call_stock: 0, total: 0 },
       ...points,
@@ -1019,10 +1038,23 @@ function drawCapital(points, netWorth) {
           const a = ndAnchors[hi - 1] || ndAnchors[0];
           const b = ndAnchors[hi] || ndAnchors[0];
           const f = b.t === a.t ? 0 : (t - a.t) / (b.t - a.t);
-          return {
-            cash: a.cash + (b.cash - a.cash) * f,
-            unrealized: a.unrealized + (b.unrealized - a.unrealized) * f,
-          };
+          // Interpolate *total account value* -- the one figure only known at
+          // sparse snapshot dates -- then subtract that day's own real
+          // committed capital (capital_series, known every day) to get the
+          // not-deployed amount. Interpolating cash/unrealized directly and
+          // stacking them on top of committed capital was wrong: selling a
+          // put the day after a snapshot moves cash into collateral without
+          // changing total value at all, but the interpolated cash figure
+          // wouldn't have caught up yet, so the same dollars got counted in
+          // both bands at once -- a false spike right on the trade date.
+          const totalValue = a.totalValue + (b.totalValue - a.totalValue) * f;
+          const amount = Math.max(totalValue - p.total, 0);
+          // The cash/unrealized split itself is interpolated as a ratio of
+          // that (now-correct) amount, not as absolute dollars.
+          const cashFraction = (x) => (x.amount > 1e-9 ? x.cash / x.amount : 1);
+          const fraction = cashFraction(a) + (cashFraction(b) - cashFraction(a)) * f;
+          const cash = Math.min(Math.max(fraction, 0), 1) * amount;
+          return { cash, unrealized: amount - cash };
         })
       : null;
   const ndTopAt = (i) =>
@@ -1154,7 +1186,7 @@ function drawCapital(points, netWorth) {
     const cashUpper = points.map((p, i) => cashLower[i] + cash[i]);
     const unrUpper = points.map((p, i) => cashUpper[i] + unrealized[i]);
 
-    const fillRun = (lower, upper, color) => {
+    const fillRun = (lower, upper, color, opacity = BAND_WASH) => {
       for (const run of bandRuns(lower, upper)) {
         const top = run.map((i) => `${x(points[i].date)},${y(upper[i])}`);
         const bottom = run.map((i) => `${x(points[i].date)},${y(lower[i])}`).reverse();
@@ -1162,14 +1194,37 @@ function drawCapital(points, netWorth) {
           svgEl('path', {
             d: `M${top.join('L')}L${bottom.join('L')}Z`,
             fill: color,
-            'fill-opacity': BAND_WASH,
+            'fill-opacity': opacity,
             stroke: 'none',
           })
         );
       }
     };
-    fillRun(cashLower, cashUpper, cssVar(NOT_DEPLOYED_COLOR));
-    fillRun(cashUpper, unrUpper, cssVar(UNREALIZED_COLOR));
+    const notDeployedColor = cssVar(NOT_DEPLOYED_COLOR);
+    const unrealizedColor = cssVar(UNREALIZED_COLOR);
+    // Unrealized fills noticeably denser than Cash (not just a different grey
+    // at the same low wash) so the two read apart at a glance, not just on
+    // close inspection -- two adjacent bands this close in hue were
+    // indistinguishable at a shared low opacity.
+    fillRun(cashLower, cashUpper, notDeployedColor, BAND_WASH);
+    fillRun(cashUpper, unrUpper, unrealizedColor, BAND_WASH * 1.9);
+
+    // A firm cap along the Cash/Unrealized boundary itself, in Unrealized's
+    // own full-strength colour -- the same "edge, not outline" cap the hued
+    // capital bands above use to stay legible where two fills meet, which
+    // this pair never had (a fill-only boundary is still a soft, easy-to-miss
+    // transition even once the two washes are visibly different densities).
+    for (const run of bandRuns(cashUpper, unrUpper)) {
+      group.appendChild(
+        svgEl('path', {
+          d: 'M' + run.map((i) => `${x(points[i].date)},${y(cashUpper[i])}`).join('L'),
+          fill: 'none',
+          stroke: unrealizedColor,
+          'stroke-width': 1.5,
+          'stroke-linejoin': 'round',
+        })
+      );
+    }
 
     // The connecting Total-value line, along the top of the area. `--text-primary`
     // (the strong ink both "total" lines use), dashed to say the stretch between
@@ -7835,11 +7890,28 @@ function openPositionRow(row, isGroupStart, groupSize) {
     )
   );
 
+  // `shares_untracked` (wheel/api.py) is the broker Positions snapshot's real
+  // quantity minus what the wheel model can trace to a known lot -- shares
+  // bought before every loaded export begins, the same gap net_worth's own
+  // `untracked_equity_value` names at the portfolio level. Shown as the real,
+  // total share count (what's actually in the account), with a tooltip
+  // explaining that the wheel math on this row (breakeven, P&L) only covers
+  // the smaller tracked piece -- rather than silently displaying just the
+  // tracked number with no sign anything is missing.
+  const totalShares = (row.shares_held || 0) + (row.shares_untracked || 0);
   const sharesHeldCell = el(
     'td',
     { class: 'num' },
-    row.shares_held ? Math.round(row.shares_held).toLocaleString('en-US') : '—'
+    totalShares ? Math.round(totalShares).toLocaleString('en-US') : '—'
   );
+  if (row.shares_untracked > 0) {
+    sharesHeldCell.title = formula([
+      `${Math.round(totalShares).toLocaleString('en-US')} held, per your broker's Positions snapshot.`,
+      `${Math.round(row.shares_untracked).toLocaleString('en-US')} of those have no known cost basis`,
+      '  (bought before every loaded export begins), so the wheel math on',
+      `  this row (breakeven, P&L) covers only the other ${Math.round(row.shares_held || 0).toLocaleString('en-US')}.`,
+    ]);
+  }
 
   // OTM is favorable for a short (it expires worthless, you keep the premium);
   // ITM is favorable for a long (it has intrinsic value). Same number, opposite
@@ -8084,6 +8156,14 @@ function renderCcCandidates() {
     symCell.appendChild(tickerLink(row.underlying));
     tr.appendChild(symCell);
 
+    // `shares_untracked` (wheel/api.py, same concept net_worth's own
+    // `untracked_equity_value` names portfolio-wide): shares this broker
+    // account really holds -- and that a call really can be written against
+    // -- but with no known cost basis (bought before every loaded export
+    // begins), so every dollar figure below can only be computed from the
+    // smaller tracked piece.
+    const trackedShares = (row.shares_held || 0) - (row.shares_untracked || 0);
+
     const targetCell = el('td', { class: 'num cc-target' }, money(row.target_cc_strike, { cents: true }));
     targetCell.title = formula([
       'Target price for CC = greatest of:',
@@ -8097,6 +8177,14 @@ function renderCcCandidates() {
       'The lowest strike worth writing a call at: an assignment sells',
       'the shares for at least their cost (keeping every premium already',
       'collected) and never below the current market.',
+      ...(row.shares_untracked
+        ? [
+            '',
+            `Priced off the ${shares(trackedShares)} shares with a known cost basis;`,
+            `  ${shares(row.shares_untracked)} more are held with none on file, so this`,
+            '  floor does not price them in.',
+          ]
+        : []),
     ]);
     tr.appendChild(targetCell);
 
@@ -8132,21 +8220,32 @@ function renderCcCandidates() {
     if (gl !== null && gl !== undefined) {
       glCell.title = formula([
         'Gain / Loss = Shares × (Last price - Cost basis)',
-        `= ${shares(row.shares_held)} × (${money(row.last_close, { cents: true })} - ${money(row.cost_basis_per_share, { cents: true })})`,
+        `= ${shares(trackedShares)} × (${money(row.last_close, { cents: true })} - ${money(row.cost_basis_per_share, { cents: true })})`,
         `= ${money(gl, { cents: true, sign: true })}`,
         'Against the raw average cost basis — premium already collected is not netted in.',
+        ...(row.shares_untracked
+          ? [`Only the ${shares(trackedShares)} shares with a known cost basis; see the Shares column.`]
+          : []),
       ]);
     }
     tr.appendChild(glCell);
 
-    // Whole-share count for the eye; the exact (sometimes fractional) figure
-    // sits in the tooltip -- fractional-share buys and DRIP dust leave odd
-    // remainders that don't matter for a 100-lot covered call.
+    // Whole-share count for the eye; the exact (sometimes fractional) figure,
+    // and any untracked-shares note, sit in the tooltip -- fractional-share
+    // buys and DRIP dust leave odd remainders that don't matter for a
+    // 100-lot covered call.
     const rounded = Math.round(row.shares_held);
     const sharesCell = el('td', { class: 'num' }, rounded.toLocaleString('en-US'));
-    if (Math.abs(row.shares_held - rounded) > 1e-6) {
-      sharesCell.title = `${shares(row.shares_held)} exact`;
+    const sharesTitle = [];
+    if (Math.abs(row.shares_held - rounded) > 1e-6) sharesTitle.push(`${shares(row.shares_held)} exact.`);
+    if (row.shares_untracked) {
+      sharesTitle.push(
+        `${shares(row.shares_untracked)} of these have no known cost basis (bought before every`,
+        `  loaded export begins), so Target price and Gain/Loss cover only the`,
+        `  other ${shares(trackedShares)}.`
+      );
     }
+    if (sharesTitle.length) sharesCell.title = formula(sharesTitle);
     tr.appendChild(sharesCell);
 
     const wheelCell = el('td', { class: 'left op-wheel' });
@@ -9152,11 +9251,12 @@ function wheelStageOf(entry) {
     };
   }
   if (entry.shares_held > 1e-9) {
+    const totalShares = entry.shares_held + (entry.shares_untracked || 0);
     return {
       cls: 'cc',
       spin: true,
       label: 'Covered Call',
-      sub: `Holding ${Math.round(entry.shares_held).toLocaleString('en-US')} sh, writing calls against them.`,
+      sub: `Holding ${Math.round(totalShares).toLocaleString('en-US')} sh, writing calls against them.`,
     };
   }
   return {
@@ -9349,15 +9449,29 @@ function renderTradeLogSummary(entry) {
       })
     );
   }
-  host.appendChild(
-    tradeLogCell('Shares held', (entry.shares_held || 0).toLocaleString('en-US'), {
-      help: formula([
-        'Shares still held from assignment(s),',
-        'net of any sold or called away.',
-        '0 once the wheel is flat.',
-      ]),
-    })
-  );
+  {
+    const totalShares = (entry.shares_held || 0) + (entry.shares_untracked || 0);
+    host.appendChild(
+      tradeLogCell('Shares held', totalShares.toLocaleString('en-US'), {
+        help: formula(
+          entry.shares_untracked
+            ? [
+                'Shares still held from assignment(s), net of any sold',
+                'or called away, plus shares the broker reports that have',
+                'no known cost basis (bought before every loaded export).',
+                `${Math.round(entry.shares_held || 0).toLocaleString('en-US')} tracked + `,
+                `${Math.round(entry.shares_untracked).toLocaleString('en-US')} untracked = ${Math.round(totalShares).toLocaleString('en-US')}.`,
+                'Cost basis / breakeven below cover only the tracked shares.',
+              ]
+            : [
+                'Shares still held from assignment(s),',
+                'net of any sold or called away.',
+                '0 once the wheel is flat.',
+              ]
+        ),
+      })
+    );
+  }
   host.appendChild(
     tradeLogCell('Open contracts', String(entry.open_contracts || 0), {
       help: formula(['Short option contracts still open, summed across all legs.']),

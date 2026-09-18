@@ -2819,10 +2819,29 @@ class Dashboard:
             "within_7d": [r["ticker"] for r in out if r["days_to_earnings"] <= 7],
         }
 
+    def _real_share_quantities(self) -> dict[str, float]:
+        """Each ticker's real total share count, straight off the latest
+        Portfolio Positions snapshot -- the broker's own count, unfiltered by
+        how much of it the wheel/cycle model can trace to a known lot. Shared
+        by `_build_cc_candidates` below (a covered call can be written
+        against shares with no known cost basis just as well as ones with
+        one -- the broker doesn't check) and by the Open option positions
+        payload's `shares_untracked` enrichment (build()); `{}` when there's
+        no Positions snapshot to read at all.
+        """
+        if not self._net_worth.get("available"):
+            return {}
+        totals: dict[str, float] = {}
+        for row in self._net_worth.get("positions", []):
+            if row.get("kind") == EQUITY and row.get("symbol"):
+                totals[row["symbol"]] = totals.get(row["symbol"], 0.0) + (row.get("quantity") or 0.0)
+        return totals
+
     def _build_cc_candidates(
         self,
         wheels: Sequence[dict[str, Any]],
         open_positions: Sequence[dict[str, Any]],
+        real_qty_by_symbol: dict[str, float],
     ) -> list[dict[str, Any]]:
         """Every position holding shares with no covered call currently written
         against it. Positions with >= 100 shares are the actionable ones -- a
@@ -2832,6 +2851,15 @@ class Dashboard:
         already-assembled Trade Log ``wheels`` (share count, cost basis, both
         break-evens, last close) and ``open_positions`` (which cycles already
         have a live CC leg); filter-independent like both.
+
+        The 100-share threshold (and ``contracts_available``) is checked
+        against ``real_qty_by_symbol`` -- the broker's real count -- not just
+        ``wheel["shares_held"]`` (the model's own, cost-basis-traceable
+        count): writing a covered call needs real shares in the account, not
+        a provable cost basis on them. A ticker with more real shares than
+        tracked ones carries the gap as ``shares_untracked``; the tracked
+        count still drives ``target_cc_strike`` and the P&L columns, since
+        there is no cost basis to price the untracked shares against.
 
         ``target_cc_strike`` is the lowest strike worth writing a call at: the
         greatest of the share cost basis, the position break-even (cost basis
@@ -2850,15 +2878,44 @@ class Dashboard:
         from :meth:`_fundamentals` (Yahoo, cached, hand-file override).
         """
         cc_cycle_ids = {p["cycle_id"] for p in open_positions if p.get("type") == "CC"}
+        # Same "tracked or real" share count the row loop below computes,
+        # just ahead of time -- a wheel with 0 tracked shares but a real,
+        # open position (JXN) still needs its sector/earnings prefetched.
         fundamentals = self._fundamentals(
-            [w["underlying"] for w in wheels if (w.get("shares_held") or 0.0) > 1e-9]
+            [
+                w["underlying"]
+                for w in wheels
+                if (w.get("shares_held") or 0.0) > 1e-9
+                or (w.get("status") != "CLOSED" and (real_qty_by_symbol.get(w["underlying"]) or 0.0) > 1e-9)
+            ]
         )
         today = date.today()
         rows: list[dict[str, Any]] = []
         for wheel in wheels:
-            shares = wheel.get("shares_held") or 0.0
-            if shares <= 1e-9 or wheel["cycle_id"] in cc_cycle_ids:
+            if wheel["cycle_id"] in cc_cycle_ids:
                 continue
+            tracked_shares = wheel.get("shares_held") or 0.0
+            # The real count wins when it's larger -- e.g. shares bought
+            # before every loaded export begins still exist in the account
+            # and can still back a call, even with no cost basis on file for
+            # them, or (JXN: 0 tracked, 300 real) an assignment the engine
+            # never saw at all. It never loses to the tracked count: a real
+            # snapshot that's simply older than the latest trades
+            # undercounting would wrongly hide an otherwise-actionable
+            # position. Only an open cycle can claim the real count -- a
+            # CLOSED wheel has sold out in the model's own terms, and a
+            # ticker keeps at most one open cycle at a time, so this can't
+            # double-count the same real shares onto two rows.
+            real_shares = real_qty_by_symbol.get(wheel["underlying"])
+            is_open = wheel.get("status") != "CLOSED"
+            shares = (
+                real_shares
+                if is_open and real_shares is not None and real_shares > tracked_shares
+                else tracked_shares
+            )
+            if shares <= 1e-9:
+                continue
+            untracked_shares = shares - tracked_shares if shares > tracked_shares else 0.0
             meets_threshold = shares >= 100 - 1e-9
             cost_basis = wheel.get("cost_basis_per_share")
             last_close = wheel.get("current_price")
@@ -2867,11 +2924,13 @@ class Dashboard:
                 if meets_threshold
                 else None
             )
-            # Total unrealized gain/loss on the shares vs. their raw average
-            # cost basis (not a break-even -- premium already banked is not
-            # netted in here), marked to the last close.
+            # Total unrealized gain/loss on the *tracked* shares vs. their raw
+            # average cost basis (not a break-even -- premium already banked
+            # is not netted in here), marked to the last close. Left off the
+            # untracked ones: there is no cost basis on file to measure a
+            # gain or loss against.
             has_marks = cost_basis is not None and last_close is not None
-            gain = round(shares * (last_close - cost_basis), 2) if has_marks else None
+            gain = round(tracked_shares * (last_close - cost_basis), 2) if has_marks else None
             gain_pct = (
                 round(100.0 * (last_close - cost_basis) / cost_basis, 2)
                 if has_marks and cost_basis
@@ -2886,6 +2945,7 @@ class Dashboard:
                     # Shown in the "Wheel" column; a plain buy-and-hold lot has none.
                     "wheel": wheel["cycle_id"] if wheel.get("is_wheel") else None,
                     "shares_held": round(shares, 4),
+                    "shares_untracked": round(untracked_shares, 4) if untracked_shares > 1e-6 else None,
                     "meets_threshold": meets_threshold,
                     # The covered-call position that could be opened, so it reads
                     # negative (a short call), e.g. 175 shares -> -1. None when
@@ -3217,7 +3277,9 @@ class Dashboard:
             )
         if self._cc_candidates is None:
             self._cc_candidates = self._build_cc_candidates(
-                (self._trade_log or {}).get("wheels", []), self._open_positions or []
+                (self._trade_log or {}).get("wheels", []),
+                self._open_positions or [],
+                self._real_share_quantities(),
             )
         if self._csp_candidates is None:
             _wheels = (self._trade_log or {}).get("wheels", [])
@@ -3282,6 +3344,33 @@ class Dashboard:
             if w["cycle_id"] not in _legged_cycles
             and (w["cycle_id"] in _wt_by_cycle or (w.get("shares_held") or 0.0) > 1e-9)
         ]
+        # Cross-reference each row's `shares_held` (the wheel/cycle model's own
+        # count -- only shares it can trace to a known lot) against the broker
+        # Positions snapshot's real quantity for that ticker (same helper
+        # `_build_cc_candidates` above uses). The gap is the same concept
+        # `_build_net_worth`'s `untracked_equity_value` already names at the
+        # portfolio level (shares bought before every loaded export begins)
+        # -- surfaced per-row here too, so "shares held" in the Open option
+        # positions table doesn't just quietly show a smaller number than the
+        # broker reports with no way to tell why.
+        _real_qty_by_symbol = self._real_share_quantities()
+        for _row in _open_positions_for_payload:
+            _held = _row.get("shares_held") or 0.0
+            _real_qty = _real_qty_by_symbol.get(_row.get("underlying"))
+            if _real_qty is not None and _real_qty - _held > 1e-6:
+                _row["shares_untracked"] = round(_real_qty - _held, 4)
+        # Same cross-reference, folded onto the Trade Log's own wheel entries
+        # (`_wheels` is `self._trade_log["wheels"]` itself, mutated in place)
+        # so a wheel currently in its Covered Call phase shows the broker's
+        # real share count there too, not just in the Open option positions
+        # table above.
+        for _w in _wheels:
+            _held = _w.get("shares_held") or 0.0
+            if _held <= 1e-9:
+                continue
+            _real_qty = _real_qty_by_symbol.get(_w.get("underlying"))
+            if _real_qty is not None and _real_qty - _held > 1e-6:
+                _w["shares_untracked"] = round(_real_qty - _held, 4)
         assignment_risk = assignment_mod.assignment_risk(
             self._open_positions or [], self._net_worth
         )
