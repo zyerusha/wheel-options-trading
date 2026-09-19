@@ -761,10 +761,40 @@
             </li>
             <li>Amber rows are longs; premium paid, not received</li>
             <li>Click a heading to sort, or hover one for its exact math</li>
+            <li id="open-positions-count"></li>
           </ul>
 
           <div style="overflow-x: auto">
             <table id="open-positions-table"></table>
+          </div>
+        </section>
+
+        <section
+          class="card"
+          id="recommended-btc-card"
+          style="margin-bottom: var(--gap)"
+          hidden
+        >
+          <header>
+            <h2>Recommended buy to close</h2>
+          </header>
+
+          <ul class="hint-list">
+            <li>
+              A standing GTC buy-to-close ladder for each open short
+              put/call: three limit prices, 50% / 20% / 10% of the premium
+              collected, each rounded down to the nearest dime.
+            </li>
+            <li>
+              Which rung fits is a judgment call: 50% is the common
+              cash-secured-put target; 20% suits a covered call early in its
+              life (still mostly time value, worth holding for), 10% once
+              most of that has burned off (worth locking in sooner).
+            </li>
+          </ul>
+
+          <div style="overflow-x: auto">
+            <table id="recommended-btc-table"></table>
           </div>
         </section>
 

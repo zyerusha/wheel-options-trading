@@ -1819,6 +1819,46 @@ def _merge_same_contract_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]
     return merged
 
 
+def _btc_target(open_price: float, fraction: float) -> float:
+    """One rung of the buy-to-close ladder: ``fraction`` of the original
+    credit per share, rounded down to the nearest dime (a tenth of a
+    dollar) once that clears ten cents a share -- below that a dime floor
+    is too coarse relative to the price itself, so it falls back to the
+    usual nearest-cent rounding instead. Rounding down, not to nearest: a
+    limit order priced a fraction above the true target would sit there
+    unfilled instead of erring toward closing early.
+    """
+    raw = open_price * fraction
+    if raw <= 0.10:
+        return _money(raw)
+    # The tiny epsilon absorbs float noise (0.35 x 0.2 is really
+    # 0.34999999999999997 in binary) that would otherwise floor a value
+    # like $0.70 down to $0.60.
+    return math.floor(raw * 10 + 1e-9) / 10
+
+
+def _btc_targets(row: dict[str, Any]) -> list[float] | None:
+    """The standing buy-to-close ladder for one open short CSP/CC leg --
+    ``None`` for a long leg or a no-contract row, neither of which is
+    something to buy back.
+
+    Three fixed rungs, 50% / 20% / 10% of the credit collected, always
+    shown together rather than the app picking one: 50% is the common
+    cash-secured-put target, 20%/10% the covered-call ones (worth holding
+    for early in its life, worth locking in once most of the time value is
+    gone) -- but exactly where a given position sits is for the trader to
+    judge, not this table. Reads off ``open_price`` -- the per-share credit
+    already on the row -- so this needs no live option quote, only the
+    trade's own history.
+    """
+    if row.get("type") not in ("CC", "CSP"):
+        return None
+    open_price = row.get("open_price")
+    if open_price is None:
+        return None
+    return [_btc_target(open_price, f) for f in (0.5, 0.2, 0.1)]
+
+
 def _no_contract_open_position_row(
     wheel: dict[str, Any],
     gap_pct: float | None,
@@ -2342,6 +2382,30 @@ class Dashboard:
         latest = max(latest_by_account.values(), key=lambda snapshot: snapshot.as_of)
         as_of_day = latest.as_of.date()
 
+        # Cash the ledger already knows about that this Positions snapshot
+        # predates -- an assignment/call-away posts to the transaction history
+        # on the next business day, two calendar days late across a weekend,
+        # so a snapshot taken right around expiry can look stale by that same
+        # money days after it has actually already arrived. Assignment rows
+        # carry their true date inline ("AS OF 09-18-26"), parsed into
+        # `as_of_date`; ordinary rows have none and are judged by `run_date`,
+        # which for them *is* the real posting day (no assignment-style lag).
+        # `>=` for the former, plain `>` for the latter: a same-day assignment
+        # can't be told apart from one that posted hours before that evening's
+        # snapshot, so it stays conservatively flagged, while an ordinary
+        # same-day trade -- already settled and in the snapshot's own cash
+        # total by definition -- must not be double-counted here too. `amount`
+        # is the authoritative net cash flow for every row (already net of
+        # commissions and fees), so this sum is an exact answer, not an
+        # estimate. Compared to `total_value` below to flag it only when it is
+        # large enough to matter.
+        def _not_yet_reflected(t: Transaction) -> bool:
+            return t.as_of_date >= as_of_day if t.as_of_date is not None else t.run_date > as_of_day
+
+        cash_pending_since_snapshot = round(
+            sum(t.amount for t in self.transactions if _not_yet_reflected(t)), 2
+        )
+
         wheel_tickers = {cycle.underlying for cycle in self.all_cycles}
         capital_series = (
             portfolio_capital_series(self.all_cycles, as_of_day) if self.all_cycles else []
@@ -2429,6 +2493,7 @@ class Dashboard:
             "cost_basis_unknown_rows": latest.cost_basis_unknown_rows,
             "wheel_capital_deployed": _money(wheel_capital_deployed),
             "untracked_equity_value": _money(untracked_equity_value),
+            "cash_pending_since_snapshot": _money(cash_pending_since_snapshot),
             "positions": [
                 {
                     "symbol": row.symbol,
@@ -2843,6 +2908,8 @@ class Dashboard:
                     )
                 )
         rows = _merge_same_contract_rows(rows)
+        for row in rows:
+            row["btc_targets"] = _btc_targets(row)
         rows.sort(key=lambda r: (r["underlying"], r["expiration"] or "", r["strike"] or 0.0))
         return rows
 

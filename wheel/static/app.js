@@ -7990,7 +7990,20 @@ function renderOpenPositions() {
       row.wheel_phase === 'csp' ? cspEntryTarget(row.last_close, state.cspTargetPct) : null,
   }));
   if (card) card.hidden = rows.length === 0;
+  const countLine = $('open-positions-count');
+  if (countLine) {
+    // "Position" here means an actual open contract (`type` set) -- the
+    // no-contract synthetic rows (shares held, nothing written) aren't one.
+    const optionCount = rows.filter((row) => row.type).length;
+    clear(countLine);
+    if (rows.length) {
+      countLine.appendChild(
+        el('strong', {}, `${optionCount} open option position${optionCount === 1 ? '' : 's'}`)
+      );
+    }
+  }
   clear(table);
+  renderRecommendedBtc();
   if (!rows.length) return;
 
   const { key, dir } = state.openPosSort;
@@ -8045,6 +8058,174 @@ function renderOpenPositions() {
   for (const group of ordered) {
     group.forEach((row, index) => tbody.appendChild(openPositionRow(row, index === 0, group.length)));
   }
+  table.appendChild(tbody);
+}
+
+/* --------------------------------------- table: recommended buy to close */
+
+const RECOMMENDED_BTC_COLUMNS = [
+  { key: 'underlying', label: 'Symbol', left: true },
+  { key: 'type', label: 'Type', left: true },
+  { key: 'btc_targets', label: 'Recommended BTC (50% / 20% / 10%)' },
+  { key: 'premium_if_btc', label: 'Premium Collected if BTC' },
+  { key: 'last_close', label: 'Last Price' },
+  { key: 'strike', label: 'Strike' },
+  { key: 'signed_contracts', label: 'Qty' },
+  { key: 'cost_basis_per_contract', label: 'Cost Basis / Contract' },
+  { key: 'net_premium', label: 'Net Premium' },
+  { key: 'expiration', label: 'Expiration' },
+  { key: 'cycle_id', label: 'Wheel', left: true },
+];
+
+// Labels the three rungs share everywhere they're spelled out: cell text,
+// tooltips, the ladder order itself (matches `btc_targets`, wheel/api.py).
+const BTC_LADDER = [
+  { fraction: 0.5, label: '50%' },
+  { fraction: 0.2, label: '20%' },
+  { fraction: 0.1, label: '10%' },
+];
+
+/**
+ * One open short put/call, paired with the standing buy-to-close ladder --
+ * see `_btc_targets` (wheel/api.py) for the 50% / 20% / 10%-of-premium
+ * rungs themselves, always shown together rather than the app picking one
+ * (that judgment call -- which rung fits where this position stands right
+ * now -- is left to the trader). Reuses the Open option positions table's
+ * own row material (same `state.data.open_positions`, already
+ * merged/sorted) rather than a separate payload, so the two tables can
+ * never drift out of sync.
+ */
+function recommendedBtcRow(row) {
+  const tr = el('tr');
+
+  const symCell = el('td', { class: 'left' });
+  symCell.appendChild(tickerLink(row.underlying));
+  tr.appendChild(symCell);
+
+  const label = OP_TYPE_LABEL[row.type] || row.type;
+  const typeCell = el('td', { class: 'left' });
+  typeCell.appendChild(el('span', { class: 'badge op-type op-type-' + row.type, title: label }, row.type));
+  tr.appendChild(typeCell);
+
+  const targets = row.btc_targets;
+  const contracts = row.contracts == null ? null : Math.abs(row.contracts);
+
+  // Rounded down to the nearest dime server-side (wheel/api.py,
+  // _btc_target) once a rung clears ten cents a share -- below that it
+  // falls back to ordinary nearest-cent rounding, so either way this is
+  // never more than two decimal places.
+  const btcCell = el(
+    'td',
+    { class: 'num cc-target' },
+    targets ? targets.map((v) => money(v, { cents: true })).join(' / ') : '—'
+  );
+  if (targets && row.open_price) {
+    btcCell.title = formula([
+      'Standing buy-to-close targets, rounded down to the nearest dime',
+      '  once a rung clears ten cents a share:',
+      ...BTC_LADDER.map(
+        (rung, i) => `  ${rung.label} × ${money(row.open_price, { cents: true })} = ${money(targets[i], { cents: true })}`
+      ),
+    ]);
+  }
+  tr.appendChild(btcCell);
+
+  // What buying back at each rung actually leaves you with: the original
+  // credit, less the cost of closing it there.
+  const kept =
+    targets && contracts && row.net_premium != null
+      ? targets.map((v) => row.net_premium - v * contracts * 100)
+      : null;
+  const netCell = el(
+    'td',
+    { class: 'num' },
+    kept ? kept.map((v) => money(v, { cents: true, sign: true })).join(' / ') : '—'
+  );
+  if (kept) {
+    netCell.title = formula([
+      'Net Premium, less the cost of closing at each rung above:',
+      ...BTC_LADDER.map(
+        (rung, i) =>
+          `  ${rung.label}: ${money(row.net_premium, { cents: true })} - (${money(targets[i], { cents: true })} × 100 × ${contracts}) = ${money(kept[i], { cents: true, sign: true })}`
+      ),
+    ]);
+  }
+  tr.appendChild(netCell);
+
+  tr.appendChild(el('td', { class: 'num' }, money(row.last_close, { cents: true })));
+  tr.appendChild(el('td', { class: 'num' }, money(row.strike, { cents: true })));
+  tr.appendChild(el('td', { class: 'num' }, row.signed_contracts == null ? '—' : row.signed_contracts));
+
+  // Net premium per contract, then per share (a contract covers 100 shares)
+  // -- the per-share cost basis this credit was actually collected at,
+  // fees included (unlike `open_price`, the raw quoted price).
+  const perContract =
+    contracts && row.net_premium != null ? row.net_premium / contracts / 100 : null;
+  const perContractCell = el(
+    'td',
+    { class: 'num ' + toneOf(perContract) },
+    perContract == null ? '—' : money(perContract, { cents: true, sign: true })
+  );
+  if (perContract != null) {
+    perContractCell.title = formula([
+      'Cost Basis / Contract = Net Premium ÷ contracts ÷ 100',
+      `= ${money(row.net_premium, { cents: true, sign: true })} ÷ ${contracts} ÷ 100`,
+      `= ${money(perContract, { cents: true, sign: true })}`,
+    ]);
+  }
+  tr.appendChild(perContractCell);
+
+  tr.appendChild(
+    el('td', { class: 'num ' + toneOf(row.net_premium) }, money(row.net_premium, { cents: true, sign: true }))
+  );
+
+  const nearExpiry = row.days_to_expiry !== null && row.days_to_expiry !== undefined && row.days_to_expiry < 8;
+  const expCell = el('td', { class: 'num' + (nearExpiry ? ' op-near-expiry' : '') });
+  if (row.expiration) {
+    const dow = parseDay(row.expiration).toLocaleDateString('en-US', { weekday: 'short' });
+    expCell.appendChild(document.createTextNode(`${longDate(row.expiration)} · ${dow} · ${row.days_to_expiry}d`));
+    if (nearExpiry) {
+      expCell.appendChild(
+        el(
+          'span',
+          { class: 'op-expiry-warn', title: `Near expiration: ${row.days_to_expiry} day(s) left` },
+          ' ⚠'
+        )
+      );
+    }
+  } else {
+    expCell.appendChild(document.createTextNode('—'));
+  }
+  tr.appendChild(expCell);
+
+  const wheelCell = el('td', { class: 'left op-wheel' });
+  wheelCell.appendChild(row.cycle_id ? wheelLink(row.cycle_id, row.underlying) : document.createTextNode('—'));
+  tr.appendChild(wheelCell);
+
+  return tr;
+}
+
+function renderRecommendedBtc() {
+  const table = $('recommended-btc-table');
+  if (!table) return;
+  const card = $('recommended-btc-card');
+  const rows = ((state.data && state.data.open_positions) || []).filter(
+    (row) => row.type === 'CC' || row.type === 'CSP'
+  );
+  if (card) card.hidden = rows.length === 0;
+  clear(table);
+  if (!rows.length) return;
+
+  const thead = el('thead');
+  const headRow = el('tr');
+  for (const column of RECOMMENDED_BTC_COLUMNS) {
+    headRow.appendChild(el('th', { class: column.left ? 'left' : '' }, column.label));
+  }
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const tbody = el('tbody');
+  for (const row of rows) tbody.appendChild(recommendedBtcRow(row));
   table.appendChild(tbody);
 }
 
@@ -8267,7 +8448,8 @@ function renderCcCandidates() {
  * value) and nets out `wheel_state.buckets.puts.amount` (current CSP
  * collateral, a hold against that same cash, not a separate pot). Shown as a
  * card right under Covered-call candidates so "what we can do next" is one
- * glance: CC candidates + this.
+ * glance: CC candidates + this. A second line names that same collateral
+ * directly -- Available Cash only implies it as a subtraction.
  */
 function renderCspCash() {
   const card = $('csp-cash-card');
@@ -8325,7 +8507,71 @@ function renderCspCash() {
     line.appendChild(document.createTextNode(' of account'));
   }
 
+  // The Positions snapshot these figures are built from can predate real
+  // cash the broker's ledger already has -- an assignment/call-away posts
+  // days after the option's own expiry. `cash_pending_since_snapshot` (same
+  // "combined" sum as cashTotal/totalValue above) is the exact net cash flow
+  // of every transaction posted after the snapshot's own date; flagged only
+  // once it is both a real dollar amount and a meaningful slice of the
+  // account, so a stray dividend doesn't light this up daily.
+  const pendingCash =
+    totals && typeof totals.cash_pending_since_snapshot === 'number'
+      ? totals.cash_pending_since_snapshot
+      : 0;
+  const pendingPct = totalValue ? (100 * Math.abs(pendingCash)) / totalValue : 0;
+  if (Math.abs(pendingCash) >= 250 && pendingPct >= 0.5) {
+    const snapshotDate = netWorth && netWorth.as_of ? longDate(netWorth.as_of.slice(0, 10)) : null;
+    line.appendChild(document.createTextNode('  '));
+    const warn = el(
+      'span',
+      { class: 'csp-cash-warn' },
+      `⚠ Upload a newer Positions export: ${money(pendingCash, { cents: true, sign: true })} not reflected yet`
+    );
+    setFormula(
+      warn,
+      formula([
+        `The loaded Positions snapshot${snapshotDate ? ` (${snapshotDate})` : ''} predates`,
+        '  transactions already posted to the ledger since then:',
+        '  assignments, calls/puts settling, dividends, and the like.',
+        `${money(pendingCash, { cents: true, sign: true })} of net cash movement since then`,
+        '  is not yet reflected in Cash / Available Cash above.',
+      ])
+    );
+    line.appendChild(warn);
+  }
+
   host.appendChild(line);
+
+  // The other side of Available Cash's subtraction, named instead of left
+  // implicit: what's currently tied up backing open cash-secured puts.
+  const reservedLine = el('div', { class: 'csp-cash-line' });
+  reservedLine.appendChild(document.createTextNode('Cash reserved for options strategies: '));
+  const reservedAmt = el('strong', {}, money(putCollateral, { cents: true }));
+  setFormula(
+    reservedAmt,
+    formula([
+      'Cash reserved for options strategies =',
+      '  Collateral held against every open cash-secured put',
+      `= ${money(putCollateral, { cents: true })}`,
+    ])
+  );
+  reservedLine.appendChild(reservedAmt);
+  if (totalValue) {
+    const reservedPct = (100 * putCollateral) / totalValue;
+    reservedLine.appendChild(document.createTextNode('  ·  '));
+    const reservedPctAmt = el('strong', {}, `${reservedPct.toFixed(1)}%`);
+    setFormula(
+      reservedPctAmt,
+      formula([
+        'Share of account = Cash reserved ÷ Total account value',
+        `= ${money(putCollateral, { cents: true })} ÷ ${money(totalValue, { cents: true })}`,
+        `= ${reservedPct.toFixed(1)}%`,
+      ])
+    );
+    reservedLine.appendChild(reservedPctAmt);
+    reservedLine.appendChild(document.createTextNode(' of account'));
+  }
+  host.appendChild(reservedLine);
 
   renderCspCandidates(available);
 }

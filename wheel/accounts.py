@@ -1627,6 +1627,7 @@ def _combine_net_worth(payloads: dict[str, dict]) -> dict[str, Any]:
         "option_value": 0.0,
         "wheel_capital_deployed": 0.0,
         "untracked_equity_value": 0.0,
+        "cash_pending_since_snapshot": 0.0,
     }
     accounts_out = []
     for account_id, net_worth in available:

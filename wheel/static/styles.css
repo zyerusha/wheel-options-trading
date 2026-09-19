@@ -422,6 +422,14 @@ button.primary {
   cursor: help;
 }
 
+/* Flags a Positions snapshot the transaction ledger has already moved past
+   (an assignment settling days after expiry, say) -- see renderCspCash(). */
+.csp-cash-warn {
+  color: var(--warning);
+  font-weight: 600;
+  cursor: help;
+}
+
 /* User-set "% of last close" for the Target price for CSP column. */
 .csp-target-ctl {
   display: flex;
@@ -960,7 +968,8 @@ th.sortable:hover {
   border-top: 2px solid var(--border);
 }
 
-#open-positions-table td.op-near-expiry {
+#open-positions-table td.op-near-expiry,
+#recommended-btc-table td.op-near-expiry {
   color: var(--warning);
   font-weight: 600;
 }
