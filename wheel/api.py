@@ -1741,6 +1741,84 @@ def _open_position_row(
     }
 
 
+def _merge_same_contract_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fold multiple open-leg rows for the very same contract (same cycle,
+    type, strike and expiration) into one -- a single order that filled in
+    pieces (LNC: 3 contracts then 1 more, same strike, same expiry, same
+    day) is one position to a viewer, not several identical-looking rows.
+    The Trade Log ledger still lists every fill separately; only this
+    summary table merges them.
+
+    Every field but the handful below is identical across the group already
+    (same cycle, same strike, same underlying market data), so it's copied
+    from the first row untouched. The handful that scale with contract count
+    are re-summed from scratch rather than picked from either row.
+    """
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    order: list[tuple[Any, ...]] = []
+    for row in rows:
+        key = (row["cycle_id"], row["type"], row["strike"], row["expiration"])
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(row)
+
+    merged: list[dict[str, Any]] = []
+    for key in order:
+        group = groups[key]
+        if len(group) == 1:
+            merged.append(group[0])
+            continue
+        base = dict(group[0])
+        contracts = sum(r["contracts"] for r in group)
+        signed_contracts = sum(r["signed_contracts"] for r in group)
+        net_premium = sum(r["net_premium"] or 0.0 for r in group)
+        collateral = (
+            sum(r["collateral"] for r in group) if all(r["collateral"] is not None for r in group) else None
+        )
+        est_close_cost = (
+            sum(r["est_close_cost"] for r in group)
+            if all(r["est_close_cost"] is not None for r in group)
+            else None
+        )
+        open_price = (
+            sum((r["open_price"] or 0.0) * r["contracts"] for r in group) / contracts
+            if contracts and all(r["open_price"] is not None for r in group)
+            else None
+        )
+        # Annualized yield is per dollar of capital committed, so it combines
+        # by weighting each fill's yield by its own collateral -- a plain
+        # average would let a 1-contract fill distort a 3-contract one.
+        annualized_yield_pct = None
+        if all(r["annualized_yield_pct"] is not None for r in group):
+            weight_total = sum(r["collateral"] or 0.0 for r in group)
+            annualized_yield_pct = (
+                round(sum((r["annualized_yield_pct"] or 0.0) * (r["collateral"] or 0.0) for r in group) / weight_total, 2)
+                if weight_total
+                else round(sum(r["annualized_yield_pct"] for r in group) / len(group), 2)
+            )
+        min_profit_captured_pct = (
+            round(min(100.0, 100.0 * (net_premium - est_close_cost) / net_premium), 1)
+            if est_close_cost is not None and net_premium
+            else None
+        )
+        base.update(
+            {
+                "contracts": round(contracts, 4),
+                "signed_contracts": round(signed_contracts, 4),
+                "net_premium": _money(net_premium),
+                "collateral": _money(collateral) if collateral is not None else None,
+                "open_price": open_price,
+                "open_date": min((r["open_date"] for r in group if r["open_date"]), default=base["open_date"]),
+                "annualized_yield_pct": annualized_yield_pct,
+                "est_close_cost": _money(est_close_cost) if est_close_cost is not None else None,
+                "min_profit_captured_pct": min_profit_captured_pct,
+            }
+        )
+        merged.append(base)
+    return merged
+
+
 def _no_contract_open_position_row(
     wheel: dict[str, Any],
     gap_pct: float | None,
@@ -2764,6 +2842,7 @@ class Dashboard:
                         ),
                     )
                 )
+        rows = _merge_same_contract_rows(rows)
         rows.sort(key=lambda r: (r["underlying"], r["expiration"] or "", r["strike"] or 0.0))
         return rows
 
