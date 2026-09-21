@@ -5895,14 +5895,22 @@ async function load({ background = false } = {}) {
     state.data = data;
     render();
     succeeded = true;
+    const errHost = $('load-error');
+    errHost.hidden = true;
+    clear(errHost);
   } catch (error) {
     if (generation !== loadGeneration) return; // superseded by a newer load()
-    const host = $('notices');
+    // Deliberately NOT #notices: that div lives inside #tab-dashboard and is
+    // invisible on every other tab, which would leave whatever account/filter
+    // was loaded before this failed fetch on screen with no visible sign
+    // anything is wrong (see the comment on #load-error in index.html).
+    const host = $('load-error');
     clear(host);
-    const notice = el('div', { class: 'notice' });
+    const notice = el('div', { class: 'notice err' });
     notice.appendChild(el('strong', {}, 'Could not load data'));
     notice.appendChild(document.createTextNode(' ' + error.message));
     host.appendChild(notice);
+    host.hidden = false;
   } finally {
     if (generation === loadGeneration) {
       document.querySelector('.wrap').classList.remove('loading');
