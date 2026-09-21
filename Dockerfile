@@ -33,6 +33,12 @@ RUN rm -rf /usr/local/lib/python3.*/site-packages/pip \
 RUN addgroup -g 1000 app \
  && adduser -D -H -u 1000 -G app -h /app -s /sbin/nologin app
 
+# su-exec drops from root to the app user after the entrypoint has fixed up
+# ownership of the bind-mounted data dir (see docker-entrypoint.sh) -- a
+# proper `USER app` can't do that fixup since it happens before the host
+# volume is even mounted.
+RUN apk add --no-cache su-exec
+
 # Application code ONLY. Never `COPY . .` -- keeps data/ and sandbox/ out of the image.
 COPY wheel/ ./wheel/
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
@@ -41,7 +47,9 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
  && mkdir -p /app/data \
  && chown -R app:app /app
 
-USER app
+# Stays root here -- the entrypoint chowns the bind-mounted data dir, which
+# only root can do, then su-exec's down to the unprivileged `app` user before
+# ever running application code.
 
 # Documentation only; the real port is $PORT at runtime.
 EXPOSE 8765

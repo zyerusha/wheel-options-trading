@@ -777,6 +777,12 @@ _SHARE_ROW_TYPES = frozenset(
 HEDGE_WIND_DOWN_DAYS = 60  # the user's "two months"
 HEDGE_EXPIRING_DAYS = 7
 
+# Once a hedge's intrinsic value alone covers this much of what it originally
+# cost, it has stopped behaving like decaying insurance -- it's carrying a
+# same-size directional bet on top. Below this it's still mostly time value
+# and the runway/wind-down "salvage its time value" framing still applies.
+HEDGE_DEEP_ITM_COST_FRACTION = 0.5
+
 # The whole-account and wheel-only XIRR comparisons replay the same cash-flow
 # timing into each of these indices. SPY stays first (and keeps the legacy
 # ``benchmark`` payload key to itself); the rest are additional lines.
@@ -1436,6 +1442,14 @@ def _open_hedge_entry(
     premium may have turned into shares now underwater. There is no options
     quote feed here, so the hedge's own market value can't be shown -- only its
     ``intrinsic_now`` floor.
+
+    A hedge whose ``intrinsic_now`` already covers most of what it cost (see
+    ``HEDGE_DEEP_ITM_COST_FRACTION``) reports as DIRECTIONAL regardless of
+    ``cycle.is_wheel``: once intrinsic value dominates, "runway left to sell
+    puts against it" / "sell it to salvage its time value" is no longer true,
+    it's carrying a same-size directional bet on top of the wheel. This
+    doesn't apply once the leg is actually EXPIRING -- time pressure is the
+    more useful thing to surface there regardless of moneyness.
     """
     days_to_expiry = (leg.expiry - through).days
     days_open = max((through - leg.open_date).days, 0)
@@ -1455,6 +1469,27 @@ def _open_hedge_entry(
     if current_price is not None and leg.strike is not None:
         per_share = max(0.0, leg.strike - current_price) if is_put else max(0.0, current_price - leg.strike)
         intrinsic = per_share * OPTION_MULTIPLIER * contracts
+
+    # This trade's own P&L, isolated from the rest of the cycle: what it's
+    # worth today (intrinsic -- no quote feed, so this is a floor, the real
+    # mark is intrinsic or better) minus what it cost. Real P&L is >= this,
+    # never worse -- any remaining time value only helps it. Distinct from
+    # wheel_pl_now below, which blends in the whole cycle's premium history
+    # and share P&L -- the right "are we winning" number for a genuine
+    # protective hedge, but not an answer to "is this trade itself up or
+    # down," which is what DIRECTIONAL is about.
+    trade_pl_floor = (intrinsic - cost) if intrinsic is not None else None
+
+    # A wheel-attached hedge that's gone deep ITM reads as DIRECTIONAL too --
+    # see HEDGE_DEEP_ITM_COST_FRACTION. Not once it's actually EXPIRING
+    # though: "close it or let it lapse" already holds there regardless of
+    # moneyness, and the time pressure is the more useful thing to surface.
+    deep_itm = (
+        phase != "expiring"
+        and intrinsic is not None
+        and cost > 0
+        and intrinsic >= HEDGE_DEEP_ITM_COST_FRACTION * cost
+    )
 
     metrics = cycle_metrics(cycle, through, current_price=current_price, dividends=dividends)
     shares_held = sum(lot.remaining for lot in cycle.share_lots if lot.remaining > 1e-9)
@@ -1483,18 +1518,30 @@ def _open_hedge_entry(
     losing = wheel_pl_now is not None and wheel_pl_now < -1
     intrinsic_phrase = f" (${intrinsic:,.0f} today)" if intrinsic is not None else ""
 
-    if not cycle.is_wheel:
+    if not cycle.is_wheel or deep_itm:
         headline = f"DIRECTIONAL · {days_to_expiry}d"
-        if phase == "runway":
-            message = (
-                f"Directional {kind}, no wheel premium behind it. Theta eats its cost daily; "
-                f"cut it or keep the exposure on purpose."
-            )
+        if not cycle.is_wheel:
+            if phase == "runway":
+                message = (
+                    f"Directional {kind}, no wheel premium behind it. Theta eats its cost daily; "
+                    f"cut it or keep the exposure on purpose."
+                )
+            else:
+                message = (
+                    f"Directional {kind}, {days_to_expiry}d left. Close for time value or hold "
+                    f"for the move, it finances nothing."
+                )
         else:
+            # Wheel-attached, but intrinsic value now dwarfs the original
+            # premium -- it's carrying a directional bet the size of the
+            # hedge itself, not cheap insurance with runway left to sell
+            # puts against.
             message = (
-                f"Directional {kind}, {days_to_expiry}d left. Close for time value or hold "
-                f"for the move, it finances nothing."
+                f"${intrinsic:,.0f} of this ${cost:,.0f} hedge is already intrinsic value, not "
+                f"time decay: it's trading like a directional {kind} now, not insurance with "
+                f"runway left. Close it to lock in the move, or hold it on purpose for more."
             )
+        phase = "directional"
     elif phase == "runway":
         headline = f"RUNWAY · {days_to_expiry}d"
         if losing:
@@ -1540,6 +1587,7 @@ def _open_hedge_entry(
         "premium_written_since": _money(premium_written_since),
         "current_price": _money(current_price),
         "intrinsic_now": _money(intrinsic),
+        "trade_pl_floor": _money(trade_pl_floor),
         "phase": phase,
         "headline": headline,
         "message": message,

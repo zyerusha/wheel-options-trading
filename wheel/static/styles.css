@@ -1367,6 +1367,14 @@ tr.detail > td {
   background: var(--closed-bg);
 }
 
+/* Same orange as .badge.DIRECTIONAL on the Open positions table -- a hedge
+   with no wheel behind it, or one gone deep enough ITM to trade like a
+   directional bet instead of decaying insurance (see HEDGE_DEEP_ITM_COST_
+   FRACTION in wheel/api.py). */
+.hedge-row.directional {
+  border-left-color: var(--series-2);
+}
+
 .hedge-row-main {
   display: flex;
   align-items: baseline;
@@ -1396,6 +1404,10 @@ tr.detail > td {
   color: var(--critical);
 }
 
+.hedge-row.directional .hedge-chip {
+  color: var(--series-2);
+}
+
 .hedge-title {
   font-weight: 650;
   color: var(--text-primary);
@@ -1417,6 +1429,12 @@ tr.detail > td {
 .hedge-econ .neg {
   color: var(--critical);
   font-weight: 600;
+}
+
+.hedge-econ .hedge-pl-floor {
+  cursor: help;
+  text-decoration: underline dotted currentColor;
+  text-underline-offset: 3px;
 }
 
 .hedge-detail {

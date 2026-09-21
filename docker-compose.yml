@@ -16,6 +16,9 @@ services:
       WHEEL_HOST: "0.0.0.0"
       WHEEL_DATA_DIR: "/app/data"
     restart: unless-stopped
-    # Linux hosts whose user is not uid 1000: uncomment so the bind mount
-    # stays writable for uploads / caches.
+    # The entrypoint starts as root and chowns the bind mount to uid 1000
+    # before dropping to the app user, so this shouldn't be needed -- but if
+    # your host's chown is somehow blocked (e.g. certain network mounts),
+    # uncomment to force the container to run as the host's own uid/gid
+    # instead of relying on the fixup.
     # user: "${WHEEL_UID:-1000}:${WHEEL_GID:-1000}"

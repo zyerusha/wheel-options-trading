@@ -4751,11 +4751,30 @@ function buildHedgeRow(h, { showAccount = true } = {}) {
   );
   row.appendChild(main);
 
-  // Facts line: what it cost, where the whole wheel stands right now (the
-  // honest "are we winning" number), and how much time is left.
+  // Facts line: what it cost, then either where the whole WHEEL stands (the
+  // honest "are we winning" number for a genuine protective hedge -- it
+  // deliberately blends in the cycle's premium history and share P&L) or,
+  // once a hedge is DIRECTIONAL, this TRADE's own P&L instead -- blending in
+  // unrelated wheel history would hide a losing directional bet behind an
+  // unrelated share/premium gain, which is exactly what a DIRECTIONAL row is
+  // warning about.
   const econ = el('div', { class: 'hedge-econ' });
   econ.appendChild(el('span', {}, `Hedge cost ${money(h.cost)}`));
-  if (typeof h.wheel_pl_now === 'number') {
+  if (h.phase === 'directional' && typeof h.trade_pl_floor === 'number') {
+    econ.appendChild(
+      el(
+        'span',
+        {
+          class: (h.trade_pl_floor >= 0 ? 'pos' : 'neg') + ' hedge-pl-floor',
+          title:
+            "Today's value minus what it cost, using intrinsic value only since there is no live " +
+            'options quote. Any remaining time value would only reduce a loss shown here, or add ' +
+            'to a gain: never the other way.',
+        },
+        `this trade's P&L ${money(h.trade_pl_floor, { sign: true })}`
+      )
+    );
+  } else if (typeof h.wheel_pl_now === 'number') {
     econ.appendChild(
       el(
         'span',
