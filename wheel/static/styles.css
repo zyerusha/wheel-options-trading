@@ -5,15 +5,23 @@
 :root {
   color-scheme: light;
 
-  --surface-1: #fcfcfb;
-  --page: #f9f9f7;
-  --text-primary: #0b0b0b;
-  --text-secondary: #52514e;
-  --text-muted: #898781;
-  --gridline: #e1e0d9;
-  --axis: #c3c2b7;
-  --border: rgba(11, 11, 11, 0.1);
-  --ghost: rgba(11, 11, 11, 0.04);
+  --surface-1: #f8f9ff;
+  --page: #edf1fc;
+  --text-primary: #0b0b0e;
+  --text-secondary: #4d5563;
+  --text-muted: #7c8593;
+  --gridline: #dde3f0;
+  --axis: #b9c2d4;
+  --border: rgba(10, 15, 40, 0.12);
+  --ghost: rgba(10, 15, 40, 0.05);
+
+  /* Brand accent (buttons, active tabs/chips, links) -- kept separate from
+     the --series-* chart palette below so re-skinning the chrome never
+     touches validated chart-data colours. */
+  --accent: #1b9fdf;
+  --accent-hover: #1886bb;
+  --accent-soft: rgba(27, 159, 223, 0.14);
+  --radius-sm: 6px;
 
   --series-1: #2a78d6;
   --series-2: #eb6834;
@@ -41,13 +49,13 @@
 @media (prefers-color-scheme: dark) {
   :root:where(:not([data-theme='light'])) {
     color-scheme: dark;
-    --surface-1: #1a1a19;
-    --page: #0d0d0d;
+    --surface-1: #113863;
+    --page: #040421;
     --text-primary: #ffffff;
-    --text-secondary: #c3c2b7;
-    --text-muted: #898781;
-    --gridline: #2c2c2a;
-    --axis: #383835;
+    --text-secondary: #a9b4c9;
+    --text-muted: #7e8aa0;
+    --gridline: #1c3f66;
+    --axis: #2a5480;
     --border: rgba(255, 255, 255, 0.1);
     --ghost: rgba(255, 255, 255, 0.06);
     --series-1: #3987e5;
@@ -67,13 +75,13 @@
 
 :root[data-theme='dark'] {
   color-scheme: dark;
-  --surface-1: #1a1a19;
-  --page: #0d0d0d;
+  --surface-1: #113863;
+  --page: #040421;
   --text-primary: #ffffff;
-  --text-secondary: #c3c2b7;
-  --text-muted: #898781;
-  --gridline: #2c2c2a;
-  --axis: #383835;
+  --text-secondary: #a9b4c9;
+  --text-muted: #7e8aa0;
+  --gridline: #1c3f66;
+  --axis: #2a5480;
   --border: rgba(255, 255, 255, 0.1);
   --ghost: rgba(255, 255, 255, 0.06);
   --series-1: #3987e5;
@@ -98,7 +106,7 @@ body {
   margin: 0;
   background: var(--page);
   color: var(--text-primary);
-  font: 14px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font: 14px/1.5 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -117,6 +125,19 @@ header.top {
   gap: 16px;
   flex-wrap: wrap;
   margin-bottom: 20px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.app-logo {
+  display: block;
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
 }
 
 h1 {
@@ -157,7 +178,7 @@ input[type='file'] {
   color: var(--text-secondary);
   background: var(--surface-1);
   border: 1px solid var(--axis);
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   padding: 5px 9px;
   min-height: 32px;
   max-width: 320px;
@@ -168,7 +189,7 @@ input[type='file']::file-selector-button {
   color: var(--text-primary);
   background: var(--ghost);
   border: 1px solid var(--axis);
-  border-radius: 5px;
+  border-radius: var(--radius-sm);
   padding: 3px 9px;
   margin-right: 9px;
   cursor: pointer;
@@ -221,8 +242,8 @@ input[type='file']::file-selector-button {
 }
 
 .dataset-chip.on {
-  border-color: var(--series-1);
-  color: var(--series-1);
+  border-color: var(--accent);
+  color: var(--accent);
   font-weight: 600;
 }
 
@@ -286,6 +307,19 @@ input[type='file']::file-selector-button {
   margin-bottom: var(--gap);
 }
 
+/* Account chips share the width of the widest account name -- same
+   equal-column grid trick as .tabs; scoped to this id only so the
+   Ticker/Status chip rows (which need to wrap freely) are untouched. */
+#account-chips {
+  display: inline-grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+}
+
+#account-chips .chip {
+  text-align: center;
+}
+
 .accounts #account-label {
   font-size: 11px;
   font-weight: 600;
@@ -315,13 +349,14 @@ button {
   color: var(--text-primary);
   background: var(--surface-1);
   border: 1px solid var(--axis);
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   padding: 6px 9px;
   min-height: 32px;
 }
 
 button {
   cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, box-shadow 0.12s;
 }
 
 button:hover {
@@ -329,9 +364,16 @@ button:hover {
 }
 
 button.primary {
-  border-color: var(--series-1);
-  color: var(--series-1);
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
   font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+}
+
+button.primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
 }
 
 .chip-row {
@@ -377,14 +419,38 @@ button.primary {
 }
 
 .chip[aria-pressed='true'] {
-  border-color: var(--series-1);
-  color: var(--series-1);
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
   font-weight: 600;
+}
+
+.chip[aria-pressed='true']:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
 }
 
 .chip[aria-pressed='true']::before {
   content: '✓ ';
   font-weight: 700;
+}
+
+/* Reset sits beside the Ticker/Status/Account chip pills, so it takes their
+   exact pill sizing (border-radius, padding, font-size, min-height) instead
+   of the generic button box -- a plain accent-outline pill, since it's a
+   one-shot action rather than a toggle. */
+#reset {
+  border-radius: 999px;
+  padding: 4px 11px;
+  font-size: 12.5px;
+  min-height: 28px;
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+#reset:hover {
+  background: var(--accent-soft);
 }
 
 /* ---------------- stat tiles ---------------- */
@@ -403,11 +469,6 @@ button.primary {
   padding: 14px 16px;
 }
 
-.tile.primary {
-  border-color: var(--series-1);
-  border-width: 2px;
-}
-
 /* "Available Cash" + share of account as one compact line, not two tiles:
    label plain, only the figures bold. */
 .csp-cash-line {
@@ -419,6 +480,14 @@ button.primary {
 .csp-cash-line strong {
   color: var(--text-primary);
   font-variant-numeric: tabular-nums;
+  cursor: help;
+}
+
+/* Flags a Positions snapshot the transaction ledger has already moved past
+   (an assignment settling days after expiry, say) -- see renderCspCash(). */
+.csp-cash-warn {
+  color: var(--warning);
+  font-weight: 600;
   cursor: help;
 }
 
@@ -558,6 +627,8 @@ button.primary {
   border-radius: var(--radius);
   padding: 16px 18px 18px;
   min-width: 0;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 2px 4px rgba(0, 0, 0, 0.04),
+    0 4px 8px rgba(0, 0, 0, 0.04);
 }
 
 .card[hidden] {
@@ -704,7 +775,7 @@ svg {
 }
 
 svg text {
-  font: 11px system-ui, -apple-system, 'Segoe UI', sans-serif;
+  font: 11px 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
   fill: var(--text-muted);
 }
 
@@ -716,6 +787,14 @@ svg .axis-line {
 svg .grid-line {
   stroke: var(--gridline);
   stroke-width: 1;
+}
+
+/* A second, lighter tier under `.grid-line` -- e.g. the Capital projection
+   chart's month/$10k lines under its year/$100k ones. */
+svg .grid-line-minor {
+  stroke: var(--gridline);
+  stroke-width: 0.5;
+  opacity: 0.55;
 }
 
 svg .tick-label {
@@ -769,7 +848,7 @@ svg .hit:focus {
 }
 
 svg .hit:focus-visible {
-  stroke: var(--series-1);
+  stroke: var(--accent);
   stroke-width: 2;
 }
 
@@ -784,17 +863,18 @@ svg .mark:focus {
 .toggle {
   font-size: 12px;
   border: 1px solid var(--axis);
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   padding: 3px 9px;
   background: var(--surface-1);
   color: var(--text-secondary);
   cursor: pointer;
   min-height: 26px;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
 }
 
 .toggle[aria-pressed='true'] {
-  border-color: var(--series-1);
-  color: var(--series-1);
+  border-color: var(--accent);
+  color: var(--accent);
 }
 
 .table-twin[hidden] {
@@ -900,8 +980,8 @@ th.sortable:hover {
 }
 
 .badge.ACTIVE {
-  color: var(--series-1);
-  border-color: var(--series-1);
+  color: var(--accent);
+  border-color: var(--accent);
 }
 
 .badge.NO_ACTIVITY {
@@ -952,7 +1032,8 @@ th.sortable:hover {
   border-top: 2px solid var(--border);
 }
 
-#open-positions-table td.op-near-expiry {
+#open-positions-table td.op-near-expiry,
+#recommended-btc-table td.op-near-expiry {
   color: var(--warning);
   font-weight: 600;
 }
@@ -974,7 +1055,7 @@ th.sortable:hover {
 
 /* Wheel id that jumps to the Trade Log when clicked. */
 .wheel-link {
-  color: var(--series-1);
+  color: var(--accent);
   cursor: pointer;
   text-decoration: underline;
   text-underline-offset: 2px;
@@ -996,7 +1077,7 @@ th.sortable:hover {
 
 .ticker-link:hover,
 .ticker-link:focus-visible {
-  color: var(--series-1);
+  color: var(--accent);
   text-decoration: underline;
   text-underline-offset: 2px;
   outline: none;
@@ -1184,6 +1265,10 @@ tr.detail > td {
 
 .notice.ok {
   border-left-color: var(--good);
+}
+
+.notice.err {
+  border-left-color: var(--critical);
 }
 
 .notice strong {
@@ -1398,26 +1483,43 @@ tr.detail > td {
 
 /* ---------------- tabs ---------------- */
 
+/* All tabs share the width of the widest label -- an intrinsically-sized
+   grid whose auto-flow columns are all `1fr` settles every column to the
+   single largest column's content width, instead of each tab hugging its
+   own text like a flex row would. */
 .tabs {
-  display: flex;
+  display: inline-grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
   gap: 6px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
   margin-bottom: var(--gap);
 }
 
 .tab {
-  border: 1px solid var(--axis);
-  border-radius: 999px;
-  padding: 5px 14px;
-  font-size: 12.5px;
-  background: var(--surface-1);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  padding: 6px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  background: transparent;
   color: var(--text-secondary);
-  min-height: 30px;
+  text-align: center;
+  min-height: 32px;
+  transition: background 0.12s, color 0.12s;
+}
+
+.tab:not([aria-selected='true']):hover {
+  background: var(--ghost);
+  color: var(--text-primary);
 }
 
 .tab[aria-selected='true'] {
-  border-color: var(--series-1);
-  color: var(--series-1);
-  font-weight: 600;
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
 }
 
 #tab-dashboard[hidden],
@@ -1992,6 +2094,36 @@ tr.detail > td {
   background: var(--ghost);
 }
 
+/* "Add to Print All" checkbox beside a card/subsection's own Print button. */
+.print-all-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.print-all-label input {
+  margin: 0;
+  cursor: pointer;
+}
+
+/* Off-screen host for a single-table print job (see printTables() in app.js).
+   Kept in the layout (not display: none) since some browsers refuse to print
+   from a display: none iframe. */
+.print-frame {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  width: 0;
+  height: 0;
+  border: 0;
+  visibility: hidden;
+}
+
 /* ---- Presentation mode: chrome-free, big headline figures ---------------- */
 
 body.presentation .source,
@@ -2008,7 +2140,8 @@ body.presentation #accounts-bar {
 }
 
 /* keep the Present button reachable so the mode can be left again */
-body.presentation #theme-toggle {
+body.presentation #theme-toggle,
+body.presentation #print-all {
   display: none;
 }
 

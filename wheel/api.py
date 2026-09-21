@@ -1741,6 +1741,124 @@ def _open_position_row(
     }
 
 
+def _merge_same_contract_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fold multiple open-leg rows for the very same contract (same cycle,
+    type, strike and expiration) into one -- a single order that filled in
+    pieces (LNC: 3 contracts then 1 more, same strike, same expiry, same
+    day) is one position to a viewer, not several identical-looking rows.
+    The Trade Log ledger still lists every fill separately; only this
+    summary table merges them.
+
+    Every field but the handful below is identical across the group already
+    (same cycle, same strike, same underlying market data), so it's copied
+    from the first row untouched. The handful that scale with contract count
+    are re-summed from scratch rather than picked from either row.
+    """
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    order: list[tuple[Any, ...]] = []
+    for row in rows:
+        key = (row["cycle_id"], row["type"], row["strike"], row["expiration"])
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(row)
+
+    merged: list[dict[str, Any]] = []
+    for key in order:
+        group = groups[key]
+        if len(group) == 1:
+            merged.append(group[0])
+            continue
+        base = dict(group[0])
+        contracts = sum(r["contracts"] for r in group)
+        signed_contracts = sum(r["signed_contracts"] for r in group)
+        net_premium = sum(r["net_premium"] or 0.0 for r in group)
+        collateral = (
+            sum(r["collateral"] for r in group) if all(r["collateral"] is not None for r in group) else None
+        )
+        est_close_cost = (
+            sum(r["est_close_cost"] for r in group)
+            if all(r["est_close_cost"] is not None for r in group)
+            else None
+        )
+        open_price = (
+            sum((r["open_price"] or 0.0) * r["contracts"] for r in group) / contracts
+            if contracts and all(r["open_price"] is not None for r in group)
+            else None
+        )
+        # Annualized yield is per dollar of capital committed, so it combines
+        # by weighting each fill's yield by its own collateral -- a plain
+        # average would let a 1-contract fill distort a 3-contract one.
+        annualized_yield_pct = None
+        if all(r["annualized_yield_pct"] is not None for r in group):
+            weight_total = sum(r["collateral"] or 0.0 for r in group)
+            annualized_yield_pct = (
+                round(sum((r["annualized_yield_pct"] or 0.0) * (r["collateral"] or 0.0) for r in group) / weight_total, 2)
+                if weight_total
+                else round(sum(r["annualized_yield_pct"] for r in group) / len(group), 2)
+            )
+        min_profit_captured_pct = (
+            round(min(100.0, 100.0 * (net_premium - est_close_cost) / net_premium), 1)
+            if est_close_cost is not None and net_premium
+            else None
+        )
+        base.update(
+            {
+                "contracts": round(contracts, 4),
+                "signed_contracts": round(signed_contracts, 4),
+                "net_premium": _money(net_premium),
+                "collateral": _money(collateral) if collateral is not None else None,
+                "open_price": open_price,
+                "open_date": min((r["open_date"] for r in group if r["open_date"]), default=base["open_date"]),
+                "annualized_yield_pct": annualized_yield_pct,
+                "est_close_cost": _money(est_close_cost) if est_close_cost is not None else None,
+                "min_profit_captured_pct": min_profit_captured_pct,
+            }
+        )
+        merged.append(base)
+    return merged
+
+
+def _btc_target(open_price: float, fraction: float) -> float:
+    """One rung of the buy-to-close ladder: ``fraction`` of the original
+    credit per share, rounded down to the nearest dime (a tenth of a
+    dollar) once that clears ten cents a share -- below that a dime floor
+    is too coarse relative to the price itself, so it falls back to the
+    usual nearest-cent rounding instead. Rounding down, not to nearest: a
+    limit order priced a fraction above the true target would sit there
+    unfilled instead of erring toward closing early.
+    """
+    raw = open_price * fraction
+    if raw <= 0.10:
+        return _money(raw)
+    # The tiny epsilon absorbs float noise (0.35 x 0.2 is really
+    # 0.34999999999999997 in binary) that would otherwise floor a value
+    # like $0.70 down to $0.60.
+    return math.floor(raw * 10 + 1e-9) / 10
+
+
+def _btc_targets(row: dict[str, Any]) -> list[float] | None:
+    """The standing buy-to-close ladder for one open short CSP/CC leg --
+    ``None`` for a long leg or a no-contract row, neither of which is
+    something to buy back.
+
+    Three fixed rungs, 50% / 20% / 10% of the credit collected, always
+    shown together rather than the app picking one: 50% is the common
+    cash-secured-put target, 20%/10% the covered-call ones (worth holding
+    for early in its life, worth locking in once most of the time value is
+    gone) -- but exactly where a given position sits is for the trader to
+    judge, not this table. Reads off ``open_price`` -- the per-share credit
+    already on the row -- so this needs no live option quote, only the
+    trade's own history.
+    """
+    if row.get("type") not in ("CC", "CSP"):
+        return None
+    open_price = row.get("open_price")
+    if open_price is None:
+        return None
+    return [_btc_target(open_price, f) for f in (0.5, 0.2, 0.1)]
+
+
 def _no_contract_open_position_row(
     wheel: dict[str, Any],
     gap_pct: float | None,
@@ -2264,6 +2382,30 @@ class Dashboard:
         latest = max(latest_by_account.values(), key=lambda snapshot: snapshot.as_of)
         as_of_day = latest.as_of.date()
 
+        # Cash the ledger already knows about that this Positions snapshot
+        # predates -- an assignment/call-away posts to the transaction history
+        # on the next business day, two calendar days late across a weekend,
+        # so a snapshot taken right around expiry can look stale by that same
+        # money days after it has actually already arrived. Assignment rows
+        # carry their true date inline ("AS OF 09-18-26"), parsed into
+        # `as_of_date`; ordinary rows have none and are judged by `run_date`,
+        # which for them *is* the real posting day (no assignment-style lag).
+        # `>=` for the former, plain `>` for the latter: a same-day assignment
+        # can't be told apart from one that posted hours before that evening's
+        # snapshot, so it stays conservatively flagged, while an ordinary
+        # same-day trade -- already settled and in the snapshot's own cash
+        # total by definition -- must not be double-counted here too. `amount`
+        # is the authoritative net cash flow for every row (already net of
+        # commissions and fees), so this sum is an exact answer, not an
+        # estimate. Compared to `total_value` below to flag it only when it is
+        # large enough to matter.
+        def _not_yet_reflected(t: Transaction) -> bool:
+            return t.as_of_date >= as_of_day if t.as_of_date is not None else t.run_date > as_of_day
+
+        cash_pending_since_snapshot = round(
+            sum(t.amount for t in self.transactions if _not_yet_reflected(t)), 2
+        )
+
         wheel_tickers = {cycle.underlying for cycle in self.all_cycles}
         capital_series = (
             portfolio_capital_series(self.all_cycles, as_of_day) if self.all_cycles else []
@@ -2303,6 +2445,36 @@ class Dashboard:
             key=lambda snapshot: snapshot.as_of,
         )
 
+        timeline = [
+            {
+                "as_of": snapshot.as_of.date().isoformat(),
+                "total_value": _money(snapshot.total_value),
+                "cash_total": _money(snapshot.cash_total),
+            }
+            for snapshot in account_history
+        ]
+        # A configured opening balance (data/accounts.json's "opening_balances")
+        # that reaches earlier than any real snapshot -- same splice as
+        # _build_benchmark()'s `series`, so the Capital deployed chart's
+        # Cash + Unrealized shading has a starting point to draw from too, not
+        # just the growth-over-time comparison. Booked entirely as cash, since
+        # a single manual balance carries no real cash/equity split, and
+        # flagged `estimated` so the frontend can render it distinctly (the
+        # same dashed/faded "this figure is a guess" treatment already used
+        # for an estimated capital band) rather than silently blending a
+        # guess in among real, itemized Positions data.
+        if account_history and self.opening_balance and self.opening_balance[0] < account_history[0].as_of.date():
+            opening_day, opening_value = self.opening_balance
+            timeline.insert(
+                0,
+                {
+                    "as_of": opening_day.isoformat(),
+                    "total_value": _money(opening_value),
+                    "cash_total": _money(opening_value),
+                    "estimated": True,
+                },
+            )
+
         return {
             "available": True,
             "warnings": warnings,
@@ -2321,6 +2493,7 @@ class Dashboard:
             "cost_basis_unknown_rows": latest.cost_basis_unknown_rows,
             "wheel_capital_deployed": _money(wheel_capital_deployed),
             "untracked_equity_value": _money(untracked_equity_value),
+            "cash_pending_since_snapshot": _money(cash_pending_since_snapshot),
             "positions": [
                 {
                     "symbol": row.symbol,
@@ -2334,14 +2507,7 @@ class Dashboard:
                 }
                 for row in latest.rows
             ],
-            "timeline": [
-                {
-                    "as_of": snapshot.as_of.date().isoformat(),
-                    "total_value": _money(snapshot.total_value),
-                    "cash_total": _money(snapshot.cash_total),
-                }
-                for snapshot in account_history
-            ],
+            "timeline": timeline,
         }
 
     def _build_benchmark(self) -> dict[str, Any]:
@@ -2741,6 +2907,9 @@ class Dashboard:
                         ),
                     )
                 )
+        rows = _merge_same_contract_rows(rows)
+        for row in rows:
+            row["btc_targets"] = _btc_targets(row)
         rows.sort(key=lambda r: (r["underlying"], r["expiration"] or "", r["strike"] or 0.0))
         return rows
 
@@ -2796,10 +2965,29 @@ class Dashboard:
             "within_7d": [r["ticker"] for r in out if r["days_to_earnings"] <= 7],
         }
 
+    def _real_share_quantities(self) -> dict[str, float]:
+        """Each ticker's real total share count, straight off the latest
+        Portfolio Positions snapshot -- the broker's own count, unfiltered by
+        how much of it the wheel/cycle model can trace to a known lot. Shared
+        by `_build_cc_candidates` below (a covered call can be written
+        against shares with no known cost basis just as well as ones with
+        one -- the broker doesn't check) and by the Open option positions
+        payload's `shares_untracked` enrichment (build()); `{}` when there's
+        no Positions snapshot to read at all.
+        """
+        if not self._net_worth.get("available"):
+            return {}
+        totals: dict[str, float] = {}
+        for row in self._net_worth.get("positions", []):
+            if row.get("kind") == EQUITY and row.get("symbol"):
+                totals[row["symbol"]] = totals.get(row["symbol"], 0.0) + (row.get("quantity") or 0.0)
+        return totals
+
     def _build_cc_candidates(
         self,
         wheels: Sequence[dict[str, Any]],
         open_positions: Sequence[dict[str, Any]],
+        real_qty_by_symbol: dict[str, float],
     ) -> list[dict[str, Any]]:
         """Every position holding shares with no covered call currently written
         against it. Positions with >= 100 shares are the actionable ones -- a
@@ -2809,6 +2997,15 @@ class Dashboard:
         already-assembled Trade Log ``wheels`` (share count, cost basis, both
         break-evens, last close) and ``open_positions`` (which cycles already
         have a live CC leg); filter-independent like both.
+
+        The 100-share threshold (and ``contracts_available``) is checked
+        against ``real_qty_by_symbol`` -- the broker's real count -- not just
+        ``wheel["shares_held"]`` (the model's own, cost-basis-traceable
+        count): writing a covered call needs real shares in the account, not
+        a provable cost basis on them. A ticker with more real shares than
+        tracked ones carries the gap as ``shares_untracked``; the tracked
+        count still drives ``target_cc_strike`` and the P&L columns, since
+        there is no cost basis to price the untracked shares against.
 
         ``target_cc_strike`` is the lowest strike worth writing a call at: the
         greatest of the share cost basis, the position break-even (cost basis
@@ -2827,15 +3024,44 @@ class Dashboard:
         from :meth:`_fundamentals` (Yahoo, cached, hand-file override).
         """
         cc_cycle_ids = {p["cycle_id"] for p in open_positions if p.get("type") == "CC"}
+        # Same "tracked or real" share count the row loop below computes,
+        # just ahead of time -- a wheel with 0 tracked shares but a real,
+        # open position (JXN) still needs its sector/earnings prefetched.
         fundamentals = self._fundamentals(
-            [w["underlying"] for w in wheels if (w.get("shares_held") or 0.0) > 1e-9]
+            [
+                w["underlying"]
+                for w in wheels
+                if (w.get("shares_held") or 0.0) > 1e-9
+                or (w.get("status") != "CLOSED" and (real_qty_by_symbol.get(w["underlying"]) or 0.0) > 1e-9)
+            ]
         )
         today = date.today()
         rows: list[dict[str, Any]] = []
         for wheel in wheels:
-            shares = wheel.get("shares_held") or 0.0
-            if shares <= 1e-9 or wheel["cycle_id"] in cc_cycle_ids:
+            if wheel["cycle_id"] in cc_cycle_ids:
                 continue
+            tracked_shares = wheel.get("shares_held") or 0.0
+            # The real count wins when it's larger -- e.g. shares bought
+            # before every loaded export begins still exist in the account
+            # and can still back a call, even with no cost basis on file for
+            # them, or (JXN: 0 tracked, 300 real) an assignment the engine
+            # never saw at all. It never loses to the tracked count: a real
+            # snapshot that's simply older than the latest trades
+            # undercounting would wrongly hide an otherwise-actionable
+            # position. Only an open cycle can claim the real count -- a
+            # CLOSED wheel has sold out in the model's own terms, and a
+            # ticker keeps at most one open cycle at a time, so this can't
+            # double-count the same real shares onto two rows.
+            real_shares = real_qty_by_symbol.get(wheel["underlying"])
+            is_open = wheel.get("status") != "CLOSED"
+            shares = (
+                real_shares
+                if is_open and real_shares is not None and real_shares > tracked_shares
+                else tracked_shares
+            )
+            if shares <= 1e-9:
+                continue
+            untracked_shares = shares - tracked_shares if shares > tracked_shares else 0.0
             meets_threshold = shares >= 100 - 1e-9
             cost_basis = wheel.get("cost_basis_per_share")
             last_close = wheel.get("current_price")
@@ -2844,11 +3070,13 @@ class Dashboard:
                 if meets_threshold
                 else None
             )
-            # Total unrealized gain/loss on the shares vs. their raw average
-            # cost basis (not a break-even -- premium already banked is not
-            # netted in here), marked to the last close.
+            # Total unrealized gain/loss on the *tracked* shares vs. their raw
+            # average cost basis (not a break-even -- premium already banked
+            # is not netted in here), marked to the last close. Left off the
+            # untracked ones: there is no cost basis on file to measure a
+            # gain or loss against.
             has_marks = cost_basis is not None and last_close is not None
-            gain = round(shares * (last_close - cost_basis), 2) if has_marks else None
+            gain = round(tracked_shares * (last_close - cost_basis), 2) if has_marks else None
             gain_pct = (
                 round(100.0 * (last_close - cost_basis) / cost_basis, 2)
                 if has_marks and cost_basis
@@ -2863,6 +3091,7 @@ class Dashboard:
                     # Shown in the "Wheel" column; a plain buy-and-hold lot has none.
                     "wheel": wheel["cycle_id"] if wheel.get("is_wheel") else None,
                     "shares_held": round(shares, 4),
+                    "shares_untracked": round(untracked_shares, 4) if untracked_shares > 1e-6 else None,
                     "meets_threshold": meets_threshold,
                     # The covered-call position that could be opened, so it reads
                     # negative (a short call), e.g. 175 shares -> -1. None when
@@ -3194,7 +3423,9 @@ class Dashboard:
             )
         if self._cc_candidates is None:
             self._cc_candidates = self._build_cc_candidates(
-                (self._trade_log or {}).get("wheels", []), self._open_positions or []
+                (self._trade_log or {}).get("wheels", []),
+                self._open_positions or [],
+                self._real_share_quantities(),
             )
         if self._csp_candidates is None:
             _wheels = (self._trade_log or {}).get("wheels", [])
@@ -3259,6 +3490,33 @@ class Dashboard:
             if w["cycle_id"] not in _legged_cycles
             and (w["cycle_id"] in _wt_by_cycle or (w.get("shares_held") or 0.0) > 1e-9)
         ]
+        # Cross-reference each row's `shares_held` (the wheel/cycle model's own
+        # count -- only shares it can trace to a known lot) against the broker
+        # Positions snapshot's real quantity for that ticker (same helper
+        # `_build_cc_candidates` above uses). The gap is the same concept
+        # `_build_net_worth`'s `untracked_equity_value` already names at the
+        # portfolio level (shares bought before every loaded export begins)
+        # -- surfaced per-row here too, so "shares held" in the Open option
+        # positions table doesn't just quietly show a smaller number than the
+        # broker reports with no way to tell why.
+        _real_qty_by_symbol = self._real_share_quantities()
+        for _row in _open_positions_for_payload:
+            _held = _row.get("shares_held") or 0.0
+            _real_qty = _real_qty_by_symbol.get(_row.get("underlying"))
+            if _real_qty is not None and _real_qty - _held > 1e-6:
+                _row["shares_untracked"] = round(_real_qty - _held, 4)
+        # Same cross-reference, folded onto the Trade Log's own wheel entries
+        # (`_wheels` is `self._trade_log["wheels"]` itself, mutated in place)
+        # so a wheel currently in its Covered Call phase shows the broker's
+        # real share count there too, not just in the Open option positions
+        # table above.
+        for _w in _wheels:
+            _held = _w.get("shares_held") or 0.0
+            if _held <= 1e-9:
+                continue
+            _real_qty = _real_qty_by_symbol.get(_w.get("underlying"))
+            if _real_qty is not None and _real_qty - _held > 1e-6:
+                _w["shares_untracked"] = round(_real_qty - _held, 4)
         assignment_risk = assignment_mod.assignment_risk(
             self._open_positions or [], self._net_worth
         )

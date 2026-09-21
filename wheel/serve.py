@@ -51,6 +51,7 @@ from wheel import exporter  # noqa: E402
 from wheel.closed_lots import looks_like_closed_lots  # noqa: E402
 from wheel.paths import DATA_DIR  # noqa: E402
 from wheel.positions import discover_position_snapshots, looks_like_position_snapshot  # noqa: E402
+from wheel.ui_config import read_config, write_config  # noqa: E402
 
 PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(PACKAGE_DIR, "static")
@@ -497,6 +498,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_file("styles.css", "text/css; charset=utf-8")
             elif route == "/wheel-strategy.png":
                 self._send_file("wheel-strategy.png", "image/png")
+            elif route == "/logo.svg":
+                self._send_file("logo.svg", "image/svg+xml")
             elif route == "/api/dashboard":
                 self._sync_registry()
                 query = parse_qs(parsed.query)
@@ -533,13 +536,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(self._dataset_listing())
             elif route == "/api/accounts":
                 self._sync_registry()
-                self._send_json(
-                    {
-                        "accounts": self.registry.list_accounts(),
-                        "default_account": self.registry.default_account_id,
-                        "default_range": self.registry.default_range,
-                    }
-                )
+                self._send_json({"accounts": self.registry.list_accounts()})
+            elif route == "/api/config":
+                self._send_json(read_config())
             else:
                 self._send_json({"error": "not found", "path": route}, 404)
         except _CLIENT_DISCONNECTED:
@@ -557,6 +556,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_upload()
             elif route == "/api/select":
                 self._handle_select()
+            elif route == "/api/config":
+                self._handle_config()
             else:
                 self._send_json({"error": "not found", "path": route}, 404)
         except DatasetError as error:
@@ -757,6 +758,23 @@ class Handler(BaseHTTPRequestHandler):
 
         self.state.switch(list(paths))
         self._send_json(self._dataset_listing(self._loaded_message("Combined")))
+
+    def _handle_config(self) -> None:
+        """``POST /api/config`` -- overwrite ``data/config.json`` with the
+        frontend's current settings snapshot. Unlike the dataset endpoints
+        above, a bad request here (an empty or unparsable body) is just
+        rejected with a 400 -- there's no partial/"active" state to report
+        back, and it never touches whatever was saved last."""
+        try:
+            payload = json.loads(self._read_body().decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as error:  # ValueError also catches DatasetError
+            self._send_json({"error": f"could not read request: {error}"}, 400)
+            return
+        if not isinstance(payload, dict):
+            self._send_json({"error": "config must be a JSON object"}, 400)
+            return
+        write_config(payload)
+        self._send_json({"ok": True})
 
 
 def _preferred_account(registry: AccountRegistry) -> str:

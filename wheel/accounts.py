@@ -47,7 +47,10 @@ too (no transaction/cycle history -- there's no column to attribute it by --
 just Net Worth and holdings). This is what makes "every real account shows up
 somewhere" true without requiring a folder per account.
 
-Three knobs in the optional ``data/accounts.json`` shape this:
+Two knobs in the optional ``data/accounts.json`` shape this (which account tab
+and date range the dashboard *opens to* is a separate, machine-managed concern
+-- see ``wheel/ui_config.py``'s ``data/config.json``, which remembers whatever
+the reader last had selected instead):
 
 * ``"folders"`` -- ``{"<folder>": "<account number>", ...}`` -- names a
   folder's account explicitly instead of leaving it to the "whichever
@@ -63,24 +66,6 @@ Three knobs in the optional ``data/accounts.json`` shape this:
   that isn't worth tracking here (e.g. a robo-advisor sleeve), this is the
   only way to hide it, since auto-discovery otherwise surfaces every account
   a Positions file mentions.
-* ``"default_account"`` -- an account id (a folder name, or an
-  auto-discovered slug like ``"roth-ira"``) *or* an account number -- which
-  account tab the UI opens to, in place of "Combined"
-  (``AccountRegistry.default_account_id``, surfaced to the frontend via
-  ``/api/accounts``). Accepting the number too means it can be copied
-  straight out of Fidelity without knowing which id auto-discovery landed
-  on. Not to be confused with the ``"default"`` *folder* id
-  (:data:`DEFAULT_ACCOUNT_ID`) -- this can name any known account, including
-  a merged/configured one. A value that resolves to neither a known id nor a
-  known number is ignored, with a warning, rather than left to silently
-  produce an empty dashboard.
-* ``"default_range"`` -- one of ``"all"``, ``"ytd"``, ``"1y"``/``"3y"``/``"5y"``,
-  a specific calendar year (``"year:2025"``), or a bare day count -- the date
-  range the UI opens to, in place of "All" (``AccountRegistry.default_range``,
-  also surfaced via ``/api/accounts``). These are exactly the presets
-  ``wheel/static/app.js``'s ``#preset`` select already understands
-  (``applyPreset``), so a value outside that set is rejected up front with a
-  warning rather than reaching the frontend as an unparsable range.
 * ``"opening_balances"`` -- ``{"<folder>": {"date": "YYYY-MM-DD", "balance":
   <number>}, ...}`` -- a manual starting point for the S&P 500 benchmark
   comparison (``Dashboard._build_benchmark()``), keyed the same way as
@@ -166,12 +151,6 @@ DEFAULT_ACCOUNT_ID = "default"
 COMBINED_ACCOUNT_ID = "combined"
 ACCOUNT_CONFIG_FILENAME = "accounts.json"
 
-# Every preset wheel/static/app.js's #preset select understands: "all", "ytd",
-# the fixed lookback windows, a specific calendar year ("year:2025"), or a
-# bare day count. Validated here so a typo in the config produces a clear
-# warning instead of the frontend computing an "Invalid Date" range from it.
-_VALID_DEFAULT_RANGE_RE = re.compile(r"^(all|ytd|1y|3y|5y|year:\d{4}|\d+)$")
-
 
 @dataclass(frozen=True)
 class AccountDir:
@@ -242,8 +221,6 @@ class AccountConfig:
 
     folders: dict[str, str] = field(default_factory=dict)  # folder id -> account number
     ignore: list[str] = field(default_factory=list)  # account number or "Account name", verbatim
-    default_account: str | None = None  # account id the UI should open to, instead of "combined"
-    default_range: str | None = None  # date-range preset the UI should open to, instead of "All"
     opening_balances: dict[str, tuple[date, float]] = field(default_factory=dict)  # folder id -> (date, balance)
 
     def folder_account(self, folder_id: str) -> str | None:
@@ -309,25 +286,6 @@ def load_account_config(base_dir: str) -> tuple[AccountConfig, list[str]]:
     elif "ignore" in raw:
         warnings.append(f"{ACCOUNT_CONFIG_FILENAME}: 'ignore' must be a list of account numbers/names; ignoring")
 
-    default_account_raw = raw.get("default_account")
-    default_account: str | None = None
-    if default_account_raw is not None:
-        if isinstance(default_account_raw, str) and default_account_raw.strip():
-            default_account = default_account_raw.strip()
-        else:
-            warnings.append(f"{ACCOUNT_CONFIG_FILENAME}: 'default_account' must be a non-empty string; ignoring")
-
-    default_range_raw = raw.get("default_range")
-    default_range: str | None = None
-    if default_range_raw is not None:
-        if isinstance(default_range_raw, str) and _VALID_DEFAULT_RANGE_RE.match(default_range_raw.strip()):
-            default_range = default_range_raw.strip()
-        else:
-            warnings.append(
-                f"{ACCOUNT_CONFIG_FILENAME}: 'default_range' must be one of "
-                "all/ytd/1y/3y/5y/year:YYYY/<day count>; ignoring"
-            )
-
     opening_balances_raw = raw.get("opening_balances", {})
     opening_balances: dict[str, tuple[date, float]] = {}
     if isinstance(opening_balances_raw, dict):
@@ -363,16 +321,19 @@ def load_account_config(base_dir: str) -> tuple[AccountConfig, list[str]]:
             "folder -> {date, balance}; ignoring"
         )
 
-    unknown_keys = set(raw) - {"folders", "ignore", "default_account", "default_range", "opening_balances"}
+    unknown_keys = set(raw) - {"folders", "ignore", "opening_balances"}
     if unknown_keys:
-        warnings.append(f"{ACCOUNT_CONFIG_FILENAME}: ignoring unknown key(s) {', '.join(sorted(unknown_keys))}")
+        message = f"{ACCOUNT_CONFIG_FILENAME}: ignoring unknown key(s) {', '.join(sorted(unknown_keys))}"
+        if unknown_keys & {"default_account", "default_range"}:
+            # A pre-config.json accounts.json: point at where these moved
+            # instead of just silently dropping them.
+            message += " (these moved to data/config.json, managed by the app itself -- see its docstring)"
+        warnings.append(message)
 
     return (
         AccountConfig(
             folders=folders,
             ignore=ignore,
-            default_account=default_account,
-            default_range=default_range,
             opening_balances=opening_balances,
         ),
         warnings,
@@ -498,8 +459,6 @@ class AccountRegistry:
         self._accounts: dict[str, Dashboard] = {}
         self._build_warnings: list[str] = []
         self._stamp: tuple | None = None
-        self.default_account_id: str | None = None  # data/accounts.json's "default_account", if valid
-        self.default_range: str | None = None  # data/accounts.json's "default_range", if valid
         self.refresh()
 
     def set_default_dashboard(self, dashboard: Dashboard) -> None:
@@ -564,7 +523,6 @@ class AccountRegistry:
             accounts: dict[str, Dashboard] = {}
             warnings: list[str] = list(config_warnings)
             claimed_numbers: set[str] = set()
-            number_to_id: dict[str, str] = {}  # lets "default_account" name an account number, not just an id
 
             # The externally managed "default" dashboard (serve.py's uploader,
             # via set_default_dashboard) owns that folder's identity outright
@@ -614,7 +572,6 @@ class AccountRegistry:
                         default_redundant = True
                 if default_number:
                     claimed_numbers.add(default_number)
-                    number_to_id[default_number] = DEFAULT_ACCOUNT_ID
                 # A 'folders'/'opening_balances' entry for "default" has no
                 # effect while a live dashboard owns it (that Dashboard was
                 # already built by DashboardState, with no knowledge of this
@@ -728,7 +685,6 @@ class AccountRegistry:
                     )
                 if resolved_number:
                     claimed_numbers.add(resolved_number)
-                    number_to_id[resolved_number] = account_id
                 if _is_ignored(resolved_number, _dashboard_account_name(dashboard), config.ignore):
                     continue
                 accounts[account_id] = dashboard
@@ -755,7 +711,6 @@ class AccountRegistry:
                     if account_number in claimed_numbers:
                         continue
                     account_id = _unique_account_id(_slugify(snapshot.account_name or account_number), accounts)
-                    number_to_id[account_number] = account_id
                     if _is_ignored(account_number, snapshot.account_name, config.ignore):
                         continue
                     try:
@@ -765,38 +720,9 @@ class AccountRegistry:
                     except ValueError as error:
                         warnings.append(f"account '{account_id}': {error}")
 
-            # "default_account" may name either an account id directly (a
-            # folder id, or an auto-discovered slug like "roth-ira") or the
-            # account's own number -- the number is what a user copies
-            # straight out of Fidelity, and shouldn't have to be translated
-            # into whatever slug auto-discovery happened to generate.
-            default_account_id = config.default_account
-            if default_account_id and default_account_id not in accounts:
-                default_account_id = number_to_id.get(default_account_id, default_account_id)
-            if default_account_id and default_account_id not in accounts:
-                # Case-insensitive fallback -- same reasoning as
-                # AccountConfig.folder_account()/opening_balance(): a
-                # data/<folder>/'s casing is whatever the OS happened to
-                # create, and an id (as opposed to a number, already handled
-                # above) shouldn't have to match it exactly either.
-                by_lower = {account_id.lower(): account_id for account_id in accounts}
-                default_account_id = by_lower.get(default_account_id.lower(), default_account_id)
-            if (
-                default_account_id
-                and default_account_id not in accounts
-                and default_account_id.lower() != COMBINED_ACCOUNT_ID
-            ):
-                warnings.append(
-                    f"{ACCOUNT_CONFIG_FILENAME}: default_account '{config.default_account}' is not a known "
-                    "account id or number; falling back to Combined"
-                )
-                default_account_id = None
-
             self._accounts = accounts
             self._build_warnings = warnings
             self._stamp = stamp
-            self.default_account_id = default_account_id
-            self.default_range = config.default_range
 
     # ---- accessors ----
 
@@ -1701,6 +1627,7 @@ def _combine_net_worth(payloads: dict[str, dict]) -> dict[str, Any]:
         "option_value": 0.0,
         "wheel_capital_deployed": 0.0,
         "untracked_equity_value": 0.0,
+        "cash_pending_since_snapshot": 0.0,
     }
     accounts_out = []
     for account_id, net_worth in available:
