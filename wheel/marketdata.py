@@ -596,6 +596,160 @@ def _fundamentals_stale(entry: Fundamentals | None, today: date, max_age_days: i
     return False
 
 
+_OPTION_EXPIRATIONS_CACHE_PATH = os.path.join(_DATA_DIR, "option_expirations_cache.json")
+_OPTIONS_URL_TMPL = "https://query2.finance.yahoo.com/v7/finance/options/{ticker}"
+
+
+@dataclass(frozen=True)
+class OptionSchedule:
+    """A ticker's known option expiration dates, as of the last fetch --
+    enough to tell whether it lists weekly expirations or only the standard
+    monthly (3rd-Friday-ish) cycle. See :func:`has_weekly_options`."""
+
+    ticker: str
+    as_of: date
+    expirations: tuple[date, ...]
+
+
+def fetch_yahoo_option_expirations(ticker: str, timeout: float = 10.0) -> str:
+    """Raw JSON text from Yahoo's options-chain endpoint for one ticker.
+    Unlike :func:`fetch_yahoo_quotes`, this endpoint isn't batchable across
+    symbols -- one request per ticker. MarketDataError on any transport
+    failure (the crumb handshake included)."""
+    opener, crumb = _yahoo_auth()
+    url = _OPTIONS_URL_TMPL.format(ticker=urllib.parse.quote(ticker.upper()))
+    if crumb:
+        url = f"{url}?{urllib.parse.urlencode({'crumb': crumb})}"
+    request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    opener = opener or urllib.request.build_opener()
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return response.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError, ValueError) as error:
+        raise MarketDataError(f"could not fetch option expirations for {ticker}: {error}") from error
+
+
+def parse_yahoo_option_expirations(text: str) -> list[date]:
+    """Yahoo ``optionChain.result[0].expirationDates`` -> sorted dates.
+    Raises MarketDataError on a response with no parseable chain (an error
+    payload, a challenge page, or a symbol with no listed options)."""
+    try:
+        result = json.loads(text)["optionChain"]["result"]
+    except (json.JSONDecodeError, KeyError, TypeError) as error:
+        raise MarketDataError(f"unrecognized Yahoo options response: {error}") from error
+    if not result:
+        raise MarketDataError("no options chain in Yahoo's response")
+    raw_dates = result[0].get("expirationDates") or []
+    return sorted({d for value in raw_dates if (d := _epoch_to_date(value)) is not None})
+
+
+def _load_option_expirations_cache(path: str) -> dict[str, OptionSchedule]:
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    out: dict[str, OptionSchedule] = {}
+    for ticker, entry in (raw or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        as_of = _parse_date(str(entry.get("as_of", "")))
+        if as_of is None:
+            continue
+        expirations = tuple(
+            sorted(d for d in (_parse_date(str(x)) for x in entry.get("expirations") or []) if d is not None)
+        )
+        out[ticker.upper()] = OptionSchedule(ticker=ticker.upper(), as_of=as_of, expirations=expirations)
+    return out
+
+
+def _save_option_expirations_cache(cache: dict[str, OptionSchedule], path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    serializable = {
+        ticker: {"as_of": s.as_of.isoformat(), "expirations": [d.isoformat() for d in s.expirations]}
+        for ticker, s in sorted(cache.items())
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(serializable, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def _option_expirations_stale(entry: OptionSchedule | None, today: date, max_age_days: int) -> bool:
+    if entry is None:
+        return True
+    if (today - entry.as_of).days >= max_age_days:
+        return True
+    # Every cached date has already passed: the weekly/monthly classification
+    # is a stable trait of the ticker, but a roll needs at least one *future*
+    # date to floor against, so this is worth refreshing early.
+    if entry.expirations and all(d < today for d in entry.expirations):
+        return True
+    return False
+
+
+def get_option_expirations(
+    tickers: Sequence[str],
+    *,
+    fetch: Callable[[str], str] | None = None,
+    cache_path: str | None = None,
+    max_age_days: int = 21,
+    local_only: bool = False,
+    force_refresh: bool = False,
+    today: date | None = None,
+) -> tuple[dict[str, list[date]], list[str]]:
+    """``({TICKER: sorted expiration dates}, warnings)`` for ``tickers``,
+    refreshing the local cache when an entry is missing or stale. Never
+    raises. One HTTP round trip per stale ticker -- see
+    :func:`fetch_yahoo_option_expirations`.
+
+    ``fetch`` (ticker -> JSON text) and ``cache_path`` default to Yahoo and
+    ``data/option_expirations_cache.json``; tests inject both.
+    """
+    path = cache_path or _OPTION_EXPIRATIONS_CACHE_PATH
+    fetch = fetch or fetch_yahoo_option_expirations
+    today = today or date.today()
+    wanted = sorted({t.upper() for t in tickers if t})
+
+    cache = _load_option_expirations_cache(path)
+    if local_only:
+        return {t: list(cache[t].expirations) for t in wanted if t in cache}, []
+
+    stale = [t for t in wanted if force_refresh or _option_expirations_stale(cache.get(t), today, max_age_days)]
+    warnings: list[str] = []
+    touched = False
+    for ticker in stale:
+        try:
+            expirations = parse_yahoo_option_expirations(fetch(ticker))
+        except MarketDataError as error:
+            warnings.append(f"could not fetch option expirations for {ticker}: {error}")
+            continue
+        cache[ticker] = OptionSchedule(ticker=ticker, as_of=today, expirations=tuple(expirations))
+        touched = True
+    if touched:
+        _save_option_expirations_cache(cache, path)
+
+    return {t: list(cache[t].expirations) for t in wanted if t in cache}, warnings
+
+
+def has_weekly_options(expirations: Sequence[date], today: date, *, horizon_days: int = 60) -> bool | None:
+    """Whether ``expirations`` (a ticker's known/listed dates) shows weekly
+    (or finer) granularity within the next ``horizon_days``, versus only the
+    standard ~monthly cycle. ``None`` when there's too little data (fewer
+    than two upcoming dates) to tell either way -- callers should treat that
+    the same as "weekly" (the more common case) rather than as "monthly."
+
+    A gap of 10 days or less between two consecutive near-term expirations
+    only happens on a weekly (or biweekly) listing; a monthly-only ticker's
+    gaps are always ~28-35 days.
+    """
+    near_term = sorted(d for d in expirations if today <= d <= today + timedelta(days=horizon_days))
+    if len(near_term) < 2:
+        return None
+    return any((b - a).days <= 10 for a, b in zip(near_term, near_term[1:]))
+
+
 def get_fundamentals(
     tickers: Sequence[str],
     *,

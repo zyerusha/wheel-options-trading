@@ -1907,6 +1907,72 @@ def _btc_targets(row: dict[str, Any]) -> list[float] | None:
     return [_btc_target(open_price, f) for f in (0.5, 0.2, 0.1)]
 
 
+# Target annualized return a rolled contract needs to clear for the roll
+# itself to be worth doing, versus just taking the assignment/call-away.
+_ROLL_TARGET_ANNUALIZED_YIELD = 0.30
+
+
+def _next_week_friday(today: date) -> date:
+    """The Friday of the week *after* this one -- the floor for the roll-to
+    expiry this app assumes when sizing a minimum roll credit. Skips the
+    nearer Friday (today's own week) since a position already this close to
+    a decision is rarely rolled into an expiry just days out. Only a floor:
+    a contract already dated further out than this gets priced against its
+    own expiry instead (see the caller in ``_build_open_positions``) --
+    rolling means pushing the date out, never pulling it in.
+    """
+    this_friday = today + timedelta(days=(4 - today.weekday()) % 7)
+    return this_friday + timedelta(days=7)
+
+
+def _roll_target_date(
+    ticker: str,
+    today: date,
+    own_expiry: date | None,
+    expirations_by_ticker: dict[str, list[date]],
+) -> date:
+    """The date a roll should be priced against for ``ticker``: the earliest
+    expiration that is both a real possibility for this ticker and strictly
+    *later* than the contract's own current expiry -- a roll can't land on
+    or before the contract it's replacing, only push the date out.
+
+    A ticker confirmed monthly-only (see ``marketdata.has_weekly_options``)
+    uses its own next real listed date past ``own_expiry`` -- JXN's current
+    contract expiring Oct 16 rolls to Nov 20, its actual next expiration, not
+    "next week's Friday," which usually isn't a real contract for a
+    monthly-only name at all. A weekly-enabled ticker (or one with too little
+    fetched data to tell, the more common case) uses next week's Friday from
+    both today and from the contract's own expiry, whichever is later --
+    never sooner than a sensible planning horizon, never at or before the
+    current contract.
+    """
+    expirations = expirations_by_ticker.get(ticker) or []
+    weekly = marketdata.has_weekly_options(expirations, today)
+    after = own_expiry or today
+    if weekly is False:
+        later = [d for d in expirations if d > after]
+        if later:
+            return min(later)
+        # No real date on file past the current contract (a short/stale
+        # fetch) -- fall through to the weekly formula as a last resort.
+    return max(_next_week_friday(today), _next_week_friday(after))
+
+
+def _min_roll_premium(strike: float | None, dte: int) -> float | None:
+    """The minimum per-share credit worth collecting to roll into a new
+    contract ``dte`` days out, instead of just taking the assignment (CSP)
+    or the call-away (CC): the credit that alone clears
+    ``_ROLL_TARGET_ANNUALIZED_YIELD`` annualized on the position's strike
+    over the ``dte`` stretch. Per share, like the Recommended BTC ladder
+    and every other price on this row, not per contract -- multiply by 100
+    x contracts for the total credit needed. Below this, the roll isn't
+    being paid enough to beat letting the current contract resolve.
+    """
+    if strike is None:
+        return None
+    return _money(strike * (dte / 365) * _ROLL_TARGET_ANNUALIZED_YIELD)
+
+
 def _no_contract_open_position_row(
     wheel: dict[str, Any],
     gap_pct: float | None,
@@ -2343,6 +2409,17 @@ class Dashboard:
             if price is not None and ticker in out:
                 out[ticker]["last"] = price
         return out
+
+    def _option_expirations(self, tickers: Sequence[str]) -> dict[str, list[date]]:
+        """Per-ticker known/listed option expiration dates
+        (``marketdata.get_option_expirations``, disk-cached) -- lets Min Roll
+        Premium (Recommended buy-to-close / Assignment risk) price a roll
+        against a real expiration instead of an assumed weekly Friday for a
+        monthly-only name. Fetch warnings append to ``self._price_warnings``.
+        """
+        fetched, warns = marketdata.get_option_expirations(sorted({t for t in tickers if t}))
+        self._price_warnings.extend(warns)
+        return fetched
 
     def _fundamentals(self, tickers: Sequence[str]) -> dict[str, dict[str, Any]]:
         """Per-ticker ``{"type", "market_cap_b", "avg_vol_10d_m",
@@ -2956,8 +3033,27 @@ class Dashboard:
                     )
                 )
         rows = _merge_same_contract_rows(rows)
+        # Real calendar today, deliberately not `through` (self.last_date --
+        # a stale account's own last export date, which would otherwise give
+        # each account in a Combined view a different "next Friday").
+        today = date.today()
+        roll_tickers = sorted({row["underlying"] for row in rows if row.get("type") in ("CC", "CSP")})
+        expirations_by_ticker = self._option_expirations(roll_tickers)
         for row in rows:
             row["btc_targets"] = _btc_targets(row)
+            if row.get("type") in ("CC", "CSP"):
+                own_expiry = date.fromisoformat(row["expiration"]) if row.get("expiration") else None
+                roll_target_date = _roll_target_date(
+                    row["underlying"], today, own_expiry, expirations_by_ticker
+                )
+                roll_dte = (roll_target_date - today).days
+                row["roll_dte"] = roll_dte
+                row["roll_target_date"] = _iso(roll_target_date)
+                row["min_roll_premium"] = _min_roll_premium(row.get("strike"), roll_dte)
+            else:
+                row["roll_dte"] = None
+                row["roll_target_date"] = None
+                row["min_roll_premium"] = None
         rows.sort(key=lambda r: (r["underlying"], r["expiration"] or "", r["strike"] or 0.0))
         return rows
 

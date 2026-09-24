@@ -4783,7 +4783,12 @@ function buildHedgeRow(h, { showAccount = true } = {}) {
       )
     );
   }
-  econ.appendChild(el('span', {}, `${h.days_to_expiry} days of protection left`));
+  // "days of protection left" claims it's still doing insurance's job -- true
+  // for RUNWAY/WIND_DOWN/EXPIRING, but exactly what a DIRECTIONAL row is
+  // saying is no longer the case here.
+  econ.appendChild(
+    el('span', {}, `${h.days_to_expiry} days ${h.phase === 'directional' ? 'to expiry' : 'of protection left'}`)
+  );
   row.appendChild(econ);
 
   // Secondary, deliberately muted: premium written while the hedge has been
@@ -6936,7 +6941,9 @@ function renderAssignmentRiskBody(card, data) {
   if (!puts.length && !calls.length) return;
   const table = el('table');
   const thead = el('thead');
-  thead.appendChild(rowOf('th', ['Leg', 'Strike', 'Qty', 'Expiry', 'ITM %', 'If assigned']));
+  thead.appendChild(
+    rowOf('th', ['Leg', 'Strike', 'Qty', 'Expiry', 'ITM %', 'If assigned', 'Min Roll Premium'])
+  );
   table.appendChild(thead);
   const tbody = el('tbody');
   puts.forEach((r) =>
@@ -6948,6 +6955,7 @@ function renderAssignmentRiskBody(card, data) {
         longDate(r.expiration),
         r.moneyness_pct === null ? '—' : `${Math.abs(r.moneyness_pct).toFixed(1)}%`,
         `${money(r.obligation)} cash`,
+        minRollPremiumCell(r),
       ])
     )
   );
@@ -6960,6 +6968,7 @@ function renderAssignmentRiskBody(card, data) {
         longDate(r.expiration),
         r.moneyness_pct === null ? '—' : `${Math.abs(r.moneyness_pct).toFixed(1)}%`,
         `${r.shares_at_risk_of_call} sh called`,
+        minRollPremiumCell(r),
       ])
     )
   );
@@ -6967,10 +6976,45 @@ function renderAssignmentRiskBody(card, data) {
   card.appendChild(table);
 }
 
+/** Each value is either a plain string/number, or `{ text, title }` for a
+ * cell that also carries a hover formula. */
 function rowOf(cell, values) {
   const tr = el('tr');
-  values.forEach((v) => tr.appendChild(el(cell, {}, v == null ? '' : String(v))));
+  values.forEach((v) => {
+    if (v && typeof v === 'object') {
+      tr.appendChild(el(cell, v.title ? { title: v.title } : {}, v.text == null ? '' : String(v.text)));
+    } else {
+      tr.appendChild(el(cell, {}, v == null ? '' : String(v)));
+    }
+  });
   return tr;
+}
+
+/** The Min Roll Premium formula tooltip, shared by the Recommended
+ * buy-to-close and Assignment risk tables -- see _min_roll_premium /
+ * _roll_floor_date in wheel/api.py. `null` when the row carries nothing to
+ * explain. The target date's weekday is read off the date itself rather than
+ * assumed "Friday": a monthly-only ticker's own next expiration (used once
+ * it's later than next week's Friday) is priced against real listed dates,
+ * which are Fridays in practice but not guaranteed to be. */
+function rollPremiumFormula(r) {
+  if (r.min_roll_premium == null || r.strike == null || r.roll_dte == null) return null;
+  const dow = parseDay(r.roll_target_date).toLocaleDateString('en-US', { weekday: 'short' });
+  return formula([
+    `Minimum credit per share to roll into a contract expiring ${r.roll_dte} days out ` +
+      `(${dow}, ${longDate(r.roll_target_date)}), instead of letting this one resolve:`,
+    'Min Roll Premium = Strike × (days to expiry ÷ 365) × 30% target annualized',
+    `= ${money(r.strike, { cents: true })} × (${r.roll_dte} ÷ 365) × 30%`,
+    `= ${money(r.min_roll_premium, { cents: true })}`,
+  ]);
+}
+
+/** Rendered as a plain `{text, title}` cell for the Assignment risk table's
+ * `rowOf` -- see `rollPremiumFormula` for the shared math. */
+function minRollPremiumCell(r) {
+  const title = rollPremiumFormula(r);
+  if (!title) return '—';
+  return { text: money(r.min_roll_premium, { cents: true }), title };
 }
 
 /** Workflow buckets -- four columns of flagged legs, each with its reason. */
@@ -8094,6 +8138,7 @@ const RECOMMENDED_BTC_COLUMNS = [
   { key: 'underlying', label: 'Symbol', left: true },
   { key: 'type', label: 'Type', left: true },
   { key: 'btc_targets', label: 'Recommended BTC (50% / 20% / 10%)' },
+  { key: 'min_roll_premium', label: 'Min Roll Premium' },
   { key: 'premium_if_btc', label: 'Premium Collected if BTC' },
   { key: 'last_close', label: 'Last Price' },
   { key: 'strike', label: 'Strike' },
@@ -8156,6 +8201,20 @@ function recommendedBtcRow(row) {
     ]);
   }
   tr.appendChild(btcCell);
+
+  // Minimum credit worth collecting to roll rather than let the current
+  // contract resolve (assignment for a CSP, call-away for a CC) -- see
+  // rollPremiumFormula() / _min_roll_premium in wheel/api.py. Same
+  // key-figure styling as the BTC targets cell above -- it's the other
+  // actionable threshold in this row.
+  const rollCell = el(
+    'td',
+    { class: 'num cc-target' },
+    row.min_roll_premium == null ? '—' : money(row.min_roll_premium, { cents: true })
+  );
+  const rollTitle = rollPremiumFormula(row);
+  if (rollTitle) rollCell.title = rollTitle;
+  tr.appendChild(rollCell);
 
   // What buying back at each rung actually leaves you with: the original
   // credit, less the cost of closing it there.
@@ -8243,6 +8302,10 @@ function renderRecommendedBtc() {
   clear(table);
   if (!rows.length) return;
 
+  // Rows can disagree on the roll target now (whichever is later of next
+  // week's Friday and the contract's own expiry -- see _min_roll_premium
+  // in wheel/api.py), so the DTE can't read once in the header; the
+  // per-row tooltip spells out each one's own days and math instead.
   const thead = el('thead');
   const headRow = el('tr');
   for (const column of RECOMMENDED_BTC_COLUMNS) {

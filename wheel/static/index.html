@@ -812,6 +812,17 @@
               life (still mostly time value, worth holding for), 10% once
               most of that has burned off (worth locking in sooner).
             </li>
+            <li>
+              <strong>Min Roll Premium</strong>: the smallest credit per
+              share worth collecting to roll into a new contract rather than
+              take the assignment or call-away, sized to a 30% annualized
+              return on the strike over that contract's life. Rolls out to
+              next week's Friday for a ticker that actually lists weekly
+              expirations (checked against real data, cached); a
+              monthly-only ticker rolls to its own next real expiration
+              instead. Either way, never sooner than the current contract's
+              own expiry. Hover for the exact days and math.
+            </li>
           </ul>
 
           <div style="overflow-x: auto">
