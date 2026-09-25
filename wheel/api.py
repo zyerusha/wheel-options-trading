@@ -636,14 +636,42 @@ def _capital_point(point) -> dict[str, Any]:
     }
 
 
+def _cached_cycle_metrics(
+    cache: dict[tuple[str, date, float | None, float], Any] | None,
+    cycle: Cycle,
+    through: date,
+    *,
+    current_price: float | None,
+    dividends: float,
+) -> Any:
+    """cycle_metrics(), memoized by ``cache`` when the caller supplies one.
+
+    The cycle list, the trade log, and the hedge banner each call this for
+    the same cycle within one dashboard build, always with the same
+    (cycle, through, current_price, dividends) -- without this, that's the
+    same cycle_metrics()/roll_chains() work redone 2-3 times per cycle for
+    an identical result. ``cache=None`` (tests, one-off callers) just calls
+    straight through with no memoization.
+    """
+    if cache is None:
+        return cycle_metrics(cycle, through, current_price=current_price, dividends=dividends)
+    key = (cycle.cycle_id, through, current_price, dividends)
+    result = cache.get(key)
+    if result is None:
+        result = cycle_metrics(cycle, through, current_price=current_price, dividends=dividends)
+        cache[key] = result
+    return result
+
+
 def _cycle_payload(
     cycle: Cycle,
     through: date,
     *,
     current_price: float | None = None,
     dividends: float = 0.0,
+    metrics_cache: dict[tuple[str, date, float | None, float], Any] | None = None,
 ) -> dict[str, Any]:
-    metrics = cycle_metrics(cycle, through, current_price=current_price, dividends=dividends)
+    metrics = _cached_cycle_metrics(metrics_cache, cycle, through, current_price=current_price, dividends=dividends)
     payload = {key: value for key, value in asdict(metrics).items()}
     payload["start_date"] = _iso(metrics.start_date)
     payload["end_date"] = _iso(metrics.end_date)
@@ -991,8 +1019,9 @@ def _trade_log_entry(
     engine_exact: bool,
     current_price: float | None = None,
     also_tickers: frozenset[str] | set[str] = frozenset(),
+    metrics_cache: dict[tuple[str, date, float | None, float], Any] | None = None,
 ) -> dict[str, Any]:
-    metrics = cycle_metrics(cycle, through, current_price=current_price, dividends=dividends)
+    metrics = _cached_cycle_metrics(metrics_cache, cycle, through, current_price=current_price, dividends=dividends)
 
     # A cycle holding no shares right now -- the fallback when a share-acquiring
     # row can't be matched to its own lot below.
@@ -1397,6 +1426,7 @@ def _trade_log_entry(
         "losses": metrics.losses,
         "roll_rate_pct": metrics.roll_rate_pct,
         "rolled_legs": metrics.rolled_legs,
+        "rollable_legs": metrics.rollable_legs,
         "open_roll_credit": _money(metrics.open_roll_credit),
         "resolved_roll_wins": metrics.resolved_roll_wins,
         "resolved_roll_losses": metrics.resolved_roll_losses,
@@ -1434,6 +1464,7 @@ def _open_hedge_entry(
     name: str | None,
     current_price: float | None,
     dividends: float,
+    metrics_cache: dict[tuple[str, date, float | None, float], Any] | None = None,
 ) -> dict[str, Any]:
     """One open, unpaired long option leg -- a protective put/call still on the
     books -- with the timing and position figures the banner needs to say "keep
@@ -1497,7 +1528,7 @@ def _open_hedge_entry(
         and intrinsic >= HEDGE_DEEP_ITM_COST_FRACTION * cost
     )
 
-    metrics = cycle_metrics(cycle, through, current_price=current_price, dividends=dividends)
+    metrics = _cached_cycle_metrics(metrics_cache, cycle, through, current_price=current_price, dividends=dividends)
     shares_held = sum(lot.remaining for lot in cycle.share_lots if lot.remaining > 1e-9)
     non_stock_pl = (
         metrics.option_realized_pl + metrics.stock_realized_pl + dividends + metrics.option_open_premium
@@ -1936,7 +1967,7 @@ def _roll_target_date(
     today: date,
     own_expiry: date | None,
     expirations_by_ticker: dict[str, list[date]],
-) -> date:
+) -> date | None:
     """The date a roll should be priced against for ``ticker``: the earliest
     expiration that is both a real possibility for this ticker and strictly
     *later* than the contract's own current expiry -- a roll can't land on
@@ -1951,17 +1982,31 @@ def _roll_target_date(
     both today and from the contract's own expiry, whichever is later --
     never sooner than a sensible planning horizon, never at or before the
     current contract.
+
+    Returns ``None`` when this ticker has never once been fetched
+    successfully (no cache entry at all -- ``ticker`` is simply absent from
+    ``expirations_by_ticker``, not just present with an empty list): a fresh
+    fetch failure with nothing to fall back on. Guessing "weekly" here would
+    be silently wrong for a ticker that's actually monthly-only, so this
+    reports unknown instead, the same as any other missing-data figure in
+    this app shows as "--" rather than a fabricated number.
     """
-    expirations = expirations_by_ticker.get(ticker) or []
+    if ticker not in expirations_by_ticker:
+        return None
+    expirations = expirations_by_ticker[ticker]
     weekly = marketdata.has_weekly_options(expirations, today)
-    after = own_expiry or today
+    # Never sooner than real today, even if the row's own expiry comes from
+    # a stale export that's already in the past -- otherwise the monthly
+    # branch below can hand back a "roll target" that's already gone by,
+    # giving a negative DTE and a nonsensical Min Roll Premium.
+    after = max(own_expiry, today) if own_expiry else today
     if weekly is False:
         later = [d for d in expirations if d > after]
         if later:
             return min(later)
         # No real date on file past the current contract (a short/stale
         # fetch) -- fall through to the weekly formula as a last resort.
-    return max(_next_week_friday(today), _next_week_friday(after))
+    return _next_week_friday(after)
 
 
 def _min_roll_premium(strike: float | None, dte: int) -> float | None:
@@ -2269,6 +2314,13 @@ class Dashboard:
         self._open_positions: list[dict[str, Any]] | None = None
         self._cc_candidates: list[dict[str, Any]] | None = None
         self._csp_candidates: list[dict[str, Any]] | None = None
+        # _cycle_metrics (below) is called 2-3 times per cycle per build --
+        # the cycle list, the trade log, and the hedge banner each want it --
+        # always with the same (cycle, through, current_price, dividends)
+        # for a given cycle within one build. Caching by that exact key
+        # skips redoing the same cycle_metrics()/roll_chains() work, and
+        # correctly recomputes if any of those inputs ever does differ.
+        self._cycle_metrics_cache: dict[tuple[str, date, float | None, float], Any] = {}
 
     # ---- market data ----
 
@@ -2915,6 +2967,7 @@ class Dashboard:
                 engine_exact=cycle.cycle_id in engine_exact,
                 current_price=current_prices.get(cycle.underlying),
                 also_tickers=former_of.get(cycle.underlying, frozenset()),
+                metrics_cache=self._cycle_metrics_cache,
             )
             for cycle in sorted(self.all_cycles, key=lambda cycle: (cycle.start_date, cycle.underlying))
         ]
@@ -2965,6 +3018,7 @@ class Dashboard:
                         name=self._company_names.get(cycle.underlying),
                         current_price=current_prices.get(cycle.underlying),
                         dividends=dividends.get(cycle.cycle_id, 0.0),
+                        metrics_cache=self._cycle_metrics_cache,
                     )
                 )
         hedges.sort(key=lambda h: h["days_to_expiry"])
@@ -3052,10 +3106,18 @@ class Dashboard:
                 roll_target_date = _roll_target_date(
                     row["underlying"], today, own_expiry, expirations_by_ticker
                 )
-                roll_dte = (roll_target_date - today).days
-                row["roll_dte"] = roll_dte
-                row["roll_target_date"] = _iso(roll_target_date)
-                row["min_roll_premium"] = _min_roll_premium(row.get("strike"), roll_dte)
+                if roll_target_date is None:
+                    # This ticker has never been fetched successfully at
+                    # all -- show unknown rather than guess weekly and risk
+                    # being wrong for an actually-monthly-only name.
+                    row["roll_dte"] = None
+                    row["roll_target_date"] = None
+                    row["min_roll_premium"] = None
+                else:
+                    roll_dte = (roll_target_date - today).days
+                    row["roll_dte"] = roll_dte
+                    row["roll_target_date"] = _iso(roll_target_date)
+                    row["min_roll_premium"] = _min_roll_premium(row.get("strike"), roll_dte)
             else:
                 row["roll_dte"] = None
                 row["roll_target_date"] = None
@@ -3560,6 +3622,7 @@ class Dashboard:
             self._open_positions = None
             self._cc_candidates = None
             self._csp_candidates = None
+            self._cycle_metrics_cache = {}
         dividends = dividends_by_cycle(cycles, transactions)
         if self._wheel_return is None:
             self._wheel_return = self._build_wheel_return(current_prices)
@@ -3797,6 +3860,7 @@ class Dashboard:
                     through,
                     current_price=current_prices.get(cycle.underlying),
                     dividends=dividends.get(cycle.cycle_id, 0.0),
+                    metrics_cache=self._cycle_metrics_cache,
                 )
                 for cycle in cycles
             ],

@@ -388,6 +388,10 @@ function wheelOptionPlFormula(row, title) {
     '',
     `= ${money(row.wheel_core_realized_pl, { cents: true })} + ${money(row.hedge_realized_pl, { cents: true })}`,
     `= ${money(row.option_realized_pl, { cents: true })}`,
+    '',
+    'The gross / paid to close / still open figures shown alongside this',
+    'cover short legs only, so they will not add up to this total: hedges',
+    'are real cash flows too, just not part of that breakdown.',
   ]);
 }
 
@@ -4471,7 +4475,7 @@ function renderTiles(portfolio, reconciliation) {
     {
       label: 'Premium collected (net)',
       value: money(portfolio.option_realized_pl, { cents: true }),
-      foot: `${money(portfolio.premium_received)} gross · ${money(portfolio.premium_paid)} paid to close · ${money(portfolio.open_premium)} still open`,
+      foot: `${money(portfolio.premium_received)} gross · ${money(portfolio.premium_paid)} paid to close · ${money(portfolio.open_premium)} still open, short legs only`,
       tone: portfolio.option_realized_pl >= 0 ? 'pos' : 'neg',
       formula: wheelOptionPlFormula(portfolio, 'Wheel option P/L (this tile)'),
     },
@@ -4619,10 +4623,11 @@ function renderTiles(portfolio, reconciliation) {
       // of rolls it belongs to stops rolling and actually closes.
       label: 'Roll rate',
       value: pct(portfolio.roll_rate_pct, 0),
-      foot: `${portfolio.rolled_legs} of ${portfolio.total_legs - portfolio.open_legs} closed legs rolled`,
+      foot: `${portfolio.rolled_legs} of ${portfolio.rollable_legs} closed puts/calls rolled`,
       formula: formula([
-        'Roll rate = Legs closed by a same-day roll ÷ all closed legs',
-        `= ${portfolio.rolled_legs} ÷ ${portfolio.total_legs - portfolio.open_legs}`,
+        'Roll rate = Puts/calls closed by a same-day roll ÷ closed puts/calls',
+        '  Long hedge legs are never rolled, so they count on neither side.',
+        `= ${portfolio.rolled_legs} ÷ ${portfolio.rollable_legs}`,
         `= ${pct(portfolio.roll_rate_pct, 1)}`,
         '',
         `Roll chains resolved so far: ${portfolio.resolved_roll_wins} win / ${portfolio.resolved_roll_losses} loss`,
@@ -4747,6 +4752,16 @@ function renderNotices(meta, reconciliation) {
  * leg exists, so it stays invisible until it matters. See
  * ``wheel/api.py``'s ``_open_hedge_entry`` for the phase / message rules.
  */
+// Wording for the "N days ___" line, keyed by hedge phase (wheel/api.py's
+// _open_hedge_entry). Only DIRECTIONAL reads differently -- it isn't acting
+// as insurance anymore, so "of protection left" would be a false claim.
+const HEDGE_PHASE_DAYS_LABEL = {
+  runway: 'of protection left',
+  wind_down: 'of protection left',
+  expiring: 'of protection left',
+  directional: 'to expiry',
+};
+
 /** One hedge row, shared by the dashboard banner and the Trade Log block. */
 function buildHedgeRow(h, { showAccount = true } = {}) {
   const row = el('div', { class: 'hedge-row ' + h.phase });
@@ -4803,10 +4818,11 @@ function buildHedgeRow(h, { showAccount = true } = {}) {
   }
   // "days of protection left" claims it's still doing insurance's job -- true
   // for RUNWAY/WIND_DOWN/EXPIRING, but exactly what a DIRECTIONAL row is
-  // saying is no longer the case here.
-  econ.appendChild(
-    el('span', {}, `${h.days_to_expiry} days ${h.phase === 'directional' ? 'to expiry' : 'of protection left'}`)
-  );
+  // saying is no longer the case here. A lookup, not a ternary, so a future
+  // phase needing its own wording extends this table instead of another
+  // bolted-on condition.
+  const daysLabel = HEDGE_PHASE_DAYS_LABEL[h.phase] || 'of protection left';
+  econ.appendChild(el('span', {}, `${h.days_to_expiry} days ${daysLabel}`));
   row.appendChild(econ);
 
   // Secondary, deliberately muted: premium written while the hedge has been
@@ -9968,8 +9984,9 @@ function renderTradeLogSummary(entry) {
       help: notWheel
         ? wheelHelp
         : formula([
-            'Closed legs that were one side of a same-day roll ÷ all closed legs.',
-            `= ${entry.rolled_legs} ÷ ${entry.closed_leg_count}`,
+            'Closed puts/calls that were one side of a same-day roll ÷ closed puts/calls.',
+            '  Long hedge legs are never rolled, so they count on neither side.',
+            `= ${entry.rolled_legs} ÷ ${entry.rollable_legs}`,
             '',
             'A roll only becomes a win or a loss once every leg in its whole',
             'chain finally closes for real, not merely rolls again.',
