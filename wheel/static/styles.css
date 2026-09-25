@@ -969,6 +969,84 @@ th.sortable:hover {
   color: var(--text-primary);
 }
 
+/* ---------------- sticky Symbol / Type columns ---------------- */
+
+/* These tables can run a dozen+ columns wide, scrolling under
+   `overflow-x: auto`; without this, scrolling right loses track of which
+   ticker/leg a cell even belongs to. Symbol (and Type, where the table has
+   one right after it) stay pinned to the left edge instead. Fixed widths on
+   both so the second sticky column's `left` offset lines up with the
+   first's actual rendered width. */
+#open-positions-table td:nth-child(1),
+#open-positions-table th:nth-child(1),
+#recommended-btc-table td:nth-child(1),
+#recommended-btc-table th:nth-child(1),
+#wheel-targets-table td:nth-child(1),
+#wheel-targets-table th:nth-child(1),
+#cc-candidates-table td:nth-child(1),
+#cc-candidates-table th:nth-child(1),
+#csp-candidates-table td:nth-child(1),
+#csp-candidates-table th:nth-child(1) {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background: var(--surface-1);
+  width: 72px;
+  /* Overrides #open-positions-table/#cc-candidates-table/#csp-candidates-table
+     th's own `max-width: 10ch` (~65px) -- without this the header caps
+     narrower than the 72px column 2 assumes, leaving a gap column 3's
+     content shows through. */
+  min-width: 72px;
+  max-width: 72px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#open-positions-table td:nth-child(2),
+#open-positions-table th:nth-child(2),
+#recommended-btc-table td:nth-child(2),
+#recommended-btc-table th:nth-child(2),
+#wheel-targets-table td:nth-child(2),
+#wheel-targets-table th:nth-child(2) {
+  position: sticky;
+  left: 72px;
+  z-index: 1;
+  background: var(--surface-1);
+  box-shadow: 2px 0 4px -2px rgba(0, 0, 0, 0.15);
+}
+
+/* A frozen column in the header needs to out-rank both the ordinary
+   sticky-top header row (z-index: 1, above) and every frozen body cell
+   scrolling underneath it. */
+#open-positions-table th:nth-child(1),
+#open-positions-table th:nth-child(2),
+#recommended-btc-table th:nth-child(1),
+#recommended-btc-table th:nth-child(2),
+#wheel-targets-table th:nth-child(1),
+#wheel-targets-table th:nth-child(2),
+#cc-candidates-table th:nth-child(1),
+#csp-candidates-table th:nth-child(1) {
+  z-index: 2;
+}
+
+/* Only Symbol freezes on these two -- no separate Type column -- so the
+   frozen/scrolling boundary line belongs on column 1 instead of column 2. */
+#cc-candidates-table td:nth-child(1),
+#csp-candidates-table td:nth-child(1) {
+  box-shadow: 2px 0 4px -2px rgba(0, 0, 0, 0.15);
+}
+
+#open-positions-table tbody tr:hover td:nth-child(1),
+#open-positions-table tbody tr:hover td:nth-child(2),
+#recommended-btc-table tbody tr:hover td:nth-child(1),
+#recommended-btc-table tbody tr:hover td:nth-child(2),
+#wheel-targets-table tbody tr:hover td:nth-child(1),
+#wheel-targets-table tbody tr:hover td:nth-child(2),
+#cc-candidates-table tbody tr:hover td:nth-child(1),
+#csp-candidates-table tbody tr:hover td:nth-child(1) {
+  background: var(--ghost);
+}
+
 .badge {
   display: inline-block;
   font-size: 11px;

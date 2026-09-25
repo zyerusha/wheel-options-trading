@@ -648,6 +648,7 @@ def _cycle_payload(
     payload["start_date"] = _iso(metrics.start_date)
     payload["end_date"] = _iso(metrics.end_date)
     payload["win_rate_pct"] = metrics.win_rate_pct
+    payload["roll_rate_pct"] = metrics.roll_rate_pct
     payload["kind"] = cycle.kind  # "wheel" | "directional" | "hold"
     payload["last_activity"] = _iso(cycle.last_activity)
     # CycleMetrics already exposes integer `rolls` / `assignments` counts, so the
@@ -1394,6 +1395,11 @@ def _trade_log_entry(
         "win_rate_pct": metrics.win_rate_pct,
         "wins": metrics.wins,
         "losses": metrics.losses,
+        "roll_rate_pct": metrics.roll_rate_pct,
+        "rolled_legs": metrics.rolled_legs,
+        "open_roll_credit": _money(metrics.open_roll_credit),
+        "resolved_roll_wins": metrics.resolved_roll_wins,
+        "resolved_roll_losses": metrics.resolved_roll_losses,
         "avg_days_in_trade": metrics.avg_days_in_trade,
         "avg_collateral": _money(metrics.avg_collateral),
         "roi_on_avg_wheel_pct": metrics.roi_on_avg_wheel_pct,
@@ -3733,6 +3739,7 @@ class Dashboard:
             "first_date": _iso(portfolio.first_date),
             "last_date": _iso(portfolio.last_date),
             "win_rate_pct": portfolio.win_rate_pct,
+            "roll_rate_pct": portfolio.roll_rate_pct,
         }
         dashboard_insights = portfolio_insights(
             portfolio_payload,

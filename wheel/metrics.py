@@ -99,7 +99,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from wheel.cashflow import dividend_transactions
 from wheel.engine import (
@@ -111,6 +111,7 @@ from wheel.engine import (
     SHORT,
     WHEEL_STRATEGIES,
     Cycle,
+    OptionLeg,
     ShareLot,
 )
 from wheel.parser import ASSIGNED, Transaction
@@ -398,6 +399,14 @@ class CycleMetrics:
     assignments: int = 0
     wins: int = 0
     losses: int = 0
+    # Rolls, tracked separately from the strict win/loss verdict above -- see
+    # roll_chains(). A leg rolled forward is neither a win nor a loss on its
+    # own; only once the whole chain it belongs to finally stops rolling and
+    # closes for real does resolved_roll_wins/losses count it.
+    rolled_legs: int = 0
+    open_roll_credit: float = 0.0
+    resolved_roll_wins: int = 0
+    resolved_roll_losses: int = 0
     avg_days_in_trade: float | None = None
     synthetic_cash: float = 0.0  # assignment share flows not present in the export
     warnings: list[str] = field(default_factory=list)
@@ -412,11 +421,108 @@ class CycleMetrics:
         entirely rather than counting against it. ``None`` -- not ``0.0`` --
         when nothing has been decided yet, since 0% would misreport "no data"
         as "all losses".
+
+        Deliberately *not* adjusted for a same-day roll's net credit: a leg
+        rolled into a new, still-open contract is scored on its own closed
+        cash flows here, full stop -- rolling it forward doesn't retroactively
+        make the leg that closed a winner. Whether the roll itself worked out
+        is a separate question, answered once the whole chain of rolls it
+        belongs to finally stops rolling and closes for real -- see
+        ``roll_chains()`` / ``resolved_roll_wins`` / ``resolved_roll_losses``
+        / ``open_roll_credit``, not this property.
         """
         if not self.is_wheel:
             return None
         decided = self.wins + self.losses
         return 100.0 * self.wins / decided if decided else None
+
+    @property
+    def roll_rate_pct(self) -> float | None:
+        """Share of this cycle's closed legs that were one side of a same-day
+        roll -- how much of this wheel is being actively managed forward
+        rather than left to expire or get assigned outright. A leg counted
+        here can simultaneously be excluded from win_rate_pct.
+        """
+        closed = self.legs_total - self.legs_open
+        return 100.0 * self.rolled_legs / closed if closed else None
+
+
+def roll_chains(cycle: Cycle) -> list[dict[str, Any]]:
+    """Every leg touched by a roll, grouped into connected chains -- a chain
+    can span several consecutive rolls (close, reopen, that reopen later
+    closes too, reopens again...) and can branch when one roll resizes a
+    position (two legs closing into one, or one opening into two).
+
+    Each chain's ``status`` is ``"OPEN"`` while any leg in it is still open,
+    and only becomes ``"WIN"`` / ``"LOSS"`` / ``"FLAT"`` once every leg has
+    actually closed for good -- an ordinary close, expiration, or assignment,
+    never merely another roll, which would already have pulled the next leg
+    into this same chain instead of ending it. ``net_cash`` is the chain's
+    running total cash flow (every leg's own opening credit, plus every
+    close's cash): the chain's realized P&L once resolved, or the credit
+    collected so far while it's still open.
+
+    This answers "did the *decision* to roll pay off," deliberately kept
+    separate from ``CycleMetrics.win_rate_pct``, which judges each closed leg
+    alone and never waits on a still-open reopen to resolve.
+    """
+    opened_by_roll: dict[str, list[OptionLeg]] = {}
+    closed_by_roll: dict[str, list[OptionLeg]] = {}
+    for leg in cycle.legs:
+        if leg.open_roll_id:
+            opened_by_roll.setdefault(leg.open_roll_id, []).append(leg)
+        if leg.closes and leg.closes[-1].roll_id:
+            closed_by_roll.setdefault(leg.closes[-1].roll_id, []).append(leg)
+
+    def neighbors(leg: OptionLeg) -> list[OptionLeg]:
+        found = []
+        if leg.open_roll_id:
+            found += closed_by_roll.get(leg.open_roll_id, [])
+            found += opened_by_roll.get(leg.open_roll_id, [])
+        if leg.closes and leg.closes[-1].roll_id:
+            roll_id = leg.closes[-1].roll_id
+            found += opened_by_roll.get(roll_id, [])
+            found += closed_by_roll.get(roll_id, [])
+        return found
+
+    visited: set[str] = set()
+    chains: list[dict[str, Any]] = []
+    for start in cycle.legs:
+        touched = start.open_roll_id is not None or bool(start.closes and start.closes[-1].roll_id)
+        if start.leg_id in visited or not touched:
+            continue
+
+        stack = [start]
+        component: list[OptionLeg] = []
+        while stack:
+            leg = stack.pop()
+            if leg.leg_id in visited:
+                continue
+            visited.add(leg.leg_id)
+            component.append(leg)
+            stack.extend(n for n in neighbors(leg) if n.leg_id not in visited)
+
+        net_cash = sum(leg.open_cash for leg in component) + sum(
+            close.cash for leg in component for close in leg.closes
+        )
+        if any(leg.is_open for leg in component):
+            status = "OPEN"
+        elif net_cash > 0:
+            status = "WIN"
+        elif net_cash < 0:
+            status = "LOSS"
+        else:
+            status = "FLAT"
+
+        chains.append(
+            {
+                "leg_ids": [leg.leg_id for leg in component],
+                "underlying": cycle.underlying,
+                "status": status,
+                "net_cash": round(net_cash, 2),
+            }
+        )
+    return chains
 
 
 def cycle_metrics(
@@ -470,9 +576,20 @@ def cycle_metrics(
     average = time_weighted_average(points)
     current = points[-1] if points else CapitalPoint(cycle.start_date)
 
+    # Strictly per leg: did *this closed position* make money, on its own
+    # cash flows, full stop. Deliberately not adjusted for a same-day roll's
+    # net credit -- a still-open reopen shouldn't retroactively decide a
+    # closed leg's verdict; see roll_chains() for that question instead,
+    # which waits for the whole chain to actually finish.
     wins = sum(1 for leg in closed_legs if leg.realized_pl > 0)
     losses = sum(1 for leg in closed_legs if leg.realized_pl < 0)
     held = [leg.days_held for leg in closed_legs if leg.days_held is not None]
+
+    rolled_legs = sum(1 for leg in closed_legs if leg.closes and leg.closes[-1].roll_id)
+    chains = roll_chains(cycle)
+    open_roll_credit = round(sum(c["net_cash"] for c in chains if c["status"] == "OPEN"), 2)
+    resolved_roll_wins = sum(1 for c in chains if c["status"] == "WIN")
+    resolved_roll_losses = sum(1 for c in chains if c["status"] == "LOSS")
 
     annualized_wheel_roc = None
     if average > 1e-9:
@@ -559,6 +676,10 @@ def cycle_metrics(
         assignments=len(cycle.assignments),
         wins=wins,
         losses=losses,
+        rolled_legs=rolled_legs,
+        open_roll_credit=open_roll_credit,
+        resolved_roll_wins=resolved_roll_wins,
+        resolved_roll_losses=resolved_roll_losses,
         avg_days_in_trade=sum(held) / len(held) if held else None,
         synthetic_cash=sum(assignment.cash for assignment in cycle.assignments),
         warnings=list(cycle.warnings),
@@ -629,6 +750,10 @@ class PortfolioMetrics:
     assignments: int = 0
     wins: int = 0
     losses: int = 0
+    rolled_legs: int = 0
+    open_roll_credit: float = 0.0
+    resolved_roll_wins: int = 0
+    resolved_roll_losses: int = 0
     avg_days_in_trade: float | None = None
 
     @property
@@ -640,10 +765,24 @@ class PortfolioMetrics:
         counts toward neither, so it drops out of this ratio's denominator
         entirely rather than counting against it. ``None`` -- not ``0.0`` --
         when nothing has been decided yet, since 0% would misreport "no data"
-        as "all losses".
+        as "all losses". Summed straight from each cycle's own ``wins``/
+        ``losses`` (strict per-leg realized P&L -- see
+        ``CycleMetrics.win_rate_pct``), never recomputed from raw legs here.
         """
         decided = self.wins + self.losses
         return 100.0 * self.wins / decided if decided else None
+
+    @property
+    def roll_rate_pct(self) -> float | None:
+        """Share of every closed leg that was one side of a same-day roll
+        (win or lose, resolved or the chain still open) -- a measure of how
+        much of the book is being actively managed forward rather than left
+        to expire or get assigned outright. Distinct from ``win_rate_pct``,
+        which excludes rolled legs from its own verdict entirely; a leg can
+        be counted here and simultaneously be a win, a loss, or neither.
+        """
+        closed = self.total_legs - self.open_legs
+        return 100.0 * self.rolled_legs / closed if closed else None
 
 
 def portfolio_capital_series(
@@ -801,6 +940,10 @@ def portfolio_metrics(
         if metric.is_wheel:
             result.wins += metric.wins
             result.losses += metric.losses
+            result.rolled_legs += metric.rolled_legs
+            result.open_roll_credit += metric.open_roll_credit
+            result.resolved_roll_wins += metric.resolved_roll_wins
+            result.resolved_roll_losses += metric.resolved_roll_losses
             wheel_option_realized_pl += metric.option_realized_pl
             wheel_initial_collateral += metric.initial_collateral
 

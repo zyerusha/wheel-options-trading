@@ -4612,6 +4612,24 @@ function renderTiles(portfolio, reconciliation) {
             ]),
     },
     {
+      // Deliberately separate from Win rate above: a leg rolled into a new,
+      // still-open contract counts here whether or not it's also a win or a
+      // loss there. Whether the roll itself paid off is a further question
+      // -- resolved_roll_wins/losses -- answered only once the whole chain
+      // of rolls it belongs to stops rolling and actually closes.
+      label: 'Roll rate',
+      value: pct(portfolio.roll_rate_pct, 0),
+      foot: `${portfolio.rolled_legs} of ${portfolio.total_legs - portfolio.open_legs} closed legs rolled`,
+      formula: formula([
+        'Roll rate = Legs closed by a same-day roll ÷ all closed legs',
+        `= ${portfolio.rolled_legs} ÷ ${portfolio.total_legs - portfolio.open_legs}`,
+        `= ${pct(portfolio.roll_rate_pct, 1)}`,
+        '',
+        `Roll chains resolved so far: ${portfolio.resolved_roll_wins} win / ${portfolio.resolved_roll_losses} loss`,
+        `Still-open roll chains hold ${money(portfolio.open_roll_credit, { sign: true })} in credit not yet realized`,
+      ]),
+    },
+    {
       label: 'Avg days in trade',
       value: portfolio.avg_days_in_trade === null ? '—' : portfolio.avg_days_in_trade.toFixed(1),
       foot: `${portfolio.rolls} rolls · ${portfolio.assignments} assignments`,
@@ -9936,6 +9954,29 @@ function renderTradeLogSummary(entry) {
         : formula([
             'Winning legs ÷ (winning + losing) closed legs.',
             'Open legs and exact break-evens are excluded from the count.',
+            'Not adjusted for rolls -- see Roll rate for that.',
+          ]),
+    })
+  );
+  host.appendChild(
+    tradeLogCell('Roll rate', notWheel ? 'n/a' : pct(entry.roll_rate_pct), {
+      foot:
+        notWheel || !entry.rolled_legs
+          ? null
+          : `${entry.resolved_roll_wins}W / ${entry.resolved_roll_losses}L resolved` +
+            (entry.open_roll_credit ? ` · ${money(entry.open_roll_credit, { sign: true })} open` : ''),
+      help: notWheel
+        ? wheelHelp
+        : formula([
+            'Closed legs that were one side of a same-day roll ÷ all closed legs.',
+            `= ${entry.rolled_legs} ÷ ${entry.closed_leg_count}`,
+            '',
+            'A roll only becomes a win or a loss once every leg in its whole',
+            'chain finally closes for real, not merely rolls again.',
+            `Resolved so far: ${entry.resolved_roll_wins} win / ${entry.resolved_roll_losses} loss.`,
+            entry.open_roll_credit
+              ? `Still-open chains hold ${money(entry.open_roll_credit, { sign: true })} not yet realized.`
+              : 'No roll chain is currently open.',
           ]),
     })
   );
