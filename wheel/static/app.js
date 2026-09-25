@@ -5713,6 +5713,8 @@ function renderYearPresets(meta) {
 }
 
 function wireFilters() {
+  $('global-search').addEventListener('input', applySearchFilter);
+
   $('load-data').addEventListener('click', loadSelectedSource);
   // Picking a file arms the button but does not evaluate anything yet.
   $('csv-file').addEventListener('change', (event) => {
@@ -6069,6 +6071,7 @@ function switchTab(name) {
   } catch (error) {
     console.error('tab render failed:', error);
   }
+  applySearchFilter();
   // Also refetch on every tab change, not just on an account/filter switch.
   // An account switch's own load() runs asynchronously, so a tab entered
   // while it's still in flight would otherwise render off whatever *older*
@@ -10651,6 +10654,8 @@ function render() {
   // full history), but re-render it so the picker tracks an account switch.
   renderTabs();
   if (state.activeTab === 'tradelog') renderTradeLog();
+
+  applySearchFilter();
 }
 
 /* ----------------------------------------------------------- table print */
@@ -10740,6 +10745,66 @@ function printableHasContent(printable) {
 // wasn't asked for, only swapping charts in for their table twins.
 function hasOwnTableHost(root) {
   return ownScoped(root, 'table, .table-twin, .table-host').length > 0;
+}
+
+/**
+ * Global search (the field above the tab bar, reachable from every tab):
+ * hides any .card / .card-subsection with no match, and, for one that owns
+ * a table, hides just its non-matching rows rather than the whole card. A
+ * card's own heading matching is enough to show all of its rows.
+ *
+ * Table bodies are rebuilt from scratch on every render() (and thus on the
+ * 15s live-price poll too), which would otherwise wipe any .search-hide
+ * classes on old <tr> elements -- so this re-runs at the end of render()
+ * and switchTab(), not just on input.
+ */
+// A few dashboard/planner panels are built straight into a bare <section>
+// (no .card wrapper or <header><h2>, so they're invisible to the .card,
+// .card-subsection query below) but still carry real per-ticker rows or text
+// worth searching: in-the-money legs, the open-hedge banner, the earnings
+// strip, and the Trade Log's own hedge block. Named explicitly rather than
+// widening the .card selector, since none of them has a heading to match on.
+const SEARCH_EXTRA_ROOTS = ['#assignment-risk', '#hedge-banner', '#earnings-in-view', '#tradelog-hedge'];
+
+function applySearchFilter() {
+  const input = $('global-search');
+  const term = input ? input.value.trim().toLowerCase() : '';
+  const items = Array.from(
+    document.querySelectorAll(['.card', '.card-subsection', ...SEARCH_EXTRA_ROOTS].join(', '))
+  );
+  // Reversed so a card-subsection (later in document order, being nested
+  // deeper) is settled before the ancestor .card that needs its outcome.
+  items.reverse().forEach((root) => {
+    if (!term) {
+      root.classList.remove('search-hide');
+      ownScoped(root, 'tbody tr').forEach((tr) => tr.classList.remove('search-hide'));
+      return;
+    }
+
+    const header = root.querySelector(':scope > header');
+    const heading = header ? header.querySelector(':scope > h2, :scope > h3') : null;
+    const headingMatch = heading ? heading.textContent.toLowerCase().includes(term) : false;
+
+    const ownRows = ownScoped(root, 'tbody tr');
+    let anyRowVisible = false;
+    ownRows.forEach((tr) => {
+      const match = headingMatch || tr.textContent.toLowerCase().includes(term);
+      tr.classList.toggle('search-hide', !match);
+      if (match) anyRowVisible = true;
+    });
+
+    const subsectionVisible = Array.from(root.querySelectorAll('.card-subsection')).some(
+      (sub) => sub.closest('.card') === root && !sub.classList.contains('search-hide')
+    );
+
+    // A card with no table at all (tiles/insights/chips only, e.g.
+    // Performance or Workflow) can't be filtered row by row -- fall back to
+    // matching its whole text.
+    const fallbackMatch = !hasOwnTableHost(root) && root.textContent.toLowerCase().includes(term);
+
+    const visible = headingMatch || anyRowVisible || subsectionVisible || fallbackMatch;
+    root.classList.toggle('search-hide', !visible);
+  });
 }
 
 // Groups a header's non-heading children (CSV links, toggle buttons, ...)

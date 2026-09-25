@@ -295,6 +295,27 @@ input[type='file']::file-selector-button {
   margin-bottom: var(--gap);
 }
 
+/* Reachable no matter which tab is active, same reasoning as .filters
+   (see the comment above it in index.html) -- one field filters whatever
+   tab is currently showing. See applySearchFilter() in app.js. */
+.search-bar {
+  margin-bottom: var(--gap);
+}
+
+.search-bar input[type='search'] {
+  width: 100%;
+  max-width: 420px;
+}
+
+/* Hidden by applySearchFilter() rather than the native `hidden` attribute,
+   so it never fights with a card/row's own data-driven hidden state (e.g.
+   #net-worth-card hidden when no Positions export is loaded) -- clearing
+   the search term just removes this class and whatever `hidden` already
+   said takes back over. */
+.search-hide {
+  display: none !important;
+}
+
 .accounts {
   display: flex;
   flex-wrap: wrap;
@@ -343,6 +364,7 @@ input[type='file']::file-selector-button {
 }
 
 input[type='date'],
+input[type='search'],
 select,
 button {
   font: inherit;
@@ -2224,6 +2246,7 @@ tr.detail > td {
 
 body.presentation .source,
 body.presentation .filters,
+body.presentation .search-bar,
 body.presentation #notices,
 body.presentation .tabs,
 body.presentation .card-actions,
