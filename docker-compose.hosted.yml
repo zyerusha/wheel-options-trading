@@ -1,0 +1,24 @@
+services:
+  wheel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: wheel-trading:local
+    container_name: wheel-trading-hosted
+    ports:
+      - "${WHEEL_PORT:-8765}:8765"
+    environment:
+      WHEEL_HOST: "0.0.0.0"
+      WHEEL_MODE: "hosted"
+      WHEEL_SESSION_TTL_SECONDS: "${WHEEL_SESSION_TTL_SECONDS:-7200}"
+      WHEEL_SESSION_MAX_BYTES: "${WHEEL_SESSION_MAX_BYTES:-262144000}"
+      WHEEL_SESSION_MAX_FILES: "${WHEEL_SESSION_MAX_FILES:-100}"
+    # No bind mount, on purpose: hosted mode gives each browser its own
+    # isolated, cookie-scoped session (see wheel/sessions.py), and that
+    # session's files live only in the container's writable layer for the
+    # life of the session. There is nothing to persist -- restarting or
+    # recreating this container discards every live session, by design.
+    # Hosted mode is a disposable, session-based service, not a place to
+    # keep data; use docker-compose.yml (the local/mounted-directory mode)
+    # for anything that needs to survive a restart.
+    restart: unless-stopped

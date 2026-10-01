@@ -81,6 +81,29 @@ docker compose up --build
 docker run --rm -e PORT=8080 -e WHEEL_DATA_DIR=/data -p 8080:8080 -v /some/data:/data ghcr.io/zyerusha/wheel-options-trading:latest
 ```
 
+### Hosted (multi-tenant browser upload, no bind mount)
+
+For deploying to a server so people without Docker can use the dashboard
+through a URL. Every browser gets its own isolated, cookie-scoped session
+instead of sharing one data folder — no login, just per-session isolation:
+
+```bash
+docker compose -f docker-compose.hosted.yml up --build
+```
+
+- Files are uploaded through the browser (`Select Files` → `Load`), same as
+  local mode — nothing is bind-mounted.
+- Each session has a storage quota (`WHEEL_SESSION_MAX_BYTES`, default 250 MB)
+  and a file-count limit (`WHEEL_SESSION_MAX_FILES`, default 100).
+- A session's data is deleted after it's idle for `WHEEL_SESSION_TTL_SECONDS`
+  (default 2 hours), and **all sessions are lost on container restart** —
+  hosted mode is a disposable, in-memory-for-the-container service, not a
+  place to keep data. Use the local/mounted-directory mode above for that.
+- Meant to run behind an HTTPS-terminating reverse proxy; the app itself only
+  ever speaks plain HTTP.
+- Same image as local mode — only `WHEEL_MODE=hosted` differs. Directly with
+  `docker run`: add `-e WHEEL_MODE=hosted` and drop the `-v` bind mount.
+
 ### Push to the registry
 
 ```bash
@@ -351,6 +374,9 @@ A `BALANCED` result means the imported transaction cash reconciles to the broker
 
 Load `#present` in the URL (or the **Present** button) for a chrome-free, large-tile view for screenshots.
 
+In [hosted mode](#hosted-multi-tenant-browser-upload-no-bind-mount), every route above is scoped to the
+requesting browser's own session (via a `wheel_session` cookie) rather than one shared dataset.
+
 `/api/dashboard` also accepts `account=<id>` (an id from `/api/accounts`, or `combined` — the default) to scope the whole payload, filters included, to one account or every account aggregated.
 
 Dashboard filters:
@@ -447,10 +473,11 @@ Capital is estimated because the supporting shares predate the available export 
 | `wheel/accounts.py`    | Account discovery and the Combined view        |
 | `wheel/api.py`         | JSON payload assembly                          |
 | `wheel/serve.py`       | HTTP server                                    |
+| `wheel/sessions.py`    | Hosted-mode session identity, quotas, TTL eviction |
 | `wheel/paths.py`       | Resolves the data directory (`WHEEL_DATA_DIR`) |
 | `wheel/static/`        | Dashboard (Dashboard / Planner / Realized Gains / Trade Log tabs) |
 | `tests/`               | Tests                                          |
-| `Dockerfile` `docker-compose.yml` `docker-entrypoint.sh` | Container packaging (see [Docker](#docker)) |
+| `Dockerfile` `docker-compose.yml` `docker-compose.hosted.yml` `docker-entrypoint.sh` | Container packaging (see [Docker](#docker)) |
 | `docs/DESIGN.md`       | Detailed design and accounting rules           |
 
 For the detailed implementation decisions, edge cases, validation results, and accounting model, see [docs/DESIGN.md](docs/DESIGN.md).

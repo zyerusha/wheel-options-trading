@@ -34,6 +34,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from bisect import bisect_right
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Sequence
@@ -441,21 +442,33 @@ def _yahoo_auth() -> tuple[urllib.request.OpenerDirector | None, str | None]:
     return _YAHOO_AUTH
 
 
-def fetch_yahoo_quotes(tickers: Sequence[str], timeout: float = 10.0) -> str:
-    """Raw JSON text from Yahoo's batched quote endpoint. MarketDataError on
-    any transport failure (the crumb handshake included)."""
+def _yahoo_get(url: str, params: dict[str, str] | None = None, *, timeout: float, error_context: str) -> str:
+    """Shared GET plumbing for every Yahoo endpoint this module calls: attach
+    the cached cookie/crumb (falling back to a plain request if that
+    handshake ever failed), fetch the URL, and decode the body as text.
+    Raises MarketDataError on any transport failure, naming what was being
+    fetched (``error_context``) in the message.
+    """
     opener, crumb = _yahoo_auth()
-    query = {"symbols": ",".join(sorted({t.upper() for t in tickers}))}
+    query = dict(params or {})
     if crumb:
         query["crumb"] = crumb
-    url = f"{_QUOTE_URL}?{urllib.parse.urlencode(query)}"
+    if query:
+        url = f"{url}?{urllib.parse.urlencode(query)}"
     request = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
     opener = opener or urllib.request.build_opener()
     try:
         with opener.open(request, timeout=timeout) as response:
             return response.read().decode("utf-8", errors="replace")
     except (urllib.error.URLError, OSError, ValueError) as error:
-        raise MarketDataError(f"could not fetch quotes for {query['symbols']}: {error}") from error
+        raise MarketDataError(f"could not fetch {error_context}: {error}") from error
+
+
+def fetch_yahoo_quotes(tickers: Sequence[str], timeout: float = 10.0) -> str:
+    """Raw JSON text from Yahoo's batched quote endpoint. MarketDataError on
+    any transport failure (the crumb handshake included)."""
+    symbols = ",".join(sorted({t.upper() for t in tickers}))
+    return _yahoo_get(_QUOTE_URL, {"symbols": symbols}, timeout=timeout, error_context=f"quotes for {symbols}")
 
 
 def parse_yahoo_quotes(text: str) -> dict[str, dict]:
@@ -532,13 +545,34 @@ def _fundamentals_from_quote(ticker: str, row: dict, as_of: date) -> Fundamental
     )
 
 
-def _load_fundamentals_cache(path: str) -> dict[str, Fundamentals]:
+def _load_json_cache(path: str) -> dict | None:
+    """Read a cache file's raw JSON dict, or None if it's missing or not
+    valid JSON. Shared by the fundamentals and option-expirations caches --
+    the rest of loading (turning each entry into a dataclass) differs per
+    cache, so it stays in each cache's own load function."""
     if not os.path.isfile(path):
-        return {}
+        return None
     try:
         with open(path, "r", encoding="utf-8") as handle:
-            raw = json.load(handle)
+            return json.load(handle)
     except (OSError, ValueError):
+        return None
+
+
+def _save_json_cache(serializable: dict, path: str) -> None:
+    """Write a cache's already-JSON-shaped dict to disk, making the parent
+    folder if needed. Shared by the fundamentals and option-expirations
+    caches -- only how each cache turns its values into plain dicts first
+    differs."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(serializable, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def _load_fundamentals_cache(path: str) -> dict[str, Fundamentals]:
+    raw = _load_json_cache(path)
+    if raw is None:
         return {}
     out: dict[str, Fundamentals] = {}
     for ticker, entry in (raw or {}).items():
@@ -561,7 +595,6 @@ def _load_fundamentals_cache(path: str) -> dict[str, Fundamentals]:
 
 
 def _save_fundamentals_cache(cache: dict[str, Fundamentals], path: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
     serializable = {
         ticker: {
             "as_of": f.as_of.isoformat(),
@@ -574,9 +607,7 @@ def _save_fundamentals_cache(cache: dict[str, Fundamentals], path: str) -> None:
         }
         for ticker, f in sorted(cache.items())
     }
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(serializable, handle, indent=2, sort_keys=True)
-        handle.write("\n")
+    _save_json_cache(serializable, path)
 
 
 def _fundamentals_stale(entry: Fundamentals | None, today: date, max_age_days: int) -> bool:
@@ -594,6 +625,176 @@ def _fundamentals_stale(entry: Fundamentals | None, today: date, max_age_days: i
     if entry.earnings_date is None and entry.kind == "common" and age >= 3:
         return True
     return False
+
+
+_OPTION_EXPIRATIONS_CACHE_PATH = os.path.join(_DATA_DIR, "option_expirations_cache.json")
+_OPTIONS_URL_TMPL = "https://query2.finance.yahoo.com/v7/finance/options/{ticker}"
+
+
+@dataclass(frozen=True)
+class OptionSchedule:
+    """A ticker's known option expiration dates, as of the last fetch --
+    enough to tell whether it lists weekly expirations or only the standard
+    monthly (3rd-Friday-ish) cycle. See :func:`has_weekly_options`."""
+
+    ticker: str
+    as_of: date
+    expirations: tuple[date, ...]
+
+
+def fetch_yahoo_option_expirations(ticker: str, timeout: float = 10.0) -> str:
+    """Raw JSON text from Yahoo's options-chain endpoint for one ticker.
+    Unlike :func:`fetch_yahoo_quotes`, this endpoint isn't batchable across
+    symbols -- one request per ticker. MarketDataError on any transport
+    failure (the crumb handshake included)."""
+    url = _OPTIONS_URL_TMPL.format(ticker=urllib.parse.quote(ticker.upper()))
+    return _yahoo_get(url, timeout=timeout, error_context=f"option expirations for {ticker}")
+
+
+def parse_yahoo_option_expirations(text: str) -> list[date]:
+    """Yahoo ``optionChain.result[0].expirationDates`` -> sorted dates.
+    Raises MarketDataError on a response with no parseable chain (an error
+    payload, a challenge page, or a symbol with no listed options)."""
+    try:
+        result = json.loads(text)["optionChain"]["result"]
+    except (json.JSONDecodeError, KeyError, TypeError) as error:
+        raise MarketDataError(f"unrecognized Yahoo options response: {error}") from error
+    if not result:
+        raise MarketDataError("no options chain in Yahoo's response")
+    raw_dates = result[0].get("expirationDates") or []
+    return sorted({d for value in raw_dates if (d := _epoch_to_date(value)) is not None})
+
+
+# In-process memo for _load_option_expirations_cache, keyed by path:
+# (mtime last read, the parsed result). The dashboard rebuilds open
+# positions roughly every 15s (the live-price TTL), which would otherwise
+# re-read and re-parse this whole file that often even though it changes
+# at most once every max_age_days. A cheap os.path.getmtime check skips
+# the actual read+parse whenever the file hasn't changed since last time.
+_option_expirations_memo: dict[str, tuple[float, dict[str, OptionSchedule]]] = {}
+
+
+def _load_option_expirations_cache(path: str) -> dict[str, OptionSchedule]:
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return {}
+    memoized = _option_expirations_memo.get(path)
+    if memoized is not None and memoized[0] == mtime:
+        return memoized[1]
+    raw = _load_json_cache(path)
+    if raw is None:
+        return {}
+    out: dict[str, OptionSchedule] = {}
+    for ticker, entry in (raw or {}).items():
+        if not isinstance(entry, dict):
+            continue
+        as_of = _parse_date(str(entry.get("as_of", "")))
+        if as_of is None:
+            continue
+        expirations = tuple(
+            sorted(d for d in (_parse_date(str(x)) for x in entry.get("expirations") or []) if d is not None)
+        )
+        out[ticker.upper()] = OptionSchedule(ticker=ticker.upper(), as_of=as_of, expirations=expirations)
+    _option_expirations_memo[path] = (mtime, out)
+    return out
+
+
+def _save_option_expirations_cache(cache: dict[str, OptionSchedule], path: str) -> None:
+    serializable = {
+        ticker: {"as_of": s.as_of.isoformat(), "expirations": [d.isoformat() for d in s.expirations]}
+        for ticker, s in sorted(cache.items())
+    }
+    _save_json_cache(serializable, path)
+    # Keep the in-process memo in step with what was just written, so the
+    # very next read (this process, this ticker's freshly-saved entry
+    # included) doesn't immediately re-read the file to learn what it just
+    # wrote.
+    _option_expirations_memo[path] = (os.path.getmtime(path), dict(cache))
+
+
+def _option_expirations_stale(entry: OptionSchedule | None, today: date, max_age_days: int) -> bool:
+    if entry is None:
+        return True
+    if (today - entry.as_of).days >= max_age_days:
+        return True
+    # Every cached date has already passed: the weekly/monthly classification
+    # is a stable trait of the ticker, but a roll needs at least one *future*
+    # date to floor against, so this is worth refreshing early.
+    if entry.expirations and all(d < today for d in entry.expirations):
+        return True
+    return False
+
+
+def get_option_expirations(
+    tickers: Sequence[str],
+    *,
+    fetch: Callable[[str], str] | None = None,
+    cache_path: str | None = None,
+    max_age_days: int = 21,
+    local_only: bool = False,
+    force_refresh: bool = False,
+    today: date | None = None,
+) -> tuple[dict[str, list[date]], list[str]]:
+    """``({TICKER: sorted expiration dates}, warnings)`` for ``tickers``,
+    refreshing the local cache when an entry is missing or stale. Never
+    raises. One HTTP round trip per stale ticker -- see
+    :func:`fetch_yahoo_option_expirations` -- run in parallel (like
+    :func:`get_price_series`'s cache-miss fetches elsewhere) rather than one
+    at a time, since this endpoint isn't batchable across symbols the way
+    the quote endpoint is.
+
+    ``fetch`` (ticker -> JSON text) and ``cache_path`` default to Yahoo and
+    ``data/option_expirations_cache.json``; tests inject both.
+    """
+    path = cache_path or _OPTION_EXPIRATIONS_CACHE_PATH
+    fetch = fetch or fetch_yahoo_option_expirations
+    today = today or date.today()
+    wanted = sorted({t.upper() for t in tickers if t})
+
+    cache = _load_option_expirations_cache(path)
+    if local_only:
+        return {t: list(cache[t].expirations) for t in wanted if t in cache}, []
+
+    stale = [t for t in wanted if force_refresh or _option_expirations_stale(cache.get(t), today, max_age_days)]
+    warnings: list[str] = []
+    touched = False
+
+    def _fetch_one(ticker: str) -> tuple[str, list[date] | None, str | None]:
+        try:
+            return ticker, parse_yahoo_option_expirations(fetch(ticker)), None
+        except MarketDataError as error:
+            return ticker, None, f"could not fetch option expirations for {ticker}: {error}"
+
+    if stale:
+        with ThreadPoolExecutor(max_workers=min(8, len(stale))) as pool:
+            for ticker, expirations, warning in pool.map(_fetch_one, stale):
+                if warning is not None:
+                    warnings.append(warning)
+                    continue
+                cache[ticker] = OptionSchedule(ticker=ticker, as_of=today, expirations=tuple(expirations or []))
+                touched = True
+    if touched:
+        _save_option_expirations_cache(cache, path)
+
+    return {t: list(cache[t].expirations) for t in wanted if t in cache}, warnings
+
+
+def has_weekly_options(expirations: Sequence[date], today: date, *, horizon_days: int = 60) -> bool | None:
+    """Whether ``expirations`` (a ticker's known/listed dates) shows weekly
+    (or finer) granularity within the next ``horizon_days``, versus only the
+    standard ~monthly cycle. ``None`` when there's too little data (fewer
+    than two upcoming dates) to tell either way -- callers should treat that
+    the same as "weekly" (the more common case) rather than as "monthly."
+
+    A gap of 10 days or less between two consecutive near-term expirations
+    only happens on a weekly (or biweekly) listing; a monthly-only ticker's
+    gaps are always ~28-35 days.
+    """
+    near_term = sorted(d for d in expirations if today <= d <= today + timedelta(days=horizon_days))
+    if len(near_term) < 2:
+        return None
+    return any((b - a).days <= 10 for a, b in zip(near_term, near_term[1:]))
 
 
 def get_fundamentals(

@@ -52,6 +52,13 @@ def _common(row: dict[str, Any]) -> dict[str, Any]:
         "expiration": row.get("expiration"),
         "days_to_expiry": row.get("days_to_expiry"),
         "moneyness_pct": row.get("moneyness_pct"),
+        # Same roll-instead-of-resolve pricing as the Recommended buy-to-close
+        # table (wheel/api.py, _min_roll_premium) -- carried through from the
+        # source open_positions row rather than recomputed, so the two tables
+        # can never disagree.
+        "min_roll_premium": row.get("min_roll_premium"),
+        "roll_dte": row.get("roll_dte"),
+        "roll_target_date": row.get("roll_target_date"),
     }
 
 

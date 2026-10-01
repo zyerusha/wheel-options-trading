@@ -388,6 +388,10 @@ function wheelOptionPlFormula(row, title) {
     '',
     `= ${money(row.wheel_core_realized_pl, { cents: true })} + ${money(row.hedge_realized_pl, { cents: true })}`,
     `= ${money(row.option_realized_pl, { cents: true })}`,
+    '',
+    'The gross / paid to close / still open figures shown alongside this',
+    'cover short legs only, so they will not add up to this total: hedges',
+    'are real cash flows too, just not part of that breakdown.',
   ]);
 }
 
@@ -4471,7 +4475,7 @@ function renderTiles(portfolio, reconciliation) {
     {
       label: 'Premium collected (net)',
       value: money(portfolio.option_realized_pl, { cents: true }),
-      foot: `${money(portfolio.premium_received)} gross · ${money(portfolio.premium_paid)} paid to close · ${money(portfolio.open_premium)} still open`,
+      foot: `${money(portfolio.premium_received)} gross · ${money(portfolio.premium_paid)} paid to close · ${money(portfolio.open_premium)} still open, short legs only`,
       tone: portfolio.option_realized_pl >= 0 ? 'pos' : 'neg',
       formula: wheelOptionPlFormula(portfolio, 'Wheel option P/L (this tile)'),
     },
@@ -4612,6 +4616,25 @@ function renderTiles(portfolio, reconciliation) {
             ]),
     },
     {
+      // Deliberately separate from Win rate above: a leg rolled into a new,
+      // still-open contract counts here whether or not it's also a win or a
+      // loss there. Whether the roll itself paid off is a further question
+      // -- resolved_roll_wins/losses -- answered only once the whole chain
+      // of rolls it belongs to stops rolling and actually closes.
+      label: 'Roll rate',
+      value: pct(portfolio.roll_rate_pct, 0),
+      foot: `${portfolio.rolled_legs} of ${portfolio.rollable_legs} closed puts/calls rolled`,
+      formula: formula([
+        'Roll rate = Puts/calls closed by a same-day roll ÷ closed puts/calls',
+        '  Long hedge legs are never rolled, so they count on neither side.',
+        `= ${portfolio.rolled_legs} ÷ ${portfolio.rollable_legs}`,
+        `= ${pct(portfolio.roll_rate_pct, 1)}`,
+        '',
+        `Roll chains resolved so far: ${portfolio.resolved_roll_wins} win / ${portfolio.resolved_roll_losses} loss`,
+        `Still-open roll chains hold ${money(portfolio.open_roll_credit, { sign: true })} in credit not yet realized`,
+      ]),
+    },
+    {
       label: 'Avg days in trade',
       value: portfolio.avg_days_in_trade === null ? '—' : portfolio.avg_days_in_trade.toFixed(1),
       foot: `${portfolio.rolls} rolls · ${portfolio.assignments} assignments`,
@@ -4729,6 +4752,16 @@ function renderNotices(meta, reconciliation) {
  * leg exists, so it stays invisible until it matters. See
  * ``wheel/api.py``'s ``_open_hedge_entry`` for the phase / message rules.
  */
+// Wording for the "N days ___" line, keyed by hedge phase (wheel/api.py's
+// _open_hedge_entry). Only DIRECTIONAL reads differently -- it isn't acting
+// as insurance anymore, so "of protection left" would be a false claim.
+const HEDGE_PHASE_DAYS_LABEL = {
+  runway: 'of protection left',
+  wind_down: 'of protection left',
+  expiring: 'of protection left',
+  directional: 'to expiry',
+};
+
 /** One hedge row, shared by the dashboard banner and the Trade Log block. */
 function buildHedgeRow(h, { showAccount = true } = {}) {
   const row = el('div', { class: 'hedge-row ' + h.phase });
@@ -4783,7 +4816,13 @@ function buildHedgeRow(h, { showAccount = true } = {}) {
       )
     );
   }
-  econ.appendChild(el('span', {}, `${h.days_to_expiry} days of protection left`));
+  // "days of protection left" claims it's still doing insurance's job -- true
+  // for RUNWAY/WIND_DOWN/EXPIRING, but exactly what a DIRECTIONAL row is
+  // saying is no longer the case here. A lookup, not a ternary, so a future
+  // phase needing its own wording extends this table instead of another
+  // bolted-on condition.
+  const daysLabel = HEDGE_PHASE_DAYS_LABEL[h.phase] || 'of protection left';
+  econ.appendChild(el('span', {}, `${h.days_to_expiry} days ${daysLabel}`));
   row.appendChild(econ);
 
   // Secondary, deliberately muted: premium written while the hedge has been
@@ -5674,6 +5713,8 @@ function renderYearPresets(meta) {
 }
 
 function wireFilters() {
+  $('global-search').addEventListener('input', applySearchFilter);
+
   $('load-data').addEventListener('click', loadSelectedSource);
   // Picking a file arms the button but does not evaluate anything yet.
   $('csv-file').addEventListener('change', (event) => {
@@ -6030,6 +6071,7 @@ function switchTab(name) {
   } catch (error) {
     console.error('tab render failed:', error);
   }
+  applySearchFilter();
   // Also refetch on every tab change, not just on an account/filter switch.
   // An account switch's own load() runs asynchronously, so a tab entered
   // while it's still in flight would otherwise render off whatever *older*
@@ -6936,7 +6978,9 @@ function renderAssignmentRiskBody(card, data) {
   if (!puts.length && !calls.length) return;
   const table = el('table');
   const thead = el('thead');
-  thead.appendChild(rowOf('th', ['Leg', 'Strike', 'Qty', 'Expiry', 'ITM %', 'If assigned']));
+  thead.appendChild(
+    rowOf('th', ['Leg', 'Strike', 'Qty', 'Expiry', 'ITM %', 'If assigned', 'Min Roll Premium'])
+  );
   table.appendChild(thead);
   const tbody = el('tbody');
   puts.forEach((r) =>
@@ -6948,6 +6992,7 @@ function renderAssignmentRiskBody(card, data) {
         longDate(r.expiration),
         r.moneyness_pct === null ? '—' : `${Math.abs(r.moneyness_pct).toFixed(1)}%`,
         `${money(r.obligation)} cash`,
+        minRollPremiumCell(r),
       ])
     )
   );
@@ -6960,6 +7005,7 @@ function renderAssignmentRiskBody(card, data) {
         longDate(r.expiration),
         r.moneyness_pct === null ? '—' : `${Math.abs(r.moneyness_pct).toFixed(1)}%`,
         `${r.shares_at_risk_of_call} sh called`,
+        minRollPremiumCell(r),
       ])
     )
   );
@@ -6967,10 +7013,45 @@ function renderAssignmentRiskBody(card, data) {
   card.appendChild(table);
 }
 
+/** Each value is either a plain string/number, or `{ text, title }` for a
+ * cell that also carries a hover formula. */
 function rowOf(cell, values) {
   const tr = el('tr');
-  values.forEach((v) => tr.appendChild(el(cell, {}, v == null ? '' : String(v))));
+  values.forEach((v) => {
+    if (v && typeof v === 'object') {
+      tr.appendChild(el(cell, v.title ? { title: v.title } : {}, v.text == null ? '' : String(v.text)));
+    } else {
+      tr.appendChild(el(cell, {}, v == null ? '' : String(v)));
+    }
+  });
   return tr;
+}
+
+/** The Min Roll Premium formula tooltip, shared by the Recommended
+ * buy-to-close and Assignment risk tables -- see _min_roll_premium /
+ * _roll_floor_date in wheel/api.py. `null` when the row carries nothing to
+ * explain. The target date's weekday is read off the date itself rather than
+ * assumed "Friday": a monthly-only ticker's own next expiration (used once
+ * it's later than next week's Friday) is priced against real listed dates,
+ * which are Fridays in practice but not guaranteed to be. */
+function rollPremiumFormula(r) {
+  if (r.min_roll_premium == null || r.strike == null || r.roll_dte == null) return null;
+  const dow = parseDay(r.roll_target_date).toLocaleDateString('en-US', { weekday: 'short' });
+  return formula([
+    `Minimum credit per share to roll into a contract expiring ${r.roll_dte} days out ` +
+      `(${dow}, ${longDate(r.roll_target_date)}), instead of letting this one resolve:`,
+    'Min Roll Premium = Strike × (days to expiry ÷ 365) × 30% target annualized',
+    `= ${money(r.strike, { cents: true })} × (${r.roll_dte} ÷ 365) × 30%`,
+    `= ${money(r.min_roll_premium, { cents: true })}`,
+  ]);
+}
+
+/** Rendered as a plain `{text, title}` cell for the Assignment risk table's
+ * `rowOf` -- see `rollPremiumFormula` for the shared math. */
+function minRollPremiumCell(r) {
+  const title = rollPremiumFormula(r);
+  if (!title) return '—';
+  return { text: money(r.min_roll_premium, { cents: true }), title };
 }
 
 /** Workflow buckets -- four columns of flagged legs, each with its reason. */
@@ -8094,6 +8175,7 @@ const RECOMMENDED_BTC_COLUMNS = [
   { key: 'underlying', label: 'Symbol', left: true },
   { key: 'type', label: 'Type', left: true },
   { key: 'btc_targets', label: 'Recommended BTC (50% / 20% / 10%)' },
+  { key: 'min_roll_premium', label: 'Min Roll Premium' },
   { key: 'premium_if_btc', label: 'Premium Collected if BTC' },
   { key: 'last_close', label: 'Last Price' },
   { key: 'strike', label: 'Strike' },
@@ -8156,6 +8238,20 @@ function recommendedBtcRow(row) {
     ]);
   }
   tr.appendChild(btcCell);
+
+  // Minimum credit worth collecting to roll rather than let the current
+  // contract resolve (assignment for a CSP, call-away for a CC) -- see
+  // rollPremiumFormula() / _min_roll_premium in wheel/api.py. Same
+  // key-figure styling as the BTC targets cell above -- it's the other
+  // actionable threshold in this row.
+  const rollCell = el(
+    'td',
+    { class: 'num cc-target' },
+    row.min_roll_premium == null ? '—' : money(row.min_roll_premium, { cents: true })
+  );
+  const rollTitle = rollPremiumFormula(row);
+  if (rollTitle) rollCell.title = rollTitle;
+  tr.appendChild(rollCell);
 
   // What buying back at each rung actually leaves you with: the original
   // credit, less the cost of closing it there.
@@ -8243,6 +8339,10 @@ function renderRecommendedBtc() {
   clear(table);
   if (!rows.length) return;
 
+  // Rows can disagree on the roll target now (whichever is later of next
+  // week's Friday and the contract's own expiry -- see _min_roll_premium
+  // in wheel/api.py), so the DTE can't read once in the header; the
+  // per-row tooltip spells out each one's own days and math instead.
   const thead = el('thead');
   const headRow = el('tr');
   for (const column of RECOMMENDED_BTC_COLUMNS) {
@@ -9873,6 +9973,30 @@ function renderTradeLogSummary(entry) {
         : formula([
             'Winning legs ÷ (winning + losing) closed legs.',
             'Open legs and exact break-evens are excluded from the count.',
+            'Not adjusted for rolls -- see Roll rate for that.',
+          ]),
+    })
+  );
+  host.appendChild(
+    tradeLogCell('Roll rate', notWheel ? 'n/a' : pct(entry.roll_rate_pct), {
+      foot:
+        notWheel || !entry.rolled_legs
+          ? null
+          : `${entry.resolved_roll_wins}W / ${entry.resolved_roll_losses}L resolved` +
+            (entry.open_roll_credit ? ` · ${money(entry.open_roll_credit, { sign: true })} open` : ''),
+      help: notWheel
+        ? wheelHelp
+        : formula([
+            'Closed puts/calls that were one side of a same-day roll ÷ closed puts/calls.',
+            '  Long hedge legs are never rolled, so they count on neither side.',
+            `= ${entry.rolled_legs} ÷ ${entry.rollable_legs}`,
+            '',
+            'A roll only becomes a win or a loss once every leg in its whole',
+            'chain finally closes for real, not merely rolls again.',
+            `Resolved so far: ${entry.resolved_roll_wins} win / ${entry.resolved_roll_losses} loss.`,
+            entry.open_roll_credit
+              ? `Still-open chains hold ${money(entry.open_roll_credit, { sign: true })} not yet realized.`
+              : 'No roll chain is currently open.',
           ]),
     })
   );
@@ -10530,6 +10654,8 @@ function render() {
   // full history), but re-render it so the picker tracks an account switch.
   renderTabs();
   if (state.activeTab === 'tradelog') renderTradeLog();
+
+  applySearchFilter();
 }
 
 /* ----------------------------------------------------------- table print */
@@ -10619,6 +10745,66 @@ function printableHasContent(printable) {
 // wasn't asked for, only swapping charts in for their table twins.
 function hasOwnTableHost(root) {
   return ownScoped(root, 'table, .table-twin, .table-host').length > 0;
+}
+
+/**
+ * Global search (the field above the tab bar, reachable from every tab):
+ * hides any .card / .card-subsection with no match, and, for one that owns
+ * a table, hides just its non-matching rows rather than the whole card. A
+ * card's own heading matching is enough to show all of its rows.
+ *
+ * Table bodies are rebuilt from scratch on every render() (and thus on the
+ * 15s live-price poll too), which would otherwise wipe any .search-hide
+ * classes on old <tr> elements -- so this re-runs at the end of render()
+ * and switchTab(), not just on input.
+ */
+// A few dashboard/planner panels are built straight into a bare <section>
+// (no .card wrapper or <header><h2>, so they're invisible to the .card,
+// .card-subsection query below) but still carry real per-ticker rows or text
+// worth searching: in-the-money legs, the open-hedge banner, the earnings
+// strip, and the Trade Log's own hedge block. Named explicitly rather than
+// widening the .card selector, since none of them has a heading to match on.
+const SEARCH_EXTRA_ROOTS = ['#assignment-risk', '#hedge-banner', '#earnings-in-view', '#tradelog-hedge'];
+
+function applySearchFilter() {
+  const input = $('global-search');
+  const term = input ? input.value.trim().toLowerCase() : '';
+  const items = Array.from(
+    document.querySelectorAll(['.card', '.card-subsection', ...SEARCH_EXTRA_ROOTS].join(', '))
+  );
+  // Reversed so a card-subsection (later in document order, being nested
+  // deeper) is settled before the ancestor .card that needs its outcome.
+  items.reverse().forEach((root) => {
+    if (!term) {
+      root.classList.remove('search-hide');
+      ownScoped(root, 'tbody tr').forEach((tr) => tr.classList.remove('search-hide'));
+      return;
+    }
+
+    const header = root.querySelector(':scope > header');
+    const heading = header ? header.querySelector(':scope > h2, :scope > h3') : null;
+    const headingMatch = heading ? heading.textContent.toLowerCase().includes(term) : false;
+
+    const ownRows = ownScoped(root, 'tbody tr');
+    let anyRowVisible = false;
+    ownRows.forEach((tr) => {
+      const match = headingMatch || tr.textContent.toLowerCase().includes(term);
+      tr.classList.toggle('search-hide', !match);
+      if (match) anyRowVisible = true;
+    });
+
+    const subsectionVisible = Array.from(root.querySelectorAll('.card-subsection')).some(
+      (sub) => sub.closest('.card') === root && !sub.classList.contains('search-hide')
+    );
+
+    // A card with no table at all (tiles/insights/chips only, e.g.
+    // Performance or Workflow) can't be filtered row by row -- fall back to
+    // matching its whole text.
+    const fallbackMatch = !hasOwnTableHost(root) && root.textContent.toLowerCase().includes(term);
+
+    const visible = headingMatch || anyRowVisible || subsectionVisible || fallbackMatch;
+    root.classList.toggle('search-hide', !visible);
+  });
 }
 
 // Groups a header's non-heading children (CSV links, toggle buttons, ...)
