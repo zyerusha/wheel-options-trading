@@ -459,6 +459,7 @@ class AccountRegistry:
         self._accounts: dict[str, Dashboard] = {}
         self._build_warnings: list[str] = []
         self._stamp: tuple | None = None
+        self._scan_dirs: tuple[str, ...] = ()
         self.refresh()
 
     def set_default_dashboard(self, dashboard: Dashboard) -> None:
@@ -611,6 +612,7 @@ class AccountRegistry:
             # that exclusion here so it doesn't just vanish with no
             # explanation of why it was never imported.
             scan_dirs = sorted({account_dir.path for account_dir in account_dirs} | {d for d in self.extra_dirs if os.path.isdir(d)})
+            self._scan_dirs = tuple(scan_dirs)
             for path in discover_multi_account_exports(scan_dirs):
                 warnings.append(
                     f"{os.path.basename(path)}: looks like Fidelity's multi-account transaction history "
@@ -794,7 +796,7 @@ class AccountRegistry:
         every file; a single-account view shows only the files that belong to
         it.
         """
-        paths = discover_closed_lots()
+        paths = discover_closed_lots(self._scan_dirs)
         if not paths:
             return None
         files: list[list[ClosedLot]] = []

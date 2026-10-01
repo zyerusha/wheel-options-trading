@@ -1,6 +1,7 @@
 """Zero-dependency dashboard server.
 
     python -m wheel.serve [--csv FILE] [--port 8765] [--no-browser] [--reopen-browser]
+    python -m wheel.serve --hosted   # multi-tenant browser mode, see wheel.sessions
 
 Routes
 ------
@@ -15,10 +16,19 @@ Routes
 The active CSV is parsed once and re-parsed only when its mtime changes, so
 editing the export and refreshing the page is enough to pick it up.
 
-The server binds to 127.0.0.1 only. Uploads are still treated as untrusted: the
-filename is reduced to a bare basename, the body is size-capped, and a file that
-doesn't look like a Fidelity transaction-history or Positions export is removed
-again rather than left on disk.
+Two run modes, one shared processing pipeline (see ``Workspace``):
+
+* Local/Docker-mount mode (default) -- one shared ``Workspace`` for the whole
+  process, scoped to ``WHEEL_DATA_DIR``/the project root, exactly as before.
+  Binds 127.0.0.1 unless told otherwise. A single trusted user, so uploads are
+  still treated as untrusted input (filename reduced to a bare basename, body
+  size-capped, unrecognized files removed again) but not isolated from one
+  another.
+* Hosted mode (``WHEEL_MODE=hosted`` / ``--hosted``) -- one isolated
+  ``Workspace`` per browser, identified by an anonymous ``wheel_session``
+  cookie (see ``wheel.sessions.SessionManager``), each with its own directory,
+  own quota, and its own idle expiry. Meant to run behind an HTTPS-terminating
+  reverse proxy; the app itself never terminates TLS.
 """
 
 from __future__ import annotations
@@ -32,7 +42,10 @@ import tempfile
 import threading
 import time
 import webbrowser
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -51,6 +64,15 @@ from wheel import exporter  # noqa: E402
 from wheel.closed_lots import looks_like_closed_lots  # noqa: E402
 from wheel.paths import DATA_DIR  # noqa: E402
 from wheel.positions import discover_position_snapshots, looks_like_position_snapshot  # noqa: E402
+from wheel.sessions import (  # noqa: E402
+    DEFAULT_SESSION_MAX_BYTES,
+    DEFAULT_SESSION_MAX_FILES,
+    DEFAULT_SESSION_TTL_SECONDS,
+    SESSION_COOKIE_NAME,
+    Session,
+    SessionManager,
+    SessionQuotaError,
+)
 from wheel.ui_config import read_config, write_config  # noqa: E402
 
 PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -91,9 +113,22 @@ def safe_account_name(raw: str) -> str:
     return _SAFE_NAME.sub("_", name).strip(". ")
 
 
-def _find_existing_duplicate(body: bytes) -> str | None:
-    """A CSV already on disk under ``data/`` (any account subfolder) or the
-    project root whose content is byte-identical to ``body``, if any.
+def _find_existing_duplicate(
+    body: bytes,
+    *,
+    walk_dirs: Sequence[str] | None = None,
+    flat_dirs: Sequence[str] | None = None,
+) -> str | None:
+    """A CSV already on disk under ``walk_dirs`` (scanned recursively -- any
+    account subfolder) or ``flat_dirs`` (scanned shallowly) whose content is
+    byte-identical to ``body``, if any.
+
+    Defaults (both omitted) are the current ``UPLOAD_DIR``/``PROJECT_ROOT``
+    globals, read at call time -- the local/Docker-mount mode's own dedup
+    scope, unchanged from before this function grew a session-scoped variant.
+    A hosted session passes its own single ``base_dir`` as ``walk_dirs`` and
+    no ``flat_dirs``, so one session never dedups against -- or thereby
+    reveals the existence of -- another session's files.
 
     The browser's file picker has no notion of "this file is already on
     disk" -- it only ever hands the server bytes and a name -- so re-selecting
@@ -102,17 +137,26 @@ def _find_existing_duplicate(body: bytes) -> str | None:
     pressed. Comparing content rather than name/path catches that regardless
     of which folder the picker happened to browse into.
     """
+    if walk_dirs is None:
+        walk_dirs = (UPLOAD_DIR,)
+    if flat_dirs is None:
+        flat_dirs = (PROJECT_ROOT,)
+
     candidates: list[str] = []
-    if os.path.isdir(UPLOAD_DIR):
-        for root, _dirs, entries in os.walk(UPLOAD_DIR):
+    for directory in walk_dirs:
+        if not os.path.isdir(directory):
+            continue
+        for root, _dirs, entries in os.walk(directory):
             candidates.extend(
                 os.path.join(root, entry) for entry in entries if entry.lower().endswith(".csv")
             )
-    if os.path.isdir(PROJECT_ROOT):
+    for directory in flat_dirs:
+        if not os.path.isdir(directory):
+            continue
         candidates.extend(
-            os.path.join(PROJECT_ROOT, entry)
-            for entry in os.listdir(PROJECT_ROOT)
-            if entry.lower().endswith(".csv") and os.path.isfile(os.path.join(PROJECT_ROOT, entry))
+            os.path.join(directory, entry)
+            for entry in os.listdir(directory)
+            if entry.lower().endswith(".csv") and os.path.isfile(os.path.join(directory, entry))
         )
 
     for path in candidates:
@@ -128,11 +172,19 @@ def _find_existing_duplicate(body: bytes) -> str | None:
     return None
 
 
-def _write_uploads(target_dir: str, files: list[tuple[str, bytes]], written: list[str]) -> list[str]:
+def _write_uploads(
+    target_dir: str,
+    files: list[tuple[str, bytes]],
+    written: list[str],
+    *,
+    walk_dirs: Sequence[str] | None = None,
+    flat_dirs: Sequence[str] | None = None,
+) -> list[str]:
     """Write ``files`` into ``target_dir`` (deduping against files already on
-    disk anywhere under ``data/`` or the project root -- see
-    :func:`_find_existing_duplicate`), then reject the batch as a whole if it
-    contains a multi-account export or anything unrecognized.
+    disk under ``walk_dirs``/``flat_dirs`` -- see
+    :func:`_find_existing_duplicate`, whose same defaults apply here), then
+    reject the batch as a whole if it contains a multi-account export or
+    anything unrecognized.
 
     Shared by :meth:`DashboardState.accept_uploads` (the default bucket) and
     :meth:`Handler._accept_account_upload` (a named account's own folder) --
@@ -157,7 +209,7 @@ def _write_uploads(target_dir: str, files: list[tuple[str, bytes]], written: lis
     for filename, body in files:
         if not body:
             raise DatasetError(f"{filename or 'upload'} was empty")
-        duplicate = _find_existing_duplicate(body)
+        duplicate = _find_existing_duplicate(body, walk_dirs=walk_dirs, flat_dirs=flat_dirs)
         if duplicate:
             resolved.append(duplicate)
             continue
@@ -210,17 +262,36 @@ class DashboardState:
     """Holds the "default" account's active transaction-history dataset.
 
     Position snapshots are deliberately not part of this class's own state --
-    ``Dashboard(csv_paths)`` is always called with ``position_paths=None``, so
-    it auto-discovers every Positions export sitting in the project root/``data``
-    on its own (see ``wheel.api.discover_position_snapshots``). That is what
-    lets an uploaded or hand-edited Positions file take effect without needing
-    its own activate/select step -- there is nothing to choose between, unlike
+    ``Dashboard(csv_paths)`` is always called with the same directories this
+    instance itself scans (see ``_scan_dirs``), so it auto-discovers every
+    Positions export sitting there on its own (see
+    ``wheel.api.discover_position_snapshots``). That is what lets an uploaded
+    or hand-edited Positions file take effect without needing its own
+    activate/select step -- there is nothing to choose between, unlike
     transaction-history exports, which really can overlap and need combining.
+
+    ``upload_dir``/``extra_dirs`` scope every discovery/dedup this instance
+    does. Omitted (the local/Docker-mount default), they resolve to the
+    module's own ``UPLOAD_DIR``/``PROJECT_ROOT`` globals -- read here, at
+    construction time, not bound as literal defaults, so this keeps working
+    unchanged for the single shared instance ``serve()`` builds, and for any
+    existing test that patches those globals before constructing one. A
+    hosted session instead passes its own isolated directory and no
+    ``extra_dirs``, so it never discovers (or dedups against) anything outside
+    its own workspace.
     """
 
-    def __init__(self, csv_path: str | list[str]):
+    def __init__(
+        self,
+        csv_path: str | list[str],
+        *,
+        upload_dir: str | None = None,
+        extra_dirs: Sequence[str] | None = None,
+    ):
         paths = [csv_path] if isinstance(csv_path, str) else list(csv_path)
         self.csv_paths = [os.path.abspath(path) for path in paths]
+        self._upload_dir = upload_dir if upload_dir is not None else UPLOAD_DIR
+        self._extra_dirs = tuple(extra_dirs) if extra_dirs is not None else (PROJECT_ROOT,)
         self._lock = threading.Lock()
         self._stamp: tuple | None = None
         self._dashboard: Dashboard | None = None
@@ -232,6 +303,9 @@ class DashboardState:
         # nothing is left loose in the project root or data/.
         return self.csv_paths[0] if self.csv_paths else None
 
+    def _scan_dirs(self) -> tuple[str, ...]:
+        return (self._upload_dir, *self._extra_dirs)
+
     def _fingerprint(self) -> tuple:
         # Position snapshots are auto-discovered, not tracked in csv_paths, so
         # their own mtimes have to be watched here too -- otherwise editing or
@@ -240,7 +314,7 @@ class DashboardState:
             tuple((path, os.path.getmtime(path)) for path in self.csv_paths),
             tuple(
                 (path, os.path.getmtime(path))
-                for path in discover_position_snapshots((PROJECT_ROOT, UPLOAD_DIR))
+                for path in discover_position_snapshots(self._scan_dirs())
             ),
         )
 
@@ -248,7 +322,9 @@ class DashboardState:
         with self._lock:
             stamp = self._fingerprint()
             if self._dashboard is None or stamp != self._stamp:
-                self._dashboard = Dashboard(self.csv_paths)
+                self._dashboard = Dashboard(
+                    self.csv_paths, position_paths=discover_position_snapshots(self._scan_dirs())
+                )
                 self._stamp = stamp
             return self._dashboard
 
@@ -257,7 +333,7 @@ class DashboardState:
     def search_paths(self) -> list[str]:
         """Every CSV the UI is allowed to switch to."""
         found: list[str] = []
-        for directory in (PROJECT_ROOT, UPLOAD_DIR):
+        for directory in self._scan_dirs():
             if not os.path.isdir(directory):
                 continue
             for entry in sorted(os.listdir(directory)):
@@ -279,7 +355,7 @@ class DashboardState:
                 {
                     "path": path,
                     "name": os.path.basename(path),
-                    "folder": "data" if os.path.dirname(path) == UPLOAD_DIR else ".",
+                    "folder": "data" if os.path.dirname(path) == self._upload_dir else ".",
                     "size_kb": round(stat.st_size / 1024, 1),
                     "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds"),
                     "active": path in self.csv_paths,
@@ -294,7 +370,7 @@ class DashboardState:
         explanation of why it never shows up as loadable.
         """
         rows = []
-        for path in discover_multi_account_exports((PROJECT_ROOT, UPLOAD_DIR)):
+        for path in discover_multi_account_exports(self._scan_dirs()):
             try:
                 stat = os.stat(path)
             except OSError:
@@ -302,7 +378,7 @@ class DashboardState:
             rows.append(
                 {
                     "name": os.path.basename(path),
-                    "folder": "data" if os.path.dirname(path) == UPLOAD_DIR else ".",
+                    "folder": "data" if os.path.dirname(path) == self._upload_dir else ".",
                     "size_kb": round(stat.st_size / 1024, 1),
                     "reason": "multi-account transaction history export; not supported yet",
                 }
@@ -378,7 +454,9 @@ class DashboardState:
         """
         written: list[str] = []  # freshly created files -- rolled back on failure
         try:
-            resolved = _write_uploads(UPLOAD_DIR, files, written)
+            resolved = _write_uploads(
+                self._upload_dir, files, written, walk_dirs=(self._upload_dir,), flat_dirs=self._extra_dirs
+            )
 
             new_history = [path for path in resolved if looks_like_export(path)]
             if keep_current:
@@ -398,6 +476,44 @@ class DashboardState:
         return dashboard
 
 
+@dataclass
+class Workspace:
+    """Everything one tenant's requests are served from: a directory, an
+    active-dataset ``DashboardState``, and an ``AccountRegistry`` over that
+    same directory.
+
+    Local/Docker-mount mode builds exactly one of these at startup, scoped to
+    ``UPLOAD_DIR``/``PROJECT_ROOT`` -- the same directories this module has
+    always scanned, so its behavior is unchanged. Hosted mode builds one per
+    browser session (see ``wheel.sessions.SessionManager``), scoped to that
+    session's own directory only, with no project-root merge -- see
+    :func:`serve`. Either way, both modes construct a ``Workspace`` the same
+    way and every route handler reaches its data through ``Handler.workspace``
+    (or the ``state``/``registry`` properties), so no processing code differs
+    between the two.
+    """
+
+    base_dir: str
+    walk_dirs: tuple[str, ...]
+    flat_dirs: tuple[str, ...]
+    state: DashboardState
+    registry: AccountRegistry
+
+    @classmethod
+    def build(cls, paths: list[str], *, base_dir: str, extra_dirs: Sequence[str] = ()) -> "Workspace":
+        state = DashboardState(paths, upload_dir=base_dir, extra_dirs=extra_dirs)
+        registry = AccountRegistry(base_dir=base_dir, extra_dirs=extra_dirs)
+        if paths:
+            registry.set_default_dashboard(state.get())  # fail fast on a bad file, before serving anything
+        return cls(
+            base_dir=base_dir,
+            walk_dirs=(base_dir,),
+            flat_dirs=tuple(extra_dirs),
+            state=state,
+            registry=registry,
+        )
+
+
 # The browser closing a tab, navigating away, or (per resetSelectionState's
 # own account-switch dedupe note) superseding an in-flight fetch with a newer
 # one all abort the socket mid-response. That's a client hanging up, not a
@@ -411,11 +527,99 @@ _CLIENT_DISCONNECTED = (ConnectionAbortedError, ConnectionResetError, BrokenPipe
 
 
 class Handler(BaseHTTPRequestHandler):
-    state: DashboardState = None  # injected by serve() -- owns the "default" account's active files
-    registry: AccountRegistry = None  # injected by serve() -- every account, "default" included
+    # Local/Docker-mount mode: injected once by serve() -- the one shared
+    # Workspace for the whole process. Hosted mode: left None; each request
+    # resolves its own session's Workspace instead (see _resolve_workspace).
+    workspace: Workspace | None = None
+    session_manager: SessionManager | None = None  # injected by serve() only in hosted mode
+    _session: Session | None = None  # this request's session, if session_manager is set
     server_version = "WheelDashboard/1.0"
 
     # ---- plumbing ----
+
+    @property
+    def state(self) -> DashboardState:
+        return self.workspace.state
+
+    @property
+    def registry(self) -> AccountRegistry:
+        return self.workspace.registry
+
+    def _session_token_from_cookie(self) -> str | None:
+        raw = self.headers.get("Cookie")
+        if not raw:
+            return None
+        jar = SimpleCookie()
+        try:
+            jar.load(raw)
+        except Exception:
+            return None
+        morsel = jar.get(SESSION_COOKIE_NAME)
+        return morsel.value if morsel else None
+
+    def _resolve_workspace(self) -> Workspace:
+        """The Workspace this request should be served from.
+
+        Local/Docker-mount mode (``session_manager is None``): always the one
+        shared instance ``serve()`` built -- unchanged from before hosted mode
+        existed. Hosted mode: the Workspace belonging to whatever
+        ``wheel_session`` cookie this request presented, or a brand-new,
+        empty one if that cookie is missing, unknown, expired, or forged --
+        never another session's. See ``wheel.sessions.SessionManager``.
+        """
+        if self.session_manager is None:
+            self._session = None
+            return self.workspace
+        self._session = self.session_manager.get_or_create(self._session_token_from_cookie())
+        return self._session.workspace
+
+    def _apply_session_cookie(self) -> None:
+        """Re-issue the session cookie on every response, in this one place,
+        so every route gets a sliding-TTL cookie without any route-specific
+        code. A no-op in local/Docker-mount mode (``self._session is None``).
+        """
+        if self._session is None:
+            return
+        cookie = SimpleCookie()
+        cookie[SESSION_COOKIE_NAME] = self._session.token
+        morsel = cookie[SESSION_COOKIE_NAME]
+        morsel["path"] = "/"
+        morsel["httponly"] = True
+        morsel["samesite"] = "Lax"
+        # Floored at 1 -- Max-Age=0 tells the browser to delete the cookie
+        # immediately, which a sub-second TTL would otherwise round down to.
+        morsel["max-age"] = str(max(1, int(self.session_manager.ttl_seconds)))
+        # The app itself never terminates TLS (hosted mode expects an
+        # HTTPS-terminating reverse proxy in front of it), so this is the only
+        # signal available for whether the connection the browser actually
+        # made was secure.
+        if self.headers.get("X-Forwarded-Proto", "").lower() == "https":
+            morsel["secure"] = True
+        self.send_header("Set-Cookie", morsel.OutputString())
+
+    def _check_session_quota(self, added_bytes: int, added_files: int) -> None:
+        """Reject (as a normal, user-facing DatasetError) an upload that would
+        push this request's session over its configured storage/file-count
+        quota. A no-op in local/Docker-mount mode. Checked against the raw
+        incoming batch size, before de-dup -- a conservative upper bound, so a
+        session can never be under-counted, only occasionally asked to retry
+        a batch that would have partly de-duped away.
+        """
+        if self._session is None:
+            return
+        try:
+            self._session.check_quota(
+                added_bytes,
+                added_files,
+                max_bytes=self.session_manager.max_session_bytes,
+                max_files=self.session_manager.max_session_files,
+            )
+        except SessionQuotaError as error:
+            raise DatasetError(str(error)) from error
+
+    def _record_session_usage(self, added_bytes: int, added_files: int) -> None:
+        if self._session is not None:
+            self._session.record_usage(added_bytes, added_files)
 
     def _sync_registry(self) -> None:
         """Keep the multi-account registry's "default" account pointed at
@@ -456,6 +660,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send(self, status: int, body: bytes, content_type: str) -> None:
         self.send_response(status)
+        self._apply_session_cookie()
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
@@ -476,6 +681,7 @@ class Handler(BaseHTTPRequestHandler):
     def _send_csv(self, text: str, filename: str) -> None:
         body = text.encode("utf-8")
         self.send_response(200)
+        self._apply_session_cookie()
         self.send_header("Content-Type", "text/csv; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
@@ -490,6 +696,7 @@ class Handler(BaseHTTPRequestHandler):
         route = parsed.path.rstrip("/") or "/"
 
         try:
+            self.workspace = self._resolve_workspace()
             if route == "/":
                 self._send_file("index.html", "text/html; charset=utf-8")
             elif route == "/app.js":
@@ -538,7 +745,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._sync_registry()
                 self._send_json({"accounts": self.registry.list_accounts()})
             elif route == "/api/config":
-                self._send_json(read_config())
+                self._send_json(read_config(self.workspace.base_dir))
             else:
                 self._send_json({"error": "not found", "path": route}, 404)
         except _CLIENT_DISCONNECTED:
@@ -552,6 +759,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
         route = urlparse(self.path).path.rstrip("/") or "/"
         try:
+            self.workspace = self._resolve_workspace()
             if route == "/api/upload":
                 self._handle_upload()
             elif route == "/api/select":
@@ -646,7 +854,7 @@ class Handler(BaseHTTPRequestHandler):
             "duplicates_removed": merge.duplicates_removed if merge else 0,
             "first_date": merge.first_date.isoformat() if merge and merge.first_date else None,
             "last_date": merge.last_date.isoformat() if merge and merge.last_date else None,
-            "upload_dir": UPLOAD_DIR,
+            "upload_dir": self.workspace.base_dir,
         }
         if message:
             payload["message"] = message
@@ -695,6 +903,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_upload(self) -> None:
         account_id = safe_account_name(self.headers.get("X-Account") or "")
+        files = self._read_uploads()
 
         # No account, or explicitly "default"/"combined": today's behavior --
         # goes through DashboardState, which owns the default account's active
@@ -704,12 +913,14 @@ class Handler(BaseHTTPRequestHandler):
         # selection" concept -- every file found in its folder is always
         # included (see AccountRegistry).
         if not account_id or account_id.lower() in {DEFAULT_ACCOUNT_ID, COMBINED_ACCOUNT_ID}:
+            self._check_session_quota(sum(len(body) for _, body in files), len(files))
             keep = (self.headers.get("X-Keep-Current") or "").lower() in {"1", "true", "yes"}
-            self.state.accept_uploads(self._read_uploads(), keep_current=keep)
+            self.state.accept_uploads(files, keep_current=keep)
+            self._record_session_usage(sum(len(body) for _, body in files), len(files))
             self._send_json(self._dataset_listing(self._loaded_message("Loaded")))
             return
 
-        message = self._accept_account_upload(account_id, self._read_uploads())
+        message = self._accept_account_upload(account_id, files)
         self._sync_registry()
         self._send_json({"message": message, "account": account_id, "accounts": self.registry.list_accounts()})
 
@@ -722,13 +933,17 @@ class Handler(BaseHTTPRequestHandler):
         default bucket. The folder is created if this is the first file for a
         brand-new account name.
         """
-        target_dir = os.path.join(UPLOAD_DIR, account_id)
+        self._check_session_quota(sum(len(body) for _, body in files), len(files))
+        target_dir = os.path.join(self.workspace.base_dir, account_id)
         written: list[str] = []  # freshly created files -- rolled back on failure
         try:
-            resolved = _write_uploads(target_dir, files, written)
+            resolved = _write_uploads(
+                target_dir, files, written, walk_dirs=self.workspace.walk_dirs, flat_dirs=self.workspace.flat_dirs
+            )
         except DatasetError:
             _rollback_uploads(written)
             raise
+        self._record_session_usage(sum(len(body) for _, body in files), len(files))
 
         self.registry.refresh(force=True)
         history_count = sum(1 for path in resolved if looks_like_export(path))
@@ -773,7 +988,7 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(payload, dict):
             self._send_json({"error": "config must be a JSON object"}, 400)
             return
-        write_config(payload)
+        write_config(payload, self.workspace.base_dir)
         self._send_json({"ok": True})
 
 
@@ -822,62 +1037,92 @@ def serve(
     open_browser: bool = True,
     reopen_browser: bool = False,
     host: str = "127.0.0.1",
+    hosted: bool = False,
+    session_ttl_seconds: float = DEFAULT_SESSION_TTL_SECONDS,
+    session_max_bytes: int = DEFAULT_SESSION_MAX_BYTES,
+    session_max_files: int = DEFAULT_SESSION_MAX_FILES,
 ) -> None:
-    if csv_path is None:
-        csv_path = discover_exports()
-    paths = [csv_path] if isinstance(csv_path, str) else list(csv_path)
-    for path in paths:
-        if not os.path.isfile(path):
-            raise SystemExit(f"CSV not found: {path}")
-
-    # `paths` covers only the project root and data/ directly -- a user who
-    # keeps every account in its own data/<account>/ subfolder can legitimately
-    # have nothing there at all, so readiness is judged from every discovered
-    # account, not just the default bucket.
-    state = DashboardState(paths)
-    registry = AccountRegistry(base_dir=UPLOAD_DIR, extra_dirs=(PROJECT_ROOT,))
-    if paths:
-        registry.set_default_dashboard(state.get())  # fail fast on a bad file, before binding the port
-
-    accounts = registry.list_accounts()
-
-    Handler.state = state
-    Handler.registry = registry
-    httpd = ThreadingHTTPServer((host, port), Handler)
     display_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     url = f"http://{display_host}:{port}/"
 
-    # No broker export anywhere yet -- a brand-new checkout, or a fresh
-    # Docker volume with nothing uploaded. The old behavior was to refuse to
-    # even bind the port; now the server starts anyway and the dashboard
-    # itself walks the user through exporting from Fidelity and adding the
-    # first CSV (see the #no-data-banner in index.html / refreshAccounts()
-    # in app.js) -- registry.build() has nothing to build yet, so it's
-    # skipped rather than raising.
-    if not accounts:
-        print(f"  source        (none yet -- {UPLOAD_DIR})")
-        print("  No broker export or Portfolio Positions file found. The dashboard")
-        print("  will walk you through adding your first Fidelity CSV once it's open.")
+    if hosted:
+        # Multi-tenant browser mode: no single active dataset to auto-discover
+        # or validate up front -- each browser gets its own empty Workspace on
+        # first contact instead (see wheel.sessions.SessionManager).
+        if csv_path:
+            print("  --csv is ignored in --hosted mode -- each browser session starts empty\n", file=sys.stderr)
+        sessions_root = os.path.join(UPLOAD_DIR, "sessions")
+        session_manager = SessionManager(
+            sessions_root=sessions_root,
+            workspace_factory=lambda base_dir: Workspace.build([], base_dir=base_dir, extra_dirs=()),
+            ttl_seconds=session_ttl_seconds,
+            max_session_bytes=session_max_bytes,
+            max_session_files=session_max_files,
+        )
+        session_manager.start_background_sweep()
+        Handler.workspace = None
+        Handler.session_manager = session_manager
+        httpd = ThreadingHTTPServer((host, port), Handler)
+
+        print("  mode          hosted (multi-tenant browser upload)")
+        print(f"  sessions      {sessions_root}")
+        print(
+            f"  session TTL   {session_ttl_seconds / 3600:.1f}h idle -- quota "
+            f"{session_max_bytes // (1024 * 1024)} MB / {session_max_files} files per session"
+        )
+        print("  Each browser gets its own isolated, cookie-scoped workspace; nothing")
+        print("  persists past its idle TTL or a restart -- see docker-compose.hosted.yml.")
         print(f"\n  Dashboard on  {url}\n  Ctrl-C to stop.\n")
     else:
-        payload = registry.build(_preferred_account(registry))
-        reconciliation = payload["reconciliation"]
-        meta = payload["meta"]
-        print(f"  source        {meta['source'] or '(none in project root/data -- see accounts below)'}")
-        if meta["combined"]:
+        if csv_path is None:
+            csv_path = discover_exports()
+        paths = [csv_path] if isinstance(csv_path, str) else list(csv_path)
+        for path in paths:
+            if not os.path.isfile(path):
+                raise SystemExit(f"CSV not found: {path}")
+
+        # `paths` covers only the project root and data/ directly -- a user who
+        # keeps every account in its own data/<account>/ subfolder can legitimately
+        # have nothing there at all, so readiness is judged from every discovered
+        # account, not just the default bucket.
+        workspace = Workspace.build(paths, base_dir=UPLOAD_DIR, extra_dirs=(PROJECT_ROOT,))
+        accounts = workspace.registry.list_accounts()
+
+        Handler.workspace = workspace
+        Handler.session_manager = None
+        httpd = ThreadingHTTPServer((host, port), Handler)
+
+        # No broker export anywhere yet -- a brand-new checkout, or a fresh
+        # Docker volume with nothing uploaded. The old behavior was to refuse to
+        # even bind the port; now the server starts anyway and the dashboard
+        # itself walks the user through exporting from Fidelity and adding the
+        # first CSV (see the #no-data-banner in index.html / refreshAccounts()
+        # in app.js) -- registry.build() has nothing to build yet, so it's
+        # skipped rather than raising.
+        if not accounts:
+            print(f"  source        (none yet -- {UPLOAD_DIR})")
+            print("  No broker export or Portfolio Positions file found. The dashboard")
+            print("  will walk you through adding your first Fidelity CSV once it's open.")
+            print(f"\n  Dashboard on  {url}\n  Ctrl-C to stop.\n")
+        else:
+            payload = workspace.registry.build(_preferred_account(workspace.registry))
+            reconciliation = payload["reconciliation"]
+            meta = payload["meta"]
+            print(f"  source        {meta['source'] or '(none in project root/data -- see accounts below)'}")
+            if meta["combined"]:
+                print(
+                    f"  combined      {meta['rows_parsed']} rows -> {meta['rows_kept']} "
+                    f"({meta['duplicates_removed']} duplicates merged)"
+                )
+            if len(accounts) > 1 or DEFAULT_ACCOUNT_ID not in {row["id"] for row in accounts}:
+                print(f"  accounts      {len(accounts)}: {', '.join(row['label'] for row in accounts)}")
+            print(f"  transactions  {meta['transactions_total']}")
+            print(f"  cycles        {len(payload['cycles'])} across {payload['portfolio']['tickers']} tickers")
             print(
-                f"  combined      {meta['rows_parsed']} rows -> {meta['rows_kept']} "
-                f"({meta['duplicates_removed']} duplicates merged)"
+                f"  cash check    {'BALANCED' if reconciliation['balanced'] else 'MISMATCH'} "
+                f"(delta {reconciliation['delta']})"
             )
-        if len(accounts) > 1 or DEFAULT_ACCOUNT_ID not in {row["id"] for row in accounts}:
-            print(f"  accounts      {len(accounts)}: {', '.join(row['label'] for row in accounts)}")
-        print(f"  transactions  {meta['transactions_total']}")
-        print(f"  cycles        {len(payload['cycles'])} across {payload['portfolio']['tickers']} tickers")
-        print(
-            f"  cash check    {'BALANCED' if reconciliation['balanced'] else 'MISMATCH'} "
-            f"(delta {reconciliation['delta']})"
-        )
-        print(f"\n  Dashboard on  {url}\n  Ctrl-C to stop.\n")
+            print(f"\n  Dashboard on  {url}\n  Ctrl-C to stop.\n")
 
     if open_browser and (reopen_browser or not _recently_opened(port)):
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
@@ -914,13 +1159,62 @@ def main() -> None:
         help="open a browser tab even if this dashboard was already opened recently "
         "(by default, restarting within a few hours skips it -- see --no-browser to skip always)",
     )
+    parser.add_argument(
+        "--hosted",
+        action="store_true",
+        help="multi-tenant browser mode: every visitor gets their own isolated, cookie-scoped "
+        "session instead of one shared dataset (same as WHEEL_MODE=hosted)",
+    )
+    parser.add_argument(
+        "--session-ttl-seconds",
+        type=float,
+        default=None,
+        help=f"hosted mode: idle session lifetime (default {DEFAULT_SESSION_TTL_SECONDS:.0f}s, "
+        "same as WHEEL_SESSION_TTL_SECONDS)",
+    )
+    parser.add_argument(
+        "--session-max-bytes",
+        type=int,
+        default=None,
+        help=f"hosted mode: max cumulative upload bytes per session (default {DEFAULT_SESSION_MAX_BYTES}, "
+        "same as WHEEL_SESSION_MAX_BYTES)",
+    )
+    parser.add_argument(
+        "--session-max-files",
+        type=int,
+        default=None,
+        help=f"hosted mode: max uploaded files per session (default {DEFAULT_SESSION_MAX_FILES}, "
+        "same as WHEEL_SESSION_MAX_FILES)",
+    )
     args = parser.parse_args()
+
+    hosted = args.hosted or os.environ.get("WHEEL_MODE", "").strip().lower() == "hosted"
+    session_ttl_seconds = (
+        args.session_ttl_seconds
+        if args.session_ttl_seconds is not None
+        else float(os.environ.get("WHEEL_SESSION_TTL_SECONDS", DEFAULT_SESSION_TTL_SECONDS))
+    )
+    session_max_bytes = (
+        args.session_max_bytes
+        if args.session_max_bytes is not None
+        else int(os.environ.get("WHEEL_SESSION_MAX_BYTES", DEFAULT_SESSION_MAX_BYTES))
+    )
+    session_max_files = (
+        args.session_max_files
+        if args.session_max_files is not None
+        else int(os.environ.get("WHEEL_SESSION_MAX_FILES", DEFAULT_SESSION_MAX_FILES))
+    )
+
     serve(
         args.csv,
         args.port,
         open_browser=not args.no_browser,
         reopen_browser=args.reopen_browser,
         host=args.host,
+        hosted=hosted,
+        session_ttl_seconds=session_ttl_seconds,
+        session_max_bytes=session_max_bytes,
+        session_max_files=session_max_files,
     )
 
 

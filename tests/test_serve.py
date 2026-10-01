@@ -132,5 +132,46 @@ class TestWriteUploadsRollback(unittest.TestCase):
         self.assertEqual(written, resolved)
 
 
+class TestBackwardCompatibleUploadDefaults(unittest.TestCase):
+    """Locks in the mechanism the Workspace/hosted-mode refactor depends on:
+    called with no walk_dirs/flat_dirs kwargs, _find_existing_duplicate and
+    _write_uploads must still resolve their scan directories from whatever
+    serve.UPLOAD_DIR/PROJECT_ROOT currently are -- read at call time, not
+    bound as literal defaults -- so DashboardState's own zero-kwarg
+    construction, and every existing test that patches those two module
+    globals, keep working unmodified.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_find_existing_duplicate_honors_patched_globals_with_no_kwargs(self):
+        body = (HISTORY_HEADER + "\n" + ONE_TRADE_ROW + "\n").encode("utf-8-sig")
+        existing = os.path.join(self.tmp.name, "History_for_Account.csv")
+        with open(existing, "wb") as handle:
+            handle.write(body)
+
+        with patch.object(serve, "PROJECT_ROOT", self.tmp.name), patch.object(
+            serve, "UPLOAD_DIR", self.tmp.name
+        ):
+            self.assertEqual(serve._find_existing_duplicate(body), existing)
+
+        # Same body, but neither global points at self.tmp.name any more --
+        # must no longer find a duplicate.
+        self.assertIsNone(serve._find_existing_duplicate(body))
+
+    def test_write_uploads_honors_patched_globals_with_no_kwargs(self):
+        target_dir = os.path.join(self.tmp.name, "default")
+        written: list[str] = []
+        body = (HISTORY_HEADER + "\n" + ONE_TRADE_ROW + "\n").encode("utf-8-sig")
+        with patch.object(serve, "PROJECT_ROOT", self.tmp.name), patch.object(
+            serve, "UPLOAD_DIR", self.tmp.name
+        ):
+            resolved = serve._write_uploads(target_dir, [("History_for_Account.csv", body)], written)
+        self.assertEqual(len(resolved), 1)
+        self.assertTrue(os.path.isfile(resolved[0]))
+
+
 if __name__ == "__main__":
     unittest.main()
