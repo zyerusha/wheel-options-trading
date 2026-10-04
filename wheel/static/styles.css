@@ -111,9 +111,50 @@ body {
 }
 
 .wrap {
-  max-width: 1440px;
+  max-width: 1800px;
   margin: 0 auto;
-  padding: 24px 20px 64px;
+  padding: 24px 12px 64px;
+}
+
+/* Covers the viewport while a user-initiated load() is in flight (see the
+   comment on .load-overlay in index.html) -- shown only via .wrap.loading
+   below, never on its own, so a background live-price poll (which never adds
+   .loading) stays invisible as before. `fixed`, not `absolute`, so its
+   centred message lands in the middle of whatever's actually on screen --
+   .wrap can run taller than the viewport, and an absolutely-positioned
+   overlay would center against its full scrollable height instead. */
+.load-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: var(--page);
+  opacity: 0.88;
+  color: var(--text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.wrap.loading .load-overlay {
+  display: flex;
+}
+
+.load-overlay-spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--axis);
+  border-top-color: var(--accent);
+  animation: load-overlay-spin 0.7s linear infinite;
+}
+
+@keyframes load-overlay-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /* ---------------- header ---------------- */
@@ -404,18 +445,6 @@ button.primary:hover {
   gap: 6px;
 }
 
-/* Status has only a few options (open/closed/expired), so stack them in a
-   single column instead of wrapping a row -- unlike Ticker, which can have
-   dozens and needs the row to wrap. */
-#status-chips {
-  flex-direction: column;
-  align-items: stretch;
-}
-
-#status-chips .chip {
-  text-align: center;
-}
-
 /* No width/height cap: the Filters card's Ticker field already grows to
    fill the card's own width (flex: 1 1 320px, see index.html), so letting
    this stretch the rest of the way fits far more chips per row than the old
@@ -647,7 +676,7 @@ button.primary:hover {
   background: var(--surface-1);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 16px 18px 18px;
+  padding: 16px 14px 18px;
   min-width: 0;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 2px 4px rgba(0, 0, 0, 0.04),
     0 4px 8px rgba(0, 0, 0, 0.04);
@@ -692,6 +721,29 @@ button.primary:hover {
 
 .card .hint-list li + li {
   margin-top: 3px;
+}
+
+/* Expiration calendar: explicit From / To date range, next to a Reset-to-full
+   button -- see renderExpirationCalendarBody()/wireFilters() in app.js. */
+.exp-cal-range {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px;
+  margin: 0 0 12px;
+}
+
+.exp-cal-range .field {
+  gap: 4px;
+}
+
+.exp-cal-range input[type='date'] {
+  min-height: 30px;
+  padding: 4px 8px;
+}
+
+.exp-cal-range button {
+  min-height: 30px;
 }
 
 /* A second chart living in the same card. */
@@ -920,7 +972,7 @@ table {
 th,
 td {
   text-align: right;
-  padding: 7px 9px;
+  padding: 7px 6px;
   border-bottom: 1px solid var(--gridline);
   white-space: nowrap;
 }
@@ -1434,6 +1486,15 @@ tr.detail > td {
   gap: 8px;
 }
 
+/* See the identical #assignment-risk[hidden] override above -- same cause
+   (this element's own `display` beats the browser's default `[hidden]`
+   rule), same fix. renderHedgeBanner() already clears its content before
+   hiding, so this one was never showing a stale account's actual hedge rows
+   -- just an empty, visually-blank grid sitting in the layout. */
+#hedge-banner[hidden] {
+  display: none;
+}
+
 .hedge-banner-head {
   font-size: 11px;
   font-weight: 700;
@@ -1563,8 +1624,14 @@ tr.detail > td {
   filter: brightness(0.96);
 }
 
-.loading {
-  opacity: 0.45;
+/* Dims the stale content a fresh load() is about to replace -- scoped to
+   .wrap's other children, not .wrap itself, so it never also fades the
+   .load-overlay sitting on top of it (see the comment there). Not
+   interactive either: a click on a row/button about to be replaced by a
+   different account's/filter's data should do nothing. */
+.loading > :not(.load-overlay) {
+  opacity: 0.35;
+  pointer-events: none;
   transition: opacity 0.15s;
 }
 
@@ -1954,6 +2021,7 @@ tr.detail > td {
   color: var(--text-secondary);
 }
 
+
 #tradelog-table tr.synthetic td {
   color: var(--text-muted);
   font-style: italic;
@@ -2042,6 +2110,18 @@ tr.detail > td {
   border-left: 4px solid var(--warning);
   border-radius: var(--radius);
   background: var(--noactivity-bg);
+}
+
+/* An own `display` declaration on the element (above) wins over the
+   browser's default `[hidden] { display: none }` rule -- both are
+   author-origin once anything sets `display` here, and the later one in
+   source order wins on equal specificity, so without this override
+   `card.hidden = true` (renderAssignmentRisk() in app.js) stopped actually
+   hiding the card: switching to an account/filter with no in-the-money risk
+   left the *previous* selection's banner (and its real dollar figures)
+   fully visible, readable as if it were the new selection's own. */
+#assignment-risk[hidden] {
+  display: none;
 }
 
 #assignment-risk.critical {

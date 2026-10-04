@@ -175,6 +175,19 @@ class OptionLeg:
         """Cash still at risk on the un-closed portion (credit positive)."""
         return self.cash_per_contract * self.remaining_contracts
 
+    def unrealized_pl(self, mark_price: float) -> float:
+        """Mark-to-market P&L on the un-closed portion at today's per-share
+        option price ``mark_price`` (e.g. a broker Positions snapshot's Last
+        price): the credit/debit already booked (``open_premium``) plus the
+        position's value right now -- a short's value is *negative* what it
+        would cost to buy back, a long's is *positive* what it would fetch to
+        sell. Unlike ``open_premium`` (which values an open leg as if it
+        expires worthless), this reflects a leg that is ITM and would actually
+        cost real money to close.
+        """
+        market_value = mark_price * OPTION_MULTIPLIER * self.remaining_contracts
+        return self.open_premium + (market_value if self.side == LONG else -market_value)
+
     @property
     def gross_premium(self) -> float:
         """Credit received at open (0 for long legs) before any buy-back."""

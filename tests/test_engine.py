@@ -23,7 +23,7 @@ from wheel.engine import (  # noqa: E402
     SHORT,
     build_cycles,
 )
-from wheel.parser import ASSIGNED, BTC, BTO, BUY_STOCK, EXPIRED, STC, STO, Transaction  # noqa: E402
+from wheel.parser import ASSIGNED, BTC, BTO, BUY_STOCK, EXPIRED, STC, STO, Transaction, _SETTLEMENT_RE  # noqa: E402
 
 _counter = itertools.count()
 
@@ -65,6 +65,12 @@ def tx(
         amount=amount,
         account_type="Cash",
         as_of_date=date.fromisoformat(as_of) if as_of else None,
+        # Same derivation wheel.parser uses for a real CSV row: a plain
+        # action constant (the default) never matches, so every existing
+        # caller is unaffected -- only a caller that passes the broker's
+        # real "YOU BOUGHT ASSIGNED PUTS..." wording as action_raw gets
+        # assignment_settlement=True, exactly like the real importer would.
+        assignment_settlement=bool(_SETTLEMENT_RE.search(action_raw or action)),
     )
 
 
@@ -151,6 +157,30 @@ class TestPartialFillsAndFIFO(unittest.TestCase):
         self.assertAlmostEqual(leg.realized_pl, 1478.66 / 2 - 112.67, places=2)
         self.assertAlmostEqual(leg.open_premium, 1478.66 / 2, places=2)
         self.assertEqual(cycles[0].status, ACTIVE)
+
+    def test_unrealized_pl_marks_short_leg_to_its_cost_to_close(self):
+        """A short put now deep ITM: open_premium alone (valuing it as if it
+        expires worthless) way overstates where the position actually stands --
+        unrealized_pl nets the credit already banked against what it would
+        really cost to buy the contract back right now."""
+        cycles, _ = build_cycles(
+            [tx("2025-10-10", STO, "-MU251024P180", -1, 7.40, 739.33)]
+        )
+        leg = cycles[0].legs[0]
+        # $739.33 credit banked, but the put now costs $12.00/share to close:
+        # true P&L is the credit minus that $1,200 cost to close.
+        self.assertAlmostEqual(leg.unrealized_pl(12.0), 739.33 - 1200.0, places=2)
+        # Worthless (far OTM/about to expire): unrealized_pl collapses to the
+        # full credit, same as the old expiry-only open_premium.
+        self.assertAlmostEqual(leg.unrealized_pl(0.0), leg.open_premium, places=2)
+
+    def test_unrealized_pl_marks_long_leg_to_its_current_value(self):
+        cycles, _ = build_cycles(
+            [tx("2025-11-21", BTO, "-MU251128C210", 1, 7.70, -770.67)]
+        )
+        leg = cycles[0].legs[0]
+        # $770.67 debit paid; now worth $20.00/share -> a real gain.
+        self.assertAlmostEqual(leg.unrealized_pl(20.0), 2000.0 - 770.67, places=2)
 
     def test_close_larger_than_position_is_reported(self):
         _, engine = build_cycles(

@@ -149,8 +149,9 @@ not part of a `Spread`. Per leg `_open_hedge_entry` computes:
   `HEDGE_EXPIRING_DAYS` (7): **runway** (> 60), **wind_down** (8–60), **expiring** (≤ 7).
 - `cost` — the debit paid.
 - `wheel_pl_now` — the cycle's **mark-to-market P&L** (realized option + realized stock
-  + dividends + open-option value at expiry + unrealized stock). This is the honest
-  "are we winning" figure and it drives the message tone: a runway hedge on a
+  + dividends + open-option legs priced at their current cost to close, falling back to
+  valuing a leg at expiry when no live quote is on hand + unrealized stock). This is the
+  honest "are we winning" figure and it drives the message tone: a runway hedge on a
   *losing* wheel gets "hold it, this is the leg that pays if it keeps falling — don't
   close while underwater"; on a winning wheel, "there's runway to keep writing puts,
   plan to wind down ~2 months out."
@@ -870,11 +871,12 @@ differently from the time-weighted-average-based Wheel ROC.
 `(option_realized_pl + stock_realized_pl + stock_unrealized_pl + dividends_received)
 ÷ initial_collateral`. Two things it deliberately does *not* include:
 
-- **Long-option (open protective put / long call) unrealized P/L.** There is no
-  options-quote feed anywhere in this stdlib-only project to mark an open hedge to
-  market, so `long_leg_unrealized_pl` is always `None` -- a labelled placeholder,
-  not a fake zero. Only a hedge leg's *realized* P/L (already inside
-  `option_realized_pl` via `hedge_realized_pl`) counts until it actually closes.
+- **Long-option (open protective put / long call) unrealized P/L**, broken out on its
+  own. `long_leg_unrealized_pl` is always `None` -- a labelled placeholder, not a fake
+  zero -- because Total Position ROI deliberately keeps its denominator-matched pair
+  stable rather than reaching for the Positions-snapshot quote `option_open_pl` uses
+  (see `mark_to_market_pl` below). Only a hedge leg's *realized* P/L (already inside
+  `option_realized_pl` via `hedge_realized_pl`) counts here until it actually closes.
 - **Fees on top of the option/stock figures.** Every cash figure feeding this
   formula is already fee-net (the broker's own `Amount`), so nothing here
   re-subtracts fees a second time -- the same principle the module docstring

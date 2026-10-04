@@ -1490,7 +1490,14 @@ def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) ->
         "total_initial_collateral": sum(p["total_initial_collateral"] for p in portfolios),
         "dividends_received": sum(p["dividends_received"] for p in portfolios),
         "stock_unrealized_pl": sum(p["stock_unrealized_pl"] for p in portfolios),
+        "option_open_pl": sum(p.get("option_open_pl", 0.0) for p in portfolios),
     }
+    # Same "any gap taints the whole" rule portfolio_metrics() applies one
+    # level down: True only when every account that has an open leg marked
+    # all of them to a real quote.
+    combined["option_open_pl_marked"] = bool(combined["open_legs"]) and all(
+        p.get("option_open_pl_marked", False) for p in portfolios if p.get("open_legs", 0) > 0
+    )
 
     combined["days_span"] = (
         max((date.fromisoformat(combined["last_date"]) - date.fromisoformat(combined["first_date"])).days, 1)
@@ -1563,6 +1570,17 @@ def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) ->
     combined["total_position_roi_pct"], combined["annualized_total_position_roi_pct"] = roi_and_annualized(
         total_position_pl, combined["total_initial_collateral"], combined["days_span"]
     )
+    # Same five-term sum as PortfolioMetrics.mark_to_market_pl / the per-wheel
+    # Trade Log tile, just over the already-combined totals above -- where the
+    # whole account (every sub-account) really stands right now, not just
+    # what every sub-account has already banked.
+    combined["mark_to_market_pl"] = (
+        combined["option_realized_pl"]
+        + combined["stock_realized_pl"]
+        + combined["dividends_received"]
+        + combined["stock_unrealized_pl"]
+        + combined["option_open_pl"]
+    )
 
     for money_key in (
         "premium_received",
@@ -1578,6 +1596,8 @@ def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) ->
         "total_initial_collateral",
         "dividends_received",
         "stock_unrealized_pl",
+        "option_open_pl",
+        "mark_to_market_pl",
         "profit_per_day",
     ):
         combined[money_key] = round(combined[money_key], 2)
