@@ -747,6 +747,13 @@ class PortfolioMetrics:
     capital_deployed_now: float = 0.0
     peak_capital: float = 0.0
     avg_capital: float = 0.0
+    # The actual ROC/yield denominators: the same averages narrowed to wheel
+    # cycles, matching wheel_option_realized_pl in the numerator. avg_capital
+    # above spans every cycle (directional longs included) and is NOT what the
+    # ratios below divide by -- the UI must quote these, not avg_capital.
+    wheel_avg_capital: float = 0.0
+    wheel_avg_active_capital: float = 0.0
+    wheel_initial_collateral: float = 0.0
     annualized_wheel_roc_pct: float | None = None  # the headline Wheel ROC: option P/L only
     roi_on_avg_wheel_pct: float | None = None
     profit_per_day: float = 0.0  # option_realized_pl / days_span -- the dashboard's headline $/day figure
@@ -1026,6 +1033,9 @@ def portfolio_metrics(
 
     wheel_avg_capital = time_weighted_average(wheel_series)
     wheel_avg_active_capital = time_weighted_average(wheel_series, lambda point: point.working_capital)
+    result.wheel_avg_capital = wheel_avg_capital
+    result.wheel_avg_active_capital = wheel_avg_active_capital
+    result.wheel_initial_collateral = wheel_initial_collateral
 
     result.roi_on_avg_wheel_pct, result.annualized_wheel_roc_pct = roi_and_annualized(
         wheel_option_realized_pl, wheel_avg_capital, result.days_span
@@ -1186,6 +1196,11 @@ def ticker_summary(
                 "losses": sum(metric.losses for metric in wheel_metrics),
                 "is_wheel": ticker_is_wheel,
                 "avg_capital": average,
+                # The real numerator/denominators behind this row's ratios, so
+                # the UI can quote them instead of the all-cycle totals above.
+                "wheel_option_realized_pl": wheel_option_net,
+                "wheel_avg_capital": wheel_average,
+                "wheel_initial_collateral": wheel_total_initial,
                 "peak_capital": max((point.total for point in series), default=0.0),
                 "capital_now": series[-1].total if series else 0.0,
                 "days_span": span,  # denominator of the 365/span annualizing factor below

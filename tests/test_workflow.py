@@ -59,7 +59,7 @@ class TestRules(unittest.TestCase):
     def test_high_captured_and_near_expiry_is_take_profit_candidate(self):
         name, reason = _bucket_of(_leg(min_profit_captured_pct=95.0, days_to_expiry=10))
         self.assertEqual(name, "take_profit_candidate")
-        self.assertIn("banked", reason)
+        self.assertIn("looks earned", reason)
 
     def test_high_captured_but_far_from_expiry_is_not_take_profit(self):
         name, _ = _bucket_of(_leg(min_profit_captured_pct=100.0, days_to_expiry=45))

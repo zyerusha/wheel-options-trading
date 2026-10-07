@@ -57,17 +57,19 @@ def wheel_insights(
                 f"{held:,.0f} shares still held" if held > 1e-9 else f"realized {_money(net)}"
             )
             line = (
-                f"Plain buy-and-hold of {cycle.underlying}, no option has ever been written "
-                f"against it ({state}). Not a wheel; its P&L counts but the wheel-return "
-                "ratios do not apply. Selling a covered call turns it into one."
+                f"{cycle.underlying} is held outright, no option has ever been sold against "
+                f"it ({state}). Its profit and loss is counted, but percentage returns that "
+                "measure option income against the cash an option ties up are left blank, "
+                "because no option was ever sold here. Selling a covered call would start one."
             )
         else:
             outcome = (
                 f"closed up {_money(net)}" if net > 0 else f"closed down {_money(net)}" if net < 0 else "closed flat"
             )
             line = (
-                f"This was a directional long-option position, not a wheel ({outcome}). "
-                "It is kept out of the wheel-return figures; only its P&L counts."
+                f"This was an option bought outright as a bet on the share price, not an "
+                f"option sold for income ({outcome}). Its profit and loss is counted on its "
+                "own; it is left out of the percentage returns, which measure only options sold."
             )
         return {"strengths": [], "improvements": [line]}
 
@@ -119,29 +121,31 @@ def wheel_insights(
 
     if premium_covers_basis:
         strengths.append(
-            "Premium and profit already banked exceed your remaining share cost, "
-            "anything the stock does from here is upside."
+            "The cash collected for selling options, plus profit already taken, now adds up "
+            "to more than the shares cost you. Whatever the stock does from here, you are ahead."
         )
     if above_water:
         strengths.append(
-            f"Shares sit above the wheel's break-even ({_price(break_even_price)}) "
-            f"at {_price(current_price)}, you could close flat-plus right now."
+            f"At {_price(current_price)} the shares are above {_price(break_even_price)}, the "
+            "price they need to reach for every dollar paid and collected here to cancel out. "
+            "Selling everything today would leave you even or ahead."
         )
     if metrics.win_rate_pct is not None and metrics.win_rate_pct >= 70 and decided >= 5:
         strengths.append(
-            f"{metrics.wins} of {decided} closed legs finished green "
-            f"({metrics.win_rate_pct:.0f}% win rate), strike selection is working."
+            f"{metrics.wins} of {decided} finished option trades made money "
+            f"({metrics.win_rate_pct:.0f}%), so the strike prices being chosen are working."
         )
     if metrics.wheel_core_realized_pl > 50 and metrics.premium_received > 0:
         kept = 100 * metrics.wheel_core_realized_pl / metrics.premium_received
         strengths.append(
-            f"The core wheel kept +{_money(metrics.wheel_core_realized_pl)} of the "
-            f"{_money(metrics.premium_received)} premium sold ({kept:.0f}%)."
+            f"Of the {_money(metrics.premium_received)} collected for selling puts and covered "
+            f"calls, {_money(metrics.wheel_core_realized_pl)} ({kept:.0f}%) was kept after "
+            "buying any of them back."
         )
     if metrics.hedge_realized_pl > 50:
         strengths.append(
-            f"Protective/long options netted +{_money(metrics.hedge_realized_pl)}, "
-            "the hedge more than paid for itself."
+            f"Options bought here for protection have made {_money(metrics.hedge_realized_pl)} "
+            "overall, more than covering what they cost."
         )
     if (
         metrics.annualized_wheel_roc_pct is not None
@@ -149,11 +153,13 @@ def wheel_insights(
         and metrics.option_realized_pl > 0
     ):
         strengths.append(
-            f"Option writing has returned {metrics.annualized_wheel_roc_pct:.0f}% "
-            "annualized on the capital it tied up."
+            f"Selling options has returned {metrics.annualized_wheel_roc_pct:.0f}% a year, "
+            "measured against the cash held aside for the puts plus the cost of any shares held."
         )
     if not cycle.is_open and mark_to_market_pl is not None and mark_to_market_pl > 0:
-        strengths.append(f"This wheel is flat and green right now at +{_money(mark_to_market_pl)}.")
+        strengths.append(
+            f"Nothing is open here any more, and it finished ahead by {_money(mark_to_market_pl)}."
+        )
 
     # ---------------- improvements (ranked by $ impact) ----------------
 
@@ -161,9 +167,10 @@ def wheel_insights(
         improvements.append(
             (
                 metrics.wheel_core_realized_pl,
-                "Buying short options back has cost more than they collected, the core "
-                f"wheel is {_money(metrics.wheel_core_realized_pl)}. Letting more puts "
-                "expire, or taking assignment, keeps more premium than rolling losers at a debit.",
+                "Buying back the puts and calls you sold has cost more than they brought in, "
+                f"leaving {_money(metrics.wheel_core_realized_pl)} on those trades. Letting "
+                "puts expire, or letting the shares be put to you, keeps more of the cash "
+                "than paying to replace a losing option.",
             )
         )
     if underwater:
@@ -171,9 +178,10 @@ def wheel_insights(
         improvements.append(
             (
                 -gap * shares_held,
-                f"Stock must reach {_price(break_even_price)} to close flat "
-                f"(now {_price(current_price)}, +{_price(gap)}/share). Selling covered calls "
-                "at or above that strike closes the gap without adding downside risk.",
+                f"The shares must reach {_price(break_even_price)} for every dollar paid and "
+                f"collected here to cancel out; they are at {_price(current_price)}, "
+                f"{_price(gap)} per share short. Selling covered calls at or above that price "
+                "closes the gap and does not add to the risk.",
             )
         )
     if shares_held >= 100 and not has_open_covered_call:
@@ -182,18 +190,20 @@ def wheel_insights(
         improvements.append(
             (
                 None,
-                f"{shares_held:,.0f} shares are held with no covered call written, that "
-                f"capital earns nothing right now. A call{tail} adds premium against stock "
-                "you already own.",
+                f"{shares_held:,.0f} shares are held with no covered call sold against them, "
+                f"so that money earns nothing right now. Selling a call{tail} brings in cash "
+                "against stock you already own.",
             )
         )
     if open_long_debit < -50:
         improvements.append(
             (
                 open_long_debit,
-                f"An open long option is {_money(open_long_debit)} if it expires worthless; "
-                f"long options have returned {_money(metrics.hedge_realized_pl)} overall on "
-                "this wheel. Size protection to the risk you actually need.",
+                f"An option bought for protection cost {_money(abs(open_long_debit))} and is "
+                "worth nothing if it expires with the share price on the wrong side of its "
+                f"strike. Protection bought here has returned "
+                f"{_money(metrics.hedge_realized_pl)} in total so far. Buy only as much as "
+                "the risk actually calls for.",
             )
         )
 
@@ -206,9 +216,10 @@ def wheel_insights(
             improvements.append(
                 (
                     -(avg_loss - avg_win) * len(losers),
-                    f"The average loser here ({_money(-avg_loss)}) is {avg_loss / avg_win:.1f}x "
-                    f"the average winner (+{_money(avg_win)}). A fixed roll-or-close rule on "
-                    "losers would flatten that.",
+                    f"Finished option trades that lost money here average {_money(-avg_loss)} "
+                    f"each, {avg_loss / avg_win:.1f} times the {_money(avg_win)} average "
+                    "winning trade. Deciding in advance at what loss you will close a trade, "
+                    "or replace it with a later-expiring one, would even that out.",
                 )
             )
 
@@ -226,9 +237,10 @@ def wheel_insights(
             improvements.append(
                 (
                     metrics.stock_unrealized_pl,
-                    f"Puts were added at falling strikes ({strikes[0]:g} -> {strikes[-1]:g}) as "
-                    f"the stock dropped, averaging down deepened the unrealized loss "
-                    f"({_money(metrics.stock_unrealized_pl)}).",
+                    f"Each new put was sold at a lower strike price as the stock fell, from "
+                    f"${strikes[0]:g} down to ${strikes[-1]:g}. Buying in lower each time "
+                    f"deepened the loss you would take by selling the shares today, now "
+                    f"{_money(metrics.stock_unrealized_pl)}.",
                 )
             )
 
@@ -236,16 +248,19 @@ def wheel_insights(
         improvements.append(
             (
                 None,
-                "Some held shares pre-date the export, so their cost basis is unknown; "
-                "break-even and stock P&L here are estimates.",
+                "Some shares you hold were bought before the oldest file you loaded, so what "
+                "you paid for them is unknown. The price the shares must reach to cancel out, "
+                "and their gain or loss, are estimates here. Load an earlier transaction "
+                "export to fix it.",
             )
         )
     elif metrics.capital_estimated:
         improvements.append(
             (
                 None,
-                "Committed capital uses a strike-based proxy for shares bought before the "
-                "export, the ROC figures are approximate.",
+                "Some shares here were bought before the oldest file you loaded, so their real "
+                "cost is unknown and the strike price is used instead. Any percentage return "
+                "on capital shown for this position is only an approximation.",
             )
         )
 
@@ -304,38 +319,47 @@ def portfolio_insights(
         added_s = f", {_money(added)} ahead" if added else ""
         bench_name = (wr.get("benchmark") or {}).get("name", "SPY")
         strengths.append(
-            f"On the capital actually committed to the wheel, its money-weighted return is "
-            f"{wr_xirr:.0f}% vs {wr_bench:.0f}% for those same dollars, on the same dates, put in "
-            f"{bench_name} instead{added_s}. (Idle cash and buy-and-hold positions are excluded "
-            "from both sides.)"
+            f"On the capital actually committed to the wheel, counting exactly when each "
+            f"dollar went in and came out, it returned {wr_xirr:.0f}% a year vs {wr_bench:.0f}% "
+            f"for those same dollars, on the same dates, put in {bench_name} instead{added_s}. "
+            "(Idle cash and buy-and-hold positions are excluded from both sides.)"
         )
 
     win_rate = _num(portfolio.get("win_rate_pct"))
     decided = (portfolio.get("wins") or 0) + (portfolio.get("losses") or 0)
     if win_rate is not None and win_rate >= 70 and decided >= 20:
         strengths.append(
-            f"{portfolio.get('wins', 0)} of {decided} decided legs finished green "
-            f"({win_rate:.0f}% win rate across the book)."
+            f"{portfolio.get('wins', 0)} of {decided} finished option trades made money "
+            f"({win_rate:.0f}% across every account shown)."
         )
 
     roc = _num(portfolio.get("annualized_wheel_roc_pct"))
     if roc is not None and roc >= 10 and (portfolio.get("option_realized_pl") or 0) > 0:
-        avg_cap = _num(portfolio.get("avg_capital")) or 0.0
+        # The denominator this percentage is actually computed against is the average
+        # capital of the option-selling positions only, not of every position in the
+        # book, so quote that field and fall back only if it is absent.
+        avg_cap = _num(portfolio.get("wheel_avg_capital"))
+        if avg_cap is None:
+            avg_cap = _num(portfolio.get("avg_capital")) or 0.0
         strengths.append(
-            f"Option writing has returned {roc:.0f}% annualized on about {_money(avg_cap)} of "
-            "average committed capital."
+            f"Selling options has returned {roc:.0f}% a year, measured against the "
+            f"{_money(avg_cap)} of cash those option-selling positions tied up on average."
         )
 
     div = _num(portfolio.get("dividends_received")) or 0.0
     if div >= 500:
-        strengths.append(f"{_money(div)} in dividends on assigned shares, on top of option premium.")
+        strengths.append(
+            f"{_money(div)} in dividends on shares you ended up owning because a put you sold "
+            "was exercised, on top of the cash the options themselves brought in."
+        )
 
     runway_hedges = [h for h in open_hedges if h.get("phase") == "runway"]
     if runway_hedges:
         names = ", ".join(dict.fromkeys(h["underlying"] for h in runway_hedges[:3]))
         strengths.append(
-            f"{len(runway_hedges)} protective hedge(s) in place with runway ({names}), "
-            "downside is capped while premium keeps coming in."
+            f"{len(runway_hedges)} protective option(s) are open with months still left on "
+            f"them ({names}), so a big drop is covered while the options you sell keep "
+            "bringing in cash."
         )
 
     # ---------------- improvements (ranked by $ impact) ----------------
@@ -358,9 +382,10 @@ def portfolio_insights(
         improvements.append(
             (
                 total,
-                f"{len(underwater)} active positions are underwater by {_money(total)} "
-                f"mark-to-market (worst: {worst}). Covered calls at or above their break-even "
-                "close the gap without adding downside.",
+                f"{len(underwater)} active positions would lose {_money(total)} in total if "
+                f"everything were closed at today's prices (worst: {worst}). Selling a covered "
+                "call at or above the price those shares must reach to cancel out their cost "
+                "brings in cash without raising the risk.",
             )
         )
 
@@ -372,8 +397,9 @@ def portfolio_insights(
             (
                 -hold_amt * 0.01,
                 f"{_money(hold_amt)} of held shares across {hold_n} positions have no covered "
-                "call written, that capital collects no premium. Selling calls at or above "
-                "break-even adds income against stock already owned.",
+                "call sold against them, so that money brings in nothing. Selling calls at or "
+                "above the price those shares must reach to cancel out their cost adds income "
+                "against stock already owned.",
             )
         )
 
@@ -384,12 +410,12 @@ def portfolio_insights(
         # >=15% of the book AND a real position size -- the Combined view keeps
         # each wheel's own account-scoped %, so a lone small wheel can read 100%.
         if pct >= 15 and amt >= 25000:
-            of = top.get("capital_committed_pct_of", "the book")
+            of = top.get("capital_committed_pct_of", "the cash tied up across every wheel")
             improvements.append(
                 (
                     amt,
-                    f"{top['underlying']} is {pct:.0f}% of {of} ({_money(amt)}). A drawdown "
-                    "there moves the whole book.",
+                    f"{top['underlying']} is {pct:.0f}% of {of} ({_money(amt)}). A sharp fall "
+                    "in that one stock would move your whole account.",
                 )
             )
 
@@ -398,8 +424,9 @@ def portfolio_insights(
         improvements.append(
             (
                 dir_net,
-                f"Directional (non-wheel) option trades have cost {_money(dir_net)} net. They "
-                "stay out of the wheel-return figures, but the loss is real.",
+                f"Options bought outright as bets on the share price, rather than sold for "
+                f"income, have cost {_money(dir_net)} in total. They are left out of the "
+                "percentage returns, but the money is really gone.",
             )
         )
 
@@ -409,8 +436,9 @@ def portfolio_insights(
         improvements.append(
             (
                 None,
-                f"{len(urgent)} protective hedge(s) are inside the wind-down window ({names}), "
-                "sell them for their remaining time value or roll them out before they decay.",
+                f"{len(urgent)} protective option(s) expire soon ({names}). An option is worth "
+                "something just for the time left on it, and that part runs out as expiry "
+                "nears: sell them now to recover it, or replace them with ones expiring later.",
             )
         )
 
@@ -421,8 +449,9 @@ def portfolio_insights(
         improvements.append(
             (
                 None,
-                f"{len(est)} active wheels ({', '.join(est)}) price capital with a strike-based "
-                "proxy for pre-export shares, their ROC figures are approximate.",
+                f"{len(est)} active positions ({', '.join(est)}) hold shares bought before the "
+                "oldest file you loaded, so the strike price stands in for their real cost. "
+                "Their percentage returns on capital are only approximations.",
             )
         )
 

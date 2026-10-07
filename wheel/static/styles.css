@@ -2134,6 +2134,12 @@ tr.detail > td {
   margin-bottom: 8px;
 }
 
+#assignment-risk .ar-sub {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 10px;
+}
+
 #assignment-risk .ar-figures {
   display: flex;
   flex-wrap: wrap;

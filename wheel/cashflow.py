@@ -445,7 +445,7 @@ def format_report(rows: Sequence[dict], summary: dict) -> str:
     avg_income = summary["avg_monthly_income"]
     coc = summary["annualized_cash_on_cash_return_pct"]
     lines = [
-        "Monthly Cash Flow -- Wheel Strategy",
+        "Monthly Cash Flow: Wheel Strategy",
         "=" * 36,
         "",
         format_monthly_table(rows),

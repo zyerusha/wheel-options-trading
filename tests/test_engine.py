@@ -505,7 +505,9 @@ class TestAssignment(unittest.TestCase):
         self.assertFalse(lot.basis_known)
         self.assertIsNone(lot.basis_per_share)
         self.assertEqual(lot.disposals[0]["realized"], 0.0)
-        self.assertTrue(any("basis unknown" in warning for warning in cycle.warnings))
+        self.assertTrue(
+            any("what you paid for them is unknown" in warning for warning in cycle.warnings)
+        )
 
     def test_assignment_with_no_matching_leg_still_books_shares(self):
         cycles, engine = build_cycles(

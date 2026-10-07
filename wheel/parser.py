@@ -445,12 +445,12 @@ def _detect_swapped_columns(rows: Sequence[dict], columns: dict[str, str]) -> tu
 
     if swapped > straight:
         return True, (
-            f"'Quantity' and '{price_col}' are transposed in this export "
-            f"(score {swapped} vs {straight}); reading them in swapped order"
+            f"In this file the 'Quantity' and '{price_col}' columns are transposed, that is, "
+            "swapped. They are being read in the corrected order."
         )
     if straight > swapped:
-        return False, f"column labels verified correct (score {straight} vs {swapped})"
-    return False, "column orientation indeterminate; assuming labels are correct"
+        return False, "column labels checked and correct"
+    return False, "not enough rows to check the column labels; assuming they are correct"
 
 
 # --------------------------------------------------------------------------

@@ -166,14 +166,17 @@ def _earnings_modifier(days_to_earnings: int | None) -> tuple[float, str]:
     if d is None or d < 0:
         return 0.0, "no earnings date on file"
     if d <= 7:
-        return -1.8, f"earnings in {d}d — gap risk, no time to react"
+        return -1.8, f"earnings in {d} days: the stock can jump overnight, no time to react"
     if d <= 14:
-        return -0.3, f"earnings in {d}d — a little close"
+        return -0.3, f"earnings in {d} days: a little close for comfort"
     if d <= 28:
-        return 0.5, f"earnings in {d}d — sell into elevated IV, clears before a ~30-45 DTE put"
+        return 0.5, (
+            f"earnings in {d} days: options sell for more before a report, and it is past "
+            f"before a put sold 30 to 45 days out expires"
+        )
     if d <= 45:
-        return 0.2, f"earnings in {d}d"
-    return 0.0, f"earnings in {d}d — too far to matter"
+        return 0.2, f"earnings in {d} days"
+    return 0.0, f"earnings in {d} days: too far away to matter here"
 
 
 def _sector_modifier(current_weight: float | None, sector: str | None) -> tuple[float, str]:
@@ -183,14 +186,20 @@ def _sector_modifier(current_weight: float | None, sector: str | None) -> tuple[
         return 0.0, "sector unknown"
     w = current_weight or 0.0
     if w <= 0.02:
-        return 0.5, f"{sector}: not in the book yet — diversifies"
+        return 0.5, f"{sector}: nothing here yet, so it spreads the risk wider"
     if w < 0.15:
-        return 0.2, f"{sector}: lightly held ({w * 100:.0f}% of committed capital)"
+        return 0.2, f"{sector}: lightly held, {w * 100:.0f}% of the money you have committed"
     if w < 0.30:
-        return 0.0, f"{sector}: {w * 100:.0f}% of committed capital"
+        return 0.0, f"{sector}: {w * 100:.0f}% of the money you have committed"
     if w < 0.45:
-        return -0.3, f"{sector}: already {w * 100:.0f}% of the book — concentration"
-    return -0.6, f"{sector}: already {w * 100:.0f}% of the book — heavy concentration"
+        return -0.3, (
+            f"{sector}: already {w * 100:.0f}% of the money you have committed, piling more "
+            f"into one place"
+        )
+    return -0.6, (
+        f"{sector}: already {w * 100:.0f}% of the money you have committed, heavily piled "
+        f"into one place"
+    )
 
 
 def csp_star_score(
@@ -542,11 +551,23 @@ def _cc_strike_floor_fundamentals(
     labeled -- shared by `_profit_target_floor` and its explanation so the two
     can never disagree about which candidates actually fed it."""
     candidates = [
-        ("cost basis", cost_basis),
-        ("breakeven", position_breakeven),
-        ("wheel breakeven", wheel_breakeven),
+        ("average price paid per share", cost_basis),
+        ("price paid less the option premium already collected", position_breakeven),
+        ("price where every dollar paid and collected cancels out", wheel_breakeven),
     ]
     return [(label, value) for label, value in candidates if value is not None]
+
+
+def _floor_candidates_text(
+    cost_basis: float | None,
+    position_breakeven: float | None,
+    wheel_breakeven: float | None,
+) -> str:
+    """The floor's candidate prices, each named in plain words and shown with
+    its own value, so a reader can see which one actually won rather than
+    being handed only the result."""
+    fundamentals = _cc_strike_floor_fundamentals(cost_basis, position_breakeven, wheel_breakeven)
+    return "; ".join(f"{label} ${value:.2f}" for label, value in fundamentals)
 
 
 def _profit_target_floor(
@@ -596,15 +617,24 @@ def _profit_target(floor: float, cushion_pct: float = PROFIT_TARGET_CUSHION_PCT)
     return _money(_round_up_half(floor * (1 + cushion_pct / 100)))
 
 
-def _profit_target_explanation(floor: float, target: float) -> str:
+def _profit_target_explanation(
+    floor: float,
+    target: float,
+    cost_basis: float | None = None,
+    position_breakeven: float | None = None,
+    wheel_breakeven: float | None = None,
+) -> str:
     """Same 4-part shape as `_cc_strike_floor_explanation`: a formula line,
-    the substitution, the result, then a one-line caveat."""
+    the substitution, the result, then a one-line caveat. The candidate prices
+    are spelled out with their own values so the floor can be checked."""
+    candidates = _floor_candidates_text(cost_basis, position_breakeven, wheel_breakeven)
+    detail = f"Highest of {candidates}\n" if candidates else ""
     return (
-        f"Profit Target = highest of cost basis, breakeven, wheel breakeven, "
-        f"+{PROFIT_TARGET_CUSHION_PCT:g}%, rounded up to $0.50\n"
-        f"= ${floor:.2f} + {PROFIT_TARGET_CUSHION_PCT:g}%\n"
+        f"Profit Target: the share price worth selling at, so this position ends up ahead.\n"
+        f"{detail}"
+        f"= ${floor:.2f} plus a {PROFIT_TARGET_CUSHION_PCT:g}% cushion, rounded up to the next $0.50\n"
         f"= ${target:.2f}\n\n"
-        f"A profitable-exit threshold; never reacts to price."
+        f"A fixed line; it does not move when the share price moves."
     )
 
 
@@ -614,10 +644,12 @@ def _preferred_csp_entry_explanation(current_price: float, entry: float) -> str:
     surface uses the adjustable client-side version instead), but is kept
     in the same format in case a future surface reads it."""
     return (
-        f"Preferred CSP entry = {CSP_ENTRY_OTM_PCT:g}% of last close, rounded down to $0.50\n"
-        f"= {CSP_ENTRY_OTM_PCT:g}% × ${current_price:.2f}\n"
+        f"Preferred put strike: the highest strike worth selling a cash-secured put at, where "
+        f"you are paid cash now and only buy the shares if the price falls that far.\n"
+        f"= {CSP_ENTRY_OTM_PCT:g}% of the last close of ${current_price:.2f}, rounded down to "
+        f"the nearest $0.50\n"
         f"= ${entry:.2f}\n\n"
-        f"A conservative entry floor."
+        f"An upper limit on the strike, not a view on which expiry to pick."
     )
 
 
@@ -627,22 +659,24 @@ def _cc_strike_floor_explanation(
     position_breakeven: float | None,
     wheel_breakeven: float | None,
     current_price: float | None,
+    cushion_pct: float = PROFIT_TARGET_CUSHION_PCT,
 ) -> str:
-    """Short and simple, like the client's CSP TO ENTER tooltip
-    (cspEntryTargetTooltip in app.js) -- not a line-by-line accounting of
-    every input. Profit Target is the one figure worth naming, since it's
-    already the adjacent column and its own tooltip has the cost basis /
-    breakeven / wheel breakeven math behind it; repeating that here would
-    just be the same numbers twice."""
+    """Spells out its own cushioned floor inline (cost basis / breakeven /
+    wheel breakeven) rather than naming the separate Profit Target column,
+    so this tooltip stands on its own even though the two share a formula."""
     floor = _profit_target_floor(cost_basis, position_breakeven, wheel_breakeven)
-    profit_target = _profit_target(floor) if floor is not None else None
-    target_text = f"${profit_target:.2f}" if profit_target is not None else "n/a"
+    cushioned_text = f"${floor * (1 + cushion_pct / 100):.2f}" if floor is not None else "n/a"
     price_text = f"${current_price:.2f}" if current_price is not None else "n/a"
+    candidates = _floor_candidates_text(cost_basis, position_breakeven, wheel_breakeven)
+    detail = f"Highest of {candidates}, plus {cushion_pct:g}% = {cushioned_text}\n" if candidates else ""
     return (
-        f"CC TO EXIT = higher of Profit Target and last price, rounded up to $0.50\n"
-        f"= higher of {target_text} and {price_text}\n"
+        f"CC to exit: the lowest strike worth selling a covered call at, so that having the "
+        f"shares bought from you still leaves this position ahead.\n"
+        f"{detail}"
+        f"= higher of {price_text} (today's last price) and {cushioned_text}, rounded up to "
+        f"the next $0.50\n"
         f"= ${strike:.2f}\n\n"
-        f"A floor, not a recommendation."
+        f"A lower limit only; it does not say which strike pays the most."
     )
 
 
@@ -1209,9 +1243,10 @@ def _trade_log_entry(
         and (t.action in (BUY_STOCK, SELL_STOCK) or t.row_id in dividend_row_ids)
     ]
     attribution_note = (
-        "Fees combines commission + fees on every row. A single broker order "
-        "that closed more than one separately-opened lot is shown here as "
-        "one row per lot, not one row per fill -- see Win rate below."
+        "The Fees column adds the broker's commission and its fees together. If one broker "
+        "order closed contracts that were opened at different times, each of those groups "
+        "gets its own row here rather than one row for the whole order, and each row shows "
+        "only its own money."
     )
 
     rows.sort(key=lambda row: row.pop("_sort"))
@@ -1383,7 +1418,9 @@ def _trade_log_entry(
         floor = _profit_target_floor(cost_basis, break_even, break_even_price)
         if floor is not None:
             profit_target = _profit_target(floor)
-            profit_target_explanation = _profit_target_explanation(floor, profit_target)
+            profit_target_explanation = _profit_target_explanation(
+                floor, profit_target, cost_basis, break_even, break_even_price
+            )
         strike_floor = _cc_strike_floor(cost_basis, break_even, break_even_price, current_price)
         if strike_floor is not None:
             cc_strike_floor = strike_floor
@@ -1546,12 +1583,12 @@ def _trade_log_entry(
 
 def _hedge_pl_phrase(value: float | None) -> str:
     if value is None:
-        return "at an unknown mark"
+        return "at an unknown value, because there is no current share price"
     if value > 1:
         return f"up +${value:,.0f}"
     if value < -1:
-        return f"down -${abs(value):,.0f}"
-    return "roughly flat"
+        return f"down ${abs(value):,.0f}"
+    return "roughly even"
 
 
 def _open_hedge_entry(
@@ -1658,13 +1695,15 @@ def _open_hedge_entry(
         if not cycle.is_wheel:
             if phase == "runway":
                 message = (
-                    f"Directional {kind}, no wheel premium behind it. Theta eats its cost daily; "
-                    f"cut it or keep the exposure on purpose."
+                    f"A {kind} bought outright as a bet on the share price, with no cash from "
+                    f"sold options paying for it. It loses a little value every day simply "
+                    f"because time is passing. Sell it, or keep the bet on purpose."
                 )
             else:
                 message = (
-                    f"Directional {kind}, {days_to_expiry}d left. Close for time value or hold "
-                    f"for the move, it finances nothing."
+                    f"A {kind} bought outright as a bet on the share price, {days_to_expiry} "
+                    f"days left. Sell it while part of its price still pays for the time "
+                    f"remaining, or hold it for the move; no sold options cover its cost."
                 )
         else:
             # Wheel-attached, but intrinsic value now dwarfs the original
@@ -1672,36 +1711,45 @@ def _open_hedge_entry(
             # hedge itself, not cheap insurance with runway left to sell
             # puts against.
             message = (
-                f"${intrinsic:,.0f} of this ${cost:,.0f} hedge is already intrinsic value, not "
-                f"time decay: it's trading like a directional {kind} now, not insurance with "
-                f"runway left. Close it to lock in the move, or hold it on purpose for more."
+                f"This protective {kind} cost ${cost:,.0f}, and ${intrinsic:,.0f} of its value "
+                f"is now just the gap between its strike and the share price, not payment for "
+                f"the time it has left. It behaves like a bet on the share price rather than "
+                f"insurance. Sell it to bank the move, or keep it on purpose for more."
             )
         phase = "directional"
     elif phase == "runway":
         headline = f"RUNWAY · {days_to_expiry}d"
         if losing:
             message = (
-                f"Wheel is {pl_phrase}"
-                f"{' with shares below cost' if shares_held > 1e-9 else ''}. Keep this hedge "
-                f"and keep selling puts to carry its cost. Do not close it while the wheel "
-                f"is underwater."
+                f"This position is {pl_phrase}"
+                f"{' with shares worth less than they cost' if shares_held > 1e-9 else ''}. "
+                f"Keep this protective {kind} and keep selling options to pay for it. Do not "
+                f"close it while the position is behind."
             )
         else:
             message = (
-                f"Runway left to sell puts against this hedge, plan to sell it around two "
-                f"months out to salvage its time value."
+                f"{days_to_expiry} days left on this protective {kind}, enough time to keep "
+                f"selling options while it covers you. Plan to sell it with about two months "
+                f"left, while part of its price still pays for the time remaining."
             )
     elif phase == "wind_down":
         headline = f"WIND DOWN · {days_to_expiry}d"
         message = (
-            f"{days_to_expiry}d left, inside two months. Sell the hedge now to recover its "
-            f"time value{intrinsic_phrase}, then stop adding puts against it."
+            f"{days_to_expiry} days left, under two months. Sell this protective {kind} now "
+            f"while part of its price still pays for the time remaining{intrinsic_phrase}, "
+            f"then stop selling new options against it."
         )
         if losing:
-            message += f" Wheel is {pl_phrase}; roll to a later expiry if you still want protection."
+            message += (
+                f" This position is {pl_phrase}; replace it with one expiring later if you "
+                f"still want the cover."
+            )
     else:  # expiring
         headline = f"EXPIRING · {days_to_expiry}d"
-        message = f"{days_to_expiry}d left, time value nearly gone{intrinsic_phrase}. Close it or let it lapse."
+        message = (
+            f"{days_to_expiry} days left, so almost none of its price still pays for time "
+            f"remaining{intrinsic_phrase}. Sell it, or let it expire."
+        )
 
     return {
         "cycle_id": cycle.cycle_id,
@@ -2265,12 +2313,12 @@ def _reconciliation(
         ),
         "synthetic_assignment_cash": _money(synthetic),
         "note": (
-            "Option cash comes verbatim from the broker's Amount column."
+            "Cash from option trades is taken exactly as your broker reported it."
             + (
-                f" {len(equity_rows)} equity rows supply real share fills."
+                f" {len(equity_rows)} share trades in the file supply the real share prices."
                 if equity_rows
-                else " Assignment share movements are synthesized at the strike, "
-                "because this export contains no equity rows."
+                else " Your file lists no share trades, so when an option was exercised the "
+                "share purchase or sale is worked out at the option's strike price instead."
             )
         ),
     }
@@ -2647,7 +2695,10 @@ class Dashboard:
             return {
                 "available": False,
                 "warnings": list(self.position_warnings)
-                + ["no Portfolio Positions snapshot found for this account"],
+                + [
+                    "Add a Fidelity Portfolio Positions export for this account to see what "
+                    "it holds and what it is worth."
+                ],
                 "snapshot_files": [],
             }
 
@@ -2795,7 +2846,10 @@ class Dashboard:
         if not self.snapshots:
             return {
                 "available": False,
-                "warnings": ["no Portfolio Positions snapshot found for this account"],
+                "warnings": [
+                    "Add a Fidelity Portfolio Positions export for this account to compare "
+                    "its growth against an index."
+                ],
             }
 
         primary_account = latest_snapshot(self.snapshots).account_number
@@ -2826,10 +2880,10 @@ class Dashboard:
             return {
                 "available": False,
                 "warnings": [
-                    "at least two Portfolio Positions snapshots, taken on different dates, are "
-                    "needed to compute a return, only one is available so far (or add an "
-                    "'opening_balances' entry for this account to data/accounts.json to supply "
-                    "an earlier starting point manually)"
+                    "Two Portfolio Positions exports taken on different dates are needed to "
+                    "work out a return, and only one is on file so far. Add a second export, "
+                    "or set an 'opening_balances' entry for this account in "
+                    "data/accounts.json to supply an earlier starting value by hand."
                 ],
             }
 
@@ -3076,10 +3130,10 @@ class Dashboard:
         # of the capital committed across every wheel right now.
         net_worth = getattr(self, "_net_worth", None) or {}
         if net_worth.get("available") and net_worth.get("total_value"):
-            denom, denom_label = net_worth["total_value"], "account value"
+            denom, denom_label = net_worth["total_value"], "the total account value"
         else:
             denom = sum(w["capital_committed_now"] or 0.0 for w in wheels)
-            denom_label = "capital in wheels"
+            denom_label = "the cash tied up across every wheel"
         for wheel in wheels:
             cap = wheel["capital_committed_now"] or 0.0
             wheel["capital_committed_pct"] = round(100.0 * cap / denom, 1) if denom and cap else None

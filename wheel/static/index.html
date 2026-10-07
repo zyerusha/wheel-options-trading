@@ -196,7 +196,7 @@
             <p>
               Give each account its own subfolder under <code>data/</code>
               and drop that account's own exports in it. Files left directly
-              in <code>data/</code> (the layout above) count as one more,
+              in <code>data/</code>, in no subfolder, count as one more,
               implicit account. An account switcher appears automatically
               once more than one account is found.
             </p>
@@ -314,6 +314,15 @@
             <h2>Wheel price targets</h2>
           </header>
 
+          <ul class="hint-list">
+            <li><strong>Type</strong>: CC = covered call; CSP = cash-secured put.</li>
+            <li><strong>CC TO EXIT</strong>: minimum target share price for selling a covered call while still locking in a profit if assigned.</li>
+            <li><strong>CSP TO ENTER</strong>: target strike price for the next cash-secured put, set a defined % below the last close and rounded to $0.50.</li>
+            <li><strong>Profit Target</strong>: share price where the wheel reaches its target profit.</li>
+            <li><strong>Gap to Target</strong>: percentage move from the last close to the Profit Target.</li>
+            <li>Hover a value or column heading for the exact calculation.</li>
+          </ul>
+
            <div style="overflow-x: auto">
             <table id="wheel-targets-table"></table>
           </div>
@@ -330,7 +339,7 @@
             <h2>Performance</h2>
           </header>
 
-          <p class="hint">Click any figure for its formula.</p>
+          <p class="hint">Click a metric to see its formula.</p>
 
           <div class="tiles" id="tiles" aria-label="Headline metrics"></div>
 
@@ -363,7 +372,12 @@
               </div>
             </header>
 
-            <p class="hint">Committed capital by day, by instrument.</p>
+            <ul class="hint-list">
+              <li>Capital committed to the wheel each day, split by position type.</li>
+              <li><strong>Idle shares</strong>: shares held without an open covered call.</li>
+              <li><strong>Call-backed shares</strong>: shares covered by an open short call.</li>
+              <li>Dots show broker-reported account value: cash plus current market value of holdings.</li>
+            </ul>
 
             <div class="chart-scroll">
               <svg id="chart-capital" role="img"></svg>
@@ -385,7 +399,7 @@
                 </button>
               </header>
 
-              <p class="hint">Latest day, by wheel phase.</p>
+              <p class="hint">Current capital by wheel stage: CSP collateral, uncovered shares, and covered-call shares.</p>
 
               <div class="chart-scroll">
                 <svg id="chart-wheel-state" role="img"></svg>
@@ -400,19 +414,19 @@
           <!-- Cumulative Wheel P/L: realized & mark-to-market -->
           <section class="card">
             <header>
-              <h2>Cumulative Wheel P/L: realized &amp; mark-to-market</h2>
+              <h2>Cumulative Wheel P/L</h2>
               <button class="toggle" data-twin="pnl-table" aria-pressed="false">
                 Table
               </button>
             </header>
 
             <ul class="hint-list">
-              <li><strong>Premium collected (net)</strong>: cumulative option cash flow from closed legs</li>
-              <li><strong>Stock P/L</strong>: cumulative realized gain or loss from shares sold</li>
-              <li><strong>Full wheel P/L</strong>: Premium collected (net) plus Stock P/L, always</li>
-              <li>Solid line: closed transactions only, fully realized, reproducible from the Trade Log</li>
-              <li>Dashed point: today's mark-to-market value, not realized; also includes dividends and every open position's live value. Hover it for the Option/Stock/Dividends breakdown</li>
-              <li>This chart is P&amp;L only; for wheel vs. buy-and-hold, see <strong>Net worth &amp; benchmark</strong> below</li>
+              <li><strong>Net premium</strong>: STO premium minus BTC cost for closed option trades.</li>
+              <li><strong>Stock P/L</strong>: realized profit or loss on shares sold.</li>
+              <li><strong>Full Wheel P/L</strong>: net option premium plus realized stock P/L.</li>
+              <li><strong>Solid line</strong>: realized P/L from closed trades.</li>
+              <li><strong>Dashed point</strong>: current mark-to-market value of open positions plus dividends. Not realized.</li>
+              <li>This chart measures Wheel P/L only; it is not a buy-and-hold comparison.</li>
             </ul>
 
             <div class="chart-scroll">
@@ -436,15 +450,15 @@
               </header>
 
               <ul class="hint-list">
-                <li>Account value comes straight from your broker's own records</li>
-                <li><strong>XIRR</strong>: a yearly growth rate that counts exactly when each dollar moved; used to compare the wheel against just buying and holding</li>
+                <li><strong>Account value</strong>: broker-reported account value for that date.</li>
+                <li><strong>XIRR</strong>: annualized return that accounts for the timing of deposits and withdrawals.</li>
               </ul>
 
               <div id="net-worth-empty" class="notice" hidden></div>
 
               <div class="tiles" id="networth-tiles"></div>
 
-              <p class="hint">Account value vs. invested capital &amp; benchmarks, over time</p>
+              <p class="hint">Compares broker-reported account value with invested capital and the buy-and-hold benchmark.</p>
 
               <div class="chart-scroll">
                 <svg id="chart-networth" role="img"></svg>
@@ -478,10 +492,10 @@
               </header>
 
               <ul class="hint-list">
-                <li>Realized credits - debits - fees, dated to settlement</li>
-                <li>In: premium, dividends</li>
-                <li>Out: buy-backs, hedges</li>
-                <li>Excludes assignments and call-aways</li>
+                <li>Actual cash movement, using the settlement date.</li>
+                <li><strong>In</strong>: option premium received and dividends.</li>
+                <li><strong>Out</strong>: BTC costs and premiums paid for protective options.</li>
+                <li>Assignment and exercise move shares, not cash, so they are excluded from cash flow.</li>
               </ul>
 
               <div class="tiles" id="cashflow-tiles"></div>
@@ -519,8 +533,10 @@
               </header>
 
               <ul class="hint-list">
-                <li>Realized P/L by period, dated to when legs close</li>
-                <li>Net Premium (options) + Closed P/L (stock) = Net P/L</li>
+                <li>Realized P/L, dated to the trade close date.</li>
+                <li><strong>Net Premium</strong>: STO premium minus BTC cost.</li>
+                <li><strong>Closed P/L</strong>: realized P/L on shares sold.</li>
+                <li><strong>Net P/L</strong>: net option premium plus realized stock P/L.</li>
               </ul>
 
               <div class="chart-scroll">
@@ -546,26 +562,11 @@
               </header>
 
               <ul class="hint-list">
-                <li>
-                  Shows the difference between cash collected and Wheel P/L
-                  realized
-                </li>
-                <li>
-                  <strong>Rising</strong> = collecting premium faster than
-                  positions are being realized
-                </li>
-                <li>
-                  <strong>Falling</strong> = previously collected premium is
-                  being realized
-                </li>
-                <li>
-                  <strong>Normal pattern</strong>: rises while positions build,
-                  then falls as positions close
-                </li>
-                <li>
-                  <strong>Watch for</strong>: a large, persistent rise with no
-                  pullback, more premium may be sitting in open risk
-                </li>
+                <li>Difference between option cash collected and realized option P/L. The gap is cash still tied to open trades.</li>
+                <li><strong>Rising</strong>: open trades are holding more collected premium.</li>
+                <li><strong>Falling</strong>: open trades are closing and premium is becoming realized P/L.</li>
+                <li><strong>Normal</strong>: rises when new positions open and falls when they close.</li>
+                <li><strong>Watch for</strong>: a persistent gap can mean significant premium remains exposed in open trades.</li>
               </ul>
 
               <div class="chart-scroll">
@@ -591,12 +592,9 @@
               </header>
 
               <ul class="hint-list">
-                <li>
-                  <strong>Profit Per Day</strong> = realized option P/L ÷
-                  calendar days
-                </li>
-                <li><strong>Line</strong> = to-date</li>
-                <li><strong>Bars</strong> = each week on its own</li>
+                <li><strong>PPD</strong>: realized option profit divided by elapsed days, including weekends. Expressed as $/day.</li>
+                <li><strong>Line</strong>: cumulative option PPD since the first trade.</li>
+                <li><strong>Bars</strong>: each week's option profit divided by 7.</li>
               </ul>
 
               <div class="chart-scroll">
@@ -626,7 +624,7 @@
             </header>
 
             <ul class="hint-list">
-              <li>Option cash + realized stock P/L</li>
+              <li><strong>Realized P/L</strong>: closed option P/L plus realized share P/L. Open positions are excluded.</li>
             </ul>
 
             <div class="chart-scroll">
@@ -640,14 +638,15 @@
 
           <section class="card">
             <header>
-              <h2>Annualized Wheel ROC</h2>
+              <h2>Annualized Wheel ROC (return on capital)</h2>
               <button class="toggle" data-twin="roc-table" aria-pressed="false">
                 Table
               </button>
             </header>
 
             <ul class="hint-list">
-              <li>Option P/L ÷ time-weighted average capital, annualized</li>
+              <li><strong>Annualized Wheel ROC</strong>: option profit ÷ average capital committed, annualized. A 30% ROC means the strategy generated a 30% annualized return on the capital committed.</li>
+              <li>Only capital used for short puts and calls is included. Bought options and stock P/L are excluded.</li>
             </ul>
 
             <div class="chart-scroll">
@@ -662,7 +661,7 @@
 
         <section class="card" style="margin-bottom: var(--gap)">
           <header>
-            <h2>Ticker efficiency: P/L vs. Annualized ROC</h2>
+            <h2>Ticker efficiency: profit and loss vs. annualized return on capital</h2>
             <div class="card-actions">
               <select id="scatter-status-filter" aria-label="Filter this chart by wheel status">
                 <option value="">All statuses</option>
@@ -681,11 +680,10 @@
           </header>
 
           <ul class="hint-list">
-            <li>
-              Each bubble a ticker: Annualized ROC (x), net realized P/L (y),
-              sized by avg capital
-            </li>
-            <li>Top-left = small but efficient</li>
+            <li>Each bubble represents one stock.</li>
+            <li><strong>Annualized ROC</strong>: option profit ÷ average capital committed, annualized.</li>
+            <li>Vertical position = total P/L. Bubble size = capital committed.</li>
+            <li>Top-right = positive P/L with high capital efficiency.</li>
           </ul>
 
           <div class="chart-scroll">
@@ -722,9 +720,9 @@
           </header>
 
           <ul class="hint-list">
-            <li>One row per cycle</li>
-            <li>Bars = option legs, green = shares held</li>
-            <li>Hover any bar for the trade</li>
+            <li>One row per Wheel cycle.</li>
+            <li>Each bar is a short put or call; share bars show stock held in the cycle.</li>
+            <li>Hover a bar for trade details.</li>
           </ul>
 
           <div class="chart-scroll">
@@ -747,28 +745,23 @@
                 <option value="CLOSED">CLOSED</option>
               </select>
               <span class="hint" style="margin: 0"
-                >Click a row for legs, rolls and assignments</span
+                >Click a row to see its contracts, any rolls, and any shares
+                that changed hands</span
               >
               <a id="export-cycles" class="csv-link" download>⬇ CSV</a>
             </div>
           </header>
 
           <p class="hint">
-            Four return lenses; hover any cell for its formula:
+            Four ways to measure the return on one trade; hover any cell
+            for the exact numbers:
           </p>
 
           <ul class="hint-list">
-            <li><strong>ROI</strong>: net P/L incl. stock ÷ avg collateral</li>
-            <li>
-              <strong>Wheel ROC</strong>: option P/L only ÷ avg collateral
-            </li>
-            <li>
-              <strong>Net Option Yield</strong>: option P/L ÷ day-one collateral
-            </li>
-            <li>
-              <strong>Total Position ROI</strong>: option + stock P/L +
-              dividends ÷ day-one collateral
-            </li>
+            <li><strong>ROI</strong>: option profit plus realized share profit ÷ initial capital committed. Not annualized.</li>
+            <li><strong>Wheel ROC</strong>: option profit ÷ average capital committed, annualized. Measures option-selling return on capital.</li>
+            <li><strong>Net Option Yield</strong>: option profit ÷ initial capital committed, annualized. Excludes share P/L.</li>
+            <li><strong>Total Position ROI</strong>: option profit + share P/L + dividends ÷ initial capital committed, annualized.</li>
           </ul>
 
           <div style="overflow-x: auto">
@@ -780,8 +773,8 @@
 
       <div id="tab-planner" hidden>
         <p class="hint tab-intro">
-          What needs a look right now: open positions, what could be assigned,
-          what expires soon, and what the cash can do next.
+          What needs a look right now: open positions, where shares could
+          change hands, what expires soon, and what the cash can do next.
         </p>
 
         <details class="card" style="margin-bottom: var(--gap)">
@@ -790,7 +783,7 @@
           </summary>
           <img
             src="/wheel-strategy.png"
-            alt="Wheel strategy flowchart. Step 1, sell puts: find a stock meeting the selection criteria, sell a put at 30%+ annualized ROI with expiration timed to the day of the week (main trading window 9AM-12PM), immediately set a buy-to-close good-till-cancelled at 50% of the premium, then check the account daily: if the buy-to-close fills, repeat; if assigned instead, move to step 2. Step 2, sell calls: sell a call timed the same way, at the assigned put's strike if ROI is 30-150% annualized, or above it if ROI exceeds 150%; if ROI is too low, hold for recovery or sell the stock as a last resort, checking daily until conditions justify selling a call. Once a call is sold, immediately set a buy-to-close at 80% of the premium for the first 24 hours and 90% after; if the stock then gets called away, go back to step 1, otherwise keep checking daily."
+            alt="Wheel strategy flowchart. Step 1, sell puts: find a stock meeting the selection criteria, sell a put at 30%+ annualized ROI (return on investment, stated as a yearly rate) with expiration timed to the day of the week (main trading window 9AM-12PM), immediately set a buy-to-close good-till-cancelled at 50% of the premium, then check the account daily: if the buy-to-close fills, repeat; if assigned instead, move to step 2. Step 2, sell calls: sell a call timed the same way, at the assigned put's strike if ROI is 30-150% annualized, or above it if ROI exceeds 150%; if ROI is too low, hold for recovery or sell the stock as a last resort, checking daily until conditions justify selling a call. Once a call is sold, immediately set a buy-to-close at 80% of the premium for the first 24 hours and 90% after; if the stock then gets called away, go back to step 1, otherwise keep checking daily."
             style="max-width: 100%; margin-top: 12px; border-radius: 8px; border: 1px solid var(--border)"
           />
         </details>
@@ -811,18 +804,13 @@
 
           <ul class="hint-list">
             <li>
-              A full account snapshot: open short calls (CC) and puts (CSP),
-              long hedges (LP/LC), plus one row for any position with no
-              open contract right now, shares held with nothing written
-              against them (assigned shares, a plain buy-and-hold lot) or a
-              wheel between phases waiting for its next trade. Strike,
-              Expiration, ITM/OTM %, Qty, Net Premium and Annualized Yield
-              read as "-" there since they need an actual contract. Last
-              Price % and Breakeven still show (a position's own daily move
-              and raw cost basis need no contract either)
+              Shows open short <strong>CC</strong> and <strong>CSP</strong> positions, plus long puts/calls purchased as hedges.
             </li>
-            <li>Amber rows are longs; premium paid, not received</li>
-            <li>Click a heading to sort, or hover one for its exact math</li>
+            <li>
+              Uncovered share rows show stock-based metrics only. Option fields such as Strike, Expiration, Premium, Annualized Yield, and ITM/OTM are blank.
+            </li>
+            <li>Amber rows are long options purchased as insurance; premium was paid, not collected.</li>
+            <li>Click a column heading to sort; hover for the calculation.</li>
             <li id="open-positions-count"></li>
           </ul>
 
@@ -843,26 +831,13 @@
 
           <ul class="hint-list">
             <li>
-              A standing GTC buy-to-close ladder for each open short
-              put/call: three limit prices, 50% / 20% / 10% of the premium
-              collected, each rounded down to the nearest dime.
+              <strong>GTC BTC</strong>: suggested buy-to-close prices at 50%, 20%, and 10% of the original premium, rounded down to $0.10.
             </li>
             <li>
-              Which rung fits is a judgment call: 50% is the common
-              cash-secured-put target; 20% suits a covered call early in its
-              life (still mostly time value, worth holding for), 10% once
-              most of that has burned off (worth locking in sooner).
+              The suggested target depends on the position and time to expiration; use the level that fits your exit plan.
             </li>
             <li>
-              <strong>Min Roll Premium</strong>: the smallest credit per
-              share worth collecting to roll into a new contract rather than
-              take the assignment or call-away, sized to a 30% annualized
-              return on the strike over that contract's life. Rolls out to
-              next week's Friday for a ticker that actually lists weekly
-              expirations (checked against real data, cached); a
-              monthly-only ticker rolls to its own next real expiration
-              instead. Either way, never sooner than the current contract's
-              own expiry. Hover for the exact days and math.
+              <strong>Min Roll Premium</strong>: minimum premium per share for rolling to a later expiration, based on strike price, 30% annualized return, and days to the new expiration.
             </li>
           </ul>
 
@@ -885,8 +860,7 @@
           </header>
 
           <p class="hint" style="margin-top: 0">
-            The <strong>Open option positions</strong> table on a time line: one
-            bar per expiry date, each split into a segment per open leg.
+            Every open put and call grouped by expiration date.
           </p>
 
           <div class="exp-cal-range">
@@ -905,19 +879,13 @@
 
           <ul class="hint-list">
             <li>
-              <strong>The dashed line is today</strong>; a bar's distance to the
-              right is how far off it expires. The <em>Daily</em> button cycles
-              Daily / Weekly / Monthly.
+              <strong>Dashed vertical line</strong>: today. Bars farther right expire later. <em>Daily</em> switches Daily / Weekly / Monthly.
             </li>
             <li>
-              Set <strong>From</strong> / <strong>To</strong> to narrow the date
-              axis to a specific range, or scroll over the axis to zoom;
-              <strong>Reset</strong> returns to the full range.
+              <strong>From / To</strong>: set the displayed expiration range. Scroll to zoom; <strong>Reset</strong> restores the full range.
             </li>
             <li>
-              A <strong>red edge</strong> means the strike is past break-even: a
-              covered call below the wheel break-even, or a put whose stock is
-              under the assignment break-even, so resolving there books a loss.
+              <strong>Red edge</strong>: assignment or exercise at the strike would produce a loss based on the wheel's current breakeven.
             </li>
           </ul>
 
@@ -939,28 +907,19 @@
 
           <ul class="hint-list">
             <li>
-              Shares held with no covered call written against them; 100+
-              share lots lead the table, smaller lots follow with Target and
-              Qty blank
+              Shares you hold without an open covered call. Batches of 100+ shares are listed first; smaller batches are shown without a target quantity.
             </li>
             <li>
-              <strong>Target price for CC</strong>: floor strike, rounded up
-              to the next $0.50, the greatest of cost basis, breakeven,
-              wheel breakeven, and last close, so an assignment never loses
-              money. A floor, not a pick for richest premium
+              <strong>Target price for CC</strong>: minimum share price for a covered call that keeps the wheel profitable if assigned. It is a floor, not necessarily the highest-premium strike.
             </li>
             <li>
-              <strong>Current Wheel</strong>: click the id to jump to that
-              wheel's Trade Log
+              <strong>Current Wheel</strong>: click the ID to open that wheel in Trade Log.
             </li>
             <li>
-              <strong>Earnings</strong>: next report date (Yahoo); amber ⚠
-              within 14 days: think twice before writing into an earnings
-              print. Override in <code>data/earnings.json</code>
+              <strong>Earnings</strong>: next report date. Amber means earnings are within 14 days.
             </li>
             <li>
-              <strong>Sector</strong>: for diversification; best-effort,
-              blank if unknown
+              <strong>Sector</strong>: helps diversify exposure across industries.
             </li>
           </ul>
 
@@ -980,9 +939,7 @@
           </header>
 
           <p class="hint">
-            Account cash not already reserved against an open put: the dry
-            powder for writing a new CSP. Rough, not a trading limit: it ignores
-            margin buying power and broker reserves.
+            Cash available for new cash-secured puts after existing CSP collateral. This is an estimate, not a broker buying-power limit.
           </p>
 
           <div
@@ -992,21 +949,15 @@
 
           <ul class="hint-list" id="csp-candidates-hint" hidden>
             <li>
-              <strong
-                >Potential stocks for Cash-Secured Puts that currently can be
-                afforded in the account</strong
-              >
+              <strong>What this lists</strong>: stocks where one 100-share CSP can be fully collateralized with current available cash.
             </li>
             <li>
-              <strong>Filter Criteria</strong>: Stocks &amp; plain ETFs only; No
-              leveraged/inverse ETFs, closed-end funds, mutual funds, or LPs;
-              $10 &le; Stock Price &le; $350; Market cap &ge; $1B; 10-day avg
-              vol &gt; 1M
+              <strong>Filter Criteria</strong>: Stocks and plain ETFs only; excludes leveraged/inverse ETFs, CEFs, mutual funds, and LPs. Price $10–$350, market cap ≥$1B, and 10-day average volume &gt;1M shares.
             </li>
           </ul>
 
           <label class="csp-target-ctl" id="csp-target-ctl" hidden>
-            Target price for CSP:
+            Target price for a cash-secured put:
             <input
               type="number"
               id="csp-target-pct"
@@ -1050,8 +1001,9 @@
 
           <p class="hint" style="margin-top: 0">
             Fidelity's own closed-lots table: every position it has closed,
-            with the gain it recorded, and below it, a rough per-ticker
-            cross-check against the wheel engine's option P/L.
+            with the gain it recorded. A second table sets Fidelity's
+            per-stock figures beside the profit this app worked out from the
+            same trades, as a rough check that the two agree.
           </p>
 
           <div id="realized-gains-empty" class="hint" hidden>
@@ -1092,12 +1044,9 @@
           </header>
 
           <ul class="hint-list">
-            <li>A selected wheel shows end to end</li>
-            <li>
-              Otherwise follows the Dashboard date range (open wheels always
-              shown)
-            </li>
-            <li>Filter by ticker here</li>
+            <li>A selected wheel shows every trade from start to finish.</li>
+            <li>With no wheel selected, it shows trades in the selected date range plus all open wheels.</li>
+            <li>Filter the Trade Log by ticker.</li>
           </ul>
 
           <div class="tradelog-nav">
@@ -1150,7 +1099,8 @@
           </div>
 
           <div id="tradelog-empty" class="hint">
-            Pick a wheel above, or click one in Wheel timelines.
+            Choose a ticker and a wheel from the two dropdowns to see every
+            trade in it.
           </div>
 
           <div id="tradelog-note" class="notice" hidden></div>
@@ -1167,8 +1117,7 @@
             <div class="ti-head">Wheel timeline</div>
 
             <p class="hint" style="margin-top: 0">
-              Every share lot and option leg this wheel ever had, laid out by
-              date; a dashed arrow marks a roll from one leg into the next.
+              Shows every share position and option contract by date. A dashed arrow marks an option roll.
             </p>
 
             <div class="chart-scroll">
@@ -1183,7 +1132,11 @@
           </div>
 
           <div id="tradelog-breakeven" class="tradelog-ppd" hidden>
-            <div class="ti-head">Wheel profit over time</div>
+            <div class="ti-head">Break-even price over time</div>
+
+            <p class="hint" style="margin-top: 0">
+              The break-even share price after each transaction. It changes as option premium and dividends affect the position. The red line is today's price.
+            </p>
 
             <div class="chart-scroll">
               <svg id="chart-tradelog-breakeven" role="img"></svg>
@@ -1194,6 +1147,10 @@
 
           <div id="tradelog-ppd" class="tradelog-ppd" hidden>
             <div class="ti-head">PPD by week</div>
+
+            <p class="hint" style="margin-top: 0">
+              PPD: each bar is weekly option profit ÷ 7. The line is cumulative option profit ÷ elapsed days since the wheel started.
+            </p>
 
             <div class="chart-scroll">
               <svg id="chart-tradelog-ppd" role="img"></svg>
@@ -1206,8 +1163,8 @@
 
       <div id="tab-tools" hidden>
         <p class="hint tab-intro">
-          Modeling aids that answer "what if" questions, separate from the
-          trade data reported above.
+          Modeling aids that answer "what if" questions. Nothing here is real
+          trade history; it is all projection.
         </p>
 
         <section
@@ -1232,9 +1189,7 @@
           </header>
 
           <p class="hint" style="margin-top: 0">
-            Projects account growth at a fixed monthly rate from today's real
-            balance, with capital gains tax paid each March on the prior
-            calendar year's earnings.
+            A projection, not a forecast. It applies the selected annualized return to today's balance and models the stated tax treatment.
           </p>
 
           <div
@@ -1251,7 +1206,7 @@
               <select id="proj-balance-source">
                 <option value="full_value">Auto: Full account value</option>
                 <option value="avg_capital">
-                  Auto: Time-weighted avg capital
+                  Auto: Average capital tied up
                 </option>
                 <option value="manual">Manual entry</option>
               </select>
@@ -1269,18 +1224,22 @@
             </div>
 
             <div class="field">
-              <label for="proj-roi-source">Annual ROI source</label>
+              <label for="proj-roi-source">Yearly return rate, source</label>
               <select id="proj-roi-source">
-                <option value="wheel_roc">Auto: Annualized Wheel ROC</option>
+                <option value="wheel_roc">
+                  Auto: yearly rate from selling options, over all cash the
+                  wheels tied up
+                </option>
                 <option value="active_wheel_roc">
-                  Auto: Annualized Active Wheel ROC
+                  Auto: yearly rate from selling options, over only the cash
+                  backing an open put or call
                 </option>
                 <option value="manual">Manual entry</option>
               </select>
             </div>
 
             <div class="field">
-              <label for="proj-roi-manual">Annual ROI %</label>
+              <label for="proj-roi-manual">Yearly return rate %</label>
               <input
                 type="number"
                 id="proj-roi-manual"
@@ -1333,33 +1292,14 @@
           ></div>
 
           <ul class="hint-list">
-            <li>
-              Left of the red Today line is the account's real value from
-              your Portfolio Positions snapshots, starting at the dashboard's
-              selected date range; right of it is the projection
-            </li>
-            <li>
-              Monthly rate = (1 + annual ROI) ^ (1/12) - 1; the dashed gray
-              line is the same projection with no tax at all, for comparison
-            </li>
-            <li>
-              Each March, tax = rate times the net line's Jan-Dec earnings
-              from the prior year; the drop is a red dot, and the first
-              partial year only counts earnings from today through December
-            </li>
-            <li>
-              The final year's tax falls due the following March, after this
-              horizon ends, so it is not deducted here
-            </li>
-            <li>
-              A single account whose name says IRA, Roth, or 401k skips the
-              tax model entirely, since gains inside it are not taxed annually
-            </li>
-            <li>
-              Scroll over either axis's tick labels to zoom that axis; the
-              y-axis always zooms from $0, so it only trims the top; Reset
-              zoom returns to the full view
-            </li>
+            <li><strong>Solid line, left of today</strong>: actual historical account value.</li>
+            <li><strong>Dashed line, right of today</strong>: projected account value.</li>
+            <li><strong>Dashed gray line</strong>: same projection with no tax, showing the effect of taxes.</li>
+            <li>The annualized return is compounded monthly.</li>
+            <li>Tax is modeled each March using the prior calendar year's earnings.</li>
+            <li>The final year's tax is not subtracted because it falls after the projection ends.</li>
+            <li>Accounts named IRA, Roth, or 401k are modeled without annual tax.</li>
+            <li>Scroll over an axis to zoom; Reset zoom restores the full view.</li>
           </ul>
 
           <div class="chart-scroll">

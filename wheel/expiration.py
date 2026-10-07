@@ -59,15 +59,26 @@ def _loss_verdict(row: dict[str, Any]) -> tuple[bool, str | None]:
 
     if kind == "CC":
         if wheel_be is not None and strike is not None and strike < wheel_be:
-            return True, f"call strike ${strike:g} is below the wheel break-even ${wheel_be:,.2f} -- assignment locks in a loss on the shares"
+            return True, (
+                f"the ${strike:g} call strike is under ${wheel_be:,.2f}, the price these "
+                "shares must reach to cancel out their cost; if they are bought from you "
+                "here, the loss is locked in"
+            )
         return False, None
     if kind == "CSP":
         if last is not None and be is not None and last < be:
-            return True, f"{row.get('underlying')} ${last:,.2f} is below the put's break-even ${be:,.2f} -- assignment starts underwater"
+            return True, (
+                f"{row.get('underlying')} at ${last:,.2f} is under ${be:,.2f}, the price at "
+                "which this put breaks even; if the shares are put to you, they start out at "
+                "a loss"
+            )
         return False, None
     # Long protective / directional leg: at a loss once it has no intrinsic left.
     if not row.get("in_the_money"):
-        return True, "long leg is out of the money -- the debit is at risk if it expires here"
+        return True, (
+            "this option was bought for protection and the share price is on the wrong side "
+            "of its strike, so the money paid for it is lost if it expires here"
+        )
     return False, None
 
 
@@ -224,7 +235,9 @@ def expiration_calendar(
             "outcome": outcome,
             "at_a_loss": at_a_loss,
             "loss_note": (
-                f"{row.get('underlying')} {verb} at a loss ({rpl:,.0f})" if at_a_loss else None
+                f"{row.get('underlying')} {verb} at a loss of ${abs(rpl):,.0f}"
+                if at_a_loss
+                else None
             ),
             "earnings_before_expiry": False,
             "earnings_soon": False,
