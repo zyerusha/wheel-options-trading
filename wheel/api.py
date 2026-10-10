@@ -549,25 +549,16 @@ def _cc_strike_floor_fundamentals(
 ) -> list[tuple[str, float]]:
     """The non-``None`` cost/breakeven inputs to the profit-target floor,
     labeled -- shared by `_profit_target_floor` and its explanation so the two
-    can never disagree about which candidates actually fed it."""
+    can never disagree about which candidates actually fed it. Labels match
+    this row's own Cost Basis / Breakeven / Wheel Breakeven columns verbatim
+    (standard trader vocabulary, not a paraphrase) so a tooltip reader can
+    match these numbers to the row without translating terms."""
     candidates = [
-        ("average price paid per share", cost_basis),
-        ("price paid less the option premium already collected", position_breakeven),
-        ("price where every dollar paid and collected cancels out", wheel_breakeven),
+        ("cost basis", cost_basis),
+        ("breakeven", position_breakeven),
+        ("wheel breakeven", wheel_breakeven),
     ]
     return [(label, value) for label, value in candidates if value is not None]
-
-
-def _floor_candidates_text(
-    cost_basis: float | None,
-    position_breakeven: float | None,
-    wheel_breakeven: float | None,
-) -> str:
-    """The floor's candidate prices, each named in plain words and shown with
-    its own value, so a reader can see which one actually won rather than
-    being handed only the result."""
-    fundamentals = _cc_strike_floor_fundamentals(cost_basis, position_breakeven, wheel_breakeven)
-    return "; ".join(f"{label} ${value:.2f}" for label, value in fundamentals)
 
 
 def _profit_target_floor(
@@ -625,16 +616,20 @@ def _profit_target_explanation(
     wheel_breakeven: float | None = None,
 ) -> str:
     """Same 4-part shape as `_cc_strike_floor_explanation`: a formula line,
-    the substitution, the result, then a one-line caveat. The candidate prices
-    are spelled out with their own values so the floor can be checked."""
-    candidates = _floor_candidates_text(cost_basis, position_breakeven, wheel_breakeven)
-    detail = f"Highest of {candidates}\n" if candidates else ""
+    the substitution, the result, then a one-line caveat. Equation-first,
+    standard trader vocabulary (cost basis / breakeven / wheel breakeven,
+    matching their own columns) per feedback_concise_tooltips -- this is a
+    hover tooltip for an experienced options trader, not a beginner
+    explainer, so it leads with the math rather than paraphrasing it."""
+    fundamentals = _cc_strike_floor_fundamentals(cost_basis, position_breakeven, wheel_breakeven)
+    labels = ", ".join(label for label, _ in fundamentals)
+    values = ", ".join(f"${value:.2f}" for _, value in fundamentals)
+    multiplier = 1 + PROFIT_TARGET_CUSHION_PCT / 100
     return (
-        f"Profit Target: the share price worth selling at, so this position ends up ahead.\n"
-        f"{detail}"
-        f"= ${floor:.2f} plus a {PROFIT_TARGET_CUSHION_PCT:g}% cushion, rounded up to the next $0.50\n"
-        f"= ${target:.2f}\n\n"
-        f"A fixed line; it does not move when the share price moves."
+        f"Profit Target = max({labels}) × {multiplier:.2f}, rounded up to $0.50\n"
+        f"Floor = max({values}) = ${floor:.2f}\n"
+        f"= ${floor:.2f} × {multiplier:.2f} = ${target:.2f}\n\n"
+        f"Fixed; doesn't move with the share price."
     )
 
 
@@ -661,22 +656,24 @@ def _cc_strike_floor_explanation(
     current_price: float | None,
     cushion_pct: float = PROFIT_TARGET_CUSHION_PCT,
 ) -> str:
-    """Spells out its own cushioned floor inline (cost basis / breakeven /
-    wheel breakeven) rather than naming the separate Profit Target column,
-    so this tooltip stands on its own even though the two share a formula."""
+    """Equation-first, standard trader vocabulary, same shape as
+    `_profit_target_explanation` (formula, substitution, result, one-line
+    caveat; per feedback_concise_tooltips). Shares that function's Profit
+    Target floor formula but spells the floor out inline here -- rather than
+    naming the separate Profit Target column -- so this tooltip stands on
+    its own."""
     floor = _profit_target_floor(cost_basis, position_breakeven, wheel_breakeven)
-    cushioned_text = f"${floor * (1 + cushion_pct / 100):.2f}" if floor is not None else "n/a"
+    multiplier = 1 + cushion_pct / 100
+    cushioned_text = f"${floor * multiplier:.2f}" if floor is not None else "n/a"
     price_text = f"${current_price:.2f}" if current_price is not None else "n/a"
-    candidates = _floor_candidates_text(cost_basis, position_breakeven, wheel_breakeven)
-    detail = f"Highest of {candidates}, plus {cushion_pct:g}% = {cushioned_text}\n" if candidates else ""
+    fundamentals = _cc_strike_floor_fundamentals(cost_basis, position_breakeven, wheel_breakeven)
+    values = ", ".join(f"${value:.2f}" for _, value in fundamentals)
+    detail = f"Profit Target floor = max({values}) × {multiplier:.2f} = {cushioned_text}\n" if values else ""
     return (
-        f"CC to exit: the lowest strike worth selling a covered call at, so that having the "
-        f"shares bought from you still leaves this position ahead.\n"
+        f"CC to exit = max(Profit Target floor, last price), rounded up to $0.50\n"
         f"{detail}"
-        f"= higher of {price_text} (today's last price) and {cushioned_text}, rounded up to "
-        f"the next $0.50\n"
-        f"= ${strike:.2f}\n\n"
-        f"A lower limit only; it does not say which strike pays the most."
+        f"= max({cushioned_text}, {price_text}) = ${strike:.2f}\n\n"
+        f"A lower limit only; it doesn't say which strike pays the most."
     )
 
 
