@@ -30,12 +30,12 @@ class TestFlows(unittest.TestCase):
         self.assertEqual(row["period"], "2025-06-02")
         self.assertEqual(row["week_start"], "2025-06-02")
         self.assertEqual(row["week_end"], "2025-06-08")
-        self.assertAlmostEqual(row["net_premium"], 150.0, places=2)
-        self.assertEqual(row["closed_pl"], 0.0)
-        self.assertAlmostEqual(row["net_pl"], 150.0, places=2)
+        self.assertAlmostEqual(row["option_pl"], 150.0, places=2)
+        self.assertEqual(row["stock_pl"], 0.0)
+        self.assertAlmostEqual(row["total_realized_pl"], 150.0, places=2)
         self.assertNotIn("open_pl", row)
 
-    def test_stock_disposal_lands_in_closed_pl(self):
+    def test_stock_disposal_lands_in_stock_pl(self):
         cycles, _ = build_cycles(
             [
                 tx("2025-06-01", BUY_STOCK, "XYZ", 100, 50.0, -5000.0, row_id=1),
@@ -44,9 +44,9 @@ class TestFlows(unittest.TestCase):
         )
         rows = periodic_pl_series(cycles, date(2025, 6, 10), "week")
         by_week = {row["period"]: row for row in rows}
-        self.assertAlmostEqual(by_week["2025-06-09"]["closed_pl"], 1000.0, places=2)
-        self.assertEqual(by_week["2025-06-09"]["net_premium"], 0.0)
-        self.assertAlmostEqual(by_week["2025-06-09"]["net_pl"], 1000.0, places=2)
+        self.assertAlmostEqual(by_week["2025-06-09"]["stock_pl"], 1000.0, places=2)
+        self.assertEqual(by_week["2025-06-09"]["option_pl"], 0.0)
+        self.assertAlmostEqual(by_week["2025-06-09"]["total_realized_pl"], 1000.0, places=2)
 
     def test_zero_fill_between_active_weeks(self):
         cycles, _ = build_cycles(
@@ -57,8 +57,8 @@ class TestFlows(unittest.TestCase):
         )
         rows = periodic_pl_series(cycles, date(2025, 6, 20), "week")
         self.assertEqual([r["period"] for r in rows], ["2025-06-02", "2025-06-09", "2025-06-16"])
-        self.assertEqual(rows[1]["net_pl"], 0.0)
-        self.assertEqual(rows[2]["net_pl"], 0.0)
+        self.assertEqual(rows[1]["total_realized_pl"], 0.0)
+        self.assertEqual(rows[2]["total_realized_pl"], 0.0)
 
     def test_no_activity_returns_no_rows(self):
         self.assertEqual(periodic_pl_series([], date(2025, 6, 20), "week"), [])
@@ -84,8 +84,8 @@ class TestFlows(unittest.TestCase):
         self.assertEqual([r["period"] for r in rows], ["2025-06", "2025-07"])
         self.assertEqual(rows[0]["year"], 2025)
         self.assertEqual(rows[0]["month"], 6)
-        self.assertAlmostEqual(rows[0]["net_premium"], 150.0, places=2)
-        self.assertAlmostEqual(rows[1]["net_premium"], 80.0, places=2)
+        self.assertAlmostEqual(rows[0]["option_pl"], 150.0, places=2)
+        self.assertAlmostEqual(rows[1]["option_pl"], 80.0, places=2)
 
     def test_bad_granularity_raises(self):
         with self.assertRaises(ValueError):
@@ -102,9 +102,9 @@ class TestCombine(unittest.TestCase):
                             "period": "2025-06-02",
                             "week_start": "2025-06-02",
                             "week_end": "2025-06-08",
-                            "net_premium": 100.0,
-                            "closed_pl": 0.0,
-                            "net_pl": 100.0,
+                            "option_pl": 100.0,
+                            "stock_pl": 0.0,
+                            "total_realized_pl": 100.0,
                         }
                     ],
                     "months": [],
@@ -117,9 +117,9 @@ class TestCombine(unittest.TestCase):
                             "period": "2025-06-02",
                             "week_start": "2025-06-02",
                             "week_end": "2025-06-08",
-                            "net_premium": 20.0,
-                            "closed_pl": 10.0,
-                            "net_pl": 30.0,
+                            "option_pl": 20.0,
+                            "stock_pl": 10.0,
+                            "total_realized_pl": 30.0,
                         }
                     ],
                     "months": [],
@@ -131,9 +131,9 @@ class TestCombine(unittest.TestCase):
         row = combined[0]
         self.assertEqual(row["period"], "2025-06-02")
         self.assertEqual(row["week_start"], "2025-06-02")
-        self.assertAlmostEqual(row["net_premium"], 120.0, places=2)
-        self.assertAlmostEqual(row["closed_pl"], 10.0, places=2)
-        self.assertAlmostEqual(row["net_pl"], 130.0, places=2)
+        self.assertAlmostEqual(row["option_pl"], 120.0, places=2)
+        self.assertAlmostEqual(row["stock_pl"], 10.0, places=2)
+        self.assertAlmostEqual(row["total_realized_pl"], 130.0, places=2)
         self.assertNotIn("open_pl", row)
 
     def test_combine_tolerates_missing_key(self):

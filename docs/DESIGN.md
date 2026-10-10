@@ -758,17 +758,60 @@ marker at its current level) and per wheel inside each Trade Log entry (empty fo
 non-wheel cycle). The Combined view sums each account's wheel-only daily P&L
 (`pnl_series_wheel`) before bucketing.
 
-### Periodic P/L histogram
+### Monthly cash flow
 
-`metrics.periodic_pl_series(cycles, through, granularity)` buckets `net_premium`
-(realized option P/L) and `closed_pl` (realized stock P/L from shares sold or
+`cashflow.monthly_cashflow_series(transactions, capital_points, through, since)`
+buckets realized cash flow into calendar months: `gross_credits` (premium sold,
+dividends), `gross_debits` and `fees` (BTC costs, protective-option premiums
+paid; assignment/exercise move shares, not cash, and never appear here),
+`net_cash_flow = gross_credits - gross_debits - fees`. Dated to the
+transaction's own `event_date` (settlement), not to when a position closes --
+see `realized_pl_series`/`periodic_pl_series` below for the close-dated view.
+Zero-filled between the first and last active month like every bucketed series
+here.
+
+The Dashboard renders it as the *Monthly cash flow* card: one diverging
+stacked bar per month -- `gross_credits` stacked above zero (In), `gross_debits
++ fees` stacked below (Out) -- via `drawCashFlow` in `wheel/static/app.js`,
+the same stacked-bar idiom `drawPeriodPl` uses, so composition and net
+direction read in one glance. Wheel realized P/L (`monthlyWheelPl`, `pnl_series`
+rebucketed to calendar months) is overlaid as its own line rather than a third
+stacked segment: it is not additive with In/Out, since it is a different,
+close-dated view of overlapping cash, not a component of this month's cash
+total. The gap between a tall In bar and a flat realized-P/L line is the
+chart's whole point -- cash books a credit the moment premium is *sold*, wheel
+P/L only once a leg actually *closes* -- and is why this card alone cannot
+answer "is this reliable as monthly income"; the *Months profitable* tile
+(`renderCashFlowTiles`) answers that directly, as a win rate over
+`monthlyWheelPl`'s per-month `total_pl` (same win/loss convention as the
+Performance tile's leg-level win rate: an exactly-$0 month counts toward
+neither side, and the tile reads "N/A" rather than a misleading 0% when no
+month has a decided result yet). A one-item transparent hit rectangle spans
+each month's full column (not just its bars) so hovering anywhere -- including
+a real $0 month, drawn as a flat baseline tick rather than an empty gap --
+surfaces one combined tooltip with the cash-flow breakdown and the wheel
+realized P/L for that month together, rather than two separate tooltips on two
+separate marks as an earlier grouped-bar version had.
+
+Two reference lines average over every month on display: a dashed line at
+`range_summary`'s `avg_monthly_income`, a dotted line (wheel's own color) at
+the plain mean of `monthlyWheelPl`'s `total_pl`. Both are display-only
+averages recomputed whenever the displayed range changes, never persisted.
+
+### Periodic P/L
+
+`metrics.periodic_pl_series(cycles, through, granularity)` buckets `option_pl`
+(realized option P/L) and `stock_pl` (realized stock P/L from shares sold or
 called away) into ISO weeks (Monday-anchored) or calendar months, zero-filled
 between the first active bucket and `through` like every other bucketed series
 here. Both are period *flows*, summed from `cycles`' `realized_pl_series` output
 (option legs dated to close, share lots dated to disposal) -- typically the
 caller's ticker/date/status-filtered cycles, matching `pnl_series` elsewhere.
-`net_pl` is their sum, deliberately realized-only to match `net_realized_pl`
-everywhere else on the dashboard.
+`total_realized_pl` is their sum, deliberately realized-only to match
+`net_realized_pl` everywhere else on the dashboard. (Field names here are
+scoped to this series only -- `net_premium` elsewhere on the dashboard, e.g.
+the Open Positions table, is an unrelated figure: cash still standing on an
+*open* leg, not a realized flow.)
 
 An earlier version also carried `open_pl`, a running mark-to-market snapshot of
 today's still-held shares (fixed share count, re-priced at each bucket's own
@@ -778,22 +821,33 @@ something happen this period, or is this just the same holding re-priced?"),
 and the figure it wanted already exists per-position elsewhere on the dashboard
 (the Trade Log's mark-to-market P&L, the Open Positions table's breakeven
 coloring) -- so it added confusion without adding information the reader
-couldn't already get, more clearly, somewhere else.
+couldn't already get, more clearly, somewhere else. This is also why the card
+still carries no cumulative line and no ROC: both already exist one card up, in
+*Cumulative Wheel P/L* (`drawPnl`) -- this card's whole reason to exist is the
+period-by-period breakdown and volatility that a cumulative view smooths away.
 
 The Dashboard computes both granularities on every `build()` call (`period_pl.weeks`
 / `period_pl.months`) -- filter-dependent, unlike the Trade Log/hedges/positions
 tables, so it is never cached across calls the way those are. `since` (a `start`
 filter) is applied afterward as a pure display crop over the finished rows, safe
 because neither series carries anything cumulative across buckets. The dashboard
-renders it as the *Periodic P/L* card: one grouped-bar cluster per period (Net
-Premium, Closed P/L, Net P/L), each series a fixed identity color -- a bar's own
-height/direction off the zero line already shows profit vs. loss, so color
-answers "which metric," never "up or down" (the same discipline `drawCashFlow`'s
-fixed wheel-color bar already follows). A toggle button swaps between the two
-already-fetched series client-side, no refetch. The Combined view merges
-accounts via `_combine_period_pl`, summing by the shared `period` key -- safe
-because `period` is a deterministic function of the calendar (unlike a capital
-or P/L date series, nothing here is cumulative across periods).
+renders it as the *Periodic P/L* card: one diverging stacked bar per period
+(`drawPeriodPl`, via `stackPeriodPl`), Option P/L and Stock P/L each a fixed
+identity color stacked from a shared zero baseline -- same-signed values stack
+contiguously (whichever series comes first in `PERIOD_PL_SERIES` sits against
+the zero line), opposite-signed values extend to opposite sides of zero instead
+of overlapping, so a mixed period never visually cancels itself out. A $0
+period (zero-filled, not missing) draws a flat tick on the baseline rather than
+an empty column, and a transparent full-height hit rectangle per period (not
+just its bar) keeps every period -- including $0 ones -- hoverable/focusable
+for the Option/Stock/Total breakdown tooltip. A compact summary row above the
+chart (`#period-pl-summary`) sums exactly the rows on display -- the full
+history, or the cropped range when `since` is set. A toggle button swaps
+between the two already-fetched granularities client-side, no refetch. The
+Combined view merges accounts via `_combine_period_pl`, summing by the shared
+`period` key -- safe because `period` is a deterministic function of the
+calendar (unlike a capital or P/L date series, nothing here is cumulative
+across periods).
 
 ### Cost basis: tax basis vs. net adjusted cost basis
 

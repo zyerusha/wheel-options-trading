@@ -492,10 +492,11 @@
               </header>
 
               <ul class="hint-list">
-                <li>Actual cash movement, using the settlement date.</li>
+                <li>Bars: actual cash movement, using the settlement date.</li>
                 <li><strong>In</strong>: option premium received and dividends.</li>
                 <li><strong>Out</strong>: BTC costs and premiums paid for protective options.</li>
-                <li>Assignment and exercise move shares, not cash, so they are excluded from cash flow.</li>
+                <li>Assignment and exercise move shares, not cash, so they are excluded from the bars.</li>
+                <li><strong>Wheel realized P/L</strong> (line): money from positions that have actually closed - the real test of profitability, since cash can come in before a position closes.</li>
               </ul>
 
               <div class="tiles" id="cashflow-tiles"></div>
@@ -533,11 +534,13 @@
               </header>
 
               <ul class="hint-list">
-                <li>Realized P/L, dated to the trade close date.</li>
-                <li><strong>Net Premium</strong>: STO premium minus BTC cost.</li>
-                <li><strong>Closed P/L</strong>: realized P/L on shares sold.</li>
-                <li><strong>Net P/L</strong>: net option premium plus realized stock P/L.</li>
+                <li>Realized P/L by period, dated to when a trade closes - not when cash settles.</li>
+                <li><strong>Option P/L</strong>: realized profit/loss from options that closed this period.</li>
+                <li><strong>Stock P/L</strong>: realized profit/loss from shares sold or called away this period.</li>
+                <li><strong>Total Realized P/L</strong>: Option P/L + Stock P/L.</li>
               </ul>
+
+              <div class="legend" id="period-pl-summary"></div>
 
               <div class="chart-scroll">
                 <svg id="chart-period-pl" role="img"></svg>

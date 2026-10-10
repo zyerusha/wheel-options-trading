@@ -1295,16 +1295,16 @@ def _combine_period_pl(payloads: dict[str, dict], key: str) -> list[dict]:
                 {
                     field_name: row[field_name]
                     for field_name in row
-                    if field_name not in ("net_premium", "closed_pl", "net_pl")
+                    if field_name not in ("option_pl", "stock_pl", "total_realized_pl")
                 },
             )
-            for field_name in ("net_premium", "closed_pl", "net_pl"):
+            for field_name in ("option_pl", "stock_pl", "total_realized_pl"):
                 bucket[field_name] = bucket.get(field_name, 0.0) + (row.get(field_name) or 0.0)
 
     rows = []
     for period in sorted(buckets):
         row = dict(buckets[period])
-        for field_name in ("net_premium", "closed_pl", "net_pl"):
+        for field_name in ("option_pl", "stock_pl", "total_realized_pl"):
             row[field_name] = round(row.get(field_name, 0.0), 2)
         rows.append(row)
     return rows

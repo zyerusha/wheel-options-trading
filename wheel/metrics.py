@@ -1341,20 +1341,20 @@ def _next_month_start(start: date) -> date:
 
 
 def periodic_pl_series(cycles: Sequence[Cycle], through: date, granularity: str) -> list[dict]:
-    """Net Premium / Closed P/L / Net P/L, one row per ISO week (Monday-anchored)
-    or calendar month -- the Dashboard's "Periodic P/L" histogram, one bucket
-    size shared by both weekly and monthly rows so the frontend can toggle
-    without a refetch.
+    """Option P/L / Stock P/L / Total Realized P/L, one row per ISO week
+    (Monday-anchored) or calendar month -- the Dashboard's "Periodic P/L" card,
+    one bucket size shared by both weekly and monthly rows so the frontend can
+    toggle without a refetch.
 
     Every figure here is a period *flow*, summed from ``cycles`` (typically the
     caller's ticker/date/status-filtered cycles, matching ``pnl_series``
     elsewhere): whatever realized option/stock P/L landed in that bucket -- the
     same event-dated figures :func:`realized_pl_series` reports day by day
     (option legs dated to close, share lots dated to disposal). A quiet bucket
-    is a real $0, not a gap. ``net_premium`` and ``closed_pl`` are the two
-    sources; ``net_pl`` is their sum, deliberately realized-only -- it matches
-    ``net_realized_pl`` everywhere else on the dashboard (the Cycles table,
-    Realized P/L by ticker) rather than blending in an unrealized figure.
+    is a real $0, not a gap. ``option_pl`` and ``stock_pl`` are the two
+    sources; ``total_realized_pl`` is their sum, deliberately realized-only --
+    it matches ``net_realized_pl`` everywhere else on the dashboard (the Cycles
+    table, Realized P/L by ticker) rather than blending in an unrealized figure.
 
     An earlier version of this also carried ``open_pl``, a running
     mark-to-market snapshot of still-held shares -- withdrawn because it isn't
@@ -1391,9 +1391,9 @@ def periodic_pl_series(cycles: Sequence[Cycle], through: date, granularity: str)
 
         row = {
             "period": start.isoformat() if granularity == "week" else f"{start.year:04d}-{start.month:02d}",
-            "net_premium": round(option_pl, 2),
-            "closed_pl": round(stock_pl, 2),
-            "net_pl": round(option_pl + stock_pl, 2),
+            "option_pl": round(option_pl, 2),
+            "stock_pl": round(stock_pl, 2),
+            "total_realized_pl": round(option_pl + stock_pl, 2),
         }
         if granularity == "week":
             row["week_start"] = start.isoformat()

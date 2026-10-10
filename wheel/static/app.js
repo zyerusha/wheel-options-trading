@@ -68,7 +68,7 @@ const state = {
   // on top -- the default, the account's recent history first) or 'ticker' (A-Z,
   // a ticker's cycles together, best for lookup). View-only, changes no data.
   timelineSort: 'time',
-  // Bucket size for the Periodic P/L histogram: 'month' or 'week'. Both are
+  // Bucket size for the Periodic P/L chart: 'month' or 'week'. Both are
   // already in the payload (data.period_pl.months / .weeks), so switching is
   // a redraw from already-fetched data, not a refetch.
   periodPlGranularity: 'month',
@@ -2085,28 +2085,35 @@ function weeklyWheelPl(rows, pnlSeries) {
 }
 
 /**
- * Realized wheel cash flow by calendar month: two grouped bars per month --
- * net cash flow (blue above zero for a credit month, red below for a debit
- * one) beside realized wheel P/L (a fixed color, since it needs its own
- * identity distinct from the credit/debit coloring, and can itself be
- * positive or negative). Reuses `frame()` for the y-scale/gridlines, same as
- * every other dollar chart, but the x-axis is categorical (one slot per
- * month) rather than the continuous date scale `timeAxis()` assumes.
+ * Realized wheel cash flow by calendar month: one diverging stacked bar per
+ * month -- cash In (credits: premium sold, dividends) stacked above zero,
+ * cash Out (debits + fees: BTC costs, protective premiums paid) stacked
+ * below -- the same stacked-bar idiom `drawPeriodPl` uses, so composition
+ * (how much came in vs. went out) and net direction read in one glance. Reuses
+ * `frame()` for the y-scale/gridlines, same as every other dollar chart, but
+ * the x-axis is categorical (one slot per month) rather than the continuous
+ * date scale `timeAxis()` assumes.
  *
- * The two bars answer the question this chart exists to make visible: cash
- * flow books a credit the moment premium is *sold* (STO), wheel P/L only
- * once the leg actually *closes* -- so a month that is heavy on new short
- * premium but light on closes shows a tall cash-flow bar next to a short
- * wheel-P/L one, and that gap is the point, not a bug. See the dashboard's
- * explanation for the full mechanics (also in docs/DESIGN.md).
+ * Realized wheel P/L is overlaid as its own line, not a third stacked
+ * segment -- it is not additive with In/Out (it is a different, event-dated
+ * view of overlapping cash, not a component of this month's cash total) and
+ * answers a different question than the bars do. Cash flow books a credit
+ * the moment premium is *sold* (STO); wheel P/L only once the leg actually
+ * *closes*. So a month heavy on new short premium but light on closes shows
+ * a tall In segment next to a flat wheel-P/L line -- that gap is the whole
+ * point of showing both: it is what separates "cash is coming in" from "the
+ * wheel is actually profitable," which is what decides whether this can be
+ * relied on as real monthly income. See the dashboard's explanation for the
+ * full mechanics (also in docs/DESIGN.md).
  *
  * Two reference lines, averaged over every month `rows` shows (the same
  * selected-range summary `renderCashFlowTiles`'s "Avg monthly income" tile
  * uses -- see `wheel.cashflow.range_summary`): a dashed red line at the
- * range's avg monthly income, and a dotted orange line at its avg wheel
- * realized P/L. Both are plain averages, not clamped to zero, so a losing
- * range draws its line below the zero axis exactly like a losing month's bar
- * would -- no separate handling for a negative average anywhere here.
+ * range's avg monthly income, and a dotted line (wheel's own color) at its
+ * avg wheel realized P/L. Both are plain averages, not clamped to zero, so a
+ * losing range draws its line below the zero axis exactly like a losing
+ * month's bar would -- no separate handling for a negative average anywhere
+ * here.
  */
 function drawCashFlow(rows, trailing, pnlSeries) {
   const svg = $('chart-cashflow');
@@ -2133,7 +2140,13 @@ function drawCashFlow(rows, trailing, pnlSeries) {
   const margin = { top: 14, right: 20, bottom: 30, left: 62 };
   const width = chartWidth(svg);
   const height = 260;
-  const values = [...rows.map((row) => row.net_cash_flow), ...wheelPl.map((w) => w.total_pl)];
+  // Gross In/Out, not just their net, so the bars honestly show how much
+  // actually moved each direction -- a high-turnover month (big credits, big
+  // debits, small net) needs an axis tall enough to fit the gross legs, not
+  // just the net that's left over.
+  const inFlow = rows.map((row) => row.gross_credits);
+  const outFlow = rows.map((row) => -(row.gross_debits + row.fees));
+  const values = [...inFlow, ...outFlow, ...wheelPl.map((w) => w.total_pl)];
   if (avgIncome !== null && avgIncome !== undefined) values.push(avgIncome);
   if (avgWheelPl !== null && avgWheelPl !== undefined) values.push(avgWheelPl);
   const yMin = Math.min(0, ...values) * 1.15;
@@ -2142,45 +2155,126 @@ function drawCashFlow(rows, trailing, pnlSeries) {
   const { group, plotWidth, plotHeight, y } = frame(svg, { width, height, margin, yMin, yMax });
 
   const slot = plotWidth / rows.length;
-  const groupGap = 3;
-  const groupWidth = Math.max(10, Math.min(46, slot * 0.62));
-  const barWidth = Math.max(3, (groupWidth - groupGap) / 2);
-  const positive = cssVar('--pos');
-  const negative = cssVar('--neg');
+  const barWidth = Math.max(8, Math.min(48, slot * 0.6));
+  const hitWidth = Math.max(barWidth, Math.min(slot * 0.9, slot - 2));
+  const positive = cssVar('--pos'); // credit/inflow identity -- direction, not P/L sign
+  const negative = cssVar('--neg'); // debit/outflow identity -- direction, not P/L sign
   const wheelColor = cssVar('--series-2'); // same color drawPnl() uses for "Full wheel P/L"
   const zeroY = y(0);
+  const centers = rows.map((_, index) => margin.left + slot * (index + 0.5));
 
   group.appendChild(
     svgEl('line', { class: 'axis-line', x1: margin.left, x2: margin.left + plotWidth, y1: zeroY, y2: zeroY })
   );
 
+  // Phase 1: In/Out bars for every month, bottom layer.
+  rows.forEach((_, index) => {
+    const cx = centers[index];
+    const inValue = inFlow[index];
+    const outValue = outFlow[index];
+
+    if (inValue > 0) {
+      const barHeight = Math.max(zeroY - y(inValue), 1.5);
+      group.appendChild(
+        svgEl('rect', {
+          class: 'mark',
+          x: cx - barWidth / 2,
+          y: y(inValue),
+          width: barWidth,
+          height: barHeight,
+          rx: 3,
+          fill: positive,
+        })
+      );
+    }
+    if (outValue < 0) {
+      const barHeight = Math.max(y(outValue) - zeroY, 1.5);
+      group.appendChild(
+        svgEl('rect', {
+          class: 'mark',
+          x: cx - barWidth / 2,
+          y: zeroY,
+          width: barWidth,
+          height: barHeight,
+          rx: 3,
+          fill: negative,
+        })
+      );
+    }
+    if (inValue === 0 && outValue === 0) {
+      // A real $0 month, not a gap -- a flat tick on the baseline instead of
+      // an empty column that would otherwise read as missing data.
+      group.appendChild(
+        svgEl('rect', { x: cx - barWidth / 2, y: zeroY - 1, width: barWidth, height: 2, rx: 1, fill: cssVar('--axis') })
+      );
+    }
+  });
+
+  // Phase 2: wheel realized P/L as a connected line + per-month dot, on top
+  // of the bars -- see the function doc for why it's a line, not a third
+  // stacked segment.
+  const wheelPath = centers.map((cx, index) => `${cx},${y(wheelPl[index].total_pl)}`).join('L');
+  group.appendChild(
+    svgEl('path', {
+      d: 'M' + wheelPath,
+      fill: 'none',
+      stroke: wheelColor,
+      'stroke-width': 2,
+      'stroke-linejoin': 'round',
+      'stroke-linecap': 'round',
+    })
+  );
+  wheelPl.forEach((wp, index) => {
+    group.appendChild(
+      svgEl('circle', {
+        cx: centers[index],
+        cy: y(wp.total_pl),
+        r: 3,
+        fill: wheelColor,
+        stroke: cssVar('--surface-1'),
+        'stroke-width': 1.5,
+      })
+    );
+  });
+
+  // Phase 3: one transparent hit target per column, topmost so it receives
+  // the pointer over both the bars and the line -- spans the whole column,
+  // not just the bars, so hovering anywhere over a month (including a $0
+  // one) shows the full cash-flow-and-wheel-P/L breakdown together.
   rows.forEach((row, index) => {
-    const cx = margin.left + slot * (index + 0.5);
-    const cashX = cx - groupWidth / 2;
-    const wheelX = cashX + barWidth + groupGap;
-
-    const value = row.net_cash_flow;
-    const barTop = value >= 0 ? y(value) : zeroY;
-    const barHeight = Math.max(Math.abs(y(value) - zeroY), value === 0 ? 0 : 1.5);
-    const rect = svgEl('rect', {
-      class: 'mark',
-      x: cashX,
-      y: barTop,
-      width: barWidth,
-      height: barHeight,
-      rx: 3,
-      fill: value < 0 ? negative : positive,
+    const cx = centers[index];
+    const wp = wheelPl[index];
+    const hit = svgEl('rect', {
+      class: 'hit',
+      x: cx - hitWidth / 2,
+      y: margin.top,
+      width: hitWidth,
+      height: plotHeight,
+      tabindex: '0',
+      'aria-label': `${monthLabel(row.period)}: net cash flow ${money(row.net_cash_flow, {
+        cents: true,
+        sign: true,
+      })}, wheel realized P/L ${money(wp.total_pl, { cents: true, sign: true })}`,
     });
-    group.appendChild(rect);
-
+    group.appendChild(hit);
     attachTip(
-      rect,
+      hit,
       monthLabel(row.period),
       [
         { label: 'Gross credits', value: money(row.gross_credits, { cents: true }) },
         { label: 'Gross debits', value: money(row.gross_debits, { cents: true }) },
         { label: 'Fees', value: money(row.fees, { cents: true }) },
-        { label: 'Net cash flow', value: money(row.net_cash_flow, { cents: true }) },
+        {
+          label: 'Net cash flow',
+          value: money(row.net_cash_flow, { cents: true, sign: true }),
+          valueClass: row.net_cash_flow < 0 ? 'neg' : 'pos',
+        },
+        {
+          label: 'Wheel realized P/L',
+          value: money(wp.total_pl, { cents: true, sign: true }),
+          color: wheelColor,
+          valueClass: wp.total_pl < 0 ? 'neg' : 'pos',
+        },
         { label: 'Avg collateral', value: money(row.avg_collateral) },
         { label: 'Monthly yield', value: pct(row.monthly_yield_pct, 2) },
       ],
@@ -2189,46 +2283,26 @@ function drawCashFlow(rows, trailing, pnlSeries) {
         `= ${money(row.gross_credits, { cents: true })} - ${money(row.gross_debits, { cents: true })} - ${money(row.fees, { cents: true })}`,
         `= ${money(row.net_cash_flow, { cents: true })}`,
         '',
+        'Wheel realized P/L = Premium collected (net) + Stock P/L',
+        '  Dated to when a leg closes or a share lot is sold,',
+        '  not to when premium was sold (unlike Net cash flow).',
+        `= ${money(wp.option_pl, { cents: true })} + ${money(wp.stock_pl, { cents: true })}`,
+        `= ${money(wp.total_pl, { cents: true })}`,
+        '',
         'Monthly yield % = Net cash flow ÷ Avg allocated collateral × 100',
         `= ${money(row.net_cash_flow, { cents: true })} ÷ ${money(row.avg_collateral)} × 100`,
         `= ${row.monthly_yield_pct === null ? 'N/A; no collateral committed this month' : pct(row.monthly_yield_pct, 2)}`,
       ])
     );
-
-    const wp = wheelPl[index];
-    const wheelTop = wp.total_pl >= 0 ? y(wp.total_pl) : zeroY;
-    const wheelHeight = Math.max(Math.abs(y(wp.total_pl) - zeroY), wp.total_pl === 0 ? 0 : 1.5);
-    const wheelRect = svgEl('rect', {
-      class: 'mark',
-      x: wheelX,
-      y: wheelTop,
-      width: barWidth,
-      height: wheelHeight,
-      rx: 3,
-      fill: wheelColor,
-    });
-    group.appendChild(wheelRect);
-
-    attachTip(
-      wheelRect,
-      `${monthLabel(row.period)}, wheel realized P/L`,
-      [
-        { label: 'Premium collected (net)', value: money(wp.option_pl, { cents: true }) },
-        { label: 'Stock P/L', value: money(wp.stock_pl, { cents: true }) },
-        { label: 'Wheel realized P/L', value: money(wp.total_pl, { cents: true }) },
-        { label: 'Net cash flow (this month)', value: money(row.net_cash_flow, { cents: true }) },
-      ],
-      formula([
-        'Wheel realized P/L = Premium collected (net) + Stock P/L',
-        '  Dated to when a leg closes or a share lot is sold,',
-        '  not to when premium was sold (unlike Net cash flow).',
-        '',
-        `= ${money(wp.option_pl, { cents: true })} + ${money(wp.stock_pl, { cents: true })}`,
-        `= ${money(wp.total_pl, { cents: true })}`,
-      ])
-    );
   });
 
+  // Reference lines only, no floating in-chart labels: now that the axis has
+  // to stretch to fit gross In/Out (not just the smaller net/wheel-P/L
+  // figures it used to), both averages sit close to zero, right where bars
+  // are densest -- a floating label there collides with whatever bar is
+  // underneath no matter which edge it's anchored to. The exact figure is
+  // already in the legend below and in the line's own tooltip; the line
+  // itself is still exact and still hoverable.
   if (avgIncome !== null && avgIncome !== undefined) {
     const avgY = y(avgIncome);
     const avgColor = cssVar('--neg');
@@ -2253,30 +2327,13 @@ function drawCashFlow(rows, trailing, pnlSeries) {
         `= ${money(avgIncome, { cents: true })}`,
       ])
     );
-    // Clamp so the label never clips past the plot's top/bottom edge when
-    // the line sits close to either one.
-    const labelY = Math.min(Math.max(avgY - 4, margin.top + 10), margin.top + plotHeight - 4);
-    group.appendChild(
-      svgEl(
-        'text',
-        {
-          class: 'tick-label',
-          x: margin.left + plotWidth - 4,
-          y: labelY,
-          'text-anchor': 'end',
-          fill: avgColor,
-        },
-        `Avg monthly income · ${money(avgIncome, { cents: true })}`
-      )
-    );
   }
 
   if (avgWheelPl !== null && avgWheelPl !== undefined) {
-    // A dotted line, not dashed, and anchored on the left (avg income's
-    // label sits on the right) so the two reference lines stay legible even
-    // when they land close together -- and a plain linear y-scale means a
-    // negative average needs no special handling: y(avgWheelPl) already
-    // falls below the zero line exactly like a negative bar would.
+    // A dotted line, not dashed, so the two reference lines stay visually
+    // distinct where they land close together -- and a plain linear y-scale
+    // means a negative average needs no special handling: y(avgWheelPl)
+    // already falls below the zero line exactly like a negative bar would.
     const wheelAvgY = y(avgWheelPl);
     const line = svgEl('line', {
       class: 'avg-wheel-pl-line',
@@ -2302,20 +2359,6 @@ function drawCashFlow(rows, trailing, pnlSeries) {
           ? 'Negative: this range closed at a net loss on the wheel side.'
           : 'Positive: this range closed at a net gain on the wheel side.',
       ])
-    );
-    const labelY = Math.min(Math.max(wheelAvgY - 4, margin.top + 10), margin.top + plotHeight - 4);
-    group.appendChild(
-      svgEl(
-        'text',
-        {
-          class: 'tick-label',
-          x: margin.left + 4,
-          y: labelY,
-          'text-anchor': 'start',
-          fill: wheelColor,
-        },
-        `Avg wheel P/L · ${money(avgWheelPl, { cents: true })}`
-      )
     );
   }
 
@@ -2348,9 +2391,9 @@ function drawCashFlow(rows, trailing, pnlSeries) {
 
   svg.setAttribute(
     'aria-label',
-    `Net monthly cash flow versus realized wheel P/L, ${rows.length} month(s) from ` +
-      `${monthLabel(rows[0].period)} to ${monthLabel(rows[rows.length - 1].period)}. ` +
-      'Hover or focus a bar for its breakdown.' +
+    `Monthly cash flow, split into money in and money out, versus realized wheel P/L (line), ` +
+      `${rows.length} month(s) from ${monthLabel(rows[0].period)} to ` +
+      `${monthLabel(rows[rows.length - 1].period)}. Hover or focus a month for its breakdown.` +
       (avgIncome !== null && avgIncome !== undefined
         ? ` Dashed red line marks the avg monthly income of ${money(avgIncome, { cents: true })} over this range.`
         : '') +
@@ -2359,18 +2402,25 @@ function drawCashFlow(rows, trailing, pnlSeries) {
         : '')
   );
 
-  const cashSwatchItem = el('span');
-  const cashSwatch = el('i');
-  cashSwatch.style.background = `linear-gradient(90deg, ${positive} 50%, ${negative} 50%)`;
-  cashSwatchItem.appendChild(cashSwatch);
-  cashSwatchItem.appendChild(document.createTextNode('Net cash flow; blue credit, red debit'));
-  legend.appendChild(cashSwatchItem);
+  const inSwatchItem = el('span');
+  const inSwatch = el('i');
+  inSwatch.style.background = positive;
+  inSwatchItem.appendChild(inSwatch);
+  inSwatchItem.appendChild(document.createTextNode('In: premium + dividends collected'));
+  legend.appendChild(inSwatchItem);
+
+  const outSwatchItem = el('span');
+  const outSwatch = el('i');
+  outSwatch.style.background = negative;
+  outSwatchItem.appendChild(outSwatch);
+  outSwatchItem.appendChild(document.createTextNode('Out: BTC costs + fees paid'));
+  legend.appendChild(outSwatchItem);
 
   const wheelSwatchItem = el('span');
-  const wheelSwatch = el('i');
+  const wheelSwatch = el('i', { class: 'line' });
   wheelSwatch.style.background = wheelColor;
   wheelSwatchItem.appendChild(wheelSwatch);
-  wheelSwatchItem.appendChild(document.createTextNode('Wheel realized P/L'));
+  wheelSwatchItem.appendChild(document.createTextNode('Wheel realized P/L (what actually closed profitably)'));
   legend.appendChild(wheelSwatchItem);
 
   if (avgIncome !== null && avgIncome !== undefined) {
@@ -2392,8 +2442,8 @@ function drawCashFlow(rows, trailing, pnlSeries) {
       money(row.gross_credits, { cents: true }),
       money(row.gross_debits, { cents: true }),
       money(row.fees, { cents: true }),
-      money(row.net_cash_flow, { cents: true }),
-      money(wheelPl[index].total_pl, { cents: true }),
+      money(row.net_cash_flow, { cents: true, sign: true }),
+      money(wheelPl[index].total_pl, { cents: true, sign: true }),
       money(row.avg_collateral),
       pct(row.monthly_yield_pct, 2),
     ])
@@ -2405,21 +2455,24 @@ function drawCashFlow(rows, trailing, pnlSeries) {
 const PERIOD_PL_TABLE_HEAD = [
   'Period',
   {
-    text: 'Net Premium',
-    title: 'Realized option P/L (CSP + covered-call + hedge legs) that closed in this period.',
+    text: 'Option P/L',
+    title: 'Realized P/L (CSP + covered-call + hedge legs) from options that closed in this period.',
   },
-  { text: 'Closed P/L', title: 'Realized stock P/L from shares sold or called away in this period.' },
-  { text: 'Net P/L', title: 'Net Premium + Closed P/L, realized only; matches Net Realized P/L elsewhere.' },
+  { text: 'Stock P/L', title: 'Realized P/L from shares sold or called away in this period.' },
+  {
+    text: 'Total Realized P/L',
+    title: 'Option P/L + Stock P/L, realized only; matches Net Realized P/L elsewhere on the dashboard.',
+  },
 ];
 
 // One fixed identity color per metric, regardless of sign -- a bar's own
-// height/direction from the zero line already shows profit vs. loss
-// unambiguously, so color here answers "which metric," not "up or down,"
-// the same discipline drawCashFlow's fixed wheel-color bar already follows.
+// position off the zero line already shows gain vs. loss, so color here
+// answers "which source," not "up or down." Same colors drawPnl's cumulative
+// option/stock lines use, so the two complementary P/L cards read as one
+// system.
 const PERIOD_PL_SERIES = [
-  { key: 'net_premium', label: 'Net Premium', varName: '--series-1' },
-  { key: 'closed_pl', label: 'Closed P/L', varName: '--series-2' },
-  { key: 'net_pl', label: 'Net P/L', varName: '--series-3' },
+  { key: 'option_pl', label: 'Option P/L', varName: '--series-1' },
+  { key: 'stock_pl', label: 'Stock P/L', varName: '--series-3' },
 ];
 
 const periodPlLabel = (row, granularity) => (granularity === 'week' ? weekLabel(row.period) : monthLabel(row.period));
@@ -2427,17 +2480,48 @@ const periodPlRangeLabel = (row, granularity) =>
   granularity === 'week' ? weekRangeLabel(row.week_start, row.week_end) : monthLabel(row.period);
 
 /**
- * One grouped-bar cluster per period -- Net Premium, Closed P/L, and their
- * realized-only sum Net P/L. Each series keeps a fixed identity color; sign
- * is read from a bar's own direction off the zero line, never from color.
- * Granularity ('week'/'month') is a view toggle, not a filter -- both series
- * are already in `periodPl` (data.period_pl), so switching redraws from
- * already-fetched data.
+ * Stacks `PERIOD_PL_SERIES` values for one period into a diverging bar: each
+ * series extends the positive cursor upward or the negative cursor downward
+ * from zero, in series order, so same-signed values stack contiguously
+ * (Option P/L touches zero, Stock P/L stacks beyond it) while opposite-signed
+ * values extend to opposite sides of zero instead of overlapping and
+ * visually canceling. Returns one `{ key, from, to, value }` segment per
+ * non-zero series plus the resulting `top`/`bottom` extents of the whole bar.
+ */
+function stackPeriodPl(row) {
+  let posCursor = 0;
+  let negCursor = 0;
+  const segments = [];
+  for (const series of PERIOD_PL_SERIES) {
+    const value = row[series.key] || 0;
+    if (value === 0) continue;
+    if (value > 0) {
+      segments.push({ key: series.key, from: posCursor, to: posCursor + value, value });
+      posCursor += value;
+    } else {
+      segments.push({ key: series.key, from: negCursor, to: negCursor + value, value });
+      negCursor += value;
+    }
+  }
+  return { segments, top: posCursor, bottom: negCursor };
+}
+
+/**
+ * One diverging stacked bar per period -- Option P/L and Stock P/L stacked
+ * from a shared zero baseline via `stackPeriodPl()`, so a glance answers
+ * "profitable or not, and from which source" without implying a trend the
+ * way a line would across discrete, unconnected periods. Each series keeps a
+ * fixed identity color; sign is read from a segment's own side of the zero
+ * line, never from color. Granularity ('week'/'month') is a view toggle, not
+ * a filter -- both series are already in `periodPl` (data.period_pl), so
+ * switching redraws from already-fetched data.
  */
 function drawPeriodPl(periodPl) {
   const svg = $('chart-period-pl');
   const legend = $('legend-period-pl');
+  const summary = $('period-pl-summary');
   clear(legend);
+  clear(summary);
   const granularity = state.periodPlGranularity;
   const rows = (periodPl && periodPl[granularity === 'week' ? 'weeks' : 'months']) || [];
 
@@ -2450,12 +2534,36 @@ function drawPeriodPl(periodPl) {
   }
   toggleChartCard(svg, true);
 
+  // Summary covers exactly the periods on display -- the full history when
+  // no date filter is set, the cropped range otherwise (`rows` is already
+  // the display-cropped series the chart and table both draw from).
+  const totalOption = rows.reduce((sum, row) => sum + (row.option_pl || 0), 0);
+  const totalStock = rows.reduce((sum, row) => sum + (row.stock_pl || 0), 0);
+  const totalRealized = rows.reduce((sum, row) => sum + (row.total_realized_pl || 0), 0);
+  const summaryItem = (label, value, colorVar) => {
+    const item = el('span');
+    if (colorVar) {
+      const swatch = el('i');
+      swatch.style.background = colorVar;
+      item.appendChild(swatch);
+    }
+    item.appendChild(document.createTextNode(label + ': '));
+    item.appendChild(
+      el('b', { class: 'legend-value ' + (value < 0 ? 'neg' : 'pos') }, money(value, { cents: true, sign: true }))
+    );
+    return item;
+  };
+  const colors = PERIOD_PL_SERIES.map((series) => cssVar(series.varName));
+  summary.appendChild(summaryItem('Total realized', totalRealized));
+  summary.appendChild(summaryItem('Option P/L', totalOption, colors[0]));
+  summary.appendChild(summaryItem('Stock P/L', totalStock, colors[1]));
+
+  const stacks = rows.map(stackPeriodPl);
   const margin = { top: 14, right: 20, bottom: 30, left: 62 };
   const width = chartWidth(svg);
   const height = 260;
-  const values = rows.flatMap((row) => PERIOD_PL_SERIES.map((series) => row[series.key] || 0));
-  const yMin = Math.min(0, ...values) * 1.15;
-  const yMax = Math.max(0, ...values, 1) * 1.15;
+  const yMax = Math.max(0, ...stacks.map((stack) => stack.top), 1) * 1.15;
+  const yMin = Math.min(0, ...stacks.map((stack) => stack.bottom)) * 1.15;
 
   const { group, plotWidth, plotHeight, y } = frame(svg, { width, height, margin, yMin, yMax });
   const zeroY = y(0);
@@ -2464,49 +2572,85 @@ function drawPeriodPl(periodPl) {
   );
 
   const slot = plotWidth / rows.length;
-  const groupGap = 2;
-  const groupWidth = Math.max(16, Math.min(56, slot * 0.7));
-  const barWidth = Math.max(2, (groupWidth - groupGap * (PERIOD_PL_SERIES.length - 1)) / PERIOD_PL_SERIES.length);
-  const colors = PERIOD_PL_SERIES.map((series) => cssVar(series.varName));
+  const barWidth = Math.max(8, Math.min(48, slot * 0.6));
+  const hitWidth = Math.max(barWidth, Math.min(slot * 0.9, slot - 2));
+  const centers = rows.map((_, index) => margin.left + slot * (index + 0.5));
 
   rows.forEach((row, index) => {
-    const cx = margin.left + slot * (index + 0.5);
-    const groupStart = cx - groupWidth / 2;
+    const cx = centers[index];
+    const { segments } = stacks[index];
 
-    PERIOD_PL_SERIES.forEach((series, seriesIndex) => {
-      const value = row[series.key] || 0;
-      const x = groupStart + seriesIndex * (barWidth + groupGap);
-      const top = value >= 0 ? y(value) : zeroY;
-      const barHeight = Math.max(Math.abs(y(value) - zeroY), value === 0 ? 0 : 1.5);
-      const rect = svgEl('rect', {
-        class: 'mark',
-        x,
-        y: top,
-        width: barWidth,
-        height: barHeight,
-        rx: 2,
-        fill: colors[seriesIndex],
-      });
-      group.appendChild(rect);
+    if (!segments.length) {
+      // A real $0 period, not a gap -- a flat tick on the baseline instead of
+      // leaving an empty column that would otherwise read as missing data.
+      group.appendChild(
+        svgEl('rect', {
+          x: cx - barWidth / 2,
+          y: zeroY - 1,
+          width: barWidth,
+          height: 2,
+          rx: 1,
+          fill: cssVar('--axis'),
+        })
+      );
+    }
 
-      attachTip(
-        rect,
-        periodPlRangeLabel(row, granularity),
-        PERIOD_PL_SERIES.map((s, i) => ({
-          label: s.label,
-          value: money(row[s.key], { cents: true, sign: true }),
-          color: colors[i],
-          valueClass: (row[s.key] || 0) < 0 ? 'neg' : 'pos',
-        })),
-        series.key === 'net_pl'
-          ? formula([
-              'Net P/L = Net Premium + Closed P/L',
-              `= ${money(row.net_premium, { cents: true })} + ${money(row.closed_pl, { cents: true })}`,
-              `= ${money(row.net_pl, { cents: true })}`,
-            ])
-          : undefined
+    segments.forEach((segment) => {
+      const seriesIndex = PERIOD_PL_SERIES.findIndex((series) => series.key === segment.key);
+      const top = y(Math.max(segment.from, segment.to));
+      const bottom = y(Math.min(segment.from, segment.to));
+      group.appendChild(
+        svgEl('rect', {
+          class: 'mark',
+          x: cx - barWidth / 2,
+          y: top,
+          width: barWidth,
+          height: Math.max(bottom - top, 1.5),
+          rx: 2,
+          fill: colors[seriesIndex],
+        })
       );
     });
+
+    // A single transparent hit target spans the whole column (not just the
+    // bar) so a $0 period -- no visible bar to land a pointer on -- is just
+    // as hoverable/focusable as any other, and reports its real $0 breakdown
+    // rather than looking unresponsive.
+    const hit = svgEl('rect', {
+      class: 'hit',
+      x: cx - hitWidth / 2,
+      y: margin.top,
+      width: hitWidth,
+      height: plotHeight,
+      tabindex: '0',
+      'aria-label': `${periodPlRangeLabel(row, granularity)}: total realized ${money(row.total_realized_pl, {
+        cents: true,
+        sign: true,
+      })}`,
+    });
+    group.appendChild(hit);
+    attachTip(
+      hit,
+      periodPlRangeLabel(row, granularity),
+      [
+        ...PERIOD_PL_SERIES.map((series, i) => ({
+          label: series.label,
+          value: money(row[series.key] || 0, { cents: true, sign: true }),
+          color: colors[i],
+          valueClass: (row[series.key] || 0) < 0 ? 'neg' : 'pos',
+        })),
+        {
+          label: 'Total Realized P/L',
+          value: money(row.total_realized_pl || 0, { cents: true, sign: true }),
+          valueClass: (row.total_realized_pl || 0) < 0 ? 'neg' : 'pos',
+        },
+      ],
+      formula([
+        'Total Realized P/L = Option P/L + Stock P/L',
+        `= ${money(row.option_pl || 0, { cents: true })} + ${money(row.stock_pl || 0, { cents: true })}`,
+        `= ${money(row.total_realized_pl || 0, { cents: true })}`,
+      ])
+    );
   });
 
   group.appendChild(
@@ -2527,7 +2671,7 @@ function drawPeriodPl(periodPl) {
         'text',
         {
           class: 'tick-label',
-          x: margin.left + slot * (index + 0.5),
+          x: centers[index],
           y: margin.top + plotHeight + 16,
           'text-anchor': 'middle',
         },
@@ -2548,7 +2692,7 @@ function drawPeriodPl(periodPl) {
     el(
       'span',
       { class: 'legend-note' },
-      'Above zero = profit, below = loss. Color = metric, not sign.'
+      'Above zero = that period’s gain, below = its loss. Bars stack from zero; opposite-signed parts extend to opposite sides rather than canceling out.'
     )
   );
 
@@ -2564,9 +2708,9 @@ function drawPeriodPl(periodPl) {
     PERIOD_PL_TABLE_HEAD,
     rows.map((row) => [
       periodPlRangeLabel(row, granularity),
-      money(row.net_premium, { cents: true, sign: true }),
-      money(row.closed_pl, { cents: true, sign: true }),
-      money(row.net_pl, { cents: true, sign: true }),
+      money(row.option_pl, { cents: true, sign: true }),
+      money(row.stock_pl, { cents: true, sign: true }),
+      money(row.total_realized_pl, { cents: true, sign: true }),
     ])
   );
 }
@@ -2984,6 +3128,18 @@ function renderCashFlowTiles(trailing, rows, pnlSeries) {
   const rangeWheelPl = wheelPl.reduce((sum, w) => sum + w.total_pl, 0);
   const gap = trailing.cash_flow - rangeWheelPl;
 
+  // "Reliable as monthly income" is a consistency question, not just a size
+  // one -- Avg monthly income already answers "how much, typically"; this
+  // answers "how often was that actually true." Same win-rate convention the
+  // Performance tile's leg-level win rate uses: an exact $0 month counts
+  // toward neither side, and N/A (not 0%) when nothing has closed yet.
+  const wheelWins = wheelPl.filter((w) => w.total_pl > 0).length;
+  const wheelLosses = wheelPl.filter((w) => w.total_pl < 0).length;
+  const wheelDecided = wheelWins + wheelLosses;
+  const wheelWinRate = wheelDecided ? (100.0 * wheelWins) / wheelDecided : null;
+  const cashWins = rows.filter((row) => row.net_cash_flow > 0).length;
+  const cashLosses = rows.filter((row) => row.net_cash_flow < 0).length;
+
   const tiles = [
     {
       label: 'Avg monthly income',
@@ -3038,6 +3194,28 @@ function renderCashFlowTiles(trailing, rows, pnlSeries) {
         '  usually open positions not yet closed, or dividends (never in wheel P/L).',
         'Negative: realized wheel P/L is running ahead of newly collected premium.',
       ]),
+    },
+    {
+      label: 'Months profitable',
+      value: wheelDecided ? pct(wheelWinRate, 0) : '—',
+      foot: wheelDecided
+        ? `${wheelWins} of ${wheelDecided} decided month(s); ${cashWins} of ${cashWins + cashLosses} cash-flow positive`
+        : 'No month has closed with a nonzero realized P/L yet',
+      tone: wheelDecided ? (wheelWinRate >= 50 ? 'pos' : 'neg') : undefined,
+      formula: wheelDecided
+        ? formula([
+            'Months profitable = months with wheel realized P/L > $0',
+            '  ÷ (months > $0 + months < $0); a month at exactly $0 counts',
+            '  toward neither side, same as the Performance tile\'s win rate.',
+            '',
+            `= ${wheelWins} ÷ (${wheelWins} + ${wheelLosses})`,
+            `= ${pct(wheelWinRate, 0)}`,
+            '',
+            'This is the real reliability check: a month can show cash in',
+            '  (the bars above) before anything has actually closed -- this',
+            '  counts realized profit/loss only, never cash timing.',
+          ])
+        : formula(['No month in the selected range has a decided (nonzero) realized P/L yet.']),
     },
   ];
 
@@ -5404,8 +5582,15 @@ function drawNetWorthChart(benchmark) {
   const margin = { top: 14, right: 58, bottom: 30, left: 62 };
   const width = chartWidth(svg);
   const height = 260;
-  const yMin = Math.min(0, ...values) * 0.98;
-  const yMax = Math.max(...values) * 1.08 || 1;
+  // Net worth never sits near $0, so anchoring the axis there (like the P/L
+  // charts do) would squash the actual account-value swings into a thin band
+  // at the top. Pad proportionally to the data's own range instead, so the
+  // axis fits what's actually displayed.
+  const dataMin = Math.min(...values);
+  const dataMax = Math.max(...values);
+  const pad = (dataMax - dataMin) * 0.08 || Math.abs(dataMax) * 0.02 || 1;
+  const yMin = dataMin - pad;
+  const yMax = dataMax + pad;
 
   const { group, plotWidth, plotHeight, y } = frame(svg, { width, height, margin, yMin, yMax });
 

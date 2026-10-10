@@ -1588,6 +1588,30 @@ def _hedge_pl_phrase(value: float | None) -> str:
     return "roughly even"
 
 
+def _merge_same_contract_legs(legs: Sequence[OptionLeg]) -> OptionLeg:
+    """Fold multiple open long legs for the very same contract (same right,
+    strike and expiry) into one -- a hedge built up over separate buys, or
+    one order that filled in pieces, is a single position to a viewer, not
+    several identical-looking hedge cards. Mirrors ``_merge_same_contract_rows``,
+    the open-positions-table equivalent, but at the leg level so the merged
+    leg's own properties (``remaining_contracts``, ``cash_per_contract``, ...)
+    stay correct for ``_open_hedge_entry`` to read -- including the rare case
+    where one of the fills has since been partially closed.
+    """
+    if len(legs) == 1:
+        return legs[0]
+    base = legs[0]
+    return replace(
+        base,
+        leg_id="+".join(leg.leg_id for leg in legs),
+        contracts=sum(leg.contracts for leg in legs),
+        open_date=min(leg.open_date for leg in legs),
+        open_cash=sum(leg.open_cash for leg in legs),
+        open_fees=sum(leg.open_fees for leg in legs),
+        closes=[close for leg in legs for close in leg.closes],
+    )
+
+
 def _open_hedge_entry(
     cycle: Cycle,
     leg,
@@ -3145,7 +3169,11 @@ class Dashboard:
         Filter-independent, like the Trade Log: a hedge needs managing whatever
         date window is on screen. A leg paired into a same-day ``Spread`` is
         excluded -- its risk is already defined, there is nothing to "wind down."
-        Sorted soonest-expiry first, so the most urgent row leads the banner.
+        Two or more open legs on the very same contract (same right, strike,
+        expiry) within a cycle are merged into one entry first, via
+        ``_merge_same_contract_legs`` -- e.g. a hedge built up across separate
+        buys -- so the banner doesn't show the same hedge twice. Sorted
+        soonest-expiry first, so the most urgent row leads the banner.
         """
         through = self.last_date or date.today()
         dividends = dividends_by_cycle(self.all_cycles, self.transactions)
@@ -3155,15 +3183,23 @@ class Dashboard:
             for spread in cycle.spreads:
                 spread_leg_ids.add(spread.short_leg_id)
                 spread_leg_ids.add(spread.long_leg_id)
+            groups: dict[tuple[str, float, date], list[OptionLeg]] = {}
+            order: list[tuple[str, float, date]] = []
             for leg in cycle.legs:
                 if not leg.is_open or leg.side != LONG or leg.expiry is None:
                     continue
                 if leg.leg_id in spread_leg_ids:
                     continue
+                key = (leg.right, leg.strike, leg.expiry)
+                if key not in groups:
+                    groups[key] = []
+                    order.append(key)
+                groups[key].append(leg)
+            for key in order:
                 hedges.append(
                     _open_hedge_entry(
                         cycle,
-                        leg,
+                        _merge_same_contract_legs(groups[key]),
                         through,
                         name=self._company_names.get(cycle.underlying),
                         current_price=current_prices.get(cycle.underlying),
