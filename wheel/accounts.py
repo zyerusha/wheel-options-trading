@@ -273,7 +273,10 @@ def load_account_config(base_dir: str) -> tuple[AccountConfig, list[str]]:
                 continue
             folders[folder] = str(number).strip()
     elif "folders" in raw:
-        warnings.append(f"{ACCOUNT_CONFIG_FILENAME}: 'folders' must be an object of folder -> account number; ignoring")
+        warnings.append(
+            f"{ACCOUNT_CONFIG_FILENAME}: 'folders' must pair each folder name with an account "
+            "number; this entry was ignored"
+        )
 
     ignore_raw = raw.get("ignore", [])
     ignore: list[str] = []
@@ -317,8 +320,8 @@ def load_account_config(base_dir: str) -> tuple[AccountConfig, list[str]]:
             opening_balances[folder] = (entry_date, float(balance_raw))
     elif "opening_balances" in raw:
         warnings.append(
-            f"{ACCOUNT_CONFIG_FILENAME}: 'opening_balances' must be an object of "
-            "folder -> {date, balance}; ignoring"
+            f"{ACCOUNT_CONFIG_FILENAME}: 'opening_balances' must pair each folder name with a "
+            "date and a balance; this entry was ignored"
         )
 
     unknown_keys = set(raw) - {"folders", "ignore", "opening_balances"}
@@ -327,7 +330,7 @@ def load_account_config(base_dir: str) -> tuple[AccountConfig, list[str]]:
         if unknown_keys & {"default_account", "default_range"}:
             # A pre-config.json accounts.json: point at where these moved
             # instead of just silently dropping them.
-            message += " (these moved to data/config.json, managed by the app itself -- see its docstring)"
+            message += " (these settings now live in data/config.json, which the app manages itself)"
         warnings.append(message)
 
     return (
@@ -616,8 +619,8 @@ class AccountRegistry:
             for path in discover_multi_account_exports(scan_dirs):
                 warnings.append(
                     f"{os.path.basename(path)}: looks like Fidelity's multi-account transaction history "
-                    "export (separate 'Account'/'Account Number' columns) -- not supported yet, so it "
-                    "was not imported"
+                    "export, with separate 'Account' and 'Account Number' columns. That format is not "
+                    "supported yet, so this file was not loaded."
                 )
 
             for key, dirs in groups.items():
@@ -630,8 +633,8 @@ class AccountRegistry:
                     ids = sorted(d.id for d in dirs)
                     warnings.append(
                         f"account {resolved_number} in {', '.join(ids)} is already covered by the "
-                        "active 'default' dataset -- not registered separately, to avoid "
-                        "double-counting in Combined"
+                        "active 'default' dataset, so it was not added a second time; counting it "
+                        "twice would double its figures in the Combined view"
                     )
                     continue
 
@@ -651,8 +654,8 @@ class AccountRegistry:
                     )
                     other_ids = sorted(d.id for d in dirs if d.id != primary.id)
                     warnings.append(
-                        f"account {key[1:]} appears in both '{primary.id}' and {', '.join(other_ids)} -- "
-                        f"merged into '{primary.id}' rather than counted twice in Combined"
+                        f"account {key[1:]} appears in both '{primary.id}' and {', '.join(other_ids)}, so "
+                        f"they were merged into '{primary.id}' rather than counted twice in the Combined view"
                     )
 
                 configured_number = config.folder_account(account_dir.id)
@@ -682,8 +685,8 @@ class AccountRegistry:
                 account_id = _unique_folder_account_id(account_dir.id, accounts)
                 if account_id != account_dir.id:
                     warnings.append(
-                        f"account '{account_dir.id}' collides with a reserved account id -- "
-                        f"registered as '{account_id}' instead"
+                        f"account '{account_dir.id}' uses a name the app reserves for itself, so it "
+                        f"was registered as '{account_id}' instead"
                     )
                 if resolved_number:
                     claimed_numbers.add(resolved_number)
@@ -1292,16 +1295,16 @@ def _combine_period_pl(payloads: dict[str, dict], key: str) -> list[dict]:
                 {
                     field_name: row[field_name]
                     for field_name in row
-                    if field_name not in ("net_premium", "closed_pl", "net_pl")
+                    if field_name not in ("option_pl", "stock_pl", "total_realized_pl")
                 },
             )
-            for field_name in ("net_premium", "closed_pl", "net_pl"):
+            for field_name in ("option_pl", "stock_pl", "total_realized_pl"):
                 bucket[field_name] = bucket.get(field_name, 0.0) + (row.get(field_name) or 0.0)
 
     rows = []
     for period in sorted(buckets):
         row = dict(buckets[period])
-        for field_name in ("net_premium", "closed_pl", "net_pl"):
+        for field_name in ("option_pl", "stock_pl", "total_realized_pl"):
             row[field_name] = round(row.get(field_name, 0.0), 2)
         rows.append(row)
     return rows
@@ -1490,7 +1493,14 @@ def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) ->
         "total_initial_collateral": sum(p["total_initial_collateral"] for p in portfolios),
         "dividends_received": sum(p["dividends_received"] for p in portfolios),
         "stock_unrealized_pl": sum(p["stock_unrealized_pl"] for p in portfolios),
+        "option_open_pl": sum(p.get("option_open_pl", 0.0) for p in portfolios),
     }
+    # Same "any gap taints the whole" rule portfolio_metrics() applies one
+    # level down: True only when every account that has an open leg marked
+    # all of them to a real quote.
+    combined["option_open_pl_marked"] = bool(combined["open_legs"]) and all(
+        p.get("option_open_pl_marked", False) for p in portfolios if p.get("open_legs", 0) > 0
+    )
 
     combined["days_span"] = (
         max((date.fromisoformat(combined["last_date"]) - date.fromisoformat(combined["first_date"])).days, 1)
@@ -1523,6 +1533,14 @@ def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) ->
     combined["peak_capital"] = round(max((point["total"] for point in capital_series), default=0.0), 2)
     combined["avg_capital"] = round(avg_capital, 2)
 
+    # The denominator these ratios actually divide by, published under the same
+    # key the single-account payload uses, so one UI tooltip can quote the real
+    # figure in either view. Here it is the whole combined series: the combined
+    # series carries no per-cycle is_wheel split to narrow it by, so a
+    # directional long in any sub-account is inside this average (the
+    # single-account path excludes one).
+    combined["wheel_avg_capital"] = round(avg_capital, 2)
+
     combined["roi_on_avg_wheel_pct"], combined["annualized_wheel_roc_pct"] = roi_and_annualized(
         combined["wheel_option_realized_pl"], avg_capital, combined["days_span"]
     )
@@ -1542,6 +1560,8 @@ def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) ->
     )
     combined["avg_active_capital"] = round(avg_active_capital, 2)
 
+    combined["wheel_avg_active_capital"] = round(avg_active_capital, 2)
+
     combined["roi_on_avg_active_capital_pct"], combined["annualized_active_wheel_roc_pct"] = roi_and_annualized(
         combined["wheel_option_realized_pl"], avg_active_capital, combined["days_span"]
     )
@@ -1551,6 +1571,8 @@ def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) ->
     # denominator from avg_capital above -- and, like every other combined
     # figure here, recomputed from the combined absolutes rather than
     # averaging each account's own percentage.
+    combined["wheel_initial_collateral"] = combined["total_initial_collateral"]
+
     combined["net_option_yield_pct"], combined["annualized_net_option_yield_pct"] = roi_and_annualized(
         combined["wheel_option_realized_pl"], combined["total_initial_collateral"], combined["days_span"]
     )
@@ -1562,6 +1584,17 @@ def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) ->
     )
     combined["total_position_roi_pct"], combined["annualized_total_position_roi_pct"] = roi_and_annualized(
         total_position_pl, combined["total_initial_collateral"], combined["days_span"]
+    )
+    # Same five-term sum as PortfolioMetrics.mark_to_market_pl / the per-wheel
+    # Trade Log tile, just over the already-combined totals above -- where the
+    # whole account (every sub-account) really stands right now, not just
+    # what every sub-account has already banked.
+    combined["mark_to_market_pl"] = (
+        combined["option_realized_pl"]
+        + combined["stock_realized_pl"]
+        + combined["dividends_received"]
+        + combined["stock_unrealized_pl"]
+        + combined["option_open_pl"]
     )
 
     for money_key in (
@@ -1578,6 +1611,8 @@ def _combine_portfolio(payloads: dict[str, dict], capital_series: list[dict]) ->
         "total_initial_collateral",
         "dividends_received",
         "stock_unrealized_pl",
+        "option_open_pl",
+        "mark_to_market_pl",
         "profit_per_day",
     ):
         combined[money_key] = round(combined[money_key], 2)
@@ -1606,7 +1641,7 @@ def _combine_reconciliation(payloads: dict[str, dict]) -> dict[str, Any]:
         ],
         "reconcile_rate_pct": round(100.0 * rows_checked_total / max(1, checkable_total), 4),
         "synthetic_assignment_cash": round(sum(r["synthetic_assignment_cash"] or 0.0 for r in records), 2),
-        "note": "Combined across every account; open one account's view for its own detail.",
+        "note": "These figures add up every account. Switch to a single account to see its own detail.",
     }
 
 

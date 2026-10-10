@@ -112,7 +112,7 @@ class TestReconcile(unittest.TestCase):
         # disposition = max(acquired, sold): 2026-03-20 and 2026-01-02.
         self.assertEqual(out["totals"]["coverage_start"], "2026-01-02")
         self.assertEqual(out["totals"]["coverage_end"], "2026-03-20")
-        self.assertIn("2026-01-02 → 2026-03-20", out["notes"])
+        self.assertIn("between 2026-01-02 and 2026-03-20", out["notes"])
         # the earliest sell-to-open (2025-11-10) must not widen it
         self.assertNotIn("2025-11-10", out["notes"])
 

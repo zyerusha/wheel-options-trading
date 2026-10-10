@@ -42,8 +42,8 @@ class TestStrengths(unittest.TestCase):
                 tx(f"2025-0{i + 1}-15", EXPIRED, f"-MU2506{10 + i:02d}P100", 1, None, 0.0, row_id=2 * i + 2, as_of=f"2025-0{i + 1}-15")
             )
         result = _insights(rows, through=date(2025, 6, 30))
-        self.assertTrue(any("win rate" in s for s in result["strengths"]))
-        self.assertTrue(any("core wheel kept" in s for s in result["strengths"]))
+        self.assertTrue(any("finished option trades made money" in s for s in result["strengths"]))
+        self.assertTrue(any("was kept after buying any of them back" in s for s in result["strengths"]))
 
     def test_shares_above_break_even(self):
         rows = [
@@ -53,7 +53,7 @@ class TestStrengths(unittest.TestCase):
         result = _insights(
             rows, through=date(2025, 2, 1), current_price=120.0, cost_basis=100.0, break_even_price=97.0
         )
-        self.assertTrue(any("above the wheel's break-even" in s for s in result["strengths"]))
+        self.assertTrue(any("the shares are above $97.00" in s for s in result["strengths"]))
 
 
 class TestImprovements(unittest.TestCase):
@@ -65,7 +65,7 @@ class TestImprovements(unittest.TestCase):
             tx("2025-01-20", BTC, "-MU250207P90", 1, 3.0, -300.67, row_id=4),
         ]
         result = _insights(rows, through=date(2025, 2, 1))
-        self.assertTrue(any("core wheel is -$" in s for s in result["improvements"]))
+        self.assertTrue(any("leaving -$" in s for s in result["improvements"]))
 
     def test_break_even_gap_when_underwater(self):
         rows = [
@@ -76,7 +76,7 @@ class TestImprovements(unittest.TestCase):
             rows, through=date(2025, 2, 1), current_price=85.0, cost_basis=100.0, break_even_price=97.0
         )
         joined = _text(result)
-        self.assertIn("must reach $97.00 to close flat", joined)
+        self.assertIn("must reach $97.00", joined)
         self.assertIn("covered calls", joined)
 
     def test_idle_shares_need_a_round_lot(self):
@@ -90,7 +90,7 @@ class TestImprovements(unittest.TestCase):
         result = wheel_insights(
             cycles[0], cycle_metrics(cycles[0], date(2025, 2, 1)), cost_basis=100.0, break_even_price=97.0
         )
-        self.assertTrue(any("no covered call written" in s for s in result["improvements"]))
+        self.assertTrue(any("no covered call sold against them" in s for s in result["improvements"]))
 
 
 class TestShape(unittest.TestCase):

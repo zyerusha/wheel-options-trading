@@ -695,6 +695,28 @@ class TestReturnMath(unittest.TestCase):
         self.assertIsNotNone(metrics.roi_pct)  # long premium counts as capital
         self.assertGreater(metrics.net_realized_pl, 0)
 
+    def test_avg_days_in_trade_floors_a_same_day_round_trip_at_one_day(self):
+        """avg_days_in_trade must use the same per-leg day-flooring
+        total_days_held (wheel/api.py's P&L / day held) already does -- a
+        same-day open+close is 1 day held, never 0, so the two figures stay
+        reconcilable (e.g. AVAV's 6 legs: 22 total days held / 6 = 3.67, not
+        the unfloored 21 / 6 = 3.5 the raw calendar difference would give).
+        """
+        cycles, _ = build_cycles(
+            [
+                # 2 days held.
+                tx("2025-09-14", STO, "-MU250916P150", -1, 3.0, 300.0, row_id=1),
+                tx("2025-09-16", BTC, "-MU250916P150", 1, 1.0, -100.0, row_id=2),
+                # Same-day round trip: 0 raw calendar days, floored to 1.
+                tx("2025-09-14", STO, "-MU250914P142", -1, 3.0, 300.0, row_id=3),
+                tx("2025-09-14", BTC, "-MU250914P142", 1, 1.0, -100.0, row_id=4),
+            ]
+        )
+        metrics = cycle_metrics(cycles[0], date(2025, 9, 16))
+        self.assertEqual(metrics.wins + metrics.losses, 2)
+        # Raw calendar days would be 2 + 0 = 2 -> mean 1.0; floored, it's 2 + 1 = 3 -> mean 1.5.
+        self.assertAlmostEqual(metrics.avg_days_in_trade, 1.5, places=6)
+
     def test_open_cycle_measures_through_the_as_of_date(self):
         cycles, _ = build_cycles([tx("2025-09-19", STO, "-MU251226P150", -1, 3.35, 334.33)])
         metrics = cycle_metrics(cycles[0], date(2025, 10, 19))
@@ -704,6 +726,42 @@ class TestReturnMath(unittest.TestCase):
         # Nothing is realized while the leg is still open.
         self.assertAlmostEqual(metrics.net_realized_pl, 0.0)
         self.assertAlmostEqual(metrics.option_open_premium, 334.33, places=2)
+
+    def test_option_open_pl_falls_back_to_premium_without_a_mark(self):
+        cycles, _ = build_cycles([tx("2025-09-19", STO, "-MU251226P150", -1, 3.35, 334.33)])
+        metrics = cycle_metrics(cycles[0], date(2025, 10, 19))
+        self.assertAlmostEqual(metrics.option_open_pl, metrics.option_open_premium)
+        self.assertFalse(metrics.option_open_pl_marked)
+
+    def test_option_open_pl_marks_an_itm_short_put_to_its_cost_to_close(self):
+        """The crux of the mark-to-market fix: a short put that went ITM is
+        still credited its full $334.33 premium by option_open_premium, but
+        option_open_pl nets that against what it would really cost ($18.00/sh)
+        to buy back today."""
+        cycles, _ = build_cycles([tx("2025-09-19", STO, "-MU251226P150", -1, 3.35, 334.33)])
+        metrics = cycle_metrics(
+            cycles[0], date(2025, 10, 19), option_mark_prices={"MU251226P150": 18.0}
+        )
+        self.assertAlmostEqual(metrics.option_open_premium, 334.33, places=2)
+        self.assertAlmostEqual(metrics.option_open_pl, 334.33 - 1800.0, places=2)
+        self.assertTrue(metrics.option_open_pl_marked)
+
+    def test_option_open_pl_marked_is_false_when_any_open_leg_is_unpriced(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-09-19", STO, "-MU251226P150", -1, 3.35, 334.33, row_id=1),
+                tx("2025-09-19", STO, "-MU251226P140", -1, 2.00, 199.33, row_id=2),
+            ]
+        )
+        metrics = cycle_metrics(
+            cycles[0], date(2025, 10, 19), option_mark_prices={"MU251226P150": 18.0}
+        )
+        self.assertFalse(metrics.option_open_pl_marked)
+        # Still marks the leg it has a price for and falls back for the other.
+        unpriced_leg = next(leg for leg in cycles[0].legs if leg.occ_symbol == "MU251226P140")
+        self.assertAlmostEqual(
+            metrics.option_open_pl, (334.33 - 1800.0) + unpriced_leg.open_premium, places=2
+        )
 
 
 class TestPortfolioRollup(unittest.TestCase):

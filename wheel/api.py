@@ -33,6 +33,7 @@ from wheel.engine import (
     LONG,
     SHORT,
     Cycle,
+    OptionLeg,
     WheelEngine,
     build_cycles,
 )
@@ -48,6 +49,7 @@ from wheel.metrics import (
     portfolio_capital_series,
     portfolio_metrics,
     realized_pl_series,
+    roll_chains,
     ticker_summary,
     weekly_ppd_series,
     wheel_cash_flow_events,
@@ -75,6 +77,7 @@ from wheel.parser import (
 from wheel.paths import DISCOVERY_DIRS
 from wheel.positions import (
     EQUITY,
+    OPTION,
     discover_position_snapshots,
     latest_snapshot,
     latest_snapshot_per_account,
@@ -163,14 +166,17 @@ def _earnings_modifier(days_to_earnings: int | None) -> tuple[float, str]:
     if d is None or d < 0:
         return 0.0, "no earnings date on file"
     if d <= 7:
-        return -1.8, f"earnings in {d}d — gap risk, no time to react"
+        return -1.8, f"earnings in {d} days: the stock can jump overnight, no time to react"
     if d <= 14:
-        return -0.3, f"earnings in {d}d — a little close"
+        return -0.3, f"earnings in {d} days: a little close for comfort"
     if d <= 28:
-        return 0.5, f"earnings in {d}d — sell into elevated IV, clears before a ~30-45 DTE put"
+        return 0.5, (
+            f"earnings in {d} days: options sell for more before a report, and it is past "
+            f"before a put sold 30 to 45 days out expires"
+        )
     if d <= 45:
-        return 0.2, f"earnings in {d}d"
-    return 0.0, f"earnings in {d}d — too far to matter"
+        return 0.2, f"earnings in {d} days"
+    return 0.0, f"earnings in {d} days: too far away to matter here"
 
 
 def _sector_modifier(current_weight: float | None, sector: str | None) -> tuple[float, str]:
@@ -180,14 +186,20 @@ def _sector_modifier(current_weight: float | None, sector: str | None) -> tuple[
         return 0.0, "sector unknown"
     w = current_weight or 0.0
     if w <= 0.02:
-        return 0.5, f"{sector}: not in the book yet — diversifies"
+        return 0.5, f"{sector}: nothing here yet, so it spreads the risk wider"
     if w < 0.15:
-        return 0.2, f"{sector}: lightly held ({w * 100:.0f}% of committed capital)"
+        return 0.2, f"{sector}: lightly held, {w * 100:.0f}% of the money you have committed"
     if w < 0.30:
-        return 0.0, f"{sector}: {w * 100:.0f}% of committed capital"
+        return 0.0, f"{sector}: {w * 100:.0f}% of the money you have committed"
     if w < 0.45:
-        return -0.3, f"{sector}: already {w * 100:.0f}% of the book — concentration"
-    return -0.6, f"{sector}: already {w * 100:.0f}% of the book — heavy concentration"
+        return -0.3, (
+            f"{sector}: already {w * 100:.0f}% of the money you have committed, piling more "
+            f"into one place"
+        )
+    return -0.6, (
+        f"{sector}: already {w * 100:.0f}% of the money you have committed, heavily piled "
+        f"into one place"
+    )
 
 
 def csp_star_score(
@@ -484,6 +496,46 @@ def _iso(value: date | None) -> str | None:
     return value.isoformat() if value else None
 
 
+def _leg_result(leg: OptionLeg) -> str | None:
+    """"WIN"/"LOSS"/"FLAT" for a closed leg, by its own realized_pl -- the
+    same three-way split win_rate_pct's wins/losses counters use (a leg
+    closed at exactly $0 counts toward neither). None while still open: the
+    ledger's Result column should show a dash, never guess a premature
+    verdict on a leg that hasn't finished closing.
+    """
+    if leg.is_open:
+        return None
+    if leg.realized_pl > 1e-9:
+        return "WIN"
+    if leg.realized_pl < -1e-9:
+        return "LOSS"
+    return "FLAT"
+
+
+def _roll_chain_membership(cycle: Cycle) -> tuple[dict[str, tuple[str, str]], list[dict[str, Any]]]:
+    """``{leg_id: (chain_id, chain_status)}`` for every leg any roll chain
+    (see :func:`wheel.metrics.roll_chains`) ever touched, plus
+    ``open_chain_credits``: ``{chain_id, net_cash}`` for every still-open
+    chain -- a per-chain breakdown of the headline ``open_roll_credit``
+    total, for when more than one chain is open at once. ``chain_id`` is just
+    this chain's rank in ``roll_chains``' own (deterministic) discovery
+    order, stable within one build, not a persistent identity across them.
+    Feeds the ledger rows' own Roll chain column (``_trade_log_engine_rows``),
+    the leg list the Trade Log's Wheel timeline chart draws
+    (``_trade_log_entry``'s ``legs``), and the Roll rate summary cell, so
+    none of the three can ever disagree about which chain a leg belongs to.
+    """
+    chain_of: dict[str, tuple[str, str]] = {}
+    open_chain_credits: list[dict[str, Any]] = []
+    for i, chain in enumerate(roll_chains(cycle)):
+        chain_id = f"RC{i + 1}"
+        for leg_id in chain["leg_ids"]:
+            chain_of[leg_id] = (chain_id, chain["status"])
+        if chain["status"] == "OPEN":
+            open_chain_credits.append({"chain_id": chain_id, "net_cash": _money(chain["net_cash"])})
+    return chain_of, open_chain_credits
+
+
 def _round_up_half(value: float) -> float:
     """Real strikes sit on 0.50-or-wider increments; round up so a floor
     stays a floor (never below what it's built from)."""
@@ -497,7 +549,10 @@ def _cc_strike_floor_fundamentals(
 ) -> list[tuple[str, float]]:
     """The non-``None`` cost/breakeven inputs to the profit-target floor,
     labeled -- shared by `_profit_target_floor` and its explanation so the two
-    can never disagree about which candidates actually fed it."""
+    can never disagree about which candidates actually fed it. Labels match
+    this row's own Cost Basis / Breakeven / Wheel Breakeven columns verbatim
+    (standard trader vocabulary, not a paraphrase) so a tooltip reader can
+    match these numbers to the row without translating terms."""
     candidates = [
         ("cost basis", cost_basis),
         ("breakeven", position_breakeven),
@@ -553,15 +608,28 @@ def _profit_target(floor: float, cushion_pct: float = PROFIT_TARGET_CUSHION_PCT)
     return _money(_round_up_half(floor * (1 + cushion_pct / 100)))
 
 
-def _profit_target_explanation(floor: float, target: float) -> str:
+def _profit_target_explanation(
+    floor: float,
+    target: float,
+    cost_basis: float | None = None,
+    position_breakeven: float | None = None,
+    wheel_breakeven: float | None = None,
+) -> str:
     """Same 4-part shape as `_cc_strike_floor_explanation`: a formula line,
-    the substitution, the result, then a one-line caveat."""
+    the substitution, the result, then a one-line caveat. Equation-first,
+    standard trader vocabulary (cost basis / breakeven / wheel breakeven,
+    matching their own columns) per feedback_concise_tooltips -- this is a
+    hover tooltip for an experienced options trader, not a beginner
+    explainer, so it leads with the math rather than paraphrasing it."""
+    fundamentals = _cc_strike_floor_fundamentals(cost_basis, position_breakeven, wheel_breakeven)
+    labels = ", ".join(label for label, _ in fundamentals)
+    values = ", ".join(f"${value:.2f}" for _, value in fundamentals)
+    multiplier = 1 + PROFIT_TARGET_CUSHION_PCT / 100
     return (
-        f"Profit Target = highest of cost basis, breakeven, wheel breakeven, "
-        f"+{PROFIT_TARGET_CUSHION_PCT:g}%, rounded up to $0.50\n"
-        f"= ${floor:.2f} + {PROFIT_TARGET_CUSHION_PCT:g}%\n"
-        f"= ${target:.2f}\n\n"
-        f"A profitable-exit threshold; never reacts to price."
+        f"Profit Target = max({labels}) × {multiplier:.2f}, rounded up to $0.50\n"
+        f"Floor = max({values}) = ${floor:.2f}\n"
+        f"= ${floor:.2f} × {multiplier:.2f} = ${target:.2f}\n\n"
+        f"Fixed; doesn't move with the share price."
     )
 
 
@@ -571,10 +639,12 @@ def _preferred_csp_entry_explanation(current_price: float, entry: float) -> str:
     surface uses the adjustable client-side version instead), but is kept
     in the same format in case a future surface reads it."""
     return (
-        f"Preferred CSP entry = {CSP_ENTRY_OTM_PCT:g}% of last close, rounded down to $0.50\n"
-        f"= {CSP_ENTRY_OTM_PCT:g}% × ${current_price:.2f}\n"
+        f"Preferred put strike: the highest strike worth selling a cash-secured put at, where "
+        f"you are paid cash now and only buy the shares if the price falls that far.\n"
+        f"= {CSP_ENTRY_OTM_PCT:g}% of the last close of ${current_price:.2f}, rounded down to "
+        f"the nearest $0.50\n"
         f"= ${entry:.2f}\n\n"
-        f"A conservative entry floor."
+        f"An upper limit on the strike, not a view on which expiry to pick."
     )
 
 
@@ -584,22 +654,26 @@ def _cc_strike_floor_explanation(
     position_breakeven: float | None,
     wheel_breakeven: float | None,
     current_price: float | None,
+    cushion_pct: float = PROFIT_TARGET_CUSHION_PCT,
 ) -> str:
-    """Short and simple, like the client's CSP TO ENTER tooltip
-    (cspEntryTargetTooltip in app.js) -- not a line-by-line accounting of
-    every input. Profit Target is the one figure worth naming, since it's
-    already the adjacent column and its own tooltip has the cost basis /
-    breakeven / wheel breakeven math behind it; repeating that here would
-    just be the same numbers twice."""
+    """Equation-first, standard trader vocabulary, same shape as
+    `_profit_target_explanation` (formula, substitution, result, one-line
+    caveat; per feedback_concise_tooltips). Shares that function's Profit
+    Target floor formula but spells the floor out inline here -- rather than
+    naming the separate Profit Target column -- so this tooltip stands on
+    its own."""
     floor = _profit_target_floor(cost_basis, position_breakeven, wheel_breakeven)
-    profit_target = _profit_target(floor) if floor is not None else None
-    target_text = f"${profit_target:.2f}" if profit_target is not None else "n/a"
+    multiplier = 1 + cushion_pct / 100
+    cushioned_text = f"${floor * multiplier:.2f}" if floor is not None else "n/a"
     price_text = f"${current_price:.2f}" if current_price is not None else "n/a"
+    fundamentals = _cc_strike_floor_fundamentals(cost_basis, position_breakeven, wheel_breakeven)
+    values = ", ".join(f"${value:.2f}" for _, value in fundamentals)
+    detail = f"Profit Target floor = max({values}) × {multiplier:.2f} = {cushioned_text}\n" if values else ""
     return (
-        f"CC TO EXIT = higher of Profit Target and last price, rounded up to $0.50\n"
-        f"= higher of {target_text} and {price_text}\n"
-        f"= ${strike:.2f}\n\n"
-        f"A floor, not a recommendation."
+        f"CC to exit = max(Profit Target floor, last price), rounded up to $0.50\n"
+        f"{detail}"
+        f"= max({cushioned_text}, {price_text}) = ${strike:.2f}\n\n"
+        f"A lower limit only; it doesn't say which strike pays the most."
     )
 
 
@@ -643,6 +717,7 @@ def _cached_cycle_metrics(
     *,
     current_price: float | None,
     dividends: float,
+    option_mark_prices: dict[str, float] | None = None,
 ) -> Any:
     """cycle_metrics(), memoized by ``cache`` when the caller supplies one.
 
@@ -651,38 +726,33 @@ def _cached_cycle_metrics(
     (cycle, through, current_price, dividends) -- without this, that's the
     same cycle_metrics()/roll_chains() work redone 2-3 times per cycle for
     an identical result. ``cache=None`` (tests, one-off callers) just calls
-    straight through with no memoization.
+    straight through with no memoization. ``option_mark_prices`` isn't part
+    of the cache key: it comes from the one Positions snapshot a whole
+    dashboard build shares, so it never varies across these calls within a
+    single build.
     """
     if cache is None:
-        return cycle_metrics(cycle, through, current_price=current_price, dividends=dividends)
+        return cycle_metrics(
+            cycle, through, current_price=current_price, dividends=dividends, option_mark_prices=option_mark_prices
+        )
     key = (cycle.cycle_id, through, current_price, dividends)
     result = cache.get(key)
     if result is None:
-        result = cycle_metrics(cycle, through, current_price=current_price, dividends=dividends)
+        result = cycle_metrics(
+            cycle, through, current_price=current_price, dividends=dividends, option_mark_prices=option_mark_prices
+        )
         cache[key] = result
     return result
 
 
-def _cycle_payload(
-    cycle: Cycle,
-    through: date,
-    *,
-    current_price: float | None = None,
-    dividends: float = 0.0,
-    metrics_cache: dict[tuple[str, date, float | None, float], Any] | None = None,
-) -> dict[str, Any]:
-    metrics = _cached_cycle_metrics(metrics_cache, cycle, through, current_price=current_price, dividends=dividends)
-    payload = {key: value for key, value in asdict(metrics).items()}
-    payload["start_date"] = _iso(metrics.start_date)
-    payload["end_date"] = _iso(metrics.end_date)
-    payload["win_rate_pct"] = metrics.win_rate_pct
-    payload["roll_rate_pct"] = metrics.roll_rate_pct
-    payload["kind"] = cycle.kind  # "wheel" | "directional" | "hold"
-    payload["last_activity"] = _iso(cycle.last_activity)
-    # CycleMetrics already exposes integer `rolls` / `assignments` counts, so the
-    # detail lists take distinct names rather than shadowing them.
-    payload["legs"] = leg_rows(cycle)
-    payload["roll_events"] = [
+def _roll_events_payload(cycle: Cycle) -> list[dict[str, Any]]:
+    """Every same-day roll on this cycle, each roll's own net credit/debit
+    and direction (up/down/out), plus exactly which legs it closed and
+    opened. Shared by the cycle payload (the Dashboard's Wheel timelines
+    chart, cycle drill-down) and the Trade Log entry (its Wheel timeline
+    chart), so both ever read the same roll bookkeeping.
+    """
+    return [
         {
             "roll_id": roll.roll_id,
             "date": _iso(roll.date),
@@ -698,7 +768,15 @@ def _cycle_payload(
         }
         for roll in cycle.rolls
     ]
-    payload["assignment_events"] = [
+
+
+def _assignment_events_payload(cycle: Cycle) -> list[dict[str, Any]]:
+    """Every option assignment / call-away on this cycle, the share
+    movement it caused. Shared by the cycle payload and the Trade Log
+    entry's Wheel timeline chart, which uses it to tell an assigned share
+    lot apart from an ordinary purchase (see drawTimelineStock in app.js).
+    """
+    return [
         {
             "date": _iso(item.date),
             "symbol": item.occ_symbol,
@@ -713,7 +791,15 @@ def _cycle_payload(
         }
         for item in cycle.assignments
     ]
-    payload["share_lots"] = [
+
+
+def _share_lots_payload(cycle: Cycle) -> list[dict[str, Any]]:
+    """Every share lot this cycle ever held, with its full disposal
+    history, so a timeline chart can draw each lot's holding period and
+    mark its sale(s) / call-away(s). Shared by the cycle payload and the
+    Trade Log entry's Wheel timeline chart.
+    """
+    return [
         {
             "lot_id": lot.lot_id,
             "acquired": _iso(lot.acquired),
@@ -739,6 +825,30 @@ def _cycle_payload(
         }
         for lot in cycle.share_lots
     ]
+
+
+def _cycle_payload(
+    cycle: Cycle,
+    through: date,
+    *,
+    current_price: float | None = None,
+    dividends: float = 0.0,
+    metrics_cache: dict[tuple[str, date, float | None, float], Any] | None = None,
+) -> dict[str, Any]:
+    metrics = _cached_cycle_metrics(metrics_cache, cycle, through, current_price=current_price, dividends=dividends)
+    payload = {key: value for key, value in asdict(metrics).items()}
+    payload["start_date"] = _iso(metrics.start_date)
+    payload["end_date"] = _iso(metrics.end_date)
+    payload["win_rate_pct"] = metrics.win_rate_pct
+    payload["roll_rate_pct"] = metrics.roll_rate_pct
+    payload["kind"] = cycle.kind  # "wheel" | "directional" | "hold"
+    payload["last_activity"] = _iso(cycle.last_activity)
+    # CycleMetrics already exposes integer `rolls` / `assignments` counts, so the
+    # detail lists take distinct names rather than shadowing them.
+    payload["legs"] = leg_rows(cycle)
+    payload["roll_events"] = _roll_events_payload(cycle)
+    payload["assignment_events"] = _assignment_events_payload(cycle)
+    payload["share_lots"] = _share_lots_payload(cycle)
     payload["spreads"] = [
         {
             "spread_id": spread.spread_id,
@@ -792,8 +902,6 @@ _CLOSE_TYPE = {
     (ASSIGNED, "C"): "Call Assigned",
 }
 
-
-_CLOSING_ACTIONS = frozenset({BTC, STC, EXPIRED, ASSIGNED})
 
 # Trade Log row types that move shares on or off the book (never contracts) --
 # used to carry a running share count down the ledger for the break-even column.
@@ -925,19 +1033,32 @@ def _trade_log_raw_row(
         # highlighted for as long as it stays unpaired.
         "is_open_long": is_open_long,
         "synthetic": False,
+        # Not an option leg -- no win/loss verdict, no roll chain.
+        "result": None,
+        "chain_id": None,
+        "chain_status": None,
         "_sort": (transaction.event_date, 1, transaction.row_id),
     }
 
 
-def _trade_log_engine_rows(cycle: Cycle) -> list[dict[str, Any]]:
+def _trade_log_engine_rows(cycle: Cycle, chain_of: dict[str, tuple[str, str]]) -> list[dict[str, Any]]:
     """Rows for one cycle taken from the engine's own structures -- exact
-    ``cycle_id`` attribution, no date-boundary ambiguity. Commission and fees
-    are combined on a leg, so those rows report a single Fees figure.
+    ``cycle_id`` attribution, no date-boundary ambiguity, and (unlike a raw
+    broker row) always exactly one leg: a single BTC that FIFO-closes two
+    separately-opened lots at once becomes two rows here, one per lot, each
+    with its own Return %/Result instead of one row blending both. Commission
+    and fees are combined on a leg (the engine never tracks them separately
+    per lot), so those rows report a single Fees figure. ``chain_id``/
+    ``chain_status`` (from :func:`_roll_chain_membership`) are stamped on
+    every row for a leg that belongs to a roll chain, open or close alike;
+    ``result`` (this leg's own win/loss verdict -- see :func:`_leg_result`)
+    only ever appears on the close row where the leg actually finishes.
     """
     rows: list[dict[str, Any]] = []
     for leg in cycle.legs:
         is_csp_open = leg.open_action == STO and leg.right == "P"
         csp = leg.strike * OPTION_MULTIPLIER * leg.contracts if is_csp_open else None
+        chain_id, chain_status = chain_of.get(leg.leg_id, (None, None))
         rows.append(
             {
                 "type": _OPEN_TYPE.get((leg.open_action, leg.right), "Other"),
@@ -956,6 +1077,9 @@ def _trade_log_engine_rows(cycle: Cycle) -> list[dict[str, Any]]:
                 "is_settled": not leg.is_open,
                 "is_open_long": leg.is_open and leg.side == LONG,
                 "synthetic": False,
+                "result": None,  # not known at open
+                "chain_id": chain_id,
+                "chain_status": chain_status,
                 "_sort": (leg.open_date, 0, 0),
             }
         )
@@ -979,6 +1103,11 @@ def _trade_log_engine_rows(cycle: Cycle) -> list[dict[str, Any]]:
                     "is_settled": not leg.is_open,
                     "is_open_long": False,
                     "synthetic": False,
+                    # None until the leg's *last* contract closes (a partial
+                    # close leaves it still open, with no verdict yet).
+                    "result": _leg_result(leg),
+                    "chain_id": chain_id,
+                    "chain_status": chain_status,
                     "_sort": (close.date, 1, 0),
                 }
             )
@@ -1004,6 +1133,9 @@ def _trade_log_assignment_row(assignment, *, is_settled: bool) -> dict[str, Any]
         "is_settled": is_settled,
         "is_open_long": False,
         "synthetic": assignment.synthetic,
+        "result": None,
+        "chain_id": None,
+        "chain_status": None,
         "_sort": (assignment.date, 2, 0),
     }
 
@@ -1016,12 +1148,19 @@ def _trade_log_entry(
     name: str | None,
     dividend_row_ids: set[int],
     dividends: float,
-    engine_exact: bool,
     current_price: float | None = None,
     also_tickers: frozenset[str] | set[str] = frozenset(),
     metrics_cache: dict[tuple[str, date, float | None, float], Any] | None = None,
+    option_mark_prices: dict[str, float] | None = None,
 ) -> dict[str, Any]:
-    metrics = _cached_cycle_metrics(metrics_cache, cycle, through, current_price=current_price, dividends=dividends)
+    metrics = _cached_cycle_metrics(
+        metrics_cache,
+        cycle,
+        through,
+        current_price=current_price,
+        dividends=dividends,
+        option_mark_prices=option_mark_prices,
+    )
 
     # A cycle holding no shares right now -- the fallback when a share-acquiring
     # row can't be matched to its own lot below.
@@ -1052,101 +1191,60 @@ def _trade_log_entry(
             return True  # a call-away / sale is complete on arrival
         return _acquire_row_settled(_assignment_disposed, assignment.date, assignment.shares)
 
-    if engine_exact:
-        rows = _trade_log_engine_rows(cycle)
-        rows += [
-            _trade_log_assignment_row(a, is_settled=_assignment_settled(a)) for a in cycle.assignments
-        ]
-        # Dividends are not an engine structure, so the leg/close/assignment
-        # derivation above misses them -- pull them from the raw ledger by the
-        # same underlying + inclusive-window rule the common path uses, so the
-        # cash column (and the running break-even) stays complete.
-        end = cycle.end_date or through
-        rows += [
-            _trade_log_raw_row(t, "Dividend", is_settled=True)
-            for t in transactions
-            if t.row_id in dividend_row_ids
-            and (t.underlying == cycle.underlying or t.underlying in also_tickers)
-            and cycle.start_date <= t.event_date <= end
-        ]
-        attribution_note = (
-            "Same-day close/reopen on this ticker: rows are attributed via the "
-            "engine, and Fees combines commission + fees."
-        )
-    else:
-        end = cycle.end_date or through
-        # Contract-weighted opening price + side per (symbol, close-day), taken
-        # from the engine's own FIFO matching, so a raw closing fill can report
-        # its return against the premium it actually opened at -- even after a
-        # roll or a scaled entry at several prices.
-        close_ref: dict[tuple[str, date], list[tuple[float, float, str]]] = {}
-        # Whether the leg a raw fill belongs to is fully closed -- so its open
-        # row is greyed together with its closes once the position is done.
-        open_settled: dict[tuple[str, date], bool] = {}
-        close_settled: dict[tuple[str, date], bool] = {}
-        open_long_keys: set[tuple[str, date]] = {
-            (leg.occ_symbol, leg.open_date)
-            for leg in cycle.legs
-            if leg.is_open and leg.side == LONG
+    def _stock_or_dividend_settled(t: Transaction) -> bool:
+        if t.row_id in dividend_row_ids or t.action == SELL_STOCK:
+            return True  # cash received / a sale is complete on arrival
+        return _acquire_row_settled(_purchase_disposed, t.event_date, t.contracts)
+
+    # Every option row comes from the engine's own legs/closes -- exact
+    # cycle_id attribution, no date-boundary ambiguity, and a single BTC that
+    # FIFO-closes two separately-opened lots at once becomes two rows, one
+    # per lot, each with its own Return %/Result rather than one row
+    # blending both (see _trade_log_engine_rows). `chain_of` is computed once
+    # here and shared by those rows and open_chain_credits below, so the
+    # ledger and the Roll rate summary can never disagree about which chain
+    # a leg belongs to.
+    chain_of, open_chain_credits = _roll_chain_membership(cycle)
+    rows = _trade_log_engine_rows(cycle, chain_of)
+    # Every leg this wheel ever had -- not just the ones a roll touched --
+    # stamped with the same chain_id/chain_status the ledger rows above
+    # carry, so the Wheel timeline chart can draw the whole history (shares
+    # and every option leg) and still color/connect the rolled ones
+    # consistently with the rest of the page.
+    timeline_legs = leg_rows(cycle)
+    for leg in timeline_legs:
+        leg["chain_id"], leg["chain_status"] = chain_of.get(leg["leg_id"], (None, None))
+    # A broker export that carries the equity leg already yields a real
+    # Buy/Sell Shares row below; only the synthesized legs need adding here.
+    rows += [
+        _trade_log_assignment_row(a, is_settled=_assignment_settled(a))
+        for a in cycle.assignments
+        if a.synthetic
+    ]
+    end = cycle.end_date or through
+    # Shares and dividends are not engine structures, so the leg/close/
+    # assignment derivation above misses them -- pulled from the raw ledger
+    # by the same underlying + inclusive-window rule as everything else.
+    # Fees/commission are combined here too (into Fees), matching every
+    # option row above -- a column that's only ever populated on some rows
+    # would be more confusing than informative.
+    rows += [
+        {
+            **_trade_log_raw_row(t, _trade_log_txn_type(t, dividend_row_ids), is_settled=_stock_or_dividend_settled(t)),
+            "fees": _money(t.total_fees),
+            "commission": None,
         }
-        for leg in cycle.legs:
-            open_settled[(leg.occ_symbol, leg.open_date)] = not leg.is_open
-            for close in leg.closes:
-                close_ref.setdefault((leg.occ_symbol, close.date), []).append(
-                    (close.contracts, leg.open_price, leg.side)
-                )
-                close_settled[(leg.occ_symbol, close.date)] = not leg.is_open
-
-        def _raw_close_pct(t: Transaction) -> float | None:
-            if t.action not in _CLOSING_ACTIONS:
-                return None
-            items = [i for i in close_ref.get((t.occ_symbol, t.event_date), []) if i[1]]
-            total = sum(qty for qty, _op, _sd in items)
-            if total <= 0:
-                return None
-            wavg_open = sum(qty * op for qty, op, _sd in items) / total
-            return _close_return_pct(wavg_open, t.price, items[0][2])
-
-        def _raw_settled(t: Transaction) -> bool:
-            if t.row_id in dividend_row_ids:
-                return True  # a dividend is cash received, complete on arrival
-            if t.action in (STO, BTO):
-                return open_settled.get((t.occ_symbol, t.event_date), False)
-            if t.action in _CLOSING_ACTIONS:
-                return close_settled.get((t.occ_symbol, t.event_date), True)
-            if t.action == SELL_STOCK:
-                return True
-            if t.action == BUY_STOCK:
-                return _acquire_row_settled(_purchase_disposed, t.event_date, t.contracts)
-            return False
-
-        rows = [
-            _trade_log_raw_row(
-                t,
-                _trade_log_txn_type(t, dividend_row_ids),
-                _raw_close_pct(t),
-                is_settled=_raw_settled(t),
-                is_open_long=(
-                    t.action == BTO and (t.occ_symbol, t.event_date) in open_long_keys
-                ),
-            )
-            for t in transactions
-            if (t.underlying == cycle.underlying or t.underlying in also_tickers)
-            and cycle.start_date <= t.event_date <= end
-            and (
-                t.action in OPTION_ACTIONS
-                or t.action in (BUY_STOCK, SELL_STOCK)
-                or t.row_id in dividend_row_ids
-            )
-        ]
-        # A broker export that carries the equity leg already yields a real
-        # Buy/Sell Shares row above; only the synthesized legs need adding.
-        rows += [
-            _trade_log_assignment_row(a, is_settled=_assignment_settled(a))
-            for a in cycle.assignments
-            if a.synthetic
-        ]
-        attribution_note = None
+        for t in transactions
+        if (t.underlying == cycle.underlying or t.underlying in also_tickers)
+        and cycle.start_date <= t.event_date <= end
+        and (t.action in (BUY_STOCK, SELL_STOCK) or t.row_id in dividend_row_ids)
+    ]
+    attribution_note = (
+        "The Fees column adds the broker's commission and its fees together. If one broker "
+        "order closed contracts that were opened at different times, each of those groups "
+        "gets its own row here rather than one row for the whole order, and each row shows "
+        "only its own money."
+    )
 
     rows.sort(key=lambda row: row.pop("_sort"))
     running = 0.0
@@ -1242,12 +1340,18 @@ def _trade_log_entry(
 
     # P&L per day a position was actually held: total realized P&L of every
     # completed open->close leg (roll segments included) over the sum of their
-    # holding days. Open legs have no finished pair yet.
+    # holding days. Open legs have no finished pair yet. Each leg is floored
+    # at 1 day (never 0): a same-day open+close round trip still held capital
+    # for part of a day, and letting it contribute 0 would inflate this ratio
+    # for free instead of diluting it -- so total_days_held can run higher
+    # than the naive sum of (close date - open date) across legs whenever one
+    # of them was a same-day round trip.
     closed_legs = [leg for leg in cycle.legs if not leg.is_open]
     leg_days = [max(1, leg.days_held or 0) for leg in closed_legs]
     closed_leg_pl = sum(leg.realized_pl for leg in closed_legs)
     total_days_held = sum(leg_days)
     pl_per_day_held = closed_leg_pl / total_days_held if total_days_held else None
+    open_roll_chains_count = len(open_chain_credits)
 
     # A lone directional/long-only cycle keeps its real P&L below but is not
     # running the wheel, so the wheel-framed ratios are withheld -- see
@@ -1257,19 +1361,28 @@ def _trade_log_entry(
     if not cycle.is_wheel:
         pl_per_day_held = None
 
-    # Where the campaign really stands right now, vs the misleading realized-only
-    # figure. Open option legs are valued at expiry (`option_open_premium`: a
-    # long put's whole debit is a loss, a short call's whole credit a gain) --
-    # their remaining time value is not marked, so a held protective put makes
-    # this conservative. `stock_unrealized_pl` marks held shares to the latest
-    # close (None when there is no price / no shares).
-    open_option_pl = metrics.option_open_premium
-    non_stock_pl = metrics.option_realized_pl + metrics.stock_realized_pl + dividends + open_option_pl
+    # Open option legs are valued at expiry for break-even/profit-target
+    # purposes (`option_open_premium`: a long put's whole debit is a loss, a
+    # short call's whole credit a gain, remaining time value never marked) --
+    # deliberately conservative and deliberately *not* reactive to today's
+    # option price, so those two stay fixed lines the stock can actually
+    # close in on (see profit_target/cc_strike_floor below).
+    open_option_pl_at_expiry = metrics.option_open_premium
+    non_stock_pl = metrics.option_realized_pl + metrics.stock_realized_pl + dividends + open_option_pl_at_expiry
     stock_unrealized = metrics.stock_unrealized_pl
+    # Where the campaign really stands right now, vs both the realized-only
+    # figure and the conservative break-even above: each open leg is priced
+    # at its actual current cost to close (`option_open_pl`, from a broker
+    # Positions snapshot's Last price -- see OptionLeg.unrealized_pl), which
+    # matters a lot once a short put/call is ITM and would cost real money to
+    # buy back. A leg with no live mark on hand still falls back to the
+    # expiry valuation, leg by leg. `stock_unrealized_pl` marks held shares to
+    # the latest close (None when there is no price / no shares).
+    non_stock_pl_marked = metrics.option_realized_pl + metrics.stock_realized_pl + dividends + metrics.option_open_pl
     mark_to_market_pl = (
         None
         if shares_held > 1e-9 and stock_unrealized is None
-        else non_stock_pl + (stock_unrealized or 0.0)
+        else non_stock_pl_marked + (stock_unrealized or 0.0)
     )
     # The stock price at which the whole campaign nets to $0: raw cost of the
     # shares still held, less every other dollar the campaign has banked or paid.
@@ -1302,7 +1415,9 @@ def _trade_log_entry(
         floor = _profit_target_floor(cost_basis, break_even, break_even_price)
         if floor is not None:
             profit_target = _profit_target(floor)
-            profit_target_explanation = _profit_target_explanation(floor, profit_target)
+            profit_target_explanation = _profit_target_explanation(
+                floor, profit_target, cost_basis, break_even, break_even_price
+            )
         strike_floor = _cc_strike_floor(cost_basis, break_even, break_even_price, current_price)
         if strike_floor is not None:
             cc_strike_floor = strike_floor
@@ -1362,8 +1477,11 @@ def _trade_log_entry(
         _step("Shares sold/away", metrics.stock_realized_pl)
     if dividends:
         _step("Dividends", dividends)
-    if open_option_pl:
-        _step("Open options", open_option_pl)
+    if metrics.option_open_pl:
+        _step(
+            "Open options" if metrics.option_open_pl_marked else "Open options (est.)",
+            metrics.option_open_pl,
+        )
     shares_priced = not (shares_held > 1e-9 and stock_unrealized is None)
     if stock_unrealized:
         _step("Held shares P&L", stock_unrealized)
@@ -1388,7 +1506,8 @@ def _trade_log_entry(
         "stock_realized_pl": _money(metrics.stock_realized_pl),
         "net_realized_pl": _money(metrics.net_realized_pl),
         "stock_unrealized_pl": _money(stock_unrealized),
-        "open_option_pl": _money(open_option_pl),
+        "open_option_pl": _money(metrics.option_open_pl),
+        "open_option_pl_marked": metrics.option_open_pl_marked,
         "mark_to_market_pl": _money(mark_to_market_pl),
         "current_price": _money(current_price),
         "break_even_price": _money(break_even_price),
@@ -1430,6 +1549,19 @@ def _trade_log_entry(
         "open_roll_credit": _money(metrics.open_roll_credit),
         "resolved_roll_wins": metrics.resolved_roll_wins,
         "resolved_roll_losses": metrics.resolved_roll_losses,
+        "open_roll_chains": open_roll_chains_count,
+        "open_chain_credits": open_chain_credits,
+        # Every leg and share lot this wheel ever had, plus every same-day
+        # roll and assignment -- everything the Wheel timeline chart needs
+        # to draw the whole wheel (shares, every option leg, and the rolls
+        # connecting one leg to the next) in one picture, independent of
+        # the Dashboard's own date-filtered cycle list (see _cycle_payload,
+        # which the Trade Log never reads: a wheel here must render end to
+        # end even when it's outside the dashboard's current filter).
+        "legs": timeline_legs,
+        "share_lots": _share_lots_payload(cycle),
+        "assignment_events": _assignment_events_payload(cycle),
+        "roll_events": _roll_events_payload(cycle),
         "avg_days_in_trade": metrics.avg_days_in_trade,
         "avg_collateral": _money(metrics.avg_collateral),
         "roi_on_avg_wheel_pct": metrics.roi_on_avg_wheel_pct,
@@ -1448,12 +1580,36 @@ def _trade_log_entry(
 
 def _hedge_pl_phrase(value: float | None) -> str:
     if value is None:
-        return "at an unknown mark"
+        return "at an unknown value, because there is no current share price"
     if value > 1:
         return f"up +${value:,.0f}"
     if value < -1:
-        return f"down -${abs(value):,.0f}"
-    return "roughly flat"
+        return f"down ${abs(value):,.0f}"
+    return "roughly even"
+
+
+def _merge_same_contract_legs(legs: Sequence[OptionLeg]) -> OptionLeg:
+    """Fold multiple open long legs for the very same contract (same right,
+    strike and expiry) into one -- a hedge built up over separate buys, or
+    one order that filled in pieces, is a single position to a viewer, not
+    several identical-looking hedge cards. Mirrors ``_merge_same_contract_rows``,
+    the open-positions-table equivalent, but at the leg level so the merged
+    leg's own properties (``remaining_contracts``, ``cash_per_contract``, ...)
+    stay correct for ``_open_hedge_entry`` to read -- including the rare case
+    where one of the fills has since been partially closed.
+    """
+    if len(legs) == 1:
+        return legs[0]
+    base = legs[0]
+    return replace(
+        base,
+        leg_id="+".join(leg.leg_id for leg in legs),
+        contracts=sum(leg.contracts for leg in legs),
+        open_date=min(leg.open_date for leg in legs),
+        open_cash=sum(leg.open_cash for leg in legs),
+        open_fees=sum(leg.open_fees for leg in legs),
+        closes=[close for leg in legs for close in leg.closes],
+    )
 
 
 def _open_hedge_entry(
@@ -1560,13 +1716,15 @@ def _open_hedge_entry(
         if not cycle.is_wheel:
             if phase == "runway":
                 message = (
-                    f"Directional {kind}, no wheel premium behind it. Theta eats its cost daily; "
-                    f"cut it or keep the exposure on purpose."
+                    f"A {kind} bought outright as a bet on the share price, with no cash from "
+                    f"sold options paying for it. It loses a little value every day simply "
+                    f"because time is passing. Sell it, or keep the bet on purpose."
                 )
             else:
                 message = (
-                    f"Directional {kind}, {days_to_expiry}d left. Close for time value or hold "
-                    f"for the move, it finances nothing."
+                    f"A {kind} bought outright as a bet on the share price, {days_to_expiry} "
+                    f"days left. Sell it while part of its price still pays for the time "
+                    f"remaining, or hold it for the move; no sold options cover its cost."
                 )
         else:
             # Wheel-attached, but intrinsic value now dwarfs the original
@@ -1574,36 +1732,45 @@ def _open_hedge_entry(
             # hedge itself, not cheap insurance with runway left to sell
             # puts against.
             message = (
-                f"${intrinsic:,.0f} of this ${cost:,.0f} hedge is already intrinsic value, not "
-                f"time decay: it's trading like a directional {kind} now, not insurance with "
-                f"runway left. Close it to lock in the move, or hold it on purpose for more."
+                f"This protective {kind} cost ${cost:,.0f}, and ${intrinsic:,.0f} of its value "
+                f"is now just the gap between its strike and the share price, not payment for "
+                f"the time it has left. It behaves like a bet on the share price rather than "
+                f"insurance. Sell it to bank the move, or keep it on purpose for more."
             )
         phase = "directional"
     elif phase == "runway":
         headline = f"RUNWAY · {days_to_expiry}d"
         if losing:
             message = (
-                f"Wheel is {pl_phrase}"
-                f"{' with shares below cost' if shares_held > 1e-9 else ''}. Keep this hedge "
-                f"and keep selling puts to carry its cost. Do not close it while the wheel "
-                f"is underwater."
+                f"This position is {pl_phrase}"
+                f"{' with shares worth less than they cost' if shares_held > 1e-9 else ''}. "
+                f"Keep this protective {kind} and keep selling options to pay for it. Do not "
+                f"close it while the position is behind."
             )
         else:
             message = (
-                f"Runway left to sell puts against this hedge, plan to sell it around two "
-                f"months out to salvage its time value."
+                f"{days_to_expiry} days left on this protective {kind}, enough time to keep "
+                f"selling options while it covers you. Plan to sell it with about two months "
+                f"left, while part of its price still pays for the time remaining."
             )
     elif phase == "wind_down":
         headline = f"WIND DOWN · {days_to_expiry}d"
         message = (
-            f"{days_to_expiry}d left, inside two months. Sell the hedge now to recover its "
-            f"time value{intrinsic_phrase}, then stop adding puts against it."
+            f"{days_to_expiry} days left, under two months. Sell this protective {kind} now "
+            f"while part of its price still pays for the time remaining{intrinsic_phrase}, "
+            f"then stop selling new options against it."
         )
         if losing:
-            message += f" Wheel is {pl_phrase}; roll to a later expiry if you still want protection."
+            message += (
+                f" This position is {pl_phrase}; replace it with one expiring later if you "
+                f"still want the cover."
+            )
     else:  # expiring
         headline = f"EXPIRING · {days_to_expiry}d"
-        message = f"{days_to_expiry}d left, time value nearly gone{intrinsic_phrase}. Close it or let it lapse."
+        message = (
+            f"{days_to_expiry} days left, so almost none of its price still pays for time "
+            f"remaining{intrinsic_phrase}. Sell it, or let it expire."
+        )
 
     return {
         "cycle_id": cycle.cycle_id,
@@ -2167,12 +2334,12 @@ def _reconciliation(
         ),
         "synthetic_assignment_cash": _money(synthetic),
         "note": (
-            "Option cash comes verbatim from the broker's Amount column."
+            "Cash from option trades is taken exactly as your broker reported it."
             + (
-                f" {len(equity_rows)} equity rows supply real share fills."
+                f" {len(equity_rows)} share trades in the file supply the real share prices."
                 if equity_rows
-                else " Assignment share movements are synthesized at the strike, "
-                "because this export contains no equity rows."
+                else " Your file lists no share trades, so when an option was exercised the "
+                "share purchase or sale is worked out at the option's strike price instead."
             )
         ),
     }
@@ -2549,7 +2716,10 @@ class Dashboard:
             return {
                 "available": False,
                 "warnings": list(self.position_warnings)
-                + ["no Portfolio Positions snapshot found for this account"],
+                + [
+                    "Add a Fidelity Portfolio Positions export for this account to see what "
+                    "it holds and what it is worth."
+                ],
                 "snapshot_files": [],
             }
 
@@ -2607,8 +2777,8 @@ class Dashboard:
         # snapshot still reports its full market value in `equity_value` (and
         # therefore `total_value`), but with no real share count to attach a
         # cost basis to, `wheel_capital_deployed` counts essentially none of
-        # it -- the single biggest reason "True capital deployed" can
-        # undercount `total_value` by a wide margin even for a fully-tracked
+        # it -- the single biggest reason "Capital at risk" can undercount
+        # `total_value` by a wide margin even for a fully-tracked
         # wheel. Compared per ticker so a *partially* tracked position (e.g.
         # 30 of 60 real shares visible) only contributes its untracked
         # fraction, not the whole position.
@@ -2697,7 +2867,10 @@ class Dashboard:
         if not self.snapshots:
             return {
                 "available": False,
-                "warnings": ["no Portfolio Positions snapshot found for this account"],
+                "warnings": [
+                    "Add a Fidelity Portfolio Positions export for this account to compare "
+                    "its growth against an index."
+                ],
             }
 
         primary_account = latest_snapshot(self.snapshots).account_number
@@ -2728,10 +2901,10 @@ class Dashboard:
             return {
                 "available": False,
                 "warnings": [
-                    "at least two Portfolio Positions snapshots, taken on different dates, are "
-                    "needed to compute a return, only one is available so far (or add an "
-                    "'opening_balances' entry for this account to data/accounts.json to supply "
-                    "an earlier starting point manually)"
+                    "Two Portfolio Positions exports taken on different dates are needed to "
+                    "work out a return, and only one is on file so far. Add a second export, "
+                    "or set an 'opening_balances' entry for this account in "
+                    "data/accounts.json to supply an earlier starting value by hand."
                 ],
             }
 
@@ -2920,15 +3093,17 @@ class Dashboard:
         filter, the same "a wheel is a historical unit" reasoning
         ``_build_wheel_return`` / ``_build_net_worth`` follow.
 
-        Transaction attribution is by underlying + inclusive date span, which is
-        only safe while a ticker's cycles are strictly separated in time. The
-        engine can legally close one cycle and open the next on the same day, so
-        any same-ticker pair that touches (or, defensively, overlaps) switches to
-        engine-exact attribution instead -- see ``_trade_log_entry``.
+        Every option row is attributed via the engine's own legs/closes, not
+        by replaying raw transactions against a date span -- exact even when
+        the engine legally closes one cycle and opens the next on the same
+        day -- see ``_trade_log_entry``. Only share/dividend rows still need
+        the underlying + inclusive-date-span filter, since shares aren't an
+        engine structure.
         """
         through = self.last_date or date.today()
         dividend_row_ids = {t.row_id for t in cf.dividend_transactions(self.transactions)}
         dividends = dividends_by_cycle(self.all_cycles, self.transactions)
+        option_mark_prices = self._option_mark_prices()
 
         by_underlying: dict[str, list[Cycle]] = {}
         for cycle in self.all_cycles:
@@ -2942,19 +3117,18 @@ class Dashboard:
         for old, new in getattr(self.engine, "_ticker_alias", {}).items():
             former_of.setdefault(new, set()).add(old)
 
-        engine_exact: set[str] = set()
+        # A genuine time overlap between two same-ticker cycles is a data-
+        # quality anomaly worth flagging -- row attribution itself no longer
+        # depends on it (every wheel is engine-attributed, see
+        # _trade_log_entry), but it's still unusual enough to call out.
         warnings: list[str] = []
         for group in by_underlying.values():
             ordered = sorted(group, key=lambda cycle: cycle.start_date)
             for prev, nxt in zip(ordered, ordered[1:]):
-                prev_end = prev.end_date or through
-                if nxt.start_date <= prev_end:
-                    engine_exact.update((prev.cycle_id, nxt.cycle_id))
-                    if prev.end_date is not None and nxt.start_date < prev.end_date:
-                        warnings.append(
-                            f"{prev.underlying}: cycles {prev.cycle_id} and {nxt.cycle_id} "
-                            "overlap in time, Trade Log attributed them via the engine"
-                        )
+                if prev.end_date is not None and nxt.start_date < prev.end_date:
+                    warnings.append(
+                        f"{prev.underlying}: cycles {prev.cycle_id} and {nxt.cycle_id} overlap in time"
+                    )
 
         wheels = [
             _trade_log_entry(
@@ -2964,10 +3138,10 @@ class Dashboard:
                 name=self._company_names.get(cycle.underlying),
                 dividend_row_ids=dividend_row_ids,
                 dividends=dividends.get(cycle.cycle_id, 0.0),
-                engine_exact=cycle.cycle_id in engine_exact,
                 current_price=current_prices.get(cycle.underlying),
                 also_tickers=former_of.get(cycle.underlying, frozenset()),
                 metrics_cache=self._cycle_metrics_cache,
+                option_mark_prices=option_mark_prices,
             )
             for cycle in sorted(self.all_cycles, key=lambda cycle: (cycle.start_date, cycle.underlying))
         ]
@@ -2977,10 +3151,10 @@ class Dashboard:
         # of the capital committed across every wheel right now.
         net_worth = getattr(self, "_net_worth", None) or {}
         if net_worth.get("available") and net_worth.get("total_value"):
-            denom, denom_label = net_worth["total_value"], "account value"
+            denom, denom_label = net_worth["total_value"], "the total account value"
         else:
             denom = sum(w["capital_committed_now"] or 0.0 for w in wheels)
-            denom_label = "capital in wheels"
+            denom_label = "the cash tied up across every wheel"
         for wheel in wheels:
             cap = wheel["capital_committed_now"] or 0.0
             wheel["capital_committed_pct"] = round(100.0 * cap / denom, 1) if denom and cap else None
@@ -2995,7 +3169,11 @@ class Dashboard:
         Filter-independent, like the Trade Log: a hedge needs managing whatever
         date window is on screen. A leg paired into a same-day ``Spread`` is
         excluded -- its risk is already defined, there is nothing to "wind down."
-        Sorted soonest-expiry first, so the most urgent row leads the banner.
+        Two or more open legs on the very same contract (same right, strike,
+        expiry) within a cycle are merged into one entry first, via
+        ``_merge_same_contract_legs`` -- e.g. a hedge built up across separate
+        buys -- so the banner doesn't show the same hedge twice. Sorted
+        soonest-expiry first, so the most urgent row leads the banner.
         """
         through = self.last_date or date.today()
         dividends = dividends_by_cycle(self.all_cycles, self.transactions)
@@ -3005,15 +3183,23 @@ class Dashboard:
             for spread in cycle.spreads:
                 spread_leg_ids.add(spread.short_leg_id)
                 spread_leg_ids.add(spread.long_leg_id)
+            groups: dict[tuple[str, float, date], list[OptionLeg]] = {}
+            order: list[tuple[str, float, date]] = []
             for leg in cycle.legs:
                 if not leg.is_open or leg.side != LONG or leg.expiry is None:
                     continue
                 if leg.leg_id in spread_leg_ids:
                     continue
+                key = (leg.right, leg.strike, leg.expiry)
+                if key not in groups:
+                    groups[key] = []
+                    order.append(key)
+                groups[key].append(leg)
+            for key in order:
                 hedges.append(
                     _open_hedge_entry(
                         cycle,
-                        leg,
+                        _merge_same_contract_legs(groups[key]),
                         through,
                         name=self._company_names.get(cycle.underlying),
                         current_price=current_prices.get(cycle.underlying),
@@ -3194,6 +3380,26 @@ class Dashboard:
             if row.get("kind") == EQUITY and row.get("symbol"):
                 totals[row["symbol"]] = totals.get(row["symbol"], 0.0) + (row.get("quantity") or 0.0)
         return totals
+
+    def _option_mark_prices(self) -> dict[str, float]:
+        """``{occ_symbol: Last price}`` for every OPTION row across the
+        latest Positions snapshot of each account, straight off the broker's
+        own export -- the only options-quote feed this project has. Feeds
+        ``mark_to_market_pl`` (see ``_trade_log_entry``/``cycle_metrics``),
+        which uses it to price each still-open leg at what it would actually
+        cost to close today instead of assuming it expires worthless.
+        ``{}`` when there's no Positions snapshot to read at all; a leg whose
+        symbol isn't a key here (snapshot predates it, or was never
+        downloaded) falls back to that expiry valuation, leg by leg.
+        """
+        if not self.snapshots:
+            return {}
+        prices: dict[str, float] = {}
+        for snapshot in latest_snapshot_per_account(self.snapshots).values():
+            for row in snapshot.rows:
+                if row.kind == OPTION and row.occ_symbol and row.last_price is not None:
+                    prices[row.occ_symbol] = row.last_price
+        return prices
 
     def _build_cc_candidates(
         self,
@@ -3757,6 +3963,7 @@ class Dashboard:
             current_prices=current_prices,
             dividends_by_cycle=dividends,
             capital_through=capital_through,
+            option_mark_prices=self._option_mark_prices(),
         )
         capital = portfolio_capital_series(capital_cycles, capital_through, since)
         # "Right now," not "since": uses capital_cycles directly (uncropped by
@@ -3803,6 +4010,7 @@ class Dashboard:
             "last_date": _iso(portfolio.last_date),
             "win_rate_pct": portfolio.win_rate_pct,
             "roll_rate_pct": portfolio.roll_rate_pct,
+            "mark_to_market_pl": _money(portfolio.mark_to_market_pl),
         }
         dashboard_insights = portfolio_insights(
             portfolio_payload,

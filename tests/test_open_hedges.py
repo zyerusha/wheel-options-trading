@@ -74,7 +74,7 @@ class TestDetection(unittest.TestCase):
         self.assertFalse(h["is_wheel"])
         self.assertEqual(h["right"], "C")
         self.assertIsNone(h["premium_written_since"])
-        self.assertIn("directional", h["message"].lower())
+        self.assertIn("bought outright as a bet on the share price", h["message"].lower())
 
 
 class TestPhasesAndMessage(unittest.TestCase):
@@ -94,13 +94,13 @@ class TestPhasesAndMessage(unittest.TestCase):
         self.assertEqual(h["phase"], "runway")
         self.assertIn("RUNWAY", h["headline"])
         self.assertGreaterEqual(h["wheel_pl_now"], 0)
-        self.assertIn("runway", h["message"].lower())
+        self.assertIn("enough time to keep selling options", h["message"].lower())
 
     def test_wind_down_inside_two_months(self):
         h = self._one("250715")  # 43 DTE
         self.assertEqual(h["phase"], "wind_down")
         self.assertIn("WIND DOWN", h["headline"])
-        self.assertIn("sell the hedge now", h["message"].lower())
+        self.assertIn("sell this protective put now", h["message"].lower())
 
     def test_expiring_within_a_week(self):
         h = self._one("250606")  # 4 DTE
@@ -140,7 +140,7 @@ class TestPhasesAndMessage(unittest.TestCase):
         h = hedges[0]
         self.assertEqual(h["phase"], "runway")
         self.assertLess(h["wheel_pl_now"], 0)
-        self.assertIn("down -$", h["message"])
+        self.assertIn("down $", h["message"])
         self.assertIn("do not close it", h["message"].lower())
 
 

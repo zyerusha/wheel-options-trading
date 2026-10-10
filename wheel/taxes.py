@@ -170,20 +170,25 @@ def reconcile(
         totals["coverage_start"] = start.isoformat()
         totals["coverage_end"] = end.isoformat()
 
-    span = f"{start} → {end}" if start and end else "its coverage window"
+    span = (
+        f"option trades closed between {start} and {end}"
+        if start and end
+        else "the option trades it covers"
+    )
     return {
         "rows": rows,
         "totals": totals,
         "lots": [_lot_payload(lot) for lot in closed_lots],
         "notes": (
-            f"This cross-check reconciles Fidelity's closed-lots export, which records "
-            f"option lots disposed of between {span}, against the wheel engine. Each "
-            "ticker's engine figure is its option P/L over that same span, counting only "
-            "closes the export would show: assignments are excluded (their premium moves "
-            "to the assigned shares' cost basis) and still-open contracts do not count. A "
-            "small gap near the end date is expected; a position that expires on the "
-            "export date is realized here before the broker books it. 'close' means within "
-            "tolerance, 'review' means worth a look."
+            f"This cross-check compares the closed-lots file from Fidelity, which lists "
+            f"{span}, against this app's own figure for money made and lost on options over "
+            "the same dates. Both sides count only trades that file would list: a put or "
+            "call that was exercised is left out, because the cash it paid becomes part of "
+            "the price paid for the shares instead, and contracts still open do not count. A "
+            "small gap on the last date is normal, because a contract expiring that day is "
+            "counted here before the broker records it. Close means the two figures agree "
+            "closely enough to trust; Review means they differ more than expected and are "
+            "worth a closer look."
         ),
     }
 
