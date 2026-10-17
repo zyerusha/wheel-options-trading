@@ -241,24 +241,175 @@ account-prefixed like the rest.
 ### Covered-call candidates table
 
 `Dashboard._build_cc_candidates` (`wheel/api.py`, filter-independent) lists every
-position **holding shares with no covered call currently written against it**. Lots of
-**≥ 100 shares** are the actionable ones — a call could be written — and lead the
-table; smaller lots follow (`meets_threshold == False`) for visibility only, with
-`target_cc_strike` and `contracts_available` both `None`. Built entirely from the
-already-assembled Trade Log `wheels` (share count, cost basis, both break-evens, last
-close) and `open_positions` (a cycle is skipped when it has a row of `type == "CC"`);
-an open cash-secured put does **not** disqualify it, since a CSP ties up cash, not the
-shares. Plain buy-and-hold lots qualify too (their `wheel` column is blank).
+position **holding shares that no open covered call covers yet**. Lots with
+**≥ 100 uncovered shares** are the actionable ones (a call could be written) and lead
+the table; smaller lots follow (`meets_threshold == False`) for visibility only, with
+`contracts_available` `None`. Built entirely from the already-assembled Trade Log
+`wheels`; share counts and the CC TO EXIT fields are the wheel's own
+`cc_to_exit_detail` / `cc_to_exit*`. An open cash-secured put does **not** disqualify
+a position, since a CSP ties up cash, not the shares. Plain buy-and-hold lots qualify
+too (their `wheel` column is blank).
 
-The computed column is **`target_cc_strike`** — `max(cost_basis_per_share,
-break_even_per_share, break_even_price, last_close)` over whichever are known, then
-**rounded up to the next $0.50** (real strikes sit on 0.50-or-wider increments, and
-rounding up keeps it a valid floor). It is the lowest strike worth writing a call at:
-called away there, the shares sell for at least their cost (every premium already
-collected kept) and never below the current market. It is deliberately a *floor*, not
-a recommendation. `None` only when nothing at all is known; a bare last close is
-enough. The raw `cost_basis_per_share` that feeds it is its own **Avg Cost Basis**
-column. **`contracts_available`** is the covered-call position that could be opened,
+### CC TO EXIT
+
+One calculation, `wheel/ccexit.py` `calculate_cc_to_exit`, run once per wheel in
+`_trade_log_entry`; every table (Open option positions, Wheel price targets, CC
+candidates) and the Trade Log card copy its `cc_to_exit`, `cc_to_exit_status`,
+`cc_to_exit_label`, `cc_to_exit_explanation` and `cc_to_exit_detail` fields verbatim
+(`_cc_exit_fields`), and the frontend renders them with one function (`ccToExitCell`).
+
+1. Covered shares = 100 × open short covered-call contracts; uncovered = held − covered.
+   None uncovered → **ALL SHARES COVERED**; no shares → a dash.
+2. Covered/uncovered follow the engine's FIFO lot order: open calls cover the oldest
+   shares, so the uncovered ones are the newest (pre-history shares count as oldest).
+3. The next call(s) cover `contracts × 100` of them; their weighted cost is the lot
+   cost. Preferred minimum exit = lot cost × 1.02, rounded up to $0.50.
+4. Expiration: CC TO EXIT's own pick (`ccexit.pick_expiration`, over the shared
+   `optionsmath.pick_expiration`): the listed date closest to 35 DTE within 30-45 DTE,
+   or closest to 35 overall if none is in the window; that fallback is flagged
+   (`expiry_in_window: false`) and stated in the tooltip. Each call strike is priced at
+   the bid/ask mid less the account's own average fee per call contract sold
+   (Fidelity's $0.65 if it has never sold one), with a Black-Scholes delta from its
+   implied volatility.
+5. Rejected: strikes below the minimum exit, and strikes whose lot-level P&L if
+   assigned (below) is not positive.
+6. The qualifying strike with delta closest to 0.30 wins. None → **NO QUALIFYING CC**
+   with a reason built from the checks that actually failed (every strike below the
+   minimum exit, or counts such as "2 would lose money if assigned; 1 no bid/ask
+   quote" among the strikes at or above it). There is no fallback to the stock price.
+
+**The one lot-level assignment P&L** (for the `contracts × 100` shares the call
+covers, FIFO):
+
+    P&L if assigned = (strike − raw cost/share) × shares        stock-only P&L
+                    + option cash those same shares already earned (metrics.lot_option_credit)
+                    + (mid × 100 − option fee/contract) × contracts   new call, net
+                    − strike × shares × sale fee rate                 sale fee
+
+- Raw cost is the lot's `basis_per_share` (the bare assignment/purchase price), or the
+  broker's average cost for pre-history shares. Earlier premium enters **once**, as the
+  credit term; it is never also netted into the cost (that netted figure is the
+  Breakeven column, `net_adjusted_cost_basis`, which CC TO EXIT does not read).
+- Three figures stay apart in `cc_to_exit_detail`: `stock_pnl_if_assigned`,
+  `prior_option_credit`, and `projected_assignment_pnl` (plus `sale_fee_if_assigned`
+  and the fee inputs with their sources). Whole-wheel realized P&L is a separate
+  Trade Log field and never enters the filter.
+- **Sale fee** = strike × shares × (fees ÷ proceeds on the account's latest stock-sale
+  day); `SALE_FEE_RATE_FALLBACK` ($20.60 per $1M) only with no stock sale on file. This
+  is a proportional estimate: Fidelity charges no stock commission, and the SEC fee is
+  per dollar, but per-trade rounding and per-share charges (FINRA's TAF) aren't modeled
+  separately. The tooltip says so; a latest sale that showed $0 in fees is named as
+  such ("showed no fee, so none is counted") rather than silently treated as zero.
+- The 2% minimum exit (`CC_EXIT_MIN_GAIN_PCT`) is a floor on the strike relative to
+  what those shares cost. It is not advice that being called away there is the best
+  decision; the tooltip says so.
+
+Lot-level option cash (`metrics.lot_option_credit`, also behind each lot's
+`net_adjusted_cost_basis` / the Breakeven column): a put roll chain that ended in
+assignment goes to the lot(s) it created, matched on the assignment day **and the
+assigned put's strike** (so two different puts assigned on the same expiration each
+keep their own premium; a day with no strike match falls back to every lot acquired
+that day); a short call is split evenly over every share held when it opened,
+pre-history shares included; puts that expired or were bought back and long hedges
+stay wheel-level. The whole-position Wheel Breakeven (`break_even_price`) is unchanged
+and is never an input to CC TO EXIT.
+
+### CSP TO ENTER
+
+One calculation per **ticker**, `wheel/cspentry.py` `calculate_csp_to_enter`
+(`analyze_support` + `recommend_put`), run by `Dashboard._build_csp_to_enter` once per
+price refresh for every ticker any surface shows it for (open positions/wheels and CSP
+candidates). The result is served once, as the payload's top-level
+`csp_to_enter: {TICKER: {...}}` map (`_csp_to_enter_payload`: `status`, `label`,
+`recommended_strike`, `collateral_per_contract`, `expiry`, `days_to_expiry`,
+`expiry_in_window`, `support_zone`, `support_score`, `support_levels`,
+`support_distance_pct`, `support_evidence` (touches, touch days, sessions since the
+last, average bounce, close-through episodes, nearby moving averages), `delta`,
+`delta_target`, `delta_allowed_range`, `bid`, `ask`, `open_interest`, `option_volume`,
+`premium`, `net_premium`, `net_premium_per_contract`, `annualized_roi_pct`,
+`effective_purchase_price`, `effective_discount_pct`, `downside_to_strike_pct`,
+`recommendation_score`, `reason`, `limitations`, `explanation`, `quotes_as_of`,
+`chain_fetched_at`, `calculated_at`). Rows do **not** carry copies: the Wheel price
+targets, Open option positions and CSP candidates tables and the Trade Log card all
+look the ticker up with one frontend function (`cspToEnterFor` / `cspToEnterCell`),
+which only displays it. It replaced the old `last_close × 93%` figure and its % slider
+entirely.
+
+**One value per ticker across accounts.** Nothing account-specific goes in: the
+per-contract fee is the fixed $0.65 (`ccexit.OPTION_FEE_PER_CONTRACT`), not an
+account's measured fee, and the risk-free rate is one constant; chains and price
+history come from process-wide caches. Two accounts' entries can still differ when a
+price refresh lands between their builds, or when one account lacked an input the
+other had (a ticker live-priced in one account may be only a candidate with no last
+price in another). Each entry carries `market_data_complete` (false when the price,
+enough daily history, a listed expiration or the chain was unavailable, as opposed to
+everything loading and no put passing), and the Combined view
+(`accounts._combine_csp_to_enter`) keeps, per ticker, a complete entry over an
+incomplete one, then the latest `calculated_at` (a full tie keeps the first), and
+re-reads Gap to Target against it. Whole entries are chosen, never mixed field by
+field; when every account's entry lacked data the newest one (NO QUALIFYING CSP with
+its reason) shows, and no strike is ever made up. A single account's
+view keeps its **own** entries and adds other accounts' only for tickers it doesn't
+have, because its Wheel price targets and Open positions Gap to Target were computed
+against its own. Either way a view never shows two values for one ticker.
+
+1. **Support zones** from the last ~252 sessions of daily OHLCV (the same Yahoo chart
+   fetch as every other price; `PricePoint` now keeps high/low/volume and a close-only
+   cache is refetched once via `get_price_series(require_ranges=True)`). A swing low is
+   a daily low below the 5 prior lows, no higher than the 5 after, followed within 20
+   sessions by a bounce of at least max(3%, 1.5 ATR). Lows within one zone width
+   (1.5 × ATR(14), clamped 2.5-6% of price) of a zone's floor join that zone.
+2. **Zone score, 0-100**: touches 30% (full at 4), recency 20% (half-life 63 sessions),
+   bounce 20% (each capped at max(4 ATR, 2 × minimum bounce)), moving-average
+   confluence 15% (21-day EMA, 50/100/200-day MA within one zone width; full at 2),
+   touch-day volume vs median 10% (0.5x → 0, 2x → full), round number 5%. Missing
+   factors drop out and the weights re-normalize. × 0.5 per close-through episode
+   after the first touch; × (0.5 + 0.5 × sessions/126) under ~6 months of history.
+   A relative ranking, never presented as a probability.
+3. **Relevant zone**: bottom below the price, top within 25% under it, score ≥ 40;
+   best on score × exp(-(distance/15%)²). None → **NO QUALIFYING CSP**.
+4. **Candidates**: puts below the price on CSP TO ENTER's **own** expiration
+   (`cspentry.pick_expiration`: `CSP_TARGET_DTE` 35 inside `CSP_DTE_WINDOW` 30-45,
+   closest to 35 overall when none is listed there, flagged `expiry_in_window: false`
+   and stated in the tooltip). It no longer reads CC TO EXIT's pick; both pick over the
+   shared `optionsmath.pick_expiration`, and since today they hold the same target and
+   window, a ticker needing both still costs one `_option_chains` fetch (the cache is
+   keyed by ticker and date). One chain snapshot feeds the whole calculation, and its
+   quote/fetch times ride on the result. Mid less $0.65/contract, Black-Scholes delta.
+   Hard filters, in order: within 2 zone widths of the zone, a bid and a usable mid
+   (`bid_ask_mid`: no missing, negative, zero-ask or crossed quote) and spread ≤ 50% of
+   mid, a delta, positive net premium, delta 0.10-0.40, annualized return ≥ 30%
+   (`net ÷ strike × 365 ÷ DTE`, the open-position Ann. Yield definition; the same
+   constant is the roll target), positive effective price (`strike - net premium`).
+5. **Rank**: support strength 35%, delta closeness to 0.25 20% (0 at ±0.15), return
+   20% (full at 60%), effective-price discount vs the price 15% (full at 15%), strike
+   position vs the zone 10%. None qualify → **NO QUALIFYING CSP** with the commonest
+   rejections near the zone. There is no fallback to a percentage of the price.
+
+**How the result is presented.** Delta has a target (0.25, the ranking's aim), a
+preferred band (0.20-0.30, wording only, nothing is rejected for leaving it) and hard
+limits (0.10-0.40, enforced); the tooltip names all three. Net premium (per share and
+per contract), collateral per contract, effective purchase price with its % under the
+current price, downside from the price to the strike, DTE and annualized return are
+separate fields. Annualized return is labelled a screening figure for comparing puts,
+not an expected or guaranteed yearly return, and the downside line says that if
+assigned you own the shares however far the price falls. Support strength is labelled
+a ranking of past evidence, not a probability, and the tooltip says support can't stop
+the price falling through it. The effective purchase price is a *proposed-entry*
+figure for this one put; it is unrelated to the historical, whole-position Wheel
+Breakeven.
+
+**Option liquidity.** Underlying-stock liquidity (10-day share volume, market cap) is
+an eligibility check on the ticker; option-contract liquidity is checked per strike:
+a positive bid and a spread no wider than half the mid (`MAX_SPREAD_PCT_OF_MID`).
+Yahoo's chain also carries `openInterest` (as of the prior session) and `volume`
+(today; omitted before a contract trades), now parsed onto `OptionContractQuote` and
+shown in the tooltip and payload ("not reported" when absent). They are deliberately
+**not** filters: no threshold has been validated against how many candidates it would
+remove, and a missing intraday volume would wrongly reject a liquid contract early in
+the session.
+
+Back in the CC candidates table, **`contracts_available`** is the covered-call position that could be opened,
 carried **negative** (a short call: 175 shares → `-1`); the **Shares** column shows
 the raw current count, which can be fractional — a fractional-share sale or DRIP dust
 leaves an odd remainder (e.g. an IRA QQQ lot reads 151.806, a 0.194-share sale short
@@ -303,25 +454,34 @@ bought back at a loss drags the ticker's rating down instead of being invisible.
 cycles don't add to the `wheels` count (or the consistency sub-score), so tacking a
 loss on can't *raise* the score. `_last_closes` (the two-pass fetch `_current_prices`
 uses, factored out) pulls a current close for each, since these are usually tickers
-the account is no longer in and so absent from `_current_prices`'s set. The frontend
-then keeps only rows whose "Qty" — `floor(cash ÷ (last_close × 100))`, a rough
-at-the-money sizing — is at least 1: a name the free cash couldn't secure a single
-put on doesn't make the cut. "Cash / Contract" alongside it is just `last_close × 100`,
-the collateral one at-the-money put would tie up. "Target price for CSP" (frontend-
-computed, next to Signal, styled the violet of the CC table's "Target price for CC")
-is `floor(last_close × pct / 0.5) × 0.5` where `pct` is a user-set percentage —
-an editable number input sits above the table (`state.cspTargetPct`, persisted to
-`localStorage`, default **93** = ~7% OTM, clamped 50–100). A conservative strike
-floor, not a claim about where the premium is richest.
+the account is no longer in and so absent from `_current_prices`'s set. The CSP TO
+ENTER column next to Signal is the ticker's canonical entry (see **CSP TO ENTER**
+above), not computed here, and the row is sized at that strike: "Cash / Contract" is
+the entry's `collateral_per_contract` (strike × 100, the open-CSP collateral
+definition) and "Qty" is `floor(cash ÷ collateral_per_contract)`; a row shows only
+when Qty ≥ 1. A ticker with NO QUALIFYING CSP has nothing to size (both columns
+read a dash) and keeps the original visibility gate, `cash ≥ last_close × 100`, so
+its reason stays on screen; that gate is never shown as a number.
 
 **Cross-account universe.** A single account's view isn't limited to what *that*
 account wheeled: `AccountRegistry.build` replaces the per-account `csp_candidates`
-with `_combine_csp_candidates` run over *every* account's list (the same merge the
-Combined view uses — P/L and wheel count summed, rate signals wheel-weighted, recency
-the soonest), re-scored against **this** account's own `sector_exposure`. The frontend
-still sizes every row against this account's free cash, so a ticker only ever traded
-elsewhere surfaces here exactly when this account could write the put. The Combined
-view is unchanged.
+with `_combine_csp_candidates` run over *every* account, re-scored against **this**
+account's own `sector_exposure`. The frontend still sizes every row against this
+account's free cash, so a ticker only ever traded elsewhere surfaces here exactly when
+this account could write the put.
+
+The merge works on raw totals, not on finished rows: each account's payload carries
+`csp_candidate_history` (`aggregate_csp_history`: P/L, wheels, ROC sum and count,
+gross premium, option P/L, collateral, days, wins, losses, latest wheel date for
+**every** ticker it wheeled, profitable or not). `merge_csp_history` adds them, the
+winner rule (`is_csp_history_winner`: ≥ 1 wheel and net-positive) runs on the merged
+totals, and the row is rebuilt by the same `csp_candidate_row` a single account uses,
+so a merged row equals what one account holding all those wheels would show. (Before,
+the merge saw only each account's already-profitable rows, so a loss in another
+account was silently left out, and rates were wheel-weighted averages of rates rather
+than ratios of totals.) Ticker facts (price, sector, earnings, volatility,
+eligibility) come from any account that listed the ticker; a ticker no account listed
+has none on file and is left out rather than shown unchecked.
 
 **Eligibility filters** (`_csp_ticker_verdict`). A row is dropped outright if the name
 looks like an LP (`\bL.?P.?\b`), the security type is `leveraged_etf` / `inverse_etf` /
@@ -349,7 +509,22 @@ When a value is still *missing* (Yahoo carried nothing, no override), the row is
 and its `vetting.unvetted` list names the gap ("market cap unknown", "security type
 unknown", …); the frontend shows a `?` marker on the symbol with those notes on hover.
 So leveraged ETFs, closed-end/mutual funds, LPs and penny/mega/thin names are hidden; a
-name we still lack data for is shown, flagged.
+name we still lack data for is shown, flagged. `vetting.status` makes the difference
+explicit (`_csp_vetting`): **`qualified`** when every eligibility check (security type,
+price, market cap, volume) had data and passed, **`unverified`** when none failed but at
+least one couldn't be run. Missing data is never read as a pass.
+
+Four separate questions, never folded into one verdict:
+
+| concept | answered by |
+|---|---|
+| Eligibility | `_csp_ticker_verdict` / `vetting.status`: security type, price band, market cap, volume |
+| Company quality | **not assessed.** No profitability, debt, growth or valuation data is loaded, so no pass/fail is given; the Signal tooltip says so |
+| Option attractiveness | CSP TO ENTER: premium, delta, spread, return, support |
+| Historical wheel performance | the Signal stars below |
+
+A high premium or a high Signal rating is not evidence that the business is a good
+one to own.
 
 Each row also carries a **`stars`** rating (integer 0–5, no half steps) with a full
 `star_breakdown` for the hover — `csp_star_score` in `wheel/api.py`. Nine
@@ -375,17 +550,19 @@ a 30–45 DTE put, tapering after) and **sector concentration** (`_sector_modifi
 using `sector_exposure` over the open wheels' `capital_committed_now`). That gives a
 per-ticker **`raw_stars`** = `clamp(base + earnings_mod + sector_mod, 0, 5)`.
 
-Left there, the weighted average buries almost every ticker in the 2–4 band, so the
-dashboard re-grades on a curve — and against the names it actually shows, not the whole
-book. `spreadStars` (in `app.js`) runs *after* the affordability filter: it's a straight
-min/max stretch across the shortlist — the weakest shown name maps to **0** stars, the
-strongest to **5**, everyone else linearly between — so the full range is always visible
-on the list. A ticker too expensive for the current cash is filtered out first and so
-can't anchor either end. The stretch only engages with ≥3 shown rows and real range to
-stretch; its pull ramps in between 0.5 and 1.5 stars of range, so a shortlist bunched
-within half a star (or fewer than three names) keeps plain absolute rounding rather than
-blowing noise up into a full spread. Order is preserved; the tooltip shows both the
-`raw` value and that a curve was applied.
+**Displayed stars are absolute**: `stars = round(raw_stars)`, computed per ticker in
+the backend and shown as-is. A ticker's stars depend only on its own history, today's
+market inputs and its sector's weight in the book (this account's in a single-account
+view, the whole book's in Combined), never on which other tickers are listed, so
+adding or removing a candidate can't move another one's rating. (The former
+`spreadStars` curve in `app.js`, which stretched the affordable shortlist so its
+weakest name read 0 and its strongest 5, is gone: it made a weak name look strong
+whenever the rest of the list was weaker.) Relative ordering is kept separately: the
+Signal column sorts by `raw_stars` (`cspSignalSortKey`), so names on the same whole-star
+level still rank by score. The tooltip shows the base, both modifiers and the rounding,
+and states that the rating covers past wheels and today's market, not a chance of
+profit and not the company itself. The weighted average does bunch most tickers in the
+2–4 band; that is the honest absolute reading.
 Volatility and price-position come from
 `_price_stats` (the two-pass fetch factored out of `_current_prices`, now also computing
 stdev of the last ~30 log returns and the 52-week range position). It is a ranking
@@ -397,11 +574,11 @@ fetched (Yahoo, cached) with `data/earnings.json` as a per-ticker override; the 
 ambers the **Earnings cell** and adds a `⚠` when `0 ≤ days_to_earnings ≤ 14`
 (`earningsCell`), the same flag Expiration gets in Open option positions.
 
-The Combined view merges by ticker via `_combine_csp_candidates` (P/L and wheel count
-summed, rate signals wheel-weighted, recency the soonest) and re-runs `csp_star_score`
-on the merged inputs against the **whole book's** `sector_exposure`, so the rating
-reflects the combined portfolio, not one account's slice. Net-negative tickers are
-dropped; `sector` / `earnings` are taken as the ticker facts they are.
+The Combined view merges by ticker via `_combine_csp_candidates` (the raw-totals
+merge described under **Cross-account universe**) and scores against the **whole
+book's** `sector_exposure`, so the rating reflects the combined portfolio, not one
+account's slice. Tickers net-negative once every account is counted are dropped;
+`sector` / `earnings` are taken as the ticker facts they are.
 
 ### Insights
 
@@ -854,13 +1031,24 @@ across periods).
 `ShareLot.basis_per_share` is the raw tax-lot basis -- the bare assignment or
 purchase price, exactly what a 1099-B would show -- and nothing in this feature
 touches it. `net_adjusted_cost_basis()` (`wheel/metrics.py`) is a second, separate
-number: the wheel's own economic break-even, `strike - net option cash flow/share`,
-accumulated over the *whole cycle's* option activity (every roll, every covered
-call sold after assignment), not just the leg that produced the lot. When a cycle
-holds more than one concurrent lot at different strikes, the cycle's net cash flow
-is allocated pro-rata by share count, against every share the cycle's lots ever
-held -- so the allocation stays stable as shares are later sold off, rather than
-each lot claiming the whole cycle's premium independently.
+number: that lot's own economic break-even, `raw basis - lot-level option cash per
+share` (`metrics.lot_option_credit`, see **CC TO EXIT**): the put roll chain that
+assigned this lot, plus each covered call's cash split evenly over every share held
+when it opened. Puts that expired or were bought back, and long hedges, are not on
+any lot; they stay in the whole-position figures. Which credits and fees each metric
+includes:
+
+| metric | stock cost | option cash | fees |
+|---|---|---|---|
+| Breakeven column (`net_adjusted_cost_basis`) | lot's raw basis | this lot's own (assigning put chain + calls written while held) | inside the fee-net option cash |
+| Wheel Breakeven (`break_even_price`) | raw cost of all shares held | every option dollar in the wheel, plus realized stock P&L and dividends | inside the fee-net cash |
+| CC TO EXIT P&L if assigned | raw basis of the shares the call covers | those shares' own lot credit + the new call's net premium | the new call's per-contract fee + the estimated sale fee |
+| CSP TO ENTER effective purchase price | the proposed strike | the proposed put's net premium only | $0.65 per contract |
+
+The first two are historical accounting; the last two are forward-looking for one
+proposed trade. No premium appears twice in any of them (the CC TO EXIT credit term
+reads the lot credit directly and starts from the raw basis, never from the
+Breakeven column).
 
 The formula's `+ fees/share` term looks like it duplicates the fee that's already
 netted into every cash figure here (`Transaction.amount` is fee-net -- see

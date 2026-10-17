@@ -5,12 +5,13 @@ from __future__ import annotations
 import os
 import sys
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.test_engine import tx  # noqa: E402
-from wheel.api import Dashboard, _cc_strike_floor, _profit_target, _trade_log_entry  # noqa: E402
+from wheel import ccexit  # noqa: E402
+from wheel.api import Dashboard, _no_contract_open_position_row, _profit_target, _trade_log_entry  # noqa: E402
 from wheel.engine import build_cycles  # noqa: E402
 from wheel.parser import ASSIGNED, BTC, BTO, BUY_STOCK, EXPIRED, OTHER, SELL_STOCK, STC, STO, parse_occ_symbol  # noqa: E402
 from wheel.positions import AccountSnapshot, OPTION, PositionRow  # noqa: E402
@@ -47,21 +48,32 @@ def _option_row(symbol: str, last_price: float) -> PositionRow:
     )
 
 
-def _trade_log(transactions, names=None, prices=None, snapshots=None) -> dict:
+def _trade_log(transactions, names=None, prices=None, snapshots=None, exit_chains=None, dashboard_out=None) -> dict:
     """Run ``Dashboard._build_trade_log`` against a hand-built transaction list,
     without touching disk or the network (the ``__init__`` pipeline).
 
     ``snapshots`` (a list of ``PositionSnapshot``) lets a test supply a
     Positions export so ``_option_mark_prices`` has something to mark open
     legs against; omitted, it behaves as if no Positions file was ever
-    downloaded.
+    downloaded. ``exit_chains``: ``{ticker: ccexit.ExitChain}`` standing in
+    for the live option chains CC TO EXIT is chosen from; omitted, no chain
+    is available. ``dashboard_out``: a list the Dashboard is appended to.
     """
     dashboard = Dashboard.__new__(Dashboard)
+    dashboard._cc_exit_chains = lambda prices, untracked: {
+        cycle.cycle_id: (exit_chains or {})[cycle.underlying]
+        for cycle in dashboard.all_cycles
+        if cycle.underlying in (exit_chains or {})
+    }
+    if dashboard_out is not None:
+        dashboard_out.append(dashboard)
     dashboard.transactions = transactions
     dashboard.all_cycles, dashboard.engine = build_cycles(transactions)
     dashboard._company_names = names or {}
     dashboard.snapshots = snapshots or []
     dashboard._cycle_metrics_cache = {}
+    # No real share counts: every wheel's shares are the ones its own lots trace.
+    dashboard._net_worth = {"available": False}
     return Dashboard._build_trade_log(dashboard, prices or {})
 
 
@@ -406,87 +418,173 @@ class TestTransactionRows(unittest.TestCase):
             )
             self.assertAlmostEqual(wheel["profit_target"], _profit_target(floor), places=2)
 
-    def test_cc_strike_floor_available_with_an_open_cc(self):
-        # This wheel holds shares AND already has an open covered call (the
-        # STO call above is never bought back) -- unlike _build_cc_candidates'
-        # target_cc_strike, which would exclude a wheel like this one entirely
-        # (its cc_cycle_ids filter), cc_strike_floor is still populated: it's
-        # useful for planning the *next* roll of an already-open call.
+    def test_cc_to_exit_is_all_covered_when_the_open_call_covers_every_share(self):
+        # 100 shares, one open call against them: nothing left to write against.
         (wheel,) = self._cc_phase_fixture(92.0)["wheels"]
-        self.assertIsNotNone(wheel["cc_strike_floor"])
+        self.assertIsNone(wheel["cc_to_exit"])
+        self.assertEqual(wheel["cc_to_exit_status"], ccexit.STATUS_ALL_COVERED)
+        self.assertEqual(wheel["cc_to_exit_label"], "ALL SHARES COVERED")
+        self.assertEqual(wheel["cc_to_exit_detail"]["covered_shares"], 100)
 
-    def test_cc_strike_floor_matches_shared_helper(self):
-        (wheel,) = self._cc_phase_fixture(92.0)["wheels"]
-        expected = _cc_strike_floor(
-            wheel["cost_basis_per_share"],
-            wheel["break_even_per_share"],
-            wheel["break_even_price"],
-            92.0,
-        )
-        self.assertAlmostEqual(wheel["cc_strike_floor"], expected, places=2)
-
-    def test_cc_strike_floor_never_below_profit_target(self):
-        # Regression: cc_strike_floor used to compare cost basis / breakeven /
-        # wheel breakeven against the current price with no cushion, while
-        # profit_target cushioned that same floor by +2% -- so whenever the
-        # price hadn't rallied past cost basis, CC TO EXIT (cc_strike_floor)
-        # came out *below* Profit Target. A call struck there and assigned
-        # would lock in a below-target exit, defeating the point of a floor.
-        # Price sits below cost basis here so the price term never dominates.
-        for price in (85.0, 91.9, 92.0):
-            rows = _trade_log(
-                [tx("2025-07-18", BUY_STOCK, "BFH", 100, 92.0, -100 * 92.0, row_id=1)],
-                prices={"BFH": price},
-            )
-            (wheel,) = rows["wheels"]
-            self.assertGreaterEqual(wheel["cc_strike_floor"], wheel["profit_target"])
-
-    def test_cc_strike_floor_applies_the_same_cushion_as_profit_target(self):
-        # Cost basis $92 cushioned +2% = $93.84, rounded up to $94.00 -- both
-        # figures land on it when the price (here $85) doesn't dominate.
-        rows = _trade_log(
-            [tx("2025-07-18", BUY_STOCK, "BFH", 100, 92.0, -100 * 92.0, row_id=1)],
-            prices={"BFH": 85.0},
-        )
-        (wheel,) = rows["wheels"]
-        self.assertAlmostEqual(wheel["profit_target"], 94.0, places=2)
-        self.assertAlmostEqual(wheel["cc_strike_floor"], 94.0, places=2)
-
-    def test_crox_style_price_rally_case(self):
-        # A plain share buy (no premium banked yet) at ~$95.43, price now
-        # ~$112.48 -- reproduces the real CROX numbers that exposed the
-        # original "stuck target" problem: Profit Target stays low/stable,
-        # CC Strike Floor tracks the current price, and they differ.
+    def test_cc_to_exit_never_falls_back_to_the_stock_price(self):
+        # The CROX numbers: a plain share buy at $95.43, price now $112.48.
+        # The old formula answered $112.50 (the last price rounded up); with
+        # no option chain to check strikes against, the answer is NO
+        # QUALIFYING CC with the reason, never a price-derived number.
         rows = _trade_log(
             [tx("2025-07-18", BUY_STOCK, "CROX", 290, 95.43, -290 * 95.43, row_id=1)],
             prices={"CROX": 112.48},
         )
         (wheel,) = rows["wheels"]
+        self.assertIsNone(wheel["cc_to_exit"])
+        self.assertEqual(wheel["cc_to_exit_status"], ccexit.STATUS_NO_QUALIFYING)
+        self.assertEqual(wheel["cc_to_exit_label"], "NO QUALIFYING CC")
+        self.assertIn("NO QUALIFYING CC", wheel["cc_to_exit_explanation"])
+        # Profit Target is a separate concept and is unaffected.
         self.assertAlmostEqual(wheel["profit_target"], 97.5, places=2)
-        self.assertAlmostEqual(wheel["cc_strike_floor"], 112.5, places=2)
-        self.assertNotAlmostEqual(wheel["profit_target"], wheel["cc_strike_floor"], places=2)
 
-    def test_csp_preferred_entry_formula(self):
+    def _assigned_then_chain(self, extra=(), chain_calls=None, price=130.58):
+        """100 shares assigned at $135 (put premium $339.34), no call open,
+        with a chain whose deltas come from ``chain_calls`` [(strike, iv)]."""
+        transactions = [
+            *extra,
+            tx("2026-09-17", STO, "-JXN261016P135", -1, 3.40, 339.34, row_id=10),
+            tx("2026-10-16", ASSIGNED, "-JXN261016P135", 1, None, 0.0, row_id=11, as_of="2026-10-16"),
+        ]
+        calls = tuple(
+            ccexit.CallQuote(strike, 2.0, 2.2, iv) for strike, iv in (chain_calls or [(135, 0.30), (140, 0.30), (145, 0.30)])
+        )
+        chain = ccexit.ExitChain(date(2026, 10, 17), date(2026, 11, 20), calls)
+        return _trade_log(transactions, prices={"JXN": price}, exit_chains={"JXN": chain})
+
+    def test_cc_to_exit_recommends_a_strike_at_or_above_the_minimum_exit(self):
+        (wheel,) = self._assigned_then_chain()["wheels"]
+        detail = wheel["cc_to_exit_detail"]
+        self.assertEqual(wheel["cc_to_exit_status"], ccexit.STATUS_RECOMMENDED)
+        self.assertEqual(detail["lot_cost"], 135.0)
+        self.assertEqual(detail["preferred_min_exit"], 138.0)
+        self.assertEqual(wheel["cc_to_exit"], 140.0)
+        self.assertIsNone(wheel["cc_to_exit_label"])
+        self.assertIn("CC TO EXIT = $140.00", wheel["cc_to_exit_explanation"])
+
+    def test_whole_position_break_even_is_independent_of_cc_to_exit(self):
+        # Test 7: an earlier put that expired adds $500 of wheel-level premium.
+        # It lowers the whole-position break-even, but it is not these shares'
+        # own cash, so CC TO EXIT (built from the lot alone) doesn't move.
+        earlier_put = (
+            tx("2026-06-01", STO, "-JXN260618P120", -1, 5.00, 500.0, row_id=1),
+            tx("2026-06-18", EXPIRED, "-JXN260618P120", 1, None, 0.0, row_id=2, as_of="2026-06-18"),
+        )
+        (plain,) = self._assigned_then_chain()["wheels"]
+        (with_put,) = self._assigned_then_chain(extra=earlier_put)["wheels"]
+        self.assertAlmostEqual(plain["break_even_price"] - with_put["break_even_price"], 5.0, places=2)
+        self.assertEqual(plain["cc_to_exit"], with_put["cc_to_exit"])
+        # Two separate builds: everything matches but the calculation time.
+        strip = lambda detail: {k: v for k, v in detail.items() if k != "calculated_at"}  # noqa: E731
+        self.assertEqual(strip(plain["cc_to_exit_detail"]), strip(with_put["cc_to_exit_detail"]))
+
+    def test_cc_to_exit_does_not_change_the_break_even(self):
+        # The reverse: a different chain changes the pick, never the break-even.
+        (a,) = self._assigned_then_chain(chain_calls=[(140, 0.30)])["wheels"]
+        (b,) = self._assigned_then_chain(chain_calls=[(145, 0.60)])["wheels"]
+        self.assertNotEqual(a["cc_to_exit"], b["cc_to_exit"])
+        self.assertEqual(a["break_even_price"], b["break_even_price"])
+        self.assertEqual(a["profit_target"], b["profit_target"])
+
+    def test_every_table_shows_the_same_cc_to_exit(self):
+        dashboards: list = []
+        trade_log = _trade_log(
+            [
+                tx("2026-09-17", STO, "-JXN261016P135", -1, 3.40, 339.34, row_id=10),
+                tx("2026-10-16", ASSIGNED, "-JXN261016P135", 1, None, 0.0, row_id=11, as_of="2026-10-16"),
+            ],
+            prices={"JXN": 130.58},
+            exit_chains={
+                "JXN": ccexit.ExitChain(
+                    date(2026, 10, 17),
+                    date(2026, 11, 20),
+                    (ccexit.CallQuote(140, 2.0, 2.2, 0.30),),
+                    quotes_as_of=datetime(2026, 10, 17, 19, 59, tzinfo=timezone.utc),
+                    fetched_at=datetime(2026, 10, 17, 20, 5, tzinfo=timezone.utc),
+                )
+            },
+            dashboard_out=dashboards,
+        )
+        (wheel,) = trade_log["wheels"]
+        dashboard = dashboards[0]
+        dashboard._fundamentals = lambda tickers: {}
+        (candidate,) = Dashboard._build_cc_candidates(dashboard, [wheel])
+        (target,) = Dashboard._build_wheel_targets_banner(dashboard, [wheel])
+        no_contract = _no_contract_open_position_row(wheel, None, None, date(2026, 10, 17), None)
+        fields = ("cc_to_exit", "cc_to_exit_status", "cc_to_exit_label", "cc_to_exit_explanation", "cc_to_exit_detail")
+        for row in (candidate, target, no_contract):
+            self.assertEqual({k: row[k] for k in fields}, {k: wheel[k] for k in fields})
+        self.assertEqual(wheel["cc_to_exit"], 140.0)
+        # Same chain snapshot and calculation time on every display.
+        detail = wheel["cc_to_exit_detail"]
+        self.assertEqual(detail["quotes_as_of"], "2026-10-17T19:59:00+00:00")
+        self.assertEqual(detail["chain_fetched_at"], "2026-10-17T20:05:00+00:00")
+        self.assertIsNotNone(detail["calculated_at"])
+        self.assertIn("Option prices as of", wheel["cc_to_exit_explanation"])
+
+    def test_csp_phase_carries_no_per_wheel_put_strike(self):
+        # CSP TO ENTER is one per-ticker result (the payload's csp_to_enter
+        # map, wheel/cspentry.py); the wheel only says it is in the CSP phase,
+        # so no wheel can hold a second, different strike for the same ticker.
         rows = _trade_log(
             [tx("2025-01-02", STO, "-MU250117P100", -1, 3.0, 300.0, row_id=1)],
             prices={"MU": 120.0},
         )
         (wheel,) = rows["wheels"]
         self.assertEqual(wheel["wheel_phase"], "csp")
-        self.assertAlmostEqual(wheel["preferred_csp_entry"], 111.5, places=2)  # floor(120*0.93 -> $0.50)
+        self.assertNotIn("preferred_csp_entry", wheel)
+        self.assertNotIn("preferred_csp_entry_explanation", wheel)
 
-    def test_csp_phase_has_no_cc_strike_floor(self):
+    def test_csp_phase_has_no_cc_to_exit(self):
+        # No shares: nothing to write a call against, and no last-price stand-in.
         rows = _trade_log(
             [tx("2025-01-02", STO, "-MU250117P100", -1, 3.0, 300.0, row_id=1)],
-            prices={"MU": 120.0},
+            prices={"MU": 120.2},
         )
         (wheel,) = rows["wheels"]
-        self.assertIsNone(wheel["cc_strike_floor"])
+        self.assertEqual(wheel["wheel_phase"], "csp")
+        self.assertIsNone(wheel["cc_to_exit"])
+        self.assertEqual(wheel["cc_to_exit_status"], ccexit.STATUS_NO_SHARES)
+        self.assertIsNone(wheel["cc_to_exit_label"])
 
-    def test_cc_phase_has_no_preferred_csp_entry(self):
+    def test_cc_phase_carries_no_per_wheel_put_strike(self):
         (wheel,) = self._cc_phase_fixture(92.0)["wheels"]
         self.assertEqual(wheel["wheel_phase"], "cc")
-        self.assertIsNone(wheel["preferred_csp_entry"])
+        self.assertNotIn("preferred_csp_entry", wheel)
+
+    def test_running_profit_target_uses_the_summarys_three_way_floor(self):
+        # The summary's Profit Target = max(cost basis, lot break-even, wheel
+        # break-even) x 1.02. Here the lot break-even is the highest: a call
+        # bought back at a loss raised it to $104.50, while an expired put
+        # (wheel-level only) keeps the wheel break-even lower. The running line
+        # used to take only max(cost basis, running break-even) = $102.
+        rows = _trade_log(
+            [
+                tx("2025-01-02", STO, "-MU250110P95", -1, 5.0, 500.0, row_id=1),
+                tx("2025-01-10", EXPIRED, "-MU250110P95", 1, None, 0.0, row_id=2, as_of="2025-01-10"),
+                tx("2025-01-13", STO, "-MU250117P100", -1, 3.0, 300.0, row_id=3),
+                tx("2025-01-17", ASSIGNED, "-MU250117P100", 1, None, 0.0, row_id=4, as_of="2025-01-17"),
+                tx("2025-01-20", STO, "-MU250221C105", -1, 1.5, 150.0, row_id=5),
+                tx("2025-02-03", BTC, "-MU250221C105", 1, 9.0, -900.0, row_id=6),
+                tx("2025-02-10", STO, "-MU250321C110", -1, 0.5, 50.0, row_id=7),
+            ],
+            prices={"MU": 90.0},
+        )
+        (wheel,) = rows["wheels"]
+        by_row = {r["date"]: r for r in wheel["transactions"]}
+        # After the buyback: lot break-even 100 - (300 + 150 - 900)/100 = 104.50
+        # -> 104.50 x 1.02 = 106.59, rounded up to 107.00.
+        self.assertAlmostEqual(by_row["2025-02-03"]["running_profit_target"], 107.0, places=2)
+        # After the last call: 100 - (300 + 150 - 900 + 50)/100 = 104.00 -> 106.50,
+        # the summary's own Profit Target.
+        self.assertAlmostEqual(wheel["break_even_per_share"], 104.0, places=2)
+        self.assertAlmostEqual(wheel["profit_target"], 106.5, places=2)
+        self.assertAlmostEqual(by_row["2025-02-10"]["running_profit_target"], wheel["profit_target"], places=2)
 
     def test_historical_running_profit_target_unchanged(self):
         # Same fixture/expectations as test_running_break_even_progression_
@@ -526,16 +624,14 @@ class TestTransactionRows(unittest.TestCase):
         # Stage 1: CSP only, no shares yet.
         (wheel1,) = _trade_log(all_txns[:1], prices={"MU": 240.0})["wheels"]
         self.assertEqual(wheel1["wheel_phase"], "csp")
-        self.assertAlmostEqual(wheel1["preferred_csp_entry"], 223.0, places=2)  # floor(240*0.93 -> $0.50)
         self.assertIsNone(wheel1["profit_target"])
-        self.assertIsNone(wheel1["cc_strike_floor"])
+        self.assertEqual(wheel1["cc_to_exit_status"], ccexit.STATUS_NO_SHARES)
 
         # Stage 2: assigned, holding shares, no CC written yet.
         (wheel2,) = _trade_log(all_txns[:2], prices={"MU": 232.0})["wheels"]
         self.assertEqual(wheel2["wheel_phase"], "cc")
         self.assertIsNotNone(wheel2["profit_target"])
-        self.assertIsNotNone(wheel2["cc_strike_floor"])
-        self.assertIsNone(wheel2["preferred_csp_entry"])
+        self.assertEqual(wheel2["cc_to_exit_detail"]["uncovered_shares"], 100)
 
         # Stage 3: CC written and called away -- cycle closes, flat again.
         # wheel_phase reports "csp" for this now-closed cycle too (is_open
@@ -544,9 +640,8 @@ class TestTransactionRows(unittest.TestCase):
         (wheel3,) = _trade_log(all_txns, prices={"MU": 236.0})["wheels"]
         self.assertFalse(wheel3["is_open"])
         self.assertEqual(wheel3["wheel_phase"], "csp")
-        self.assertIsNotNone(wheel3["preferred_csp_entry"])
         self.assertIsNone(wheel3["profit_target"])
-        self.assertIsNone(wheel3["cc_strike_floor"])
+        self.assertEqual(wheel3["cc_to_exit_status"], ccexit.STATUS_NO_SHARES)
 
     def test_pl_bridge_sums_to_mark_to_market(self):
         rows = _trade_log(
@@ -623,6 +718,47 @@ def _find_row(wheel, date_str, type_, strike=None):
     ]
     assert len(matches) == 1, f"expected exactly one match, got {matches}"
     return matches[0]
+
+
+class TestCcExitFeeModel(unittest.TestCase):
+    """Dashboard._cc_exit_fee_model: CC TO EXIT's fees, measured from the
+    account's own ledger (Commission + Fees columns)."""
+
+    def _model(self, transactions):
+        dashboard = Dashboard.__new__(Dashboard)
+        dashboard.transactions = transactions
+        return Dashboard._cc_exit_fee_model(dashboard)
+
+    def test_call_fee_is_the_contract_weighted_average(self):
+        model = self._model(
+            [
+                tx("2026-08-07", STO, "-JXN260918C140", -3, 3.06, 915.99, row_id=1, commission=1.95, fees=0.06),
+                tx("2026-10-14", STO, "-JXN261120C135", -1, 4.86, 485.32, row_id=2, commission=0.65, fees=0.03),
+                # A put sale is not a covered call; it doesn't count.
+                tx("2026-09-09", STO, "-JXN260918P135", -1, 2.30, 229.34, row_id=3, commission=0.65, fees=0.01),
+            ]
+        )
+        self.assertAlmostEqual(model.option_fee_per_contract, (2.01 + 0.68) / 4)
+        self.assertIn("4 call contracts", model.option_fee_source)
+
+    def test_sale_fee_rate_comes_from_the_latest_stock_sale_date(self):
+        model = self._model(
+            [
+                # An old sale at a different rate is ignored.
+                tx("2025-09-22", SELL_STOCK, "BHF", -100, 50.0, 5000.0, row_id=1),
+                tx("2026-04-20", SELL_STOCK, "MU", -100, 425.0, 42499.12, row_id=2, fees=0.88),
+                tx("2026-04-20", SELL_STOCK, "MU", -22, 440.0, 9679.80, row_id=3, fees=0.20),
+            ]
+        )
+        self.assertAlmostEqual(model.sale_fee_rate, (0.88 + 0.20) / (42500.0 + 9680.0))
+        self.assertIn("Apr 20, 2026", model.sale_fee_source)
+
+    def test_fallbacks_say_so_when_there_is_nothing_to_measure(self):
+        model = self._model([tx("2026-06-01", STO, "-JXN260618P100", -1, 2.5, 249.33, row_id=1)])
+        self.assertEqual(model.option_fee_per_contract, ccexit.OPTION_FEE_PER_CONTRACT)
+        self.assertIn("no call sales", model.option_fee_source)
+        self.assertEqual(model.sale_fee_rate, ccexit.SALE_FEE_RATE_FALLBACK)
+        self.assertIn("no stock sales", model.sale_fee_source)
 
 
 class TestWinRateAndRollChainDrillDown(unittest.TestCase):

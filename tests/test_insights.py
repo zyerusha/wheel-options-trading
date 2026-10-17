@@ -102,5 +102,24 @@ class TestShape(unittest.TestCase):
         self.assertEqual(sorted(result), ["improvements", "strengths"])
 
 
+class TestPreHistoryShares(unittest.TestCase):
+    """A covered call written on shares bought before the oldest loaded file:
+    its capital is estimated at the strike (OptionLeg.collateral_per_contract)."""
+
+    def _result(self, pre_history_cost_known: bool):
+        cycles, _ = build_cycles([tx("2026-10-14", STO, "-JXN261120C135", -1, 4.86, 485.32, row_id=1)])
+        cycle = cycles[0]
+        self.assertTrue(cycle.capital_estimated)
+        return wheel_insights(
+            cycle, cycle_metrics(cycle, date(2026, 10, 17)), pre_history_cost_known=pre_history_cost_known
+        )
+
+    def test_unknown_cost_is_flagged(self):
+        self.assertIn("real cost is unknown", _text(self._result(False)))
+
+    def test_no_unknown_cost_claim_once_the_broker_cost_is_on_file(self):
+        self.assertNotIn("real cost is unknown", _text(self._result(True)))
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -42,7 +42,12 @@ def wheel_insights(
     dividends: float = 0.0,
     break_even_price: float | None = None,
     mark_to_market_pl: float | None = None,
+    pre_history_cost_known: bool = False,
 ) -> dict[str, list[str]]:
+    """``pre_history_cost_known``: shares held from before the oldest loaded
+    export have a cost on file (the broker's average, see
+    ``Dashboard._untracked_cost_per_share``), so "their cost is unknown" no
+    longer applies to them."""
     strengths: list[str] = []
     improvements: list[tuple[float | None, str]] = []
 
@@ -254,7 +259,7 @@ def wheel_insights(
                 "export to fix it.",
             )
         )
-    elif metrics.capital_estimated:
+    elif metrics.capital_estimated and not pre_history_cost_known:
         improvements.append(
             (
                 None,

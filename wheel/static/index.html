@@ -316,10 +316,10 @@
 
           <ul class="hint-list">
             <li><strong>Type</strong>: CC = covered call; CSP = cash-secured put.</li>
-            <li><strong>CC TO EXIT</strong>: minimum target share price for selling a covered call while still locking in a profit if assigned.</li>
-            <li><strong>CSP TO ENTER</strong>: target strike price for the next cash-secured put, set a defined % below the last close and rounded to $0.50.</li>
+            <li><strong>CC TO EXIT</strong>: strike for the next covered call on shares no open call covers yet. It must be at least 2% above what those shares cost and make money if assigned; of the strikes that pass, it picks the one with delta closest to 0.30 (about 35 days out). Shows ALL SHARES COVERED when every share already has a call, or NO QUALIFYING CC with the reason when no strike passes.</li>
+            <li><strong>CSP TO ENTER</strong>: put strike to sell next, anchored to historical support below the price (swing lows scored 0-100 on touches, recency, bounce, moving averages, volume and round numbers), with delta near 0.25 and at least 30% annualized on strike collateral (about 35 days out). Shows NO QUALIFYING CSP with the reason when no put passes. Support strength is historical evidence, not a guarantee.</li>
             <li><strong>Profit Target</strong>: share price where the wheel reaches its target profit.</li>
-            <li><strong>Gap to Target</strong>: percentage move from the last close to the Profit Target.</li>
+            <li><strong>Gap to Target</strong>: (target - last price) ÷ last price, where the target is the Profit Target on a CC row and the CSP TO ENTER strike on a CSP row.</li>
             <li>Hover a value or column heading for the exact calculation.</li>
           </ul>
 
@@ -910,10 +910,10 @@
 
           <ul class="hint-list">
             <li>
-              Shares you hold without an open covered call. Batches of 100+ shares are listed first; smaller batches are shown without a target quantity.
+              Shares you hold that no open covered call is using yet. Batches of 100+ free shares are listed first; smaller batches are shown without a target quantity.
             </li>
             <li>
-              <strong>Target price for CC</strong>: minimum share price for a covered call that keeps the wheel profitable if assigned. It is a floor, not necessarily the highest-premium strike.
+              <strong>CC TO EXIT</strong>: strike for the next covered call on shares no open call covers yet. It must be at least 2% above what those shares cost and make money if assigned; of the strikes that pass, it picks the one with delta closest to 0.30 (about 35 days out). Shows ALL SHARES COVERED when every share already has a call, or NO QUALIFYING CC with the reason when no strike passes.
             </li>
             <li>
               <strong>Current Wheel</strong>: click the ID to open that wheel in Trade Log.
@@ -952,26 +952,12 @@
 
           <ul class="hint-list" id="csp-candidates-hint" hidden>
             <li>
-              <strong>What this lists</strong>: stocks where one 100-share CSP can be fully collateralized with current available cash.
+              <strong>What this lists</strong>: stocks where current available cash fully collateralizes at least one CSP at the CSP TO ENTER strike (Qty and Cash / Contract are sized at that strike). A stock with NO QUALIFYING CSP stays listed with the reason while one 100-share lot at its last price fits the cash.
             </li>
             <li>
               <strong>Filter Criteria</strong>: Stocks and plain ETFs only; excludes leveraged/inverse ETFs, CEFs, mutual funds, and LPs. Price $10–$350, market cap ≥$1B, and 10-day average volume &gt;1M shares.
             </li>
           </ul>
-
-          <label class="csp-target-ctl" id="csp-target-ctl" hidden>
-            Target price for a cash-secured put:
-            <input
-              type="number"
-              id="csp-target-pct"
-              min="50"
-              max="100"
-              step="0.5"
-              value="93"
-              inputmode="decimal"
-            />
-            % of last close, rounded down to $0.50
-          </label>
 
           <div style="overflow-x: auto">
             <table id="csp-candidates-table"></table>
@@ -1115,6 +1101,12 @@
           <div id="tradelog-bridge" class="tradelog-bridge" hidden></div>
 
           <div id="tradelog-summary" class="tradelog-summary" hidden></div>
+
+          <!-- A wheel (or hold) cycle that also bought a long call/put --
+               e.g. a covered-call wheel that also holds a protective put --
+               gets this card too, in its own section below the wheel's own
+               summary above; see renderTradeLogSummary/renderDirectionalSummary. -->
+          <div id="tradelog-directional-extra" class="tradelog-summary" hidden></div>
 
           <div id="tradelog-timeline" class="tradelog-ppd" hidden>
             <div class="ti-head">Wheel timeline</div>

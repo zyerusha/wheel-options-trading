@@ -529,5 +529,138 @@ class TestOpenPositionsIsAFullSnapshot(unittest.TestCase):
             self.assertAlmostEqual(rows[0]["shares_held"], 100.0, places=4)
 
 
+class TestTradeLogUntrackedShares(unittest.TestCase):
+    """A still-open wheel whose shares were all bought before the oldest
+    loaded export (the IRA's JXN: 0 tracked, 300 real) shows the broker's
+    real share count as `shares_untracked`, rolled forward by any share
+    trade the Positions snapshot predates so it reflects today's holding.
+    """
+
+    # A covered call against shares this history never saw being bought.
+    COVERED_CALL_ROW = (
+        '09/01/2026,"YOU SOLD OPENING TRANSACTION CALL (XOM) ...",-XOM270115C150,'
+        '"CALL ...",Cash,-1,3.00,0,0,,300.00,10000.00,09/02/2026'
+    )
+
+    def _xom_wheel(self, history_rows: list[str]) -> dict:
+        return self._xom_build(history_rows)[0]
+
+    # Fidelity lists freshly assigned shares as their own Margin row with no
+    # cost basis ("--") until they settle.
+    UNCOSTED_MARGIN_ROW = (
+        '111111111,"Test Account",XOM,"EXXON MOBIL CORP",100,$100.00,,'
+        "$10000.00,,,,,25.00%,--,--,Margin,\n"
+    )
+
+    def _xom_build(
+        self,
+        history_rows: list[str],
+        cost_basis_total: str = "$18000.00",
+        extra_position_rows: tuple[str, ...] | list[str] = (),
+    ) -> tuple[dict, dict]:
+        """(the XOM Trade Log wheel, its Wheel price targets row). The broker
+        file reports 300 shares; ``cost_basis_total`` "" means no cost on file."""
+        with tempfile.TemporaryDirectory() as tmp:
+            history_path = os.path.join(tmp, "History.csv")
+            _write_history_csv(history_path, history_rows)
+            positions_path = os.path.join(tmp, "Positions.csv")
+            with open(positions_path, "w", encoding="utf-8-sig", newline="") as handle:
+                handle.write(POSITIONS_HEADER + "\n")
+                handle.write(
+                    '111111111,"Test Account",XOM,"EXXON MOBIL CORP",300,$100.00,,'
+                    f"$30000.00,,,,,100.00%,{cost_basis_total},,Cash,\n"
+                )
+                handle.writelines(extra_position_rows)
+                handle.write('\n"Date downloaded Sep-05-2026 5:00 p.m ET"\n')
+            data = Dashboard(history_path, position_paths=[positions_path]).build()
+        (wheel,) = [w for w in data["trade_log"]["wheels"] if w["underlying"] == "XOM"]
+        (target,) = [t for t in data["wheel_targets"] if t["underlying"] == "XOM"]
+        return wheel, target
+
+    def _sale_row(self, run_date: str, shares: int) -> str:
+        return (
+            f'{run_date},"YOU SOLD EXXON MOBIL CORP (XOM) (Cash)",XOM,"EXXON MOBIL CORP",Cash,'
+            f"-{shares},100.00,0,0,,{shares * 100}.00,20000.00,{run_date}"
+        )
+
+    def test_open_wheel_with_no_tracked_shares_shows_the_real_count(self):
+        wheel = self._xom_wheel([self.COVERED_CALL_ROW])
+        self.assertNotEqual(wheel["status"], "CLOSED")
+        self.assertAlmostEqual(wheel["shares_held"], 0.0, places=4)
+        self.assertAlmostEqual(wheel["shares_untracked"], 300.0, places=4)
+
+    def test_untracked_shares_put_the_wheel_in_its_covered_call_phase(self):
+        wheel, target = self._xom_build([self.COVERED_CALL_ROW])
+        self.assertEqual(wheel["wheel_phase"], "cc")
+        self.assertNotIn("preferred_csp_entry", wheel)
+        self.assertEqual(target["wheel_phase"], "cc")
+        self.assertAlmostEqual(target["shares_untracked"], 300.0, places=4)
+
+    def test_untracked_shares_are_costed_at_the_broker_average(self):
+        wheel, _ = self._xom_build([self.COVERED_CALL_ROW])
+        # $18,000 / 300 shares.
+        self.assertEqual(wheel["untracked_cost_per_share"], 60.0)
+        self.assertEqual(wheel["cost_basis_per_share"], 60.0)
+        # $60 cost less the $300 open call credit (valued at expiry) over 300 shares.
+        self.assertAlmostEqual(wheel["break_even_price"], 59.0, places=2)
+        # max($60 cost, $59 break-even) x 1.02 = $61.20, rounded up to $0.50.
+        self.assertEqual(wheel["profit_target"], 61.5)
+
+    def test_running_break_even_starts_out_holding_the_untracked_shares(self):
+        # Feeds the "Break-even price over time" chart, which had no points at
+        # all when no share row in the history ever bought the shares.
+        wheel, _ = self._xom_build([self.COVERED_CALL_ROW])
+        (row,) = [r for r in wheel["transactions"] if r["type"] != "Dividend"]
+        # Real cash only: the opening shares' cost never enters this column.
+        self.assertAlmostEqual(row["running_cash_flow"], 300.0, places=2)
+        # ($18,000 opening cost - $300 credit) / 300 shares, = the summary figure.
+        self.assertAlmostEqual(row["running_break_even"], 59.0, places=2)
+        self.assertAlmostEqual(row["running_cost_basis"], 60.0, places=2)
+
+    def test_no_broker_cost_leaves_the_targets_explained_but_blank(self):
+        wheel, _ = self._xom_build([self.COVERED_CALL_ROW], cost_basis_total="")
+        self.assertIsNone(wheel["untracked_cost_per_share"])
+        self.assertIsNone(wheel["cost_basis_per_share"])
+        self.assertIsNone(wheel["break_even_price"])
+        self.assertIsNone(wheel["profit_target"])
+        self.assertIn("unknown", wheel["profit_target_explanation"])
+
+    def test_uncosted_row_the_ledger_traces_keeps_the_broker_average(self):
+        # The IRA's JXN: 300 old shares with a broker cost, plus 100 just
+        # assigned that the broker shows as "--". The ledger costs those 100 at
+        # the strike itself, so the 300 still get the broker's average.
+        assignment_rows = _assigned_put_rows("-XOM260918P95", "XOM", "09/01/2026", "09/18/2026", "Sep-18-2026")
+        wheel, _ = self._xom_build(
+            [self.COVERED_CALL_ROW, *assignment_rows],
+            extra_position_rows=[self.UNCOSTED_MARGIN_ROW],
+        )
+        self.assertAlmostEqual(wheel["shares_held"], 100.0, places=4)
+        self.assertAlmostEqual(wheel["shares_untracked"], 300.0, places=4)
+        # $18,000 / 300 costed shares; the uncosted Margin row is the assignment.
+        self.assertEqual(wheel["untracked_cost_per_share"], 60.0)
+        # (300 x $60 + 100 x $95) / 400 shares.
+        self.assertAlmostEqual(wheel["cost_basis_per_share"], 68.75, places=2)
+        # Every row after the opening holds all 300 old shares, so every one
+        # has a break-even point for the chart, not just the assignment row.
+        self.assertTrue(all(r["running_break_even"] is not None for r in wheel["transactions"]))
+
+    def test_uncosted_row_the_ledger_does_not_trace_leaves_no_cost(self):
+        # Nothing in the history bought those 100 shares, so they could be
+        # among the untracked ones; averaging over the costed row alone would
+        # misprice them.
+        wheel, _ = self._xom_build([self.COVERED_CALL_ROW], extra_position_rows=[self.UNCOSTED_MARGIN_ROW])
+        self.assertAlmostEqual(wheel["shares_untracked"], 400.0, places=4)
+        self.assertIsNone(wheel["untracked_cost_per_share"])
+
+    def test_a_sale_after_the_snapshot_is_subtracted(self):
+        wheel = self._xom_wheel([self.COVERED_CALL_ROW, self._sale_row("09/08/2026", 100)])
+        self.assertAlmostEqual(wheel["shares_untracked"], 200.0, places=4)
+
+    def test_a_sale_on_the_snapshot_day_is_not_counted_twice(self):
+        # Already settled into the Sep-05 snapshot's 300, by definition.
+        wheel = self._xom_wheel([self.COVERED_CALL_ROW, self._sale_row("09/05/2026", 100)])
+        self.assertAlmostEqual(wheel["shares_untracked"], 300.0, places=4)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

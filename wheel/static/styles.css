@@ -542,34 +542,6 @@ button.primary:hover {
   cursor: help;
 }
 
-/* User-set "% of last close" for the Target price for CSP column. */
-.csp-target-ctl {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-  font-size: 13px;
-  color: var(--text-secondary);
-  margin: 0 0 10px;
-}
-
-.csp-target-ctl[hidden] {
-  display: none;
-}
-
-.csp-target-ctl input[type='number'] {
-  width: 5.5em;
-  font: inherit;
-  color: var(--text-primary);
-  background: var(--surface-1);
-  border: 1px solid var(--axis);
-  border-radius: 7px;
-  padding: 4px 7px;
-  min-height: 30px;
-  text-align: right;
-  font-variant-numeric: tabular-nums;
-}
-
 /* CSP recommender: a 0-5 star rating, half-star aware. */
 #csp-candidates-table td.csp-star {
   white-space: nowrap;
@@ -630,6 +602,10 @@ button.primary:hover {
 
 .neg {
   color: var(--critical);
+}
+
+.warn {
+  color: var(--warning);
 }
 
 /* ---------------- cards & charts ---------------- */
@@ -1340,12 +1316,53 @@ tr.detail > td {
   padding: 9px 11px;
   font-size: 12px;
   min-width: 150px;
+  /* Never clipped: long text wraps, and a tip taller than the window scrolls
+     inside itself. */
+  max-width: min(440px, calc(100vw - 16px));
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  overflow-wrap: anywhere;
   opacity: 0;
   transition: opacity 0.09s;
 }
 
 #tooltip.on {
   opacity: 1;
+}
+
+/* Pinned (opened with T) stays until T again, so it takes the pointer -- the
+   reader can scroll it and select its text -- and reads larger. The readout
+   that follows the mouse over a chart must not, or it would block the chart. */
+#tooltip.pinned {
+  pointer-events: auto;
+  font-size: 14px;
+  max-width: min(560px, calc(100vw - 16px));
+  padding: 12px 14px;
+}
+
+#tooltip.pinned .tt-formula {
+  font-size: 13px;
+}
+
+#tooltip.on::after {
+  content: 'Press T to keep open';
+  display: block;
+  margin-top: 6px;
+  font-size: 10px;
+  color: var(--text-secondary);
+  text-align: right;
+}
+
+#tooltip.pinned::after {
+  content: 'Press T to close';
+  font-size: 11px;
+}
+
+#tooltip .tt-text {
+  white-space: pre-line;
+  color: var(--text-primary);
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
 }
 
 #tooltip .tt-title {
@@ -1398,7 +1415,6 @@ tr.detail > td {
   color: var(--text-secondary);
   font-size: 11px;
   line-height: 1.45;
-  max-width: 260px;
   font-variant-numeric: tabular-nums;
 }
 
@@ -2019,6 +2035,112 @@ tr.detail > td {
 .tradelog-summary .tl-foot {
   font-size: 11px;
   color: var(--text-secondary);
+}
+
+/* Section divider inside the directional (LC/LP) card -- groups cells into
+   Position & P&L / Exposure / Cost & breakeven / Risk / Greeks without a
+   separate card or table. */
+.tradelog-summary .tl-section {
+  grid-column: 1 / -1;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.tradelog-summary .tl-section:first-child {
+  padding-top: 0;
+  border-top: none;
+}
+
+.tradelog-summary .tl-mgmt-input {
+  width: 5.5em;
+  font: inherit;
+  color: var(--text-primary);
+  background: var(--surface-1);
+  border: 1px solid var(--axis);
+  border-radius: 7px;
+  padding: 4px 7px;
+  min-height: 28px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.tradelog-summary .tl-mgmt-select {
+  font: inherit;
+  padding: 4px 6px;
+  min-height: 28px;
+}
+
+.tradelog-summary .tl-mgmt-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+}
+
+.tradelog-summary .tl-mgmt-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.tradelog-summary .tl-mgmt-checklist {
+  grid-column: 1 / -1;
+  font-size: 12px;
+  color: var(--text-secondary);
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+}
+
+.tradelog-summary .tl-mgmt-checklist ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+
+.tradelog-summary .tl-leg-table-wrap {
+  grid-column: 1 / -1;
+  overflow-x: auto;
+}
+
+.tradelog-summary table.tl-leg-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+
+.tradelog-summary table.tl-leg-table th,
+.tradelog-summary table.tl-leg-table td {
+  padding: 4px 8px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.tradelog-summary table.tl-leg-table th:first-child,
+.tradelog-summary table.tl-leg-table td:first-child {
+  text-align: left;
+}
+
+.tradelog-summary table.tl-leg-table th {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+}
+
+.tradelog-summary table.tl-leg-table td {
+  border-bottom: 1px solid var(--border);
+  font-variant-numeric: tabular-nums;
 }
 
 

@@ -265,44 +265,158 @@ def capital_timeline(cycle: Cycle, through: date) -> list[CapitalPoint]:
 # --------------------------------------------------------------------------
 
 
-def net_adjusted_cost_basis(cycle: Cycle, lot: ShareLot) -> float | None:
-    """The wheel's own break-even per share: strike minus every dollar of net
-    option cash flow the cycle has produced, allocated to this lot.
+@dataclass(frozen=True)
+class LotOptionCredit:
+    """Net option cash (credit positive, already fee-net) attributed to each
+    share still held, per share. ``by_lot``: per ``ShareLot.lot_id``;
+    ``untracked``: for each share held from before the oldest loaded export
+    that no lot traces (``Dashboard._untracked_shares_by_cycle``)."""
+
+    by_lot: dict[str, float]
+    untracked: float
+
+
+def _leg_net_cash(leg: OptionLeg, through: date | None = None) -> float:
+    """The leg's net cash, counting only fills on or before ``through``
+    (every fill when ``None``). Every cash figure on a leg is the broker's
+    own Amount, already net of commission and fees (see wheel/parser.py), so
+    no fee term is added."""
+    if through is not None and leg.open_date > through:
+        return 0.0
+    return leg.open_cash + sum(close.cash for close in leg.closes if through is None or close.date <= through)
+
+
+def _legs_by_roll_chain(cycle: Cycle) -> list[list[OptionLeg]]:
+    """Every leg, grouped by ``roll_chains``; a leg never rolled is a chain of one."""
+    by_id = {leg.leg_id: leg for leg in cycle.legs}
+    chained: set[str] = set()
+    groups: list[list[OptionLeg]] = []
+    for chain in roll_chains(cycle):
+        groups.append([by_id[leg_id] for leg_id in chain["leg_ids"]])
+        chained.update(chain["leg_ids"])
+    groups += [[leg] for leg in cycle.legs if leg.leg_id not in chained]
+    return groups
+
+
+def _lot_shares_on(lot: ShareLot, day: date, assignment_dates: set[date]) -> float:
+    """Shares of ``lot`` held while a call opened on ``day`` was written.
+    Assigned shares arrive after the put's expiration close, so a call sold
+    that same day was written against shares already held, never these;
+    bought shares count from their own trade date."""
+    arrived = lot.acquired < day or (lot.acquired == day and lot.acquired not in assignment_dates)
+    if not arrived:
+        return 0.0
+    sold_before = sum(d["shares"] for d in lot.disposals if d["date"] < day)
+    return max(lot.shares - sold_before, 0.0)
+
+
+def _lots_from_put_assignments(cycle: Cycle, assignments: set[tuple[date, float]]) -> list[ShareLot]:
+    """The lots a chain's put assignments created: acquired on the assignment
+    day at that put's strike (an assigned put buys at its strike, whether the
+    engine synthesized the shares or the broker's own fill booked them).
+    Matching the strike too keeps two different puts assigned on the same
+    expiration from pooling each other's premium. A day whose strike matches
+    no lot falls back to every lot acquired that day, so the cash still lands
+    on the shares the assignment brought in rather than vanishing."""
+    found: dict[str, ShareLot] = {}
+    for day, strike in assignments:
+        same_day = [lot for lot in cycle.share_lots if lot.acquired == day and lot.shares > 0]
+        at_strike = [
+            lot for lot in same_day if lot.basis_per_share is not None and abs(lot.basis_per_share - strike) < 0.005
+        ]
+        for lot in at_strike or same_day:
+            found[lot.lot_id] = lot
+    return list(found.values())
+
+
+def lot_option_credit(
+    cycle: Cycle, *, untracked_shares: float = 0.0, through: date | None = None
+) -> LotOptionCredit:
+    """Lot-level option cash: only what each lot's own shares earned, never
+    the whole wheel's history poured onto whichever lot happens to be held.
+
+    - A short-put roll chain that ended in assignment: all of its net cash
+      goes to the lot(s) that assignment created, per share assigned.
+    - A short call: its net cash (open credit plus any buyback) is split
+      evenly over every share held when it was opened, including shares
+      held from before the oldest loaded export (``untracked_shares``,
+      assumed held for the whole cycle since they predate it).
+    - Everything else (puts that expired or were bought back, long hedges)
+      is wheel-level P&L and is not attributed to any lot.
+
+    Every share still held was held at every point since its lot arrived
+    (shares only ever leave), so a call's per-share credit applies in full
+    to each remaining share of each lot that held it.
+
+    ``through``: the credit as it stood at the end of that day (only fills
+    and assignments on or before it), for the Trade Log's per-row history.
+    """
+    assignment_dates = _assignment_lot_dates(cycle)
+    by_lot = {lot.lot_id: 0.0 for lot in cycle.share_lots}
+    untracked = 0.0
+
+    for chain in _legs_by_roll_chain(cycle):
+        assignments = {
+            (close.date, leg.strike)
+            for leg in chain
+            if leg.side == SHORT and leg.right == "P"
+            for close in leg.closes
+            if close.action == ASSIGNED and (through is None or close.date <= through)
+        }
+        if not assignments:
+            continue
+        lots = _lots_from_put_assignments(cycle, assignments)
+        assigned_shares = sum(lot.shares for lot in lots)
+        if assigned_shares <= 0:
+            continue
+        per_share = sum(_leg_net_cash(leg, through) for leg in chain) / assigned_shares
+        for lot in lots:
+            by_lot[lot.lot_id] += per_share
+
+    for leg in cycle.legs:
+        if leg.side != SHORT or leg.right != "C" or (through is not None and leg.open_date > through):
+            continue
+        held = {lot.lot_id: _lot_shares_on(lot, leg.open_date, assignment_dates) for lot in cycle.share_lots}
+        total_held = sum(held.values()) + untracked_shares
+        if total_held <= 1e-9:
+            continue
+        per_share = _leg_net_cash(leg, through) / total_held
+        for lot_id, shares in held.items():
+            if shares > 1e-9:
+                by_lot[lot_id] += per_share
+        if untracked_shares > 1e-9:
+            untracked += per_share
+
+    return LotOptionCredit(by_lot=by_lot, untracked=untracked)
+
+
+def net_adjusted_cost_basis(
+    cycle: Cycle,
+    lot: ShareLot,
+    *,
+    untracked_shares: float = 0.0,
+    credit: LotOptionCredit | None = None,
+) -> float | None:
+    """This lot's own break-even per share: its raw cost less the option
+    cash its own shares earned (``lot_option_credit``).
 
     Distinct from ``lot.basis_per_share`` (the raw tax-lot basis -- the bare
     assignment or purchase price, exactly what a 1099-B would show) which
     this function never touches or reads back into: the two numbers answer
-    different questions and both stay available side by side.
+    different questions and both stay available side by side. The
+    whole-position figure (every dollar the wheel made, over every share)
+    is the Trade Log's ``break_even_price``, not this.
 
-    The formula is ``strike - net premiums/share + fees/share``, but every
-    cash figure already on a leg (``open_cash``, ``LegClose.cash``) is the
-    broker's own Amount, already net of commission and fees -- see
-    ``wheel/parser.py``. Reconstructing gross premium and then subtracting
-    fees back out algebraically collapses to using the already-fee-net total
-    directly (``-gross/share + fees/share == -(gross-fees)/share ==
-    -net/share``), so that is what this does; adding a fee term on top of the
-    already-fee-net total would double the fee's cost, the same trap this
-    module's docstring warns about elsewhere.
-
-    Cumulative and whole-cycle: every roll, every covered call sold after
-    assignment, folds into the same running total, not just the leg that
-    produced this particular lot. When a cycle holds more than one concurrent
-    lot (e.g. two partial assignments at different strikes before either
-    sells), the cycle's net premium is allocated pro-rata by share count,
-    against every share the cycle's lots ever held -- not just what remains
-    today -- so the allocation stays stable as shares are later sold off.
+    ``credit``: a precomputed ``lot_option_credit(cycle, untracked_shares=...)``
+    to reuse across a cycle's lots.
 
     ``None`` when the lot's own basis is unknown (a ``PRE_HISTORY`` lot, see
-    ``wheel/engine.py``): there is no strike to net against.
+    ``wheel/engine.py``): there is no cost to net against.
     """
     if lot.basis_per_share is None or lot.shares <= 0:
         return None
-    total_shares = sum(other.shares for other in cycle.share_lots)
-    if total_shares <= 0:
-        return None
-    net_cash_flow = sum(leg.open_cash + sum(close.cash for close in leg.closes) for leg in cycle.legs)
-    allocated = net_cash_flow * (lot.shares / total_shares)
-    return lot.basis_per_share - allocated / lot.shares
+    credit = credit or lot_option_credit(cycle, untracked_shares=untracked_shares)
+    return lot.basis_per_share - credit.by_lot.get(lot.lot_id, 0.0)
 
 
 # --------------------------------------------------------------------------
@@ -359,6 +473,10 @@ class CycleMetrics:
     wheel_core_realized_pl: float = 0.0  # CSP + covered-call legs only
     hedge_realized_pl: float = 0.0  # protective puts + credit-spread legs (LONG_PUT/LONG_CALL)
     option_open_premium: float = 0.0  # credit held on still-open legs
+    # The short-leg part of option_open_premium only (open CSPs / covered
+    # calls / short hedge legs): premium sold but not yet realized. A long
+    # leg's open debit is excluded -- it's a cost paid, not premium collected.
+    option_open_short_premium: float = 0.0
     # Marked-to-market P&L on those same open legs: open_premium netted
     # against today's actual cost to close (a broker Positions snapshot's
     # Last price), when one is on hand -- see OptionLeg.unrealized_pl. Falls
@@ -576,6 +694,7 @@ def cycle_metrics(
     option_realized = wheel_core_realized + hedge_realized
     open_legs = [leg for leg in cycle.legs if leg.is_open]
     option_open_premium = sum(leg.open_premium for leg in open_legs)
+    option_open_short_premium = sum(leg.open_premium for leg in open_legs if leg.side == SHORT)
     option_open_pl_marked = bool(open_legs) and all(leg.occ_symbol in (option_mark_prices or {}) for leg in open_legs)
     option_open_pl = sum(
         leg.unrealized_pl(option_mark_prices[leg.occ_symbol])
@@ -677,6 +796,7 @@ def cycle_metrics(
         wheel_core_realized_pl=wheel_core_realized,
         hedge_realized_pl=hedge_realized,
         option_open_premium=option_open_premium,
+        option_open_short_premium=option_open_short_premium,
         option_open_pl=option_open_pl,
         option_open_pl_marked=option_open_pl_marked,
         stock_realized_pl=stock_realized,
@@ -742,6 +862,7 @@ class PortfolioMetrics:
     stock_realized_pl: float = 0.0
     net_realized_pl: float = 0.0
     open_premium: float = 0.0
+    open_short_premium: float = 0.0  # Σ option_open_short_premium
     fees: float = 0.0
 
     capital_deployed_now: float = 0.0
@@ -993,6 +1114,7 @@ def portfolio_metrics(
         result.stock_realized_pl += metric.stock_realized_pl
         result.net_realized_pl += metric.net_realized_pl
         result.open_premium += metric.option_open_premium
+        result.open_short_premium += metric.option_open_short_premium
         result.fees += metric.fees
         result.total_legs += metric.legs_total
         result.open_legs += metric.legs_open
