@@ -1,5 +1,5 @@
 """CC TO EXIT: wheel/ccexit.py's ``calculate_cc_to_exit`` / ``pick_expiration``
-/ ``explain``. Pure, no network: every chain is hand-built. A strike's
+/ ``tooltip_card``. Pure, no network: every chain is hand-built. A strike's
 implied volatility is solved here so the model delta lands on the value a
 test wants, since delta itself is always derived (wheel.optionsmath), never
 supplied."""
@@ -14,8 +14,15 @@ from datetime import date, timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from wheel import ccexit  # noqa: E402
-from wheel.ccexit import CallQuote, FeeModel, ShareBlock, calculate_cc_to_exit, explain, pick_expiration  # noqa: E402
+from wheel.ccexit import CallQuote, FeeModel, ShareBlock, calculate_cc_to_exit, pick_expiration, tooltip_card  # noqa: E402
+from wheel.tooltipcard import card_text  # noqa: E402
 from wheel.optionsmath import black_scholes_greeks  # noqa: E402
+
+
+def explain(result):
+    """The CC TO EXIT tooltip as the reader sees it, flattened to text."""
+    return card_text(tooltip_card(result))
+
 
 TODAY = date(2026, 10, 17)
 EXPIRY = date(2026, 11, 20)  # 34 days out
@@ -117,7 +124,7 @@ class TestDeltaSelection(unittest.TestCase):
 
     def test_outside_the_preferred_range_is_explained(self):
         result = _run(calls=[_call(135, 0.30), _call(140, 0.22)])
-        self.assertIn("no qualifying strike lands inside it", explain(result))
+        self.assertIn("no qualifying strike lands inside the preferred 0.25 to 0.35 range", explain(result))
 
     def test_tie_goes_to_the_lower_strike(self):
         result = _run(calls=[_call(140, 0.33), _call(145, 0.27)])
@@ -239,7 +246,7 @@ class TestFees(unittest.TestCase):
         text = explain(_run(calls=[_call(140, 0.30)], fees=self.MEASURED))
         self.assertIn("less $0.67 per contract (your average over 189 call contracts sold)", text)
         self.assertIn("$20.60 per $1M sold (your latest sale)", text)
-        self.assertIn("- sale fee $0.29", text)
+        self.assertIn("Sale fee if assigned: - $0.29", text)
 
 
 class TestStatuses(unittest.TestCase):
@@ -256,7 +263,9 @@ class TestStatuses(unittest.TestCase):
         self.assertEqual(result.status, ccexit.STATUS_NO_QUALIFYING)
         self.assertIsNone(result.strike)
         self.assertEqual(ccexit.STATUS_LABELS[result.status], "NO QUALIFYING CC")
-        self.assertIn("NO QUALIFYING CC", explain(result))
+        card = tooltip_card(result)
+        self.assertEqual(card["status_label"], "DOES NOT QUALIFY")
+        self.assertEqual(card["summary"], result.reason)
 
     def test_no_shares(self):
         result = _run([], covered=0)
@@ -341,11 +350,12 @@ class TestExplanation(unittest.TestCase):
             "Shares held: 400",
             "Covered by open calls: 300",
             "Uncovered: 100",
-            "cost $135.00/share",
+            "Cost of those shares: $135.00 a share",
             "$135.00 × 1.02 = $137.70, rounded up to $138.00",
-            "Target delta: 0.30",
-            "$135.00: delta 0.30, rejected, below the $138.00 minimum exit",
-            "CC TO EXIT = $140.00",
+            "Target 0.30",
+            "$135.00 | 0.30 | $",
+            "| FAIL | Rejected\n  Below the $138.00 minimum exit",
+            "Recommended call\n$140.00",
         ):
             self.assertIn(expected, text)
 
@@ -426,12 +436,47 @@ class TestRejectionReasonsMatchTheFilter(unittest.TestCase):
         self.assertEqual(result.reason, "The option chain lists no call strikes.")
 
 
+class TestTooltipCard(unittest.TestCase):
+    def test_statuses(self):
+        self.assertEqual(tooltip_card(_run(calls=[_call(140, 0.30)]))["status_label"], "QUALIFIES")
+        covered = tooltip_card(_run(covered=400, calls=[_call(140, 0.30)]))
+        self.assertEqual((covered["status"], covered["status_label"]), ("info", "ALL SHARES COVERED"))
+        self.assertIsNone(tooltip_card(_run([], covered=0)))
+        # Missing inputs can't be checked: UNVERIFIED, not a rule failure.
+        self.assertEqual(tooltip_card(_run(calls=[_call(140, 0.30)], price=None))["status_label"], "UNVERIFIED")
+        self.assertEqual(tooltip_card(_run(chain=False, chain_reason="down"))["status_label"], "UNVERIFIED")
+        unknown_cost = _run([ShareBlock(100, 50.0), ShareBlock(100, None)], covered=100, calls=[_call(140, 0.30)])
+        self.assertEqual(tooltip_card(unknown_cost)["status_label"], "UNVERIFIED")
+        # Fewer than 100 uncovered shares is a rule outcome, not missing data.
+        self.assertEqual(tooltip_card(_run([ShareBlock(150, 50.0)], covered=100))["status_label"], "DOES NOT QUALIFY")
+
+    def test_key_numbers_match_the_result(self):
+        fees = FeeModel(0.667, "measured", 20.60e-6, "latest sale")
+        result = _run([ShareBlock(200, 135.0)], covered=0, calls=[_call(140, 0.30, bid=3.70, ask=3.80)], fees=fees)
+        card = tooltip_card(result, "JXN")
+        metrics = {m["label"]: m["value"] for m in card["metrics"]}
+        # Per contract = mid x 100 - fee = 375 - 0.667; the call is 2 contracts.
+        self.assertAlmostEqual(result.pick.net_premium, 2 * (3.75 * 100 - 0.667))
+        self.assertEqual(metrics["Net premium / contract"], "$374.33")
+        self.assertEqual(metrics["P&L if assigned"], f"${result.pick.projected_assignment_pnl:,.2f}")
+        self.assertEqual(metrics["Minimum exit strike"], "$138.00")
+        self.assertEqual(card["headline"]["value"], "$140.00")
+        self.assertEqual(card["ticker"], "JXN")
+        self.assertLessEqual(len(card["why"]), 3)
+        self.assertIn(f"{DTE} DTE from Oct 17", card["subtitle"])
+
+    def test_risk_section_says_the_minimum_is_a_floor_not_advice(self):
+        text = explain(_run(calls=[_call(140, 0.30)]))
+        self.assertIn("is a floor on the strike, not advice that selling there is the best move", text)
+        self.assertIn("newest uncovered shares are sold at $140.00", text)
+
+
 class TestExpirationWindowIsVisible(unittest.TestCase):
     def test_outside_the_window_is_flagged(self):
         far = TODAY + timedelta(days=60)
         result = _run([ShareBlock(100, 135.0)], covered=0, calls=[], expiry=far)
         self.assertIs(result.expiry_in_window, False)
-        self.assertIn("None listed 30-45 days out", explain(result))
+        self.assertIn("none listed 30 to 45 days out", explain(result))
 
     def test_inside_the_window(self):
         self.assertIs(_run(calls=[_call(140, 0.30)]).expiry_in_window, True)

@@ -47,6 +47,7 @@ from datetime import date, datetime
 from typing import Sequence
 
 from wheel import optionsmath
+from wheel import tooltipcard as tc
 from wheel.ccexit import OPTION_FEE_PER_CONTRACT, OPTION_MULTIPLIER
 from wheel.marketdata import PricePoint
 from wheel.optionsmath import PUT, bid_ask_mid, black_scholes_greeks
@@ -242,6 +243,28 @@ class PutCandidate:
     def qualifies(self) -> bool:
         return self.rejected_reason is None
 
+    @property
+    def spread_pct_of_mid(self) -> float | None:
+        return spread_pct_of_mid(self.bid, self.ask, self.mid_premium)
+
+    @property
+    def spread_check(self) -> str:
+        """The spread rule on its own: PASS, FAIL (no bid, or wider than
+        ``MAX_SPREAD_PCT_OF_MID``) or UNAVAILABLE (no usable quote at all)."""
+        if self.mid_premium is None:
+            return "FAIL" if self.ask and not self.bid else "UNAVAILABLE"
+        if not self.bid:
+            return "FAIL"
+        return "PASS" if self.spread_pct_of_mid <= MAX_SPREAD_PCT_OF_MID else "FAIL"
+
+
+def spread_pct_of_mid(bid: float | None, ask: float | None, mid: float | None) -> float | None:
+    """(ask - bid) / mid, %: the one spread definition the filter and the
+    tooltip both use. ``None`` without a usable mid."""
+    if mid is None or mid <= 0 or bid is None or ask is None:
+        return None
+    return 100.0 * (ask - bid) / mid
+
 
 @dataclass(frozen=True)
 class CspEntry:
@@ -265,6 +288,9 @@ class CspEntry:
     # didn't load), as opposed to every input loading and no put passing.
     # A cross-account merge prefers an entry that had all its data.
     market_data_missing: bool = False
+    # The calendar date DTE is counted from (the calculation date, which can
+    # be after the quote time over a weekend or holiday).
+    today: date | None = None
 
     @property
     def strike(self) -> float | None:
@@ -611,7 +637,7 @@ def _evaluate(
         reason = f"{gap:.1f}% {position} the support zone, past the {reach_pct:.1f}% reach"
     elif mid is None or not quote.bid:
         reason = "no two-sided quote (no bid)"
-    elif 100.0 * (quote.ask - quote.bid) / mid > MAX_SPREAD_PCT_OF_MID:
+    elif spread_pct_of_mid(quote.bid, quote.ask, mid) > MAX_SPREAD_PCT_OF_MID:
         reason = f"bid/ask spread wider than {MAX_SPREAD_PCT_OF_MID:g}% of the mid"
     elif delta is None:
         reason = "no implied volatility, so no delta"
@@ -699,6 +725,7 @@ def calculate_csp_to_enter(
             current_price,
             calculated_at=calculated_at,
             market_data_missing=True,
+            today=today,
         )
     return recommend_put(
         current_price=current_price,
@@ -731,7 +758,7 @@ def recommend_put(
     analysis: pick the relevant zone, then the best qualifying put near it.
     ``quotes_as_of`` / ``fetched_at`` / ``calculated_at`` are carried onto the
     result unchanged, so every display shows the same snapshot time."""
-    stamps = {"quotes_as_of": quotes_as_of, "fetched_at": fetched_at, "calculated_at": calculated_at}
+    stamps = {"quotes_as_of": quotes_as_of, "fetched_at": fetched_at, "calculated_at": calculated_at, "today": today}
     zone, why_not = select_support_zone(support, current_price)
     if zone is None:
         return CspEntry(
@@ -800,67 +827,27 @@ def recommend_put(
 
 
 def _money(value: float) -> str:
-    return f"-${-value:,.2f}" if value < 0 else f"${value:,.2f}"
+    return tc.money(value)
 
 
 def zone_text(zone: SupportZone) -> str:
     return f"{_money(zone.low)} to {_money(zone.high)}"
 
 
-def recommendation_reason(pick: PutCandidate, zone: SupportZone) -> str:
+def _zone_position_text(pick: PutCandidate, zone: SupportZone) -> str:
     if pick.zone_position == INSIDE:
-        where = f"{_money(pick.strike)} is inside the {zone_text(zone)} support zone"
-    elif pick.zone_position == ABOVE:
-        where = f"{_money(pick.strike)} is {pick.zone_gap_pct:.1f}% above the {zone_text(zone)} support zone"
-    else:
-        where = f"{_money(pick.strike)} is {pick.zone_gap_pct:.1f}% below the {zone_text(zone)} support zone"
+        return f"{_money(pick.strike)} is inside the {zone_text(zone)} support zone"
+    side = "above" if pick.zone_position == ABOVE else "below"
+    return f"{_money(pick.strike)} is {pick.zone_gap_pct:.1f}% {side} the {zone_text(zone)} support zone"
+
+
+def recommendation_reason(pick: PutCandidate, zone: SupportZone) -> str:
     low, high = PREFERRED_DELTA_RANGE
     delta_note = "near" if low <= pick.delta <= high else "outside the preferred range around"
     return (
-        f"{where} (strength {zone.score:.0f}/100), its delta {pick.delta:.2f} is {delta_note} the "
-        f"{TARGET_DELTA:.2f} target, and it returns {pick.annualized_return_pct:.1f}% annualized "
-        f"(minimum {MIN_ANNUALIZED_RETURN_PCT:g}%)."
-    )
-
-
-def _when(moment: datetime) -> str:
-    """Local wall-clock time, e.g. "Oct 17, 2026 3:59 PM"."""
-    return moment.astimezone().strftime("%b %d, %Y %I:%M %p").replace(" 0", " ")
-
-
-def _liquidity_text(candidate: PutCandidate) -> str:
-    """Open interest / today's volume as the chain reported them, or "not
-    reported": informational, not a filter."""
-    oi = f"{candidate.open_interest:,} open" if candidate.open_interest is not None else "open interest not reported"
-    vol = f"{candidate.volume:,} traded today" if candidate.volume is not None else "volume not reported"
-    return f"{oi}, {vol}"
-
-
-def _zone_evidence(zone: SupportZone) -> str:
-    parts = [
-        f"{zone.touches} swing low{'s' if zone.touches != 1 else ''}",
-        f"last {zone.sessions_since_last_touch} sessions ago",
-        f"avg bounce {zone.avg_bounce_pct:.1f}%",
-    ]
-    if zone.moving_averages_near:
-        parts.append("near " + ", ".join(zone.moving_averages_near))
-    if zone.volume_ratio is not None:
-        parts.append(f"touch volume {zone.volume_ratio:.1f}x median")
-    if zone.round_level is not None:
-        parts.append(f"round number {_money(zone.round_level)}")
-    if zone.breaks:
-        parts.append(f"closed through {zone.breaks}x since (score cut)")
-    return "; ".join(parts)
-
-
-def _candidate_line(candidate: PutCandidate, *, picked: bool) -> str:
-    delta = f"delta {candidate.delta:.2f}" if candidate.delta is not None else "delta n/a"
-    if candidate.rejected_reason:
-        return f"  {_money(candidate.strike)}: {delta}, rejected, {candidate.rejected_reason}"
-    marker = " (pick)" if picked else ""
-    return (
-        f"  {_money(candidate.strike)}: {delta}, {candidate.annualized_return_pct:.1f}% ann., "
-        f"score {candidate.score:.0f}{marker}"
+        f"{_zone_position_text(pick, zone)} (strength {zone.score:.0f}/100), its delta {pick.delta:.2f} is "
+        f"{delta_note} the {TARGET_DELTA:.2f} target, and it returns {pick.annualized_return_pct:.1f}% "
+        f"annualized (minimum {MIN_ANNUALIZED_RETURN_PCT:g}%)."
     )
 
 
@@ -873,79 +860,269 @@ def _nearby_candidates(entry: CspEntry) -> list[PutCandidate]:
     return shown
 
 
-def explain(entry: CspEntry) -> str:
-    """The tooltip every CSP TO ENTER cell shows, built from the live numbers."""
-    lines = ["CSP TO ENTER" + (f": {_money(entry.strike)}" if entry.strike is not None else "")]
-    if entry.current_price is None:
-        lines += ["", f"NO QUALIFYING CSP: {entry.reason}"]
-        return "\n".join(lines)
-    lines.append(f"Last price: {_money(entry.current_price)}")
+# ---- tooltip card ----------------------------------------------------------
 
-    zone = entry.zone
-    if zone is not None:
-        lines.append(
-            f"Support zone: {zone_text(zone)}, strength {zone.score:.0f}/100, "
-            f"{entry.zone_distance_pct:.1f}% below the price"
+STRATEGY = "CSP TO ENTER"
+SUPPORT_CAVEAT = (
+    "Historical price levels are estimates based on past data. They do not guarantee that the "
+    "stock will stop falling."
+)
+SCORE_NOTE = (
+    "The support score ranks past evidence (swing lows, how recent, bounce size, moving averages, "
+    "volume, round numbers) from 0 to 100. It is not a probability that support holds."
+)
+
+
+def card_status(entry: CspEntry) -> str:
+    if entry.status == STATUS_RECOMMENDED:
+        return tc.STATUS_QUALIFIES
+    return tc.STATUS_UNVERIFIED if entry.market_data_missing else tc.STATUS_DOES_NOT_QUALIFY
+
+
+def _per_share(value: float | None) -> str:
+    """Per-share premium to 4 decimals, so the formulas below reproduce exactly."""
+    return "Unavailable" if value is None else f"${value:,.4f}"
+
+
+def _per_contract(per_share: float | None) -> str:
+    return "Unavailable" if per_share is None else _money(per_share * OPTION_MULTIPLIER)
+
+
+def _why(entry: CspEntry) -> list[str]:
+    pick, zone = entry.pick, entry.zone
+    low, high = PREFERRED_DELTA_RANGE
+    hard_low, hard_high = ACCEPTABLE_DELTA_RANGE
+    if low <= pick.delta <= high:
+        delta_line = f"Delta {pick.delta:.2f} is inside the preferred {low:.2f} to {high:.2f} range."
+    else:
+        delta_line = (
+            f"Delta {pick.delta:.2f} is outside the preferred {low:.2f} to {high:.2f} range, but inside "
+            f"the allowed {hard_low:.2f} to {hard_high:.2f}."
         )
-        lines.append(f"  {_zone_evidence(zone)}")
-    lines.append(
-        "Strength ranks past support (touches, recency, bounce, moving averages, volume, round "
-        "numbers); it is not a probability the level holds, and support can't stop the price falling through it."
+    return [
+        f"{pick.annualized_return_pct:.1f}% annualized screening return, above the "
+        f"{MIN_ANNUALIZED_RETURN_PCT:g}% minimum.",
+        delta_line,
+        f"Strike {_zone_position_text(pick, zone)} (support score {zone.score:.0f}/100).",
+    ]
+
+
+def _strike_table(entry: CspEntry) -> dict | None:
+    rows = []
+    for candidate in _nearby_candidates(entry):
+        picked = candidate is entry.pick
+        if picked:
+            reason = None
+        elif candidate.qualifies:
+            reason = f"Ranked lower: {candidate.score:.0f}/100 vs the pick's {entry.pick.score:.0f}/100"
+        else:
+            reason = candidate.rejected_reason[:1].upper() + candidate.rejected_reason[1:]
+        rows.append(
+            tc.table_row(
+                [
+                    _money(candidate.strike),
+                    tc.delta(candidate.delta),
+                    _per_contract(candidate.net_premium),
+                    tc.pct(candidate.annualized_return_pct),
+                    candidate.spread_check,
+                ],
+                picked=picked,
+                qualifies=candidate.qualifies,
+                reason=reason,
+            )
+        )
+    return tc.table(
+        ["Strike", "Delta", "Net / contract", "Ann. return", "Spread"],
+        [True, True, True, True, False],
+        rows,
     )
-    if entry.support is not None:
-        lines += [f"  {note}" for note in entry.support.limitations]
 
-    if entry.expiry is not None:
+
+def _moving_average_rows(entry: CspEntry) -> list[tuple[str, str]]:
+    rows = []
+    for name, value in entry.support.moving_averages.items():
+        gap = 100.0 * (value - entry.current_price) / entry.current_price
+        side = "above" if gap >= 0 else "below"
+        rows.append((name, f"{_money(value)}, {abs(gap):.1f}% {side} the price"))
+    return rows
+
+
+def _support_section(entry: CspEntry) -> dict | None:
+    support, zone = entry.support, entry.zone
+    if support is None:
+        return None
+    rows: list[tuple[str, str]] = []
+    if zone is not None:
+        last_day = zone.touch_days[-1] if zone.touch_days else None
+        rows += [
+            ("Support zone", zone_text(zone)),
+            ("Zone top vs price", f"{entry.zone_distance_pct:.1f}% below"),
+            ("Support score", f"{zone.score:.0f}/100"),
+            ("Swing lows", f"{zone.touches}: " + ", ".join(tc.day(d) for d in zone.touch_days)),
+            ("Last touch", f"{tc.day(last_day)}, {zone.sessions_since_last_touch} sessions ago"),
+            ("Average bounce", f"{zone.avg_bounce_pct:.1f}% (highest high within {BOUNCE_WINDOW_BARS} sessions)"),
+            (
+                "Touch-day volume",
+                f"{zone.volume_ratio:.1f}x the median day" if zone.volume_ratio is not None else "Unavailable",
+            ),
+            ("Closed through since", f"{zone.breaks}x (each halves the score)" if zone.breaks else "Never"),
+            ("Round number", _money(zone.round_level) if zone.round_level is not None else "None in the zone"),
+        ]
+        if entry.pick is not None:
+            rows.insert(2, ("Strike vs zone", _zone_position_text(entry.pick, zone)))
+    rows += _moving_average_rows(entry)
+    notes = [
+        SCORE_NOTE,
+        SUPPORT_CAVEAT,
+        f"Based on the last {support.sessions_analyzed} daily sessions. A swing low is the lowest daily low "
+        f"within {SWING_PIVOT_BARS} sessions either side, followed by a bounce of at least "
+        f"max({SWING_MIN_BOUNCE_PCT:g}%, {SWING_MIN_BOUNCE_ATR:g} ATR). Moving averages use daily closes.",
+        *support.limitations,
+    ]
+    return tc.section("Historical support", rows=rows, notes=notes)
+
+
+def _quote_section(entry: CspEntry) -> dict | None:
+    pick = entry.pick
+    if pick is None:
+        return None
+    spread = pick.spread_pct_of_mid
+    spread_text = (
+        f"{_money(pick.ask - pick.bid)} ({spread:.1f}% of the midpoint): {pick.spread_check}, "
+        f"limit {MAX_SPREAD_PCT_OF_MID:g}%"
+        if spread is not None
+        else pick.spread_check
+    )
+    rows = [
+        ("Bid", _money(pick.bid) if pick.bid is not None else "Unavailable"),
+        ("Ask", _money(pick.ask) if pick.ask is not None else "Unavailable"),
+        ("Midpoint", f"{_per_share(pick.mid_premium)} (an estimate, not a guaranteed fill)"),
+        ("Spread", spread_text),
+        ("Open interest", tc.count(pick.open_interest)),
+        ("Volume today", tc.count(pick.volume)),
+        ("Prices as of", tc.when(entry.quotes_as_of)),
+        ("Fetched", tc.when(entry.fetched_at)),
+    ]
+    notes = ["Open interest and volume are shown for judgment only; they are not filters."]
+    return tc.section("Option quote and liquidity", rows=rows, notes=notes)
+
+
+def _calculation_section(entry: CspEntry) -> dict | None:
+    rows: list[tuple[str, str]] = []
+    pick = entry.pick
+    if entry.expiry is not None and entry.days_to_expiry is not None:
         low_dte, high_dte = CSP_DTE_WINDOW
-        window_note = (
-            f"target {CSP_TARGET_DTE}, window {low_dte}-{high_dte}"
+        rule = (
+            f"closest to {CSP_TARGET_DTE} inside {low_dte} to {high_dte}"
             if entry.expiry_in_window
-            else f"none listed {low_dte}-{high_dte} days out, so the closest to {CSP_TARGET_DTE}"
+            else f"none listed {low_dte} to {high_dte} days out, so the closest to {CSP_TARGET_DTE}"
         )
-        lines.append(
-            f"Expiration: {entry.expiry.strftime('%b %d, %Y')} ({entry.days_to_expiry} DTE; {window_note})"
+        rows.append(
+            ("DTE", f"{entry.days_to_expiry} calendar days, {tc.day(entry.today)} to {tc.day(entry.expiry)} ({rule})")
         )
-    if entry.quotes_as_of is not None or entry.fetched_at is not None:
-        lines.append(f"Option prices as of {_when(entry.quotes_as_of or entry.fetched_at)}")
-    if entry.candidates:
-        lines.append("")
-        lines += [_candidate_line(c, picked=c is entry.pick) for c in _nearby_candidates(entry)]
+    if pick is not None:
+        rows += [
+            (
+                "Net premium / share",
+                f"{_per_share(pick.mid_premium)} - (${OPTION_FEE_PER_CONTRACT:.2f} fee ÷ 100) = "
+                f"{_per_share(pick.net_premium)}",
+            ),
+            ("Net premium / contract", f"{_per_share(pick.net_premium)} × 100 = {_per_contract(pick.net_premium)}"),
+            (
+                "Effective cost / share",
+                f"{_money(pick.strike)} - {_per_share(pick.net_premium)} = {_money(pick.effective_purchase_price)}",
+            ),
+            (
+                "Annualized return",
+                f"{_per_share(pick.net_premium)} ÷ {_money(pick.strike)} × 365 ÷ {entry.days_to_expiry} = "
+                f"{pick.annualized_return_pct:.1f}%",
+            ),
+            (
+                "Price to strike",
+                f"({_money(entry.current_price)} - {_money(pick.strike)}) ÷ {_money(entry.current_price)} = "
+                f"{pick.downside_to_strike_pct:.1f}%",
+            ),
+            ("Ranking score", f"{pick.score:.0f}/100 (support, delta, return, discount, zone position)"),
+        ]
+    low, high = PREFERRED_DELTA_RANGE
+    hard_low, hard_high = ACCEPTABLE_DELTA_RANGE
+    rows.append(
+        (
+            "Delta rule",
+            f"target {TARGET_DELTA:.2f}; preferred {low:.2f} to {high:.2f}; allowed {hard_low:.2f} to {hard_high:.2f}",
+        )
+    )
+    rows.append(("Calculated", tc.when(entry.calculated_at)))
+    return tc.section("Calculation details", rows=rows)
 
-    lines.append("")
-    if entry.status == STATUS_NO_QUALIFYING:
-        lines.append(f"NO QUALIFYING CSP: {entry.reason}")
-        return "\n".join(lines)
+
+def tooltip_card(entry: CspEntry, ticker: str | None = None) -> dict:
+    """The CSP TO ENTER tooltip every table and card shows, built from this
+    one result (layout: ``wheel/tooltipcard.py``)."""
+    status = card_status(entry)
+    common = {
+        "strategy": STRATEGY,
+        "ticker": ticker,
+        "status": status,
+        "subtitle_text": tc.subtitle(entry.current_price, entry.expiry, entry.days_to_expiry, entry.today),
+        "quoted_text": tc.quoted(entry.quotes_as_of, entry.fetched_at),
+        "footer": (
+            "Premium uses the bid/ask midpoint, an estimate, not a guaranteed fill. Annualized return is a "
+            "screening figure for comparing puts, not a forecast."
+        ),
+    }
+    strikes = tc.section(
+        "Strikes near the support zone",
+        table=_strike_table(entry) if entry.candidates else None,
+        open_=status != tc.STATUS_QUALIFIES,
+    )
+    sections = [strikes, _support_section(entry), _quote_section(entry), _calculation_section(entry)]
+    if entry.status != STATUS_RECOMMENDED:
+        return tc.card(**common, summary=entry.reason, sections=sections)
 
     pick = entry.pick
     low, high = PREFERRED_DELTA_RANGE
-    hard_low, hard_high = ACCEPTABLE_DELTA_RANGE
-    lines.append(
-        f"Delta: {pick.delta:.2f} (target {TARGET_DELTA:.2f}, preferred {low:.2f} to {high:.2f}, "
-        f"allowed {hard_low:.2f} to {hard_high:.2f})"
+    qualifying = sum(1 for c in entry.candidates if c.qualifies)
+    who = ticker or "the stock"
+    return tc.card(
+        **common,
+        headline=tc.item(
+            "Recommended put",
+            _money(pick.strike),
+            f"Ranked first of {qualifying} qualifying put{'s' if qualifying != 1 else ''}",
+        ),
+        headline_side=tc.item(
+            "Delta", tc.delta(pick.delta), f"Target {TARGET_DELTA:.2f} · preferred {low:.2f} to {high:.2f}"
+        ),
+        metrics=[
+            tc.item(
+                "Net premium / contract",
+                _per_contract(pick.net_premium),
+                f"Midpoint less the ${OPTION_FEE_PER_CONTRACT:.2f} fee",
+            ),
+            tc.item("Effective cost / share", _money(pick.effective_purchase_price), "If assigned"),
+            tc.item(
+                "Annualized screening return",
+                tc.pct(pick.annualized_return_pct),
+                f"Minimum {MIN_ANNUALIZED_RETURN_PCT:g}%",
+            ),
+            tc.item("Cash collateral / contract", _money(pick.strike * OPTION_MULTIPLIER)),
+        ],
+        why=_why(entry),
+        risk={
+            "title": "If assigned",
+            "text": (
+                f"You must buy 100 shares per contract at {_money(pick.strike)} "
+                f"({_money(pick.strike * OPTION_MULTIPLIER)} per contract). The premium lowers your cost to "
+                f"about {_money(pick.effective_purchase_price)} a share, but it does not limit losses if {who} "
+                "keeps falling."
+            ),
+            "stats": [
+                tc.item("Strike purchase price", _money(pick.strike)),
+                tc.item("Effective cost after premium", _money(pick.effective_purchase_price)),
+                tc.item("Price to strike", f"{pick.downside_to_strike_pct:.1f}% lower"),
+                tc.item("Effective cost vs price", f"{pick.effective_discount_pct:.1f}% lower"),
+            ],
+        },
+        sections=sections,
     )
-    lines.append(
-        f"Premium: {_money(pick.mid_premium)} mid, {_money(pick.net_premium)}/share after the "
-        f"${OPTION_FEE_PER_CONTRACT:.2f}/contract fee"
-    )
-    lines.append(
-        f"Collateral: {_money(pick.strike * OPTION_MULTIPLIER)} per contract; net premium "
-        f"{_money(pick.net_premium * OPTION_MULTIPLIER)} per contract"
-    )
-    lines.append(
-        f"Effective purchase price = {_money(pick.strike)} - {_money(pick.net_premium)} = "
-        f"{_money(pick.effective_purchase_price)}, {pick.effective_discount_pct:.1f}% under the price"
-    )
-    lines.append(
-        f"Ann. return = {_money(pick.net_premium)} ÷ {_money(pick.strike)} × 365/{entry.days_to_expiry} = "
-        f"{pick.annualized_return_pct:.1f}% (min {MIN_ANNUALIZED_RETURN_PCT:g}%)"
-    )
-    lines.append("  A screening figure for comparing puts, not an expected or guaranteed yearly return.")
-    lines.append(
-        f"Downside: the price can fall {pick.downside_to_strike_pct:.1f}% before the strike; "
-        "if assigned you own the shares however far it falls."
-    )
-    lines.append(f"Contract liquidity: {_liquidity_text(pick)}")
-    lines.append("")
-    lines.append(f"Why: {entry.reason}")
-    lines.append("Picked from support and the live chain, not a fixed % of the price.")
-    return "\n".join(lines)

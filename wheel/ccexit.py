@@ -36,6 +36,7 @@ from datetime import date, datetime
 from typing import Sequence
 
 from wheel import optionsmath
+from wheel import tooltipcard as tc
 from wheel.optionsmath import CALL, bid_ask_mid, black_scholes_greeks
 
 OPTION_MULTIPLIER = 100
@@ -161,6 +162,13 @@ class CcExit:
     fetched_at: datetime | None = None
     calculated_at: datetime | None = None
     fees: FeeModel = FeeModel()
+    current_price: float | None = None
+    # The calendar date DTE is counted from (the calculation date).
+    today: date | None = None
+    # True when an input the rules need was unavailable (the price, the
+    # shares' cost, a listed expiration, the chain), as opposed to every
+    # input loading and no call passing.
+    market_data_missing: bool = False
 
     @property
     def strike(self) -> float | None:
@@ -280,7 +288,14 @@ def calculate_cc_to_exit(
     (``chain_unavailable_reason`` says why). ``quotes_as_of`` / ``fetched_at``
     / ``calculated_at`` are carried onto the result unchanged, so every
     display of it can show the same snapshot and calculation time."""
-    stamps = {"quotes_as_of": quotes_as_of, "fetched_at": fetched_at, "calculated_at": calculated_at, "fees": fees}
+    stamps = {
+        "quotes_as_of": quotes_as_of,
+        "fetched_at": fetched_at,
+        "calculated_at": calculated_at,
+        "fees": fees,
+        "current_price": current_price,
+        "today": today,
+    }
     shares_held = sum(block.shares for block in share_blocks)
     if shares_held <= _EPS:
         return CcExit(STATUS_NO_SHARES, "No shares held.", 0.0, covered_shares, 0.0, **stamps)
@@ -310,6 +325,7 @@ def calculate_cc_to_exit(
             STATUS_NO_QUALIFYING,
             "What you paid for the uncovered shares isn't on file, so no strike can be checked for a loss.",
             contracts=contracts,
+            market_data_missing=True,
             **base,
         )
     lot_cost = sum(block.shares * block.cost_per_share for block in next_blocks) / next_shares
@@ -326,17 +342,28 @@ def calculate_cc_to_exit(
     }
 
     if current_price is None:
-        return CcExit(STATUS_NO_QUALIFYING, "No current stock price, so delta can't be worked out.", **sized)
+        return CcExit(
+            STATUS_NO_QUALIFYING,
+            "No current stock price, so delta can't be worked out.",
+            market_data_missing=True,
+            **sized,
+        )
     if expiry is None:
         return CcExit(
             STATUS_NO_QUALIFYING,
             chain_unavailable_reason or "No listed option expiration to check.",
+            market_data_missing=True,
             **sized,
         )
     days_to_expiry = (expiry - today).days
     sized = {**sized, "expiry": expiry, "days_to_expiry": days_to_expiry}
     if calls is None:
-        return CcExit(STATUS_NO_QUALIFYING, chain_unavailable_reason or "Option prices couldn't be loaded.", **sized)
+        return CcExit(
+            STATUS_NO_QUALIFYING,
+            chain_unavailable_reason or "Option prices couldn't be loaded.",
+            market_data_missing=True,
+            **sized,
+        )
 
     candidates = tuple(
         _evaluate(
@@ -374,27 +401,11 @@ def calculate_cc_to_exit(
 
 
 def _shares(value: float) -> str:
-    return f"{value:,.0f}" if abs(value - round(value)) < 1e-6 else f"{value:,.3f}"
+    return tc.shares(value)
 
 
 def _money(value: float) -> str:
-    return f"-${-value:,.2f}" if value < 0 else f"${value:,.2f}"
-
-
-def _when(moment: datetime) -> str:
-    """Local wall-clock time, e.g. "Oct 17, 2026 3:59 PM"."""
-    return moment.astimezone().strftime("%b %d, %Y %I:%M %p").replace(" 0", " ")
-
-
-def _candidate_line(candidate: CandidateCall, *, picked: bool) -> str:
-    delta = f"delta {candidate.delta:.2f}" if candidate.delta is not None else "delta n/a"
-    if candidate.rejected_reason:
-        return f"  {_money(candidate.strike)}: {delta}, rejected, {candidate.rejected_reason}"
-    marker = " (pick)" if picked else ""
-    return (
-        f"  {_money(candidate.strike)}: {delta}, mid ${candidate.mid_premium:.2f}, "
-        f"P&L if assigned {_money(candidate.projected_assignment_pnl)}{marker}"
-    )
+    return tc.money(value)
 
 
 def _nearby_candidates(result: CcExit) -> list[CandidateCall]:
@@ -408,69 +419,227 @@ def _nearby_candidates(result: CcExit) -> list[CandidateCall]:
     return shown
 
 
-def explain(result: CcExit) -> str:
-    """The tooltip every CC TO EXIT cell shows, built from the live numbers."""
-    if result.status == STATUS_NO_SHARES:
-        return "CC TO EXIT\nNo shares held, so there is no covered call to write."
+# ---- tooltip card ----------------------------------------------------------
 
-    lines = ["CC TO EXIT"]
-    lines.append(f"Shares held: {_shares(result.shares_held)}")
-    lines.append(f"Covered by open calls: {_shares(result.covered_shares)}")
-    lines.append(f"Uncovered: {_shares(result.uncovered_shares)} (newest shares; open calls cover the oldest first)")
+STRATEGY = "CC TO EXIT"
+FIFO_NOTE = (
+    "Open calls cover your oldest shares first (FIFO, also Fidelity's default for stocks), so the "
+    "next call covers the newest uncovered shares, priced at what those shares cost."
+)
+
+
+def card_status(result: CcExit) -> str:
+    if result.status == STATUS_RECOMMENDED:
+        return tc.STATUS_QUALIFIES
     if result.status == STATUS_ALL_COVERED:
-        lines += ["", "ALL SHARES COVERED: no shares are free for another call."]
-        return "\n".join(lines)
+        return tc.STATUS_INFO
+    return tc.STATUS_UNVERIFIED if result.market_data_missing else tc.STATUS_DOES_NOT_QUALIFY
 
-    if result.lot_cost is not None:
-        lines.append(
-            f"Next call covers {_shares(result.contracts * OPTION_MULTIPLIER)} shares "
-            f"({result.contracts} contract{'s' if result.contracts != 1 else ''}), cost {_money(result.lot_cost)}/share"
-        )
-        lines.append(
-            f"Minimum exit = {_money(result.lot_cost)} × {1 + CC_EXIT_MIN_GAIN_PCT / 100:.2f} = "
-            f"{_money(result.raw_min_exit)}, rounded up to {_money(result.preferred_min_exit)}"
-        )
-    if result.expiry is not None:
-        lines.append(f"Expiration: {result.expiry.strftime('%b %d, %Y')} ({result.days_to_expiry} days)")
-        if result.expiry_in_window is False:
-            low_dte, high_dte = CC_EXIT_DTE_WINDOW
-            lines.append(f"  None listed {low_dte}-{high_dte} days out, so the closest to {CC_EXIT_TARGET_DTE} is used.")
-    if result.quotes_as_of is not None or result.fetched_at is not None:
-        lines.append(f"Option prices as of {_when(result.quotes_as_of or result.fetched_at)}")
+
+def _net_per_contract(result: CcExit, candidate: CandidateCall) -> float | None:
+    """One contract's premium after its fee: the per-contract slice of
+    ``net_premium`` (which covers every contract of the call)."""
+    if candidate.net_premium is None or result.contracts < 1:
+        return None
+    return candidate.net_premium / result.contracts
+
+
+def _contracts_text(result: CcExit) -> str:
+    covered = _shares(result.contracts * OPTION_MULTIPLIER)
+    return f"{result.contracts} contract{'s' if result.contracts != 1 else ''}, {covered} shares"
+
+
+def _why(result: CcExit) -> list[str]:
+    pick = result.pick
     low, high = CC_EXIT_PREFERRED_DELTA_RANGE
-    lines.append(f"Target delta: {CC_EXIT_TARGET_DELTA:.2f} (preferred {low:.2f} to {high:.2f})")
+    in_band = low <= pick.delta <= high
+    delta_line = (
+        f"Delta {pick.delta:.2f} is the qualifying strike closest to the {CC_EXIT_TARGET_DELTA:.2f} target"
+        + (
+            f", inside the preferred {low:.2f} to {high:.2f} range."
+            if in_band
+            else f"; no qualifying strike lands inside the preferred {low:.2f} to {high:.2f} range."
+        )
+    )
+    return [
+        f"{_money(pick.strike)} is at or above the {_money(result.preferred_min_exit)} minimum exit.",
+        delta_line,
+        f"P&L if assigned is {_money(pick.projected_assignment_pnl)}, above zero as required.",
+    ]
 
-    if result.candidates:
-        lines.append("")
-        lines += [_candidate_line(c, picked=c is result.pick) for c in _nearby_candidates(result)]
 
-    lines.append("")
-    if result.status == STATUS_NO_QUALIFYING:
-        lines.append(f"NO QUALIFYING CC: {result.reason}")
-        return "\n".join(lines)
+def _strike_table(result: CcExit) -> dict | None:
+    rows = []
+    for candidate in _nearby_candidates(result):
+        picked = candidate is result.pick
+        if picked:
+            reason = None
+        elif candidate.qualifies:
+            reason = f"Delta further from the {CC_EXIT_TARGET_DELTA:.2f} target"
+        else:
+            reason = candidate.rejected_reason[:1].upper() + candidate.rejected_reason[1:]
+        meets_min = candidate.strike >= (result.preferred_min_exit or 0) - _EPS
+        rows.append(
+            tc.table_row(
+                [
+                    _money(candidate.strike),
+                    tc.delta(candidate.delta),
+                    _money(candidate.mid_premium) if candidate.mid_premium is not None else "Unavailable",
+                    _money(candidate.projected_assignment_pnl)
+                    if candidate.projected_assignment_pnl is not None
+                    else "Unavailable",
+                    "PASS" if meets_min else "FAIL",
+                ],
+                picked=picked,
+                qualifies=candidate.qualifies,
+                reason=reason,
+            )
+        )
+    return tc.table(
+        ["Strike", "Delta", "Midpoint", "P&L if assigned", "Min exit"],
+        [True, True, True, True, False],
+        rows,
+    )
+
+
+def _allocation_section(result: CcExit) -> dict | None:
+    rows = [
+        ("Shares held", _shares(result.shares_held)),
+        ("Covered by open calls", _shares(result.covered_shares)),
+        ("Uncovered", _shares(result.uncovered_shares)),
+    ]
+    if result.contracts >= 1:
+        rows.append(("This call covers", f"the newest {_contracts_text(result)}"))
+    if result.lot_cost is not None:
+        rows.append(("Cost of those shares", f"{_money(result.lot_cost)} a share"))
+    return tc.section("Share allocation", rows=rows, notes=[FIFO_NOTE])
+
+
+def _pnl_section(result: CcExit) -> dict | None:
+    pick = result.pick
+    if pick is None:
+        return None
+    covered = _shares(result.contracts * OPTION_MULTIPLIER)
+    fees = result.fees
+    rows = [
+        (
+            "Stock P&L at the strike",
+            f"({_money(pick.strike)} - {_money(result.lot_cost)}) × {covered} = {_money(pick.stock_pnl)}",
+        ),
+        ("New call premium", f"{_money(pick.net_premium)} after fees, all contracts"),
+        ("Sale fee if assigned", f"- {_money(pick.sale_fee)}"),
+        ("Earlier premium on these shares", _money(result.prior_credit)),
+        ("P&L if assigned", _money(pick.projected_assignment_pnl)),
+    ]
+    notes = [
+        f"Premium is the bid/ask midpoint less ${fees.option_fee_per_contract:.2f} per contract "
+        f"({fees.option_fee_source}).",
+        f"Sale fee = strike × shares × ${fees.sale_fee_rate * 1_000_000:.2f} per $1M sold ({fees.sale_fee_source}); "
+        "per-trade rounding and per-share charges aren't modeled.",
+        "Earlier premium is only the option cash these same shares already earned.",
+    ]
+    return tc.section("P&L if assigned, step by step", rows=rows, notes=notes)
+
+
+def _calculation_section(result: CcExit) -> dict | None:
+    rows: list[tuple[str, str]] = []
+    if result.raw_min_exit is not None:
+        rows.append(
+            (
+                "Minimum exit",
+                f"{_money(result.lot_cost)} × {1 + CC_EXIT_MIN_GAIN_PCT / 100:.2f} = {_money(result.raw_min_exit)}, "
+                f"rounded up to {_money(result.preferred_min_exit)}",
+            )
+        )
+    if result.expiry is not None and result.days_to_expiry is not None:
+        low_dte, high_dte = CC_EXIT_DTE_WINDOW
+        rule = (
+            f"closest to {CC_EXIT_TARGET_DTE} inside {low_dte} to {high_dte}"
+            if result.expiry_in_window
+            else f"none listed {low_dte} to {high_dte} days out, so the closest to {CC_EXIT_TARGET_DTE}"
+        )
+        rows.append(
+            ("DTE", f"{result.days_to_expiry} calendar days, {tc.day(result.today)} to {tc.day(result.expiry)} ({rule})")
+        )
+    if result.pick is not None:
+        low, high = CC_EXIT_PREFERRED_DELTA_RANGE
+        rows.append(("Delta rule", f"closest to {CC_EXIT_TARGET_DELTA:.2f}; preferred {low:.2f} to {high:.2f}"))
+        per_contract = _net_per_contract(result, result.pick)
+        rows.append(
+            (
+                "Net premium / contract",
+                f"{_money(result.pick.mid_premium)} × 100 - ${result.fees.option_fee_per_contract:.2f} = "
+                f"{_money(per_contract)}",
+            )
+        )
+    rows += [
+        ("Prices as of", tc.when(result.quotes_as_of)),
+        ("Fetched", tc.when(result.fetched_at)),
+        ("Calculated", tc.when(result.calculated_at)),
+    ]
+    return tc.section("Calculation details", rows=rows)
+
+
+def tooltip_card(result: CcExit, ticker: str | None = None) -> dict | None:
+    """The CC TO EXIT tooltip every table and card shows, built from this
+    one result (layout: ``wheel/tooltipcard.py``). ``None`` with no shares:
+    there is nothing to explain."""
+    if result.status == STATUS_NO_SHARES:
+        return None
+    status = card_status(result)
+    common = {
+        "strategy": STRATEGY,
+        "ticker": ticker,
+        "status": status,
+        "status_label": STATUS_LABELS.get(STATUS_ALL_COVERED) if status == tc.STATUS_INFO else None,
+        "subtitle_text": tc.subtitle(result.current_price, result.expiry, result.days_to_expiry, result.today),
+        "quoted_text": tc.quoted(result.quotes_as_of, result.fetched_at),
+        "footer": "Premium uses the bid/ask midpoint, an estimate, not a guaranteed fill.",
+    }
+    strikes = tc.section(
+        "Strikes checked",
+        table=_strike_table(result) if result.candidates else None,
+        open_=status != tc.STATUS_QUALIFIES,
+    )
+    sections = [strikes, _allocation_section(result), _pnl_section(result), _calculation_section(result)]
+    if result.status != STATUS_RECOMMENDED:
+        return tc.card(**common, summary=result.reason, sections=sections)
 
     pick = result.pick
-    lines.append(f"CC TO EXIT = {_money(pick.strike)}, the qualifying strike closest to {CC_EXIT_TARGET_DELTA:.2f} delta.")
-    if not low <= pick.delta <= high:
-        lines.append(f"Its delta is outside {low:.2f} to {high:.2f}: no qualifying strike lands inside it.")
-    shares_text = _shares(result.contracts * OPTION_MULTIPLIER)
-    lines.append(
-        f"Stock P&L at the strike = ({_money(pick.strike)} - {_money(result.lot_cost)}) × {shares_text} = "
-        f"{_money(pick.stock_pnl)}"
+    low, high = CC_EXIT_PREFERRED_DELTA_RANGE
+    covered = _shares(result.contracts * OPTION_MULTIPLIER)
+    return tc.card(
+        **common,
+        headline=tc.item(
+            "Recommended call", _money(pick.strike), f"Qualifying strike closest to {CC_EXIT_TARGET_DELTA:.2f} delta"
+        ),
+        headline_side=tc.item(
+            "Delta", tc.delta(pick.delta), f"Target {CC_EXIT_TARGET_DELTA:.2f} · preferred {low:.2f} to {high:.2f}"
+        ),
+        metrics=[
+            tc.item(
+                "Net premium / contract",
+                _money(_net_per_contract(result, pick)),
+                f"Midpoint less the ${result.fees.option_fee_per_contract:.2f} fee",
+            ),
+            tc.item("P&L if assigned", _money(pick.projected_assignment_pnl), _contracts_text(result)),
+            tc.item("Minimum exit strike", _money(result.preferred_min_exit), f"Cost + {CC_EXIT_MIN_GAIN_PCT:g}%, rounded up"),
+            tc.item("Stock P&L at the strike", _money(pick.stock_pnl), "Before any premium"),
+        ],
+        why=_why(result),
+        risk={
+            "title": "If assigned",
+            "text": (
+                f"Your {covered} newest uncovered shares are sold at {_money(pick.strike)}. The "
+                f"{_money(result.preferred_min_exit)} minimum exit is a floor on the strike, not advice that "
+                "selling there is the best move."
+            ),
+            "stats": [
+                tc.item("Shares held", _shares(result.shares_held)),
+                tc.item("Covered by open calls", _shares(result.covered_shares)),
+                tc.item("Uncovered", _shares(result.uncovered_shares)),
+                tc.item("This call covers", covered),
+            ],
+        },
+        sections=sections,
     )
-    lines.append(
-        f"P&L if assigned = stock {_money(pick.stock_pnl)} + premium {_money(pick.net_premium)} "
-        f"- sale fee {_money(pick.sale_fee)} + earlier premium on these shares {_money(result.prior_credit)} "
-        f"= {_money(pick.projected_assignment_pnl)}"
-    )
-    fees = result.fees
-    lines.append(
-        f"Premium is the bid/ask mid less ${fees.option_fee_per_contract:.2f} per contract ({fees.option_fee_source})."
-    )
-    lines.append(
-        f"Sale fee ≈ {_money(pick.strike)} × {shares_text} shares × "
-        f"${fees.sale_fee_rate * 1_000_000:.2f} per $1M sold ({fees.sale_fee_source}); "
-        "per-trade rounding and per-share charges aren't modeled."
-    )
-    lines.append("The minimum exit is a floor on the strike, not advice that selling there is the best move.")
-    return "\n".join(lines)

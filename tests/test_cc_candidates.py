@@ -34,7 +34,7 @@ def _wheel(
         "cc_to_exit": 140.0,
         "cc_to_exit_status": "recommended",
         "cc_to_exit_label": None,
-        "cc_to_exit_explanation": "CC TO EXIT ...",
+        "cc_to_exit_card": {"strategy": "CC TO EXIT"},
         "cc_to_exit_detail": {
             "shares_held": held,
             "covered_shares": covered,
@@ -178,7 +178,7 @@ class TestCcToExit(unittest.TestCase):
         wheel = _wheel("MU-1", "MU", shares=100, cost=100.0, last=110.0)
         wheel.update(cc_to_exit=None, cc_to_exit_status="no_qualifying", cc_to_exit_label="NO QUALIFYING CC")
         (row,) = _candidates([wheel])
-        for key in ("cc_to_exit", "cc_to_exit_status", "cc_to_exit_label", "cc_to_exit_explanation", "cc_to_exit_detail"):
+        for key in ("cc_to_exit", "cc_to_exit_status", "cc_to_exit_label", "cc_to_exit_card", "cc_to_exit_detail"):
             self.assertEqual(row[key], wheel[key])
         self.assertNotIn("target_cc_strike", row)
 

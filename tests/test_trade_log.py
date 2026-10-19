@@ -439,7 +439,7 @@ class TestTransactionRows(unittest.TestCase):
         self.assertIsNone(wheel["cc_to_exit"])
         self.assertEqual(wheel["cc_to_exit_status"], ccexit.STATUS_NO_QUALIFYING)
         self.assertEqual(wheel["cc_to_exit_label"], "NO QUALIFYING CC")
-        self.assertIn("NO QUALIFYING CC", wheel["cc_to_exit_explanation"])
+        self.assertEqual(wheel["cc_to_exit_card"]["summary"], wheel["cc_to_exit_detail"]["reason"])
         # Profit Target is a separate concept and is unaffected.
         self.assertAlmostEqual(wheel["profit_target"], 97.5, places=2)
 
@@ -465,7 +465,7 @@ class TestTransactionRows(unittest.TestCase):
         self.assertEqual(detail["preferred_min_exit"], 138.0)
         self.assertEqual(wheel["cc_to_exit"], 140.0)
         self.assertIsNone(wheel["cc_to_exit_label"])
-        self.assertIn("CC TO EXIT = $140.00", wheel["cc_to_exit_explanation"])
+        self.assertEqual(wheel["cc_to_exit_card"]["headline"]["value"], "$140.00")
 
     def test_whole_position_break_even_is_independent_of_cc_to_exit(self):
         # Test 7: an earlier put that expired adds $500 of wheel-level premium.
@@ -516,7 +516,7 @@ class TestTransactionRows(unittest.TestCase):
         (candidate,) = Dashboard._build_cc_candidates(dashboard, [wheel])
         (target,) = Dashboard._build_wheel_targets_banner(dashboard, [wheel])
         no_contract = _no_contract_open_position_row(wheel, None, None, date(2026, 10, 17), None)
-        fields = ("cc_to_exit", "cc_to_exit_status", "cc_to_exit_label", "cc_to_exit_explanation", "cc_to_exit_detail")
+        fields = ("cc_to_exit", "cc_to_exit_status", "cc_to_exit_label", "cc_to_exit_card", "cc_to_exit_detail")
         for row in (candidate, target, no_contract):
             self.assertEqual({k: row[k] for k in fields}, {k: wheel[k] for k in fields})
         self.assertEqual(wheel["cc_to_exit"], 140.0)
@@ -525,7 +525,7 @@ class TestTransactionRows(unittest.TestCase):
         self.assertEqual(detail["quotes_as_of"], "2026-10-17T19:59:00+00:00")
         self.assertEqual(detail["chain_fetched_at"], "2026-10-17T20:05:00+00:00")
         self.assertIsNotNone(detail["calculated_at"])
-        self.assertIn("Option prices as of", wheel["cc_to_exit_explanation"])
+        self.assertTrue(wheel["cc_to_exit_card"]["quoted"].startswith("Option prices as of"))
 
     def test_csp_phase_carries_no_per_wheel_put_strike(self):
         # CSP TO ENTER is one per-ticker result (the payload's csp_to_enter

@@ -1327,7 +1327,7 @@ def _lot_break_even_on(
     return sum(qty * value for qty, value in weighted) / total if total > 1e-9 else None
 
 
-def _cc_exit_payload(result: ccexit.CcExit) -> dict[str, Any]:
+def _cc_exit_payload(result: ccexit.CcExit, ticker: str | None = None) -> dict[str, Any]:
     """The CC TO EXIT fields every table copies verbatim from its wheel.
     ``cc_to_exit`` is the strike (sortable), ``None`` unless one qualified;
     ``cc_to_exit_label`` is what to show instead (ALL SHARES COVERED / NO
@@ -1337,7 +1337,8 @@ def _cc_exit_payload(result: ccexit.CcExit) -> dict[str, Any]:
         "cc_to_exit": _money(result.strike),
         "cc_to_exit_status": result.status,
         "cc_to_exit_label": ccexit.STATUS_LABELS.get(result.status),
-        "cc_to_exit_explanation": ccexit.explain(result),
+        # The tooltip, as a structured card (wheel/tooltipcard.py); None with no shares.
+        "cc_to_exit_card": ccexit.tooltip_card(result, ticker),
         "cc_to_exit_detail": {
             "shares_held": round(result.shares_held, 4),
             "covered_shares": round(result.covered_shares, 4),
@@ -1379,7 +1380,7 @@ CC_EXIT_FIELDS = (
     "cc_to_exit",
     "cc_to_exit_status",
     "cc_to_exit_label",
-    "cc_to_exit_explanation",
+    "cc_to_exit_card",
     "cc_to_exit_detail",
 )
 
@@ -1391,13 +1392,14 @@ def _cc_exit_fields(wheel: dict[str, Any] | None) -> dict[str, Any]:
     return {key: wheel.get(key) for key in CC_EXIT_FIELDS}
 
 
-def _csp_to_enter_payload(result: cspentry.CspEntry) -> dict[str, Any]:
+def _csp_to_enter_payload(result: cspentry.CspEntry, ticker: str | None = None) -> dict[str, Any]:
     """One ticker's CSP TO ENTER, as every table, card and tooltip reads it
     (by ticker, from the payload's top-level ``csp_to_enter`` map).
     ``recommended_strike`` is ``None`` unless a put qualified; ``label`` is
-    then what to show instead (NO QUALIFYING CSP). ``explanation`` is the
-    tooltip and ``reason`` its one-line "why", both built from this same
-    result -- the frontend formats, it never recomputes."""
+    then what to show instead (NO QUALIFYING CSP). ``card`` is the tooltip
+    (``cspentry.tooltip_card``, already formatted) and ``reason`` its
+    one-line "why", both built from this same result -- the frontend only
+    displays them, it never recomputes."""
     pick, zone = result.pick, result.zone
     return {
         "status": result.status,
@@ -1455,7 +1457,7 @@ def _csp_to_enter_payload(result: cspentry.CspEntry) -> dict[str, Any]:
         "recommendation_score": round(pick.score, 1) if pick else None,
         "reason": result.reason,
         "limitations": list(result.support.limitations) if result.support else [],
-        "explanation": cspentry.explain(result),
+        "card": cspentry.tooltip_card(result, ticker),
         "quotes_as_of": _iso_dt(result.quotes_as_of),
         "chain_fetched_at": _iso_dt(result.fetched_at),
         "calculated_at": _iso_dt(result.calculated_at),
@@ -1933,7 +1935,7 @@ def _trade_log_entry(
         "profit_target": profit_target,
         "profit_target_explanation": profit_target_explanation,
         "profit_target_cushion_pct": PROFIT_TARGET_CUSHION_PCT,
-        **_cc_exit_payload(cc_exit),
+        **_cc_exit_payload(cc_exit, cycle.underlying),
         "pl_bridge": pl_bridge,
         "insights": wheel_insights(
             cycle,
@@ -4550,7 +4552,7 @@ class Dashboard:
                     current_price=prices[ticker], bars=[], expiry=None, today=today, puts=None,
                     calculated_at=calculated_at,
                 )
-                out[ticker] = _csp_to_enter_payload(result)
+                out[ticker] = _csp_to_enter_payload(result, ticker)
                 continue
             expiry = expiry_of.get(ticker)
             puts: tuple[cspentry.PutQuote, ...] | None = None
@@ -4583,7 +4585,7 @@ class Dashboard:
                 fetched_at=getattr(self, "_option_chain_fetched_at", {}).get((ticker, expiry)) if puts is not None else None,
                 calculated_at=calculated_at,
             )
-            out[ticker] = _csp_to_enter_payload(result)
+            out[ticker] = _csp_to_enter_payload(result, ticker)
         return out
 
     def _build_cc_candidates(self, wheels: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:

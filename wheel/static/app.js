@@ -505,6 +505,7 @@ let lastPointer = { clientX: 0, clientY: 0 };
 
 function renderTooltip(title, rows, formula) {
   clear(tooltip);
+  tooltip.classList.remove('card');
   if (title) tooltip.appendChild(el('div', { class: 'tt-title' }, title));
   for (const row of rows) {
     const line = el('div', { class: 'tt-row' });
@@ -559,13 +560,20 @@ function hideTooltip() {
   if (!tooltipPinned) tooltip.classList.remove('on');
 }
 
-/** Pin what is under the pointer: the open chart readout, else its text tip. */
+/** Pin what is under the pointer: the open chart readout, else its tip card
+ * or text tip. */
 function pinTooltip() {
   if (tooltipPinned) return;
   if (!tooltip.classList.contains('on')) {
-    const text = nearestTipText(hoveredNode || document.activeElement);
-    if (!text) return;
-    renderTooltip('', [], text);
+    const tip = nearestTip(hoveredNode || document.activeElement);
+    if (!tip) return;
+    if (tip.card) {
+      clear(tooltip);
+      tooltip.appendChild(tipCardNode(tip.card));
+      tooltip.classList.add('card');
+    } else {
+      renderTooltip('', [], tip.text);
+    }
     tooltip.classList.add('on');
   }
   tooltipPinned = true;
@@ -576,8 +584,21 @@ function pinTooltip() {
 
 function dismissTooltip() {
   tooltipPinned = false;
-  tooltip.classList.remove('on', 'pinned');
+  tooltip.classList.remove('on', 'pinned', 'card');
 }
+
+// Opening a details section makes the tooltip taller; keep it on screen
+// (it scrolls inside itself once it reaches the window height).
+tooltip.addEventListener(
+  'toggle',
+  () => {
+    const box = tooltip.getBoundingClientRect();
+    if (box.bottom > window.innerHeight - 8) {
+      tooltip.style.top = Math.max(8, window.innerHeight - 8 - box.height) + 'px';
+    }
+  },
+  true
+);
 
 const isTypingTarget = (node) =>
   !!node && (node.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(node.tagName));
@@ -664,13 +685,129 @@ new MutationObserver((records) => {
 });
 adoptTitles(document.body);
 
-function nearestTipText(start) {
+/* Tip cards: the structured CSP TO ENTER / CC TO EXIT tooltips. The backend
+ * builds each card already formatted (wheel/tooltipcard.py documents the
+ * shape); `tipCardNode` is the one renderer for both, so they can't drift
+ * apart, and it only lays out what it is given -- no numbers are computed
+ * or reformatted here. */
+const tipCards = new WeakMap();
+
+function setTipCard(node, card) {
+  if (card) tipCards.set(node, card);
+}
+
+/** The nearest tip at or above `start`: `{card}` or `{text}`, else null. */
+function nearestTip(start) {
   for (let node = start; node && node !== document; node = node.parentNode) {
-    if (node.nodeType === Node.ELEMENT_NODE && node !== tooltip && node.dataset && node.dataset.tip) {
-      return node.dataset.tip;
+    if (node.nodeType !== Node.ELEMENT_NODE || node === tooltip) continue;
+    if (tipCards.has(node)) return { card: tipCards.get(node) };
+    if (node.dataset && node.dataset.tip) return { text: node.dataset.tip };
+  }
+  return null;
+}
+
+function tipCardItem(item, className) {
+  const box = el('div', { class: className });
+  box.appendChild(el('div', { class: 'tc-label' }, item.label));
+  box.appendChild(el('strong', { class: 'tc-value' }, item.value));
+  if (item.note) box.appendChild(el('div', { class: 'tc-muted' }, item.note));
+  return box;
+}
+
+function tipCardTable(spec) {
+  const wrap = el('div', { class: 'tc-table-wrap' });
+  const table = el('table', { class: 'tc-table' });
+  const head = el('tr');
+  spec.columns.forEach((name, i) => head.appendChild(el('th', { class: spec.numeric[i] ? 'num' : '' }, name)));
+  const thead = el('thead');
+  thead.appendChild(head);
+  table.appendChild(thead);
+  const body = el('tbody');
+  for (const row of spec.rows) {
+    const tr = el('tr', { class: row.picked ? 'picked' : '' });
+    row.cells.forEach((cell, i) => tr.appendChild(el('td', { class: spec.numeric[i] ? 'num' : '' }, cell)));
+    body.appendChild(tr);
+    // The reason gets its own full-width line so a long one never squeezes the figures.
+    if (row.reason) {
+      const why = el('tr', { class: 'tc-reason' + (row.picked ? ' picked' : '') });
+      why.appendChild(el('td', { colspan: spec.columns.length }, row.reason));
+      body.appendChild(why);
     }
   }
-  return '';
+  table.appendChild(body);
+  wrap.appendChild(table);
+  return wrap;
+}
+
+function tipCardSection(spec) {
+  const details = el('details', { class: 'tc-details' });
+  details.open = !!spec.open;
+  details.appendChild(el('summary', {}, spec.title));
+  const content = el('div', { class: 'tc-details-content' });
+  if (spec.table) content.appendChild(tipCardTable(spec.table));
+  if (spec.rows.length) {
+    const list = el('dl', { class: 'tc-rows' });
+    for (const [label, value] of spec.rows) {
+      list.appendChild(el('dt', {}, label));
+      list.appendChild(el('dd', {}, value));
+    }
+    content.appendChild(list);
+  }
+  for (const note of spec.notes) content.appendChild(el('p', { class: 'tc-muted' }, note));
+  details.appendChild(content);
+  return details;
+}
+
+function tipCardNode(card) {
+  const root = el('div', { class: `tip-card tip-card--${card.status}` });
+
+  const header = el('header', { class: 'tc-header' });
+  const titles = el('div');
+  titles.appendChild(el('div', { class: 'tc-eyebrow' }, card.strategy));
+  if (card.ticker) titles.appendChild(el('div', { class: 'tc-ticker' }, card.ticker));
+  titles.appendChild(el('div', { class: 'tc-muted' }, card.subtitle));
+  if (card.quoted) titles.appendChild(el('div', { class: 'tc-muted' }, card.quoted));
+  header.appendChild(titles);
+  // The badge carries the status in words; its colour only reinforces it.
+  header.appendChild(el('span', { class: 'tc-status' }, card.status_label));
+  root.appendChild(header);
+
+  if (card.headline) {
+    const rec = el('section', { class: 'tc-recommendation' });
+    rec.appendChild(tipCardItem(card.headline, 'tc-headline'));
+    if (card.headline_side) rec.appendChild(tipCardItem(card.headline_side, 'tc-headline-side'));
+    root.appendChild(rec);
+  }
+  if (card.summary) root.appendChild(el('p', { class: 'tc-summary' }, card.summary));
+
+  if (card.metrics.length) {
+    const grid = el('section', { class: 'tc-metrics' });
+    for (const metric of card.metrics) grid.appendChild(tipCardItem(metric, 'tc-metric'));
+    root.appendChild(grid);
+  }
+
+  if (card.why.length) {
+    const why = el('section', { class: 'tc-section' });
+    why.appendChild(el('h4', {}, 'Why this strike?'));
+    const list = el('ul');
+    for (const line of card.why) list.appendChild(el('li', {}, line));
+    why.appendChild(list);
+    root.appendChild(why);
+  }
+
+  if (card.risk) {
+    const risk = el('section', { class: 'tc-section tc-risk' });
+    risk.appendChild(el('h4', {}, card.risk.title));
+    risk.appendChild(el('p', {}, card.risk.text));
+    const stats = el('div', { class: 'tc-risk-stats' });
+    for (const stat of card.risk.stats) stats.appendChild(tipCardItem(stat, 'tc-stat'));
+    risk.appendChild(stats);
+    root.appendChild(risk);
+  }
+
+  for (const section of card.sections) root.appendChild(tipCardSection(section));
+  if (card.footer) root.appendChild(el('footer', { class: 'tc-footer' }, card.footer));
+  return root;
 }
 
 /* ------------------------------------------------------------- chart frame */
@@ -5335,9 +5472,9 @@ function renderHedgeBanner() {
 /**
  * CC TO EXIT, the one renderer every table and card uses. All four fields
  * come verbatim from the wheel's single backend calculation (wheel/ccexit.py,
- * copied onto each row as cc_to_exit / cc_to_exit_label /
- * cc_to_exit_explanation): a strike when one qualified, otherwise ALL SHARES
- * COVERED / NO QUALIFYING CC, or a dash when no shares are held.
+ * copied onto each row as cc_to_exit / cc_to_exit_label / cc_to_exit_card):
+ * a strike when one qualified, otherwise ALL SHARES COVERED / NO QUALIFYING
+ * CC, or a dash when no shares are held. The card is the T tooltip.
  */
 function ccToExitText(row) {
   if (row.cc_to_exit != null) return money(row.cc_to_exit, { cents: true });
@@ -5347,7 +5484,7 @@ function ccToExitText(row) {
 function ccToExitCell(row) {
   const hasValue = row.cc_to_exit != null || row.cc_to_exit_label;
   const cell = el('td', { class: hasValue ? 'num cc-target' : 'num' }, ccToExitText(row));
-  if (row.cc_to_exit_explanation) cell.title = row.cc_to_exit_explanation;
+  setTipCard(cell, row.cc_to_exit_card);
   return cell;
 }
 
@@ -5379,7 +5516,7 @@ function cspToEnterText(entry) {
 function cspToEnterCell(ticker) {
   const entry = cspToEnterFor(ticker);
   const cell = el('td', { class: entry ? 'num cc-target' : 'num' }, cspToEnterText(entry));
-  if (entry && entry.explanation) cell.title = entry.explanation;
+  if (entry) setTipCard(cell, entry.card);
   return cell;
 }
 
@@ -8316,19 +8453,21 @@ function stepTradeLog(delta) {
   renderTradeLog();
 }
 
-function tradeLogCell(label, value, { help, foot, tone, extra } = {}) {
+function tradeLogCell(label, value, { help, card, foot, tone, extra } = {}) {
   const cell = el('div', { class: 'tl-cell' });
   cell.appendChild(el('div', { class: 'tl-label' }, label));
   // An array value stacks each part on its own line (e.g. a date range), so a
   // long value never wraps mid-token across two lines. `tone` ('pos'|'neg')
   // colours the value.
   const valueNode = el('div', {
-    class: 'tl-value' + (help ? ' help' : '') + (tone ? ' ' + tone : ''),
+    class: 'tl-value' + (help || card ? ' help' : '') + (tone ? ' ' + tone : ''),
   });
   for (const part of Array.isArray(value) ? value : [value]) {
     valueNode.appendChild(el('div', {}, part));
   }
   if (help) setFormula(valueNode, help);
+  // card: a structured CSP TO ENTER / CC TO EXIT tooltip (tipCardNode).
+  setTipCard(valueNode, card);
   cell.appendChild(valueNode);
   // `foot` is one line, or an array for several stacked lines.
   if (foot) {
@@ -8426,7 +8565,7 @@ const OPEN_POS_COLUMNS = [
 
 // Header tooltips, one per column that isn't self-explanatory from its raw
 // value. Kept short: the exact per-row math already lives in each cell's own
-// title (see cc_to_exit_explanation, positionBreakevenMath, etc.) --
+// tooltip (see cc_to_exit_card, positionBreakevenMath, etc.) --
 // these just say what the column means and, where there's a real formula
 // behind it, spell that out too.
 const OPEN_POS_HEAD_HELP = {
@@ -11761,7 +11900,7 @@ function renderTradeLogSummary(entry) {
             entry.cc_to_exit != null && detail.delta != null
               ? `delta ${detail.delta.toFixed(2)}, ${detail.days_to_expiry} days`
               : null,
-          help: formula([entry.cc_to_exit_explanation || '']),
+          card: entry.cc_to_exit_card,
         })
       );
     }
@@ -11779,7 +11918,8 @@ function renderTradeLogSummary(entry) {
             cspEntry && cspEntry.recommended_strike != null
               ? `delta ${cspEntry.delta.toFixed(2)}, ${cspEntry.days_to_expiry} days`
               : null,
-          help: formula([(cspEntry && cspEntry.explanation) || 'Not enough data yet (no price).']),
+          card: cspEntry ? cspEntry.card : null,
+          help: cspEntry ? null : 'Not enough data yet (no price).',
         }
       )
     );

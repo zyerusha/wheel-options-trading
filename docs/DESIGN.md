@@ -255,8 +255,10 @@ too (their `wheel` column is blank).
 One calculation, `wheel/ccexit.py` `calculate_cc_to_exit`, run once per wheel in
 `_trade_log_entry`; every table (Open option positions, Wheel price targets, CC
 candidates) and the Trade Log card copy its `cc_to_exit`, `cc_to_exit_status`,
-`cc_to_exit_label`, `cc_to_exit_explanation` and `cc_to_exit_detail` fields verbatim
+`cc_to_exit_label`, `cc_to_exit_card` and `cc_to_exit_detail` fields verbatim
 (`_cc_exit_fields`), and the frontend renders them with one function (`ccToExitCell`).
+`cc_to_exit_card` is the tooltip (`ccexit.tooltip_card`; see **CSP TO ENTER / CC TO
+EXIT tooltip cards** below).
 
 1. Covered shares = 100 × open short covered-call contracts; uncovered = held − covered.
    None uncovered → **ALL SHARES COVERED**; no shares → a dash.
@@ -328,7 +330,7 @@ last, average bounce, close-through episodes, nearby moving averages), `delta`,
 `delta_target`, `delta_allowed_range`, `bid`, `ask`, `open_interest`, `option_volume`,
 `premium`, `net_premium`, `net_premium_per_contract`, `annualized_roi_pct`,
 `effective_purchase_price`, `effective_discount_pct`, `downside_to_strike_pct`,
-`recommendation_score`, `reason`, `limitations`, `explanation`, `quotes_as_of`,
+`recommendation_score`, `reason`, `limitations`, `card` (the tooltip), `quotes_as_of`,
 `chain_fetched_at`, `calculated_at`). Rows do **not** carry copies: the Wheel price
 targets, Open option positions and CSP candidates tables and the Trade Log card all
 look the ticker up with one frontend function (`cspToEnterFor` / `cspToEnterCell`),
@@ -390,14 +392,49 @@ against its own. Either way a view never shows two values for one ticker.
 preferred band (0.20-0.30, wording only, nothing is rejected for leaving it) and hard
 limits (0.10-0.40, enforced); the tooltip names all three. Net premium (per share and
 per contract), collateral per contract, effective purchase price with its % under the
-current price, downside from the price to the strike, DTE and annualized return are
+current price, distance from the price to the strike, DTE and annualized return are
 separate fields. Annualized return is labelled a screening figure for comparing puts,
-not an expected or guaranteed yearly return, and the downside line says that if
-assigned you own the shares however far the price falls. Support strength is labelled
-a ranking of past evidence, not a probability, and the tooltip says support can't stop
-the price falling through it. The effective purchase price is a *proposed-entry*
-figure for this one put; it is unrelated to the historical, whole-position Wheel
-Breakeven.
+not a forecast, and is net of the $0.65 fee. The risk block says assignment means
+buying 100 shares per contract at the strike and that the premium does not limit
+losses if the stock keeps falling; the distance to the strike is never called
+protection or a maximum loss. Support strength is labelled a ranking of past evidence,
+not a probability, with the note that historical levels do not guarantee the stock
+stops falling. The effective purchase price is a *proposed-entry* figure for this one
+put; it is unrelated to the historical, whole-position Wheel Breakeven.
+
+The tooltip's spread check (`PutCandidate.spread_check`) reads PASS, FAIL (no bid, or
+spread over 50% of the mid) or UNAVAILABLE (no usable quote), from the same
+`spread_pct_of_mid` the hard filter uses, so the two can't disagree. DTE counts
+calendar days from the calculation date (`CspEntry.today`, the server's local date),
+which can be after the quote time (a weekend or holiday); the tooltip names that date
+("34 DTE from Oct 17") and the annualized return uses the same DTE.
+
+### CSP TO ENTER / CC TO EXIT tooltip cards
+
+Both tooltips are one component: a structured **card** built next to each calculation
+(`cspentry.tooltip_card`, `ccexit.tooltip_card`) in the shape `wheel/tooltipcard.py`
+documents, rendered by one frontend function (`tipCardNode`) with one set of CSS
+(`.tip-card`). The backend formats every value; the frontend lays it out and never
+computes. The card replaces the old plain-text `explanation` / `cc_to_exit_explanation`
+strings. Opened with T like every tooltip.
+
+Order, the same for both: header (strategy, ticker, stock price, expiration, DTE and
+its as-of date, quote time, a status badge in words: QUALIFIES, DOES NOT QUALIFY,
+UNVERIFIED when a market input was missing, or ALL SHARES COVERED); the selected strike
+with its delta; up to four key numbers; up to three "Why this strike?" reasons built
+from the result; the "If assigned" risk block; then collapsible sections (the strike
+table first, open by default when nothing qualified; then strategy detail; then
+calculation details and timestamps); a footer caveat that the midpoint is an estimate.
+The strike table puts a one-word result in its last column and the reason on its own
+line below the row; the selected strike has a subtle fill and the word "Selected", so
+nothing relies on colour alone.
+
+| | CSP TO ENTER | CC TO EXIT |
+|---|---|---|
+| Key numbers | net premium / contract, effective cost / share, annualized screening return, cash collateral / contract | net premium / contract, P&L if assigned, minimum exit strike, stock P&L at the strike |
+| If assigned | buy 100 shares per contract at the strike; premium does not limit losses | the newest uncovered shares are sold at the strike; the minimum exit is a floor, not advice |
+| Strike table | strike, delta, net / contract, ann. return, spread check | strike, delta, midpoint, P&L if assigned, minimum-exit check |
+| Sections | historical support (zone, score, swing lows, last touch, bounce, volume, moving averages vs price), quote and liquidity, calculation details | share allocation, P&L if assigned step by step, calculation details |
 
 **Option liquidity.** Underlying-stock liquidity (10-day share volume, market cap) is
 an eligibility check on the ticker; option-contract liquidity is checked per strike:

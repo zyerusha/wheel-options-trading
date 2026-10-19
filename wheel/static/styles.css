@@ -1365,6 +1365,273 @@ tr.detail > td {
   font-variant-numeric: tabular-nums;
 }
 
+/* ---- tip cards: the CSP TO ENTER / CC TO EXIT tooltip, one layout for both
+   (tipCardNode in app.js; content from wheel/tooltipcard.py) ---- */
+
+#tooltip.card {
+  width: min(470px, calc(100vw - 16px));
+  max-width: min(470px, calc(100vw - 16px));
+  padding: 14px 16px;
+  font-size: 13px;
+  border-radius: 12px;
+}
+
+.tip-card {
+  color: var(--text-primary);
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+
+.tip-card .tc-header,
+.tip-card .tc-recommendation {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.tip-card .tc-eyebrow,
+.tip-card .tc-label {
+  font-size: 11px;
+  font-weight: 640;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.tip-card .tc-ticker {
+  font-size: 18px;
+  font-weight: 700;
+  margin: 1px 0 2px;
+}
+
+.tip-card .tc-muted {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.tip-card .tc-status {
+  flex: none;
+  padding: 4px 8px;
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+  color: var(--text-secondary);
+}
+
+.tip-card--qualifies .tc-status {
+  color: var(--success-text);
+}
+
+.tip-card--does_not_qualify .tc-status {
+  color: var(--critical);
+}
+
+.tip-card--unverified .tc-status {
+  border-style: dashed;
+}
+
+.tip-card--info .tc-status {
+  color: var(--accent);
+}
+
+.tip-card .tc-recommendation {
+  margin-top: 12px;
+}
+
+.tip-card .tc-headline .tc-value {
+  display: block;
+  font-size: 28px;
+  font-weight: 700;
+  line-height: 1.15;
+}
+
+.tip-card .tc-headline-side {
+  text-align: right;
+}
+
+.tip-card .tc-headline-side .tc-value {
+  display: block;
+  font-size: 18px;
+}
+
+.tip-card .tc-summary {
+  margin: 12px 0 0;
+  padding: 9px 11px;
+  border-radius: 8px;
+  background: var(--ghost);
+}
+
+.tip-card .tc-metrics,
+.tip-card .tc-risk-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.tip-card .tc-metrics {
+  margin-top: 12px;
+}
+
+.tip-card .tc-metric {
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.tip-card .tc-metric .tc-value,
+.tip-card .tc-stat .tc-value {
+  display: block;
+  margin-top: 3px;
+  font-size: 16px;
+}
+
+.tip-card .tc-stat .tc-value {
+  font-size: 14px;
+}
+
+.tip-card .tc-section,
+.tip-card .tc-details {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.tip-card h4 {
+  margin: 0 0 6px;
+  font-size: 13px;
+}
+
+.tip-card .tc-section p,
+.tip-card .tc-section ul {
+  margin: 0;
+}
+
+.tip-card .tc-section ul {
+  padding-left: 18px;
+}
+
+.tip-card .tc-section li + li {
+  margin-top: 3px;
+}
+
+.tip-card .tc-risk {
+  padding: 10px 11px;
+  border: 0;
+  border-left: 3px solid var(--warning);
+  border-radius: 8px;
+  background: var(--ghost);
+}
+
+.tip-card .tc-risk-stats {
+  margin-top: 8px;
+}
+
+.tip-card .tc-details summary {
+  cursor: pointer;
+  font-weight: 640;
+}
+
+.tip-card .tc-details summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.tip-card .tc-details-content {
+  padding-top: 8px;
+}
+
+.tip-card .tc-details-content > p {
+  margin: 6px 0 0;
+}
+
+.tip-card .tc-rows {
+  display: grid;
+  grid-template-columns: minmax(110px, auto) 1fr;
+  gap: 3px 12px;
+  margin: 0;
+}
+
+.tip-card .tc-rows dt {
+  color: var(--text-secondary);
+}
+
+.tip-card .tc-rows dd {
+  margin: 0;
+  min-width: 0;
+}
+
+/* Wide tables scroll sideways inside the card rather than widening it. */
+.tip-card .tc-table-wrap {
+  overflow-x: auto;
+}
+
+.tip-card .tc-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.tip-card .tc-table th,
+.tip-card .tc-table td {
+  padding: 4px 6px;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border);
+}
+
+.tip-card .tc-table th {
+  font-weight: 640;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.tip-card .tc-table .num {
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* A strike's reason line sits under its figures, so the figures' row drops
+   its divider and the reason carries it. */
+.tip-card .tc-table tr:has(+ tr.tc-reason) td {
+  border-bottom: 0;
+  padding-bottom: 1px;
+}
+
+.tip-card .tc-table tr.tc-reason td {
+  padding-top: 0;
+  font-size: 11px;
+  color: var(--text-secondary);
+  white-space: normal;
+}
+
+/* The selected strike: a subtle fill plus its "Selected" result text. */
+.tip-card .tc-table tr.picked td {
+  background: var(--accent-soft);
+  font-weight: 640;
+}
+
+.tip-card .tc-footer {
+  margin-top: 12px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+@media (max-width: 380px) {
+  #tooltip.card {
+    padding: 12px;
+  }
+
+  .tip-card .tc-metrics,
+  .tip-card .tc-risk-stats {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 #tooltip .tt-title {
   font-weight: 640;
   color: var(--text-primary);

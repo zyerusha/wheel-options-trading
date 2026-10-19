@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from wheel import cspentry as ce  # noqa: E402
 from wheel import marketdata  # noqa: E402
+from wheel.tooltipcard import card_text  # noqa: E402
 from wheel.accounts import _combine_csp_to_enter, _combine_wheel_targets  # noqa: E402
 from wheel.api import Dashboard, _csp_to_enter_payload, wheel_target_gap_pct  # noqa: E402
 from wheel.marketdata import OptionChainSnapshot, OptionContractQuote, PricePoint  # noqa: E402
@@ -198,7 +199,8 @@ class TestStrikeSelection(unittest.TestCase):
         payload = _csp_to_enter_payload(entry)
         self.assertIsNone(payload["recommended_strike"])
         self.assertEqual(payload["label"], "NO QUALIFYING CSP")
-        self.assertIn("NO QUALIFYING CSP", payload["explanation"])
+        self.assertEqual(payload["card"]["status_label"], "DOES NOT QUALIFY")
+        self.assertEqual(payload["card"]["summary"], entry.reason)
 
     def test_missing_chain_or_price_is_no_qualifying_with_reason(self):
         no_chain = ce.recommend_put(
@@ -313,7 +315,7 @@ class TestInsufficientHistory(unittest.TestCase):
         self.assertTrue(any(note.startswith("Limited history") for note in analysis.limitations))
         self.assertEqual(len(analysis.zones), 1)
         entry = ce.calculate_csp_to_enter(current_price=150.0, bars=short, expiry=EXPIRY_15D, today=TODAY, puts=())
-        self.assertIn("Limited history", ce.explain(entry))
+        self.assertIn("Limited history", card_text(ce.tooltip_card(entry)))
 
     def test_too_little_history_is_no_qualifying_not_an_error(self):
         tiny = bars_through([(0, 150), (20, 148)])
@@ -426,29 +428,118 @@ class TestCandidateSizingUsesTheStrike(unittest.TestCase):
 class TestTooltipMatchesCanonicalResult(unittest.TestCase):
     """Test 9: the tooltip is generated from, and agrees with, the same result."""
 
-    def test_explanation_shows_the_payload_numbers(self):
+    def test_card_shows_the_payload_numbers(self):
         entry = recommend(
             zone(140, 143, 86),
             (ce.PutQuote(145, 3.10, 3.30, 0.55), ce.PutQuote(140, 1.95, 2.05, 0.55)),
         )
-        payload = _csp_to_enter_payload(entry)
-        text = payload["explanation"]
-        self.assertTrue(text.startswith(f"CSP TO ENTER: ${payload['recommended_strike']:,.2f}"))
-        self.assertIn("Support zone: $140.00 to $143.00, strength 86/100", text)
-        self.assertIn(f"Delta: {payload['delta']:.2f} (target 0.25", text)
-        self.assertIn(f"= ${payload['effective_purchase_price']:,.2f}", text)
-        self.assertIn(f"= {payload['annualized_roi_pct']:.1f}% (min 30%)", text)
+        payload = _csp_to_enter_payload(entry, "ABC")
+        card = payload["card"]
+        self.assertEqual((card["strategy"], card["ticker"], card["status_label"]), ("CSP TO ENTER", "ABC", "QUALIFIES"))
+        self.assertEqual(card["headline"]["value"], f"${payload['recommended_strike']:,.2f}")
+        self.assertEqual(card["headline_side"]["value"], f"{payload['delta']:.2f}")
+        metrics = {m["label"]: m["value"] for m in card["metrics"]}
+        self.assertEqual(metrics["Net premium / contract"], f"${payload['net_premium_per_contract']:,.2f}")
+        self.assertEqual(metrics["Effective cost / share"], f"${payload['effective_purchase_price']:,.2f}")
+        self.assertEqual(metrics["Annualized screening return"], f"{payload['annualized_roi_pct']:.1f}%")
+        self.assertEqual(metrics["Cash collateral / contract"], f"${payload['collateral_per_contract']:,.2f}")
+        text = card_text(card)
+        self.assertIn("Support zone: $140.00 to $143.00", text)
+        self.assertIn("Support score: 86/100", text)
         self.assertIn("not a probability", text)
-        self.assertIn("not a fixed % of the price", text)
-        self.assertIn(payload["reason"], text)
         for banned in ("−", " -- ", " — ", " – "):
             self.assertNotIn(banned, text)
 
-    def test_frontend_shows_the_explanation_verbatim(self):
+    def test_card_keeps_to_three_reasons_and_four_key_numbers(self):
+        card = ce.tooltip_card(
+            recommend(zone(140, 143, 86), (ce.PutQuote(145, 3.10, 3.30, 0.55), ce.PutQuote(140, 1.95, 2.05, 0.55)))
+        )
+        self.assertEqual(len(card["why"]), 3)
+        self.assertEqual(len(card["metrics"]), 4)
+        self.assertIn("above the 30% minimum", card["why"][0])
+        self.assertIn("preferred 0.20 to 0.30", card["why"][1])
+
+    def test_strike_table_marks_the_pick_and_says_why_others_lost(self):
+        entry = recommend(
+            zone(140, 143, 86),
+            (ce.PutQuote(140, 1.95, 2.05, 0.55), ce.PutQuote(135, 0.50, 2.50, 0.30)),
+        )
+        table = ce.tooltip_card(entry)["sections"][0]["table"]
+        by_strike = {row["cells"][0]: row for row in table["rows"]}
+        self.assertTrue(by_strike["$140.00"]["picked"])
+        self.assertEqual((by_strike["$140.00"]["result"], by_strike["$140.00"]["reason"]), ("Selected", None))
+        self.assertFalse(by_strike["$135.00"]["picked"])
+        self.assertEqual(by_strike["$135.00"]["result"], "Rejected")
+        self.assertEqual(by_strike["$135.00"]["reason"], "Bid/ask spread wider than 50% of the mid")
+        self.assertEqual(table["columns"][4], "Spread")
+        self.assertEqual(by_strike["$135.00"]["cells"][4], "FAIL")
+        self.assertEqual(by_strike["$135.00"]["cells"][-1], "Rejected")
+
+    def test_missing_market_data_reads_unverified_not_rejected(self):
+        no_chain = ce.recommend_put(
+            current_price=150.0, support=zone(140, 143, 86), expiry=EXPIRY_15D, today=TODAY, puts=None,
+        )
+        self.assertEqual(ce.tooltip_card(no_chain)["status_label"], "UNVERIFIED")
+        failed = recommend(zone(140, 143, 86), (ce.PutQuote(140, 0.50, 0.60, 0.55),))
+        self.assertEqual(ce.tooltip_card(failed)["status_label"], "DOES NOT QUALIFY")
+        no_price = ce.calculate_csp_to_enter(current_price=None, bars=[], expiry=None, today=TODAY, puts=None)
+        self.assertEqual(ce.tooltip_card(no_price)["status_label"], "UNVERIFIED")
+
+
+class TestWorkedExample(unittest.TestCase):
+    """$331.21 stock, $310 put at a $10.00 mid, $0.65 fee, Nov 20 expiry."""
+
+    def _entry(self, today):
+        return ce.recommend_put(
+            current_price=331.21, support=zone(311.43, 326.48, 92), expiry=date(2026, 11, 20), today=today,
+            puts=(ce.PutQuote(310, 9.90, 10.10, 0.42),),
+        )
+
+    def test_economics(self):
+        pick = self._entry(date(2026, 10, 16)).pick
+        self.assertAlmostEqual(pick.net_premium, 9.9935, places=10)
+        self.assertAlmostEqual(pick.net_premium * 100, 999.35, places=8)
+        self.assertAlmostEqual(pick.effective_purchase_price, 300.0065, places=10)
+        self.assertAlmostEqual(pick.downside_to_strike_pct, 100 * (331.21 - 310) / 331.21, places=10)
+        self.assertAlmostEqual(pick.effective_discount_pct, 100 * (331.21 - 300.0065) / 331.21, places=10)
+        card = ce.tooltip_card(self._entry(date(2026, 10, 16)))
+        metrics = {m["label"]: m["value"] for m in card["metrics"]}
+        self.assertEqual(metrics["Net premium / contract"], "$999.35")
+        self.assertEqual(metrics["Effective cost / share"], "$300.01")
+        self.assertEqual(metrics["Cash collateral / contract"], "$31,000.00")
+        self.assertIn("Price to strike: 6.4% lower", card_text(card))
+
+    def test_dte_and_return_use_the_same_as_of_date(self):
+        for today, dte, annualized in ((date(2026, 10, 16), 35, "33.6%"), (date(2026, 10, 17), 34, "34.6%")):
+            card = ce.tooltip_card(self._entry(today))
+            self.assertIn(f"{dte} DTE from {today.strftime('%b')} {today.day}", card["subtitle"])
+            self.assertEqual(card["metrics"][2]["value"], annualized)
+            self.assertIn(f"× 365 ÷ {dte} = {annualized}", card_text(card))
+
+
+class TestSpreadCheck(unittest.TestCase):
+    def _candidate(self, bid, ask):
+        entry = recommend(zone(140, 143, 86), (ce.PutQuote(140, bid, ask, 0.55),))
+        return entry.candidates[0]
+
+    def test_states(self):
+        self.assertEqual(self._candidate(1.95, 2.05).spread_check, "PASS")
+        self.assertEqual(self._candidate(1.20, 2.80).spread_check, "FAIL")  # 80% of the mid
+        self.assertEqual(self._candidate(0.0, 0.40).spread_check, "FAIL")  # no bid
+        self.assertEqual(self._candidate(None, None).spread_check, "UNAVAILABLE")
+
+    def test_boundary_is_inclusive(self):
+        # (2.5 - 1.5) / 2.0 = exactly 50% of the mid: allowed, as the filter allows it.
+        candidate = self._candidate(1.5, 2.5)
+        self.assertAlmostEqual(candidate.spread_pct_of_mid, 50.0)
+        self.assertEqual(candidate.spread_check, "PASS")
+        self.assertNotIn("spread", candidate.rejected_reason or "")
+
+    def test_frontend_shows_the_card_verbatim(self):
         with open(os.path.join(ROOT, "wheel", "static", "app.js"), encoding="utf-8") as handle:
             js = handle.read()
-        self.assertIn("if (entry && entry.explanation) cell.title = entry.explanation;", js)
-        self.assertIn("help: formula([(cspEntry && cspEntry.explanation)", js)
+        self.assertIn("if (entry) setTipCard(cell, entry.card);", js)
+        self.assertIn("card: cspEntry ? cspEntry.card : null,", js)
 
 
 class TestDailyRangesInPriceCache(unittest.TestCase):
@@ -522,7 +613,7 @@ class TestExpirationIsCspsOwn(unittest.TestCase):
         entry = recommend(zone(140, 143, 86), (ce.PutQuote(140, 1.95, 2.05, 0.55),), expiry=expiry)
         payload = _csp_to_enter_payload(entry)
         self.assertIs(payload["expiry_in_window"], False)
-        self.assertIn("none listed 30-45 days out", payload["explanation"])
+        self.assertIn("none listed 30 to 45 days out", card_text(payload["card"]))
         inside = _csp_to_enter_payload(recommend(zone(140, 143, 86), (), expiry=TODAY + timedelta(days=35)))
         self.assertIs(inside["expiry_in_window"], True)
 
@@ -572,12 +663,16 @@ class TestEntryEconomicsArePresentedSeparately(unittest.TestCase):
         self.assertEqual(p["days_to_expiry"], 15)
 
     def test_tooltip_labels_the_screening_metric_and_the_downside(self):
-        text = self.payload["explanation"]
+        text = card_text(self.payload["card"])
         self.assertIn("allowed 0.10 to 0.40", text)
-        self.assertIn("not an expected or guaranteed yearly return", text)
-        self.assertIn("however far it falls", text)
-        self.assertIn("support can't stop the price falling through it", text)
-        self.assertIn("% under the price", text)
+        self.assertIn("screening figure for comparing puts, not a forecast", text)
+        self.assertIn("does not limit losses", text)
+        self.assertIn("You must buy 100 shares per contract", text)
+        self.assertIn("They do not guarantee that the stock will stop falling", text)
+        self.assertIn("an estimate, not a guaranteed fill", text)
+        # Distance to the strike is never called protection or a maximum loss.
+        for misleading in ("protection", "maximum loss", "max loss", "downside"):
+            self.assertNotIn(misleading, text.lower())
 
     def test_snapshot_times_are_carried_onto_the_payload(self):
         from datetime import datetime, timezone
@@ -594,7 +689,7 @@ class TestEntryEconomicsArePresentedSeparately(unittest.TestCase):
             (payload["quotes_as_of"], payload["chain_fetched_at"], payload["calculated_at"]),
             (quoted.isoformat(), fetched.isoformat(), ran.isoformat()),
         )
-        self.assertIn("Option prices as of", payload["explanation"])
+        self.assertTrue(payload["card"]["quoted"].startswith("Option prices as of"))
 
 
 class TestOptionLiquidityFilters(unittest.TestCase):
@@ -621,9 +716,11 @@ class TestOptionLiquidityFilters(unittest.TestCase):
         self.assertEqual(reported.strike, 140)
         self.assertEqual(unreported.strike, 140)
         self.assertEqual(_csp_to_enter_payload(reported)["open_interest"], 1234)
-        self.assertIn("1,234 open, 56 traded today", ce.explain(reported))
+        self.assertIn("Open interest: 1,234\nVolume today: 56", card_text(ce.tooltip_card(reported)))
         self.assertIsNone(_csp_to_enter_payload(unreported)["open_interest"])
-        self.assertIn("open interest not reported, volume not reported", ce.explain(unreported))
+        self.assertIn(
+            "Open interest: Not reported\nVolume today: Not reported", card_text(ce.tooltip_card(unreported))
+        )
 
 
 class TestSupportEvidenceInPayload(unittest.TestCase):
@@ -650,7 +747,7 @@ class TestSupportEvidenceInPayload(unittest.TestCase):
         )
         payload = _csp_to_enter_payload(recommend(broken, (ce.PutQuote(140, 1.95, 2.05, 0.55),)))
         self.assertEqual(payload["support_evidence"]["breaks"], 1)
-        self.assertIn("closed through 1x since (score cut)", payload["explanation"])
+        self.assertIn("Closed through since: 1x (each halves the score)", card_text(payload["card"]))
 
 
 def replace_zone(z, **changes):
