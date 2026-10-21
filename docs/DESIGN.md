@@ -306,6 +306,45 @@ covers, FIFO):
   what those shares cost. It is not advice that being called away there is the best
   decision; the tooltip says so.
 
+**Historical resistance (context only).** Delta picks the strike; resistance only
+describes where that strike sits. `ccexit.resistance_context` runs after the pick is
+final and can't reject, move or re-rank a strike. Zones come from
+`pricezones.analyze(bars, RESISTANCE)`, the same swing-point method as CSP TO ENTER's
+support, mirrored: a swing high is a daily high above the 5 prior highs and no lower
+than the 5 after, followed within 20 sessions by a pullback of at least max(3%, 1.5
+ATR); highs within one zone width of a zone's highest high join it; the score uses the
+support weights (the 20% "bounce" share is the pullback), and every close more than one
+zone width above the zone after its first touch halves it. Daily bars come from the same
+cache (`Dashboard._daily_bars`) and ride on the ticker's `ExitChain`.
+
+- **Meaningful**: score at least 40 (`MIN_RESISTANCE_SCORE`, the same bar as support),
+  top still above the current price (a zone the price already trades above has broken),
+  and within 25% of the strike.
+- Of the nearest meaningful zone under the strike, the one around it and the nearest
+  over it, the **most useful** is the best on score x exp(-(distance / 15%)^2), the
+  support relevance curve; a tie goes to the zone around the strike, then the nearer.
+- **Relationship**: the strike is above, inside or below that zone; "just" above/below
+  when within one zone width. Strength reads "Strong" at 70+, "Moderate" below.
+- None meaningful: "No significant historical resistance identified near the
+  recommended strike." (or the history/swing-high reason). No pick: no resistance.
+- Payload: `cc_to_exit_detail.resistance` (`found`, `zone` with low/high/score/touches/
+  touch days/last touch/average pullback/breaks/nearby moving averages,
+  `strength_label`, `relationship`, `distance_from_strike_pct`, `near`, `reason`, the
+  nearest zone under/around/over the strike, limitations). The card shows it right
+  after "Why this strike?" (`context`), with an "About this resistance" section saying
+  it is historical context, not a prediction, and never changes the recommendation.
+- **Per-strike guidance** (`ccexit.strike_guidance` / `candidate_guidance`, advice
+  only): the strike table's **Resistance** column rates every *qualifying* strike against
+  that same zone (rejected strikes show "-" and keep their reason). Below; Inside; Just
+  above (within one zone width of the zone's top, the same ATR-based width the zones are
+  built with and the "just" in the resistance sentence); Well above (past that); None
+  found. The row's one-sentence line gives the advice with a bold lead-in: below or
+  inside suggests a higher strike (above the zone, for inside) **only when one actually
+  qualifies**, and says it usually pays less premium; just above notes the room to move
+  through resistance; well above weighs the extra room against the usually lower premium;
+  none found falls back to delta, profitability and the minimum exit. Sentences never
+  repeat zone prices. Also in the payload as `resistance.strike_guidance`.
+
 Lot-level option cash (`metrics.lot_option_credit`, also behind each lot's
 `net_adjusted_cost_basis` / the Breakeven column): a put roll chain that ended in
 assignment goes to the lot(s) it created, matched on the assignment day **and the
@@ -355,7 +394,8 @@ view keeps its **own** entries and adds other accounts' only for tickers it does
 have, because its Wheel price targets and Open positions Gap to Target were computed
 against its own. Either way a view never shows two values for one ticker.
 
-1. **Support zones** from the last ~252 sessions of daily OHLCV (the same Yahoo chart
+1. **Support zones** (`wheel/pricezones.py`, shared with CC TO EXIT's resistance;
+   `cspentry.analyze_support` is its support side) from the last ~252 sessions of daily OHLCV (the same Yahoo chart
    fetch as every other price; `PricePoint` now keeps high/low/volume and a close-only
    cache is refetched once via `get_price_series(require_ranges=True)`). A swing low is
    a daily low below the 5 prior lows, no higher than the 5 after, followed within 20
@@ -402,6 +442,25 @@ not a probability, with the note that historical levels do not guarantee the sto
 stops falling. The effective purchase price is a *proposed-entry* figure for this one
 put; it is unrelated to the historical, whole-position Wheel Breakeven.
 
+**Per-strike support guidance** (`cspentry.strike_guidance` / `candidate_guidance`,
+advice only, never a ranking input). The strike table adds **To strike** (how far the
+stock can fall from today's price before reaching the strike, the existing
+`downside_to_strike_pct`) and **Support**, rating every *qualifying* put against the
+chosen support zone (rejected puts show "-" and keep their reason). Distances are % of
+the current price, the zone-reach rule's measure, and one zone width
+(`support.zone_width_pct`) is the boundary: Above (more than one width over the zone's
+top); Near (over the top by at most one width); Inside; Just below (under the bottom by
+at most one width); Well below (more than one width under); None found. Each row's one
+sentence has a bold lead-in: above suggests a lower strike only when one qualifies and
+says it usually pays less premium; inside says a break below the zone could lead to
+assignment (and that the stock is already trading in the zone when it is), suggesting a
+strike below the zone only when one qualifies; well below weighs the extra room against
+the lower premium and return. A zone the price has fallen through is never selected
+(`select_support_zone`), so broken support gets the neutral message, never a floor.
+Under the table, once: support is a past price area, not a floor; ask how far the stock
+can fall before your strike and whether you would own 100 shares there. Also in the
+payload as `support_guidance`. Missing figures read "n/a" in strike tables.
+
 The tooltip's spread check (`PutCandidate.spread_check`) reads PASS, FAIL (no bid, or
 spread over 50% of the mid) or UNAVAILABLE (no usable quote), from the same
 `spread_pct_of_mid` the hard filter uses, so the two can't disagree. DTE counts
@@ -433,7 +492,8 @@ nothing relies on colour alone.
 |---|---|---|
 | Key numbers | net premium / contract, effective cost / share, annualized screening return, cash collateral / contract | net premium / contract, P&L if assigned, minimum exit strike, stock P&L at the strike |
 | If assigned | buy 100 shares per contract at the strike; premium does not limit losses | the newest uncovered shares are sold at the strike; the minimum exit is a floor, not advice |
-| Strike table | strike, delta, net / contract, ann. return, spread check | strike, delta, midpoint, P&L if assigned, minimum-exit check |
+| Strike table | strike, delta, net / contract, ann. return, to strike, spread check, support guidance | strike, delta, midpoint, P&L if assigned, minimum-exit check, resistance guidance |
+| Context (after "Why") | none | historical resistance: the zone, Strong/Moderate and score, the strike vs the zone, and an "About" section |
 | Sections | historical support (zone, score, swing lows, last touch, bounce, volume, moving averages vs price), quote and liquidity, calculation details | share allocation, P&L if assigned step by step, calculation details |
 
 **Option liquidity.** Underlying-stock liquidity (10-day share volume, market cap) is

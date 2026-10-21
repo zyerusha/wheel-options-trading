@@ -20,10 +20,14 @@ A card is a plain dict:
     summary       one sentence shown when nothing qualified, or None
     metrics       up to four {label, value, note}: the key numbers
     why           up to three short sentences, built from the result
+    context       {title, value, badge, text, stats: [{label, value}],
+                  details: section} historical context shown right after
+                  ``why`` (CC TO EXIT's resistance), or None
     risk          {title, text, stats: [{label, value}]} or None
     sections      [{title, open, rows: [[label, value]], table, notes}]
                   collapsible details; ``table`` is {columns, numeric, rows:
-                  [{cells, picked, result, reason}]} (``table_row``)
+                  [{cells, picked, result, reason, reason_label}]}
+                  (``table_row``)
     footer        a closing caveat, or None
 """
 
@@ -45,6 +49,7 @@ STATUS_BADGES = {
     STATUS_UNVERIFIED: "UNVERIFIED",
 }
 
+UNAVAILABLE = "Unavailable"
 MAX_WHY_BULLETS = 3
 MAX_METRICS = 4
 
@@ -53,6 +58,13 @@ def money(value: float | None) -> str:
     if value is None:
         return "Unavailable"
     return f"-${-value:,.2f}" if value < 0 else f"${value:,.2f}"
+
+
+def price_range(low: float, high: float) -> str:
+    """"$135.55 to $140.90", or one price when both ends show the same
+    (a zone built from a single swing point)."""
+    low_text, high_text = money(low), money(high)
+    return low_text if low_text == high_text else f"{low_text} to {high_text}"
 
 
 def pct(value: float | None, digits: int = 1) -> str:
@@ -120,6 +132,7 @@ def card(
     summary: str | None = None,
     metrics: list[dict[str, Any]] | None = None,
     why: list[str] | None = None,
+    context: dict[str, Any] | None = None,
     risk: dict[str, Any] | None = None,
     sections: list[dict[str, Any]] | None = None,
     footer: str | None = None,
@@ -140,6 +153,7 @@ def card(
         "summary": summary,
         "metrics": metrics,
         "why": why,
+        "context": context,
         "risk": risk,
         "sections": [section for section in (sections or []) if section],
         "footer": footer,
@@ -181,6 +195,15 @@ def card_text(card_dict: dict[str, Any] | None) -> str:
     for metric in card_dict["metrics"]:
         lines += [metric["label"], metric["value"], metric.get("note") or ""]
     lines += card_dict["why"]
+    context = card_dict.get("context")
+    if context:
+        lines += [context["title"], context["value"], context.get("badge") or "", context["text"]]
+        lines += [f"{stat['label']}: {stat['value']}" for stat in context["stats"]]
+        details = context.get("details")
+        if details:
+            lines.append(details["title"])
+            lines += [f"{label}: {value}" for label, value in details["rows"]]
+            lines += details["notes"]
     risk = card_dict.get("risk")
     if risk:
         lines += [risk["title"], risk["text"]]
@@ -192,7 +215,8 @@ def card_text(card_dict: dict[str, Any] | None) -> str:
             for row in block["table"]["rows"]:
                 lines.append(" | ".join(row["cells"]))
                 if row["reason"]:
-                    lines.append(f"  {row['reason']}")
+                    lead = f"{row['reason_label']}: " if row.get("reason_label") else ""
+                    lines.append(f"  {lead}{row['reason']}")
         lines += [f"{label}: {value}" for label, value in block["rows"]]
         lines += block["notes"]
     lines.append(card_dict.get("footer") or "")
@@ -204,12 +228,24 @@ RESULT_QUALIFIES = "Qualifies"
 RESULT_REJECTED = "Rejected"
 
 
-def table_row(cells: list[str], *, picked: bool, qualifies: bool, reason: str | None = None) -> dict[str, Any]:
+def table_row(
+    cells: list[str], *, picked: bool, qualifies: bool, reason: str | None = None, reason_label: str | None = None
+) -> dict[str, Any]:
     """One strike: its figures, then a one-word result (the table's last
     column) and, when there is one, the reason in words on its own line, so
-    a long rejection never squeezes the numbers."""
+    a long rejection never squeezes the numbers. ``reason_label``: an
+    optional bold lead-in for that line (e.g. "Below resistance")."""
     result = RESULT_SELECTED if picked else RESULT_QUALIFIES if qualifies else RESULT_REJECTED
-    return {"cells": [*cells, result], "picked": picked, "result": result, "reason": reason}
+    # A missing figure reads "n/a" in a table cell, so a row of them can't
+    # push the table wider than the card.
+    cells = ["n/a" if cell == UNAVAILABLE else cell for cell in cells]
+    return {
+        "cells": [*cells, result],
+        "picked": picked,
+        "result": result,
+        "reason": reason,
+        "reason_label": reason_label,
+    }
 
 
 def table(columns: list[str], numeric: list[bool], rows: list[dict[str, Any]]) -> dict[str, Any] | None:

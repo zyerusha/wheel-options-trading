@@ -27,6 +27,7 @@ from wheel import cspentry
 from wheel import cashflow as cf
 from wheel import expiration as expiration_mod
 from wheel import marketdata
+from wheel import pricezones
 from wheel import workflow as workflow_mod
 from wheel.engine import (
     CLOSED,
@@ -1372,7 +1373,58 @@ def _cc_exit_payload(result: ccexit.CcExit, ticker: str | None = None) -> dict[s
             "quotes_as_of": _iso_dt(result.quotes_as_of),
             "chain_fetched_at": _iso_dt(result.fetched_at),
             "calculated_at": _iso_dt(result.calculated_at),
+            # Historical resistance around the pick: context, never a
+            # selection input. None without a recommended strike.
+            "resistance": _resistance_payload(result),
         },
+    }
+
+
+def _price_zone_payload(zone: pricezones.PriceZone | None) -> dict[str, Any] | None:
+    if zone is None:
+        return None
+    return {
+        "low": _money(zone.low),
+        "high": _money(zone.high),
+        "score": round(zone.score, 1),
+        "touches": zone.touches,
+        "touch_days": [_iso(day) for day in zone.touch_days],
+        "sessions_since_last_touch": zone.sessions_since_last_touch,
+        "avg_reaction_pct": round(zone.avg_reaction_pct, 2),
+        "breaks": zone.breaks,
+        "moving_averages_near": list(zone.moving_averages_near),
+    }
+
+
+def _resistance_payload(result: ccexit.CcExit) -> dict[str, Any] | None:
+    """CC TO EXIT's one resistance result (``ccexit.resistance_context``):
+    the most useful zone, where the strike sits against it, the nearest
+    zone under / around / over the strike, and the advice for every
+    qualifying strike (``ccexit.candidate_guidance``). ``zone`` is None with
+    ``reason`` saying why there is no meaningful resistance."""
+    context = result.resistance
+    if context is None:
+        return None
+    guidance = [ccexit.candidate_guidance(result, candidate) for candidate in result.candidates]
+    return {
+        "found": context.zone is not None,
+        "zone": _price_zone_payload(context.zone),
+        "strength_label": context.strength_label,
+        "relationship": context.relationship,
+        "distance_from_strike_pct": round(context.distance_pct, 2) if context.distance_pct is not None else None,
+        "near": context.near,
+        "reason": context.reason,
+        "meaningful_zones": context.meaningful_zones,
+        "nearest_below_strike": _price_zone_payload(context.below),
+        "around_strike": _price_zone_payload(context.at),
+        "nearest_above_strike": _price_zone_payload(context.above),
+        "sessions_analyzed": context.sessions_analyzed,
+        "limitations": list(context.limitations),
+        "strike_guidance": [
+            {"strike": item.strike, "position": item.position, "label": item.label, "text": item.text}
+            for item in guidance
+            if item is not None
+        ],
     }
 
 
@@ -1458,6 +1510,13 @@ def _csp_to_enter_payload(result: cspentry.CspEntry, ticker: str | None = None) 
         "reason": result.reason,
         "limitations": list(result.support.limitations) if result.support else [],
         "card": cspentry.tooltip_card(result, ticker),
+        # Advice for every qualifying put against the chosen support zone
+        # (cspentry.candidate_guidance): context, never a ranking input.
+        "support_guidance": [
+            {"strike": item.strike, "position": item.position, "label": item.label, "text": item.text}
+            for item in (cspentry.candidate_guidance(result, candidate) for candidate in result.candidates)
+            if item is not None
+        ],
         "quotes_as_of": _iso_dt(result.quotes_as_of),
         "chain_fetched_at": _iso_dt(result.fetched_at),
         "calculated_at": _iso_dt(result.calculated_at),
@@ -1829,6 +1888,7 @@ def _trade_log_entry(
         fetched_at=exit_chain.fetched_at if exit_chain else None,
         calculated_at=calculated_at,
         fees=cc_exit_fees or ccexit.FeeModel(),
+        resistance=exit_chain.resistance if exit_chain else None,
     )
     if holding_shares:
         wheel_phase = "cc"
@@ -4443,7 +4503,10 @@ class Dashboard:
         (``ccexit.pick_expiration``), counted from the real calendar today,
         not the last export date. A ticker with no listed expirations or a
         failed chain fetch still gets an entry, with the reason, so the
-        result says why instead of going quiet.
+        result says why instead of going quiet. Each entry also carries the
+        ticker's historical resistance zones (``pricezones``, from the same
+        daily-history cache CSP TO ENTER's support reads), context for the
+        strike CC TO EXIT picks, never an input to the pick.
         """
         today = date.today()
         needs: dict[str, str] = {}  # cycle_id -> ticker
@@ -4462,19 +4525,25 @@ class Dashboard:
         for snapshot, warning in chains.values():
             if warning:
                 self._price_warnings.append(warning)
+        bars = self._daily_bars(sorted(set(needs.values())))
+        resistance = {
+            ticker: pricezones.analyze(bars.get(ticker, []), pricezones.RESISTANCE) for ticker in set(needs.values())
+        }
 
         out: dict[str, ccexit.ExitChain] = {}
         for cycle_id, ticker in needs.items():
             expiry = expiry_of[ticker]
             if expiry is None:
                 out[cycle_id] = ccexit.ExitChain(
-                    today, None, None, f"No upcoming option expirations for {ticker} could be loaded."
+                    today, None, None, f"No upcoming option expirations for {ticker} could be loaded.",
+                    resistance=resistance[ticker],
                 )
                 continue
             snapshot, _ = chains[(ticker, expiry)]
             if snapshot is None:
                 out[cycle_id] = ccexit.ExitChain(
-                    today, expiry, None, f"Option prices for {ticker} {expiry.isoformat()} couldn't be loaded."
+                    today, expiry, None, f"Option prices for {ticker} {expiry.isoformat()} couldn't be loaded.",
+                    resistance=resistance[ticker],
                 )
                 continue
             calls = tuple(
@@ -4488,6 +4557,7 @@ class Dashboard:
                 calls,
                 quotes_as_of=snapshot.quote_time,
                 fetched_at=self._option_chain_fetched_at.get((ticker, expiry)),
+                resistance=resistance[ticker],
             )
         return out
 

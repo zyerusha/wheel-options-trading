@@ -26,6 +26,9 @@ Selection, in order:
 6. Of the rest, the one with delta closest to 0.30 wins (lower strike on a
    tie). None left -> NO QUALIFYING CC with the reason. Never a fallback to
    the stock price.
+7. Historical resistance (``resistance_context``) is then related to the
+   strike already chosen: context for the reader, never an input to the
+   choice. It can't reject, move or re-rank a strike.
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Sequence
 
-from wheel import optionsmath
+from wheel import optionsmath, pricezones
 from wheel import tooltipcard as tc
 from wheel.optionsmath import CALL, bid_ask_mid, black_scholes_greeks
 
@@ -70,6 +73,33 @@ STATUS_LABELS = {
 }
 
 _EPS = 1e-9
+
+# ---- historical resistance (context only) ----------------------------------
+
+# A zone has to score this much to count as meaningful: the same bar CSP TO
+# ENTER sets for support (cspentry.MIN_SUPPORT_SCORE), so "meaningful" means
+# the same on both sides.
+MIN_RESISTANCE_SCORE = 40.0
+STRONG_RESISTANCE_SCORE = 70.0  # "Strong" at or above, "Moderate" below
+# Zones further than this from the strike (% of the strike) say nothing
+# useful about it; mirrors CSP TO ENTER's 25% support reach.
+MAX_RESISTANCE_DISTANCE_PCT = 25.0
+# Usefulness = strength x exp(-(distance / 15%)^2), CSP TO ENTER's support
+# relevance curve: a strong zone 3% away beats a weak one touching the strike.
+RESISTANCE_DISTANCE_SCALE_PCT = 15.0
+
+ABOVE_ZONE, INSIDE_ZONE, BELOW_ZONE = "above", "inside", "below"  # the strike vs the zone
+RELATIONSHIP_LABELS = {
+    ABOVE_ZONE: "Above resistance",
+    INSIDE_ZONE: "Inside resistance",
+    BELOW_ZONE: "Below resistance",
+}
+NO_RESISTANCE_NEAR = "No significant historical resistance identified near the recommended strike."
+RESISTANCE_EXPLAINER = (
+    "Historical resistance is based on prior swing highs and repeated price reactions. It can help show "
+    "where the stock has previously struggled to move higher, but it does not guarantee that the stock "
+    "will stop there."
+)
 
 
 def round_up_to_half_dollar(value: float) -> float:
@@ -124,6 +154,38 @@ class ExitChain:
     # fetched it; both shown so every display can say how fresh the prices are.
     quotes_as_of: datetime | None = None
     fetched_at: datetime | None = None
+    # The ticker's resistance zones from its daily history
+    # (``pricezones.analyze(bars, RESISTANCE)``); context only.
+    resistance: pricezones.ZoneAnalysis | None = None
+
+
+@dataclass(frozen=True)
+class ResistanceContext:
+    """Historical resistance around the recommended strike. ``zone`` is the
+    most useful meaningful zone (``None`` with ``reason`` saying why there
+    is none); ``below`` / ``at`` / ``above`` are the nearest meaningful zone
+    under the strike, around it, and over it."""
+
+    strike: float
+    zone: pricezones.PriceZone | None
+    relationship: str | None  # ABOVE_ZONE / INSIDE_ZONE / BELOW_ZONE: the strike vs ``zone``
+    # Strike to the zone's nearest edge, % of the strike; 0 inside it.
+    distance_pct: float | None
+    near: bool  # within one zone width of the zone ("just above/below")
+    below: pricezones.PriceZone | None
+    at: pricezones.PriceZone | None
+    above: pricezones.PriceZone | None
+    meaningful_zones: int  # zones that scored >= MIN_RESISTANCE_SCORE within reach
+    zone_width_pct: float | None
+    sessions_analyzed: int
+    limitations: tuple[str, ...]
+    reason: str  # the one-sentence relationship, or why there is no zone
+
+    @property
+    def strength_label(self) -> str | None:
+        if self.zone is None:
+            return None
+        return "Strong" if self.zone.score >= STRONG_RESISTANCE_SCORE else "Moderate"
 
 
 @dataclass(frozen=True)
@@ -169,6 +231,8 @@ class CcExit:
     # shares' cost, a listed expiration, the chain), as opposed to every
     # input loading and no call passing.
     market_data_missing: bool = False
+    # Historical resistance around the pick (context only); None without a pick.
+    resistance: ResistanceContext | None = None
 
     @property
     def strike(self) -> float | None:
@@ -268,6 +332,153 @@ def _no_candidate_reason(candidates: Sequence[CandidateCall], preferred_min_exit
     return f"No call at or above the ${preferred_min_exit:.2f} minimum exit passes every check ({detail})."
 
 
+def _strike_vs_zone(strike: float, zone: pricezones.PriceZone) -> tuple[str, float]:
+    """(where the strike sits relative to ``zone``, its distance from the
+    zone's nearest edge as % of the strike; 0 inside)."""
+    if strike > zone.high + _EPS:
+        return ABOVE_ZONE, 100.0 * (strike - zone.high) / strike
+    if strike < zone.low - _EPS:
+        return BELOW_ZONE, 100.0 * (zone.low - strike) / strike
+    return INSIDE_ZONE, 0.0
+
+
+def _resistance_sentence(strike: float, zone: pricezones.PriceZone, relationship: str, near: bool) -> str:
+    where = f"the {tc.price_range(zone.low, zone.high)} resistance zone"
+    if relationship == INSIDE_ZONE:
+        return f"Recommended {_money(strike)} falls inside {where}."
+    side = "above" if relationship == ABOVE_ZONE else "below"
+    return f"Recommended {_money(strike)} is {'just ' if near else ''}{side} {where}."
+
+
+def resistance_context(
+    analysis: pricezones.ZoneAnalysis | None, strike: float, current_price: float | None
+) -> ResistanceContext:
+    """Historical resistance around ``strike``, for context only.
+
+    Meaningful zones score at least ``MIN_RESISTANCE_SCORE``, still sit
+    overhead (their top is above the current price; a zone the price is
+    already above has broken) and lie within ``MAX_RESISTANCE_DISTANCE_PCT``
+    of the strike. Of the nearest one under the strike, the one around it
+    and the nearest one over it, the most useful is the best on strength x
+    distance decay (CSP TO ENTER's support relevance), a tie going to the
+    zone around the strike, then the nearer one."""
+    empty = {
+        "strike": strike, "zone": None, "relationship": None, "distance_pct": None, "near": False,
+        "below": None, "at": None, "above": None, "meaningful_zones": 0,
+        "zone_width_pct": analysis.zone_width_pct if analysis else None,
+        "sessions_analyzed": analysis.sessions_analyzed if analysis else 0,
+        "limitations": analysis.limitations if analysis else (),
+    }
+    if analysis is None:
+        return ResistanceContext(**empty, reason="No daily price history was available to look for resistance.")
+    if analysis.sessions_analyzed < pricezones.MIN_BARS:
+        return ResistanceContext(**empty, reason="Not enough daily price history to find resistance.")
+    if not analysis.zones:
+        return ResistanceContext(
+            **empty, reason=f"No swing highs with a real pullback in the last {analysis.sessions_analyzed} sessions."
+        )
+
+    placed = []
+    for zone in analysis.zones:
+        if zone.score < MIN_RESISTANCE_SCORE:
+            continue
+        if current_price is not None and zone.high <= current_price:
+            continue
+        relationship, distance = _strike_vs_zone(strike, zone)
+        if distance <= MAX_RESISTANCE_DISTANCE_PCT + _EPS:
+            placed.append((zone, relationship, distance))
+    if not placed:
+        return ResistanceContext(**empty, reason=NO_RESISTANCE_NEAR)
+
+    def nearest(relationship: str) -> tuple | None:
+        options = [item for item in placed if item[1] == relationship]
+        # Nearest first; among zones the strike sits inside, the strongest.
+        return min(options, key=lambda item: (round(item[2], 6), -item[0].score), default=None)
+
+    under, around, over = nearest(ABOVE_ZONE), nearest(INSIDE_ZONE), nearest(BELOW_ZONE)
+
+    def usefulness(item: tuple) -> tuple:
+        zone, relationship, distance = item
+        relevance = zone.score * math.exp(-((distance / RESISTANCE_DISTANCE_SCALE_PCT) ** 2))
+        return (round(relevance, 6), relationship == INSIDE_ZONE, -round(distance, 6))
+
+    zone, relationship, distance = max((item for item in (under, around, over) if item), key=usefulness)
+    near = analysis.zone_width_pct is not None and distance <= analysis.zone_width_pct + _EPS
+    return ResistanceContext(
+        **{
+            **empty,
+            "zone": zone,
+            "relationship": relationship,
+            "distance_pct": distance,
+            "near": near,
+            "below": under[0] if under else None,
+            "at": around[0] if around else None,
+            "above": over[0] if over else None,
+            "meaningful_zones": len(placed),
+        },
+        reason=_resistance_sentence(strike, zone, relationship, near),
+    )
+
+
+# ---- per-strike resistance guidance (advice only) ---------------------------
+
+GUIDE_BELOW, GUIDE_INSIDE, GUIDE_JUST_ABOVE, GUIDE_WELL_ABOVE, GUIDE_NONE = (
+    "below", "inside", "just_above", "well_above", "none",
+)
+# Short column text, then the bold lead-in of the advice line.
+GUIDANCE_LABELS = {
+    GUIDE_BELOW: ("Below", "Below resistance"),
+    GUIDE_INSIDE: ("Inside", "Inside resistance"),
+    GUIDE_JUST_ABOVE: ("Just above", "Just above resistance"),
+    GUIDE_WELL_ABOVE: ("Well above", "Well above resistance"),
+    GUIDE_NONE: ("None found", "No resistance found"),
+}
+
+
+StrikeGuidance = pricezones.StrikeGuidance
+
+
+def strike_guidance(
+    context: ResistanceContext | None, strike: float, qualifying_strikes: Sequence[float]
+) -> StrikeGuidance | None:
+    """Advice for one *qualifying* strike against the resistance zone CC TO
+    EXIT already reported (``context.zone``); ``None`` without a context.
+    Same classification as the context: above / inside / below the zone,
+    "just" above when within one zone width of its top (the ATR-based width
+    the zones are built with), "well" above past that. A higher strike is
+    only suggested when one actually qualifies (``qualifying_strikes``).
+    Advice only: it never rejects, moves or re-ranks a strike."""
+    if context is None:
+        return None
+    zone = context.zone
+
+    def make(position: str, text: str) -> StrikeGuidance:
+        label, title = GUIDANCE_LABELS[position]
+        return StrikeGuidance(strike, position, label, title, text)
+
+    if zone is None:
+        return make(GUIDE_NONE, "Decide using delta, profitability and the minimum exit.")
+    relationship, distance = _strike_vs_zone(strike, zone)
+    if relationship == BELOW_ZONE:
+        if any(other > strike + _EPS for other in qualifying_strikes):
+            return make(
+                GUIDE_BELOW,
+                "Caps your upside before the stock reaches resistance; consider a higher qualifying strike, "
+                "which usually pays less premium.",
+            )
+        return make(GUIDE_BELOW, "Caps your upside before resistance, but no higher strike qualifies.")
+    if relationship == INSIDE_ZONE:
+        if any(other > zone.high + _EPS for other in qualifying_strikes):
+            return make(
+                GUIDE_INSIDE,
+                "Sits within resistance; consider a qualifying strike above the zone, which usually pays less premium.",
+            )
+        return make(GUIDE_INSIDE, "Sits within resistance, and no qualifying strike is above the zone.")
+    if context.zone_width_pct is not None and distance <= context.zone_width_pct + _EPS:
+        return make(GUIDE_JUST_ABOVE, "Gives the stock room to move through resistance before your shares are called away.")
+    return make(GUIDE_WELL_ABOVE, "More upside room, but check whether the usually lower premium is worth it.")
+
+
 def calculate_cc_to_exit(
     *,
     share_blocks: Sequence[ShareBlock],
@@ -282,6 +493,7 @@ def calculate_cc_to_exit(
     fetched_at: datetime | None = None,
     calculated_at: datetime | None = None,
     fees: FeeModel = FeeModel(),
+    resistance: pricezones.ZoneAnalysis | None = None,
 ) -> CcExit:
     """``share_blocks``: every share held, oldest first. ``calls``: the call
     side of the chain for ``expiry``; ``None`` when it couldn't be loaded
@@ -396,6 +608,8 @@ def calculate_cc_to_exit(
         "Qualifying strike closest to the target delta.",
         pick=pick,
         candidates=candidates,
+        # Worked out only after the pick is final: context, never a selection input.
+        resistance=resistance_context(resistance, pick.strike, current_price),
         **sized,
     )
 
@@ -468,38 +682,54 @@ def _why(result: CcExit) -> list[str]:
     ]
 
 
+def candidate_guidance(result: CcExit, candidate: CandidateCall) -> StrikeGuidance | None:
+    """Resistance advice for one listed strike: qualifying strikes only (a
+    rejected one keeps its rejection reason), against every qualifying
+    strike on the chain, not just the ones the table shows."""
+    if not candidate.qualifies:
+        return None
+    qualifying = [c.strike for c in result.candidates if c.qualifies]
+    return strike_guidance(result.resistance, candidate.strike, qualifying)
+
+
 def _strike_table(result: CcExit) -> dict | None:
+    # The Resistance column appears whenever resistance was looked at (a
+    # strike was recommended); its advice takes the row's one-sentence line.
+    with_guidance = result.resistance is not None
     rows = []
     for candidate in _nearby_candidates(result):
         picked = candidate is result.pick
-        if picked:
+        guidance = candidate_guidance(result, candidate) if with_guidance else None
+        reason_label = None
+        if guidance is not None:
+            reason_label, reason = guidance.title, guidance.text
+        elif picked:
             reason = None
         elif candidate.qualifies:
             reason = f"Delta further from the {CC_EXIT_TARGET_DELTA:.2f} target"
         else:
             reason = candidate.rejected_reason[:1].upper() + candidate.rejected_reason[1:]
         meets_min = candidate.strike >= (result.preferred_min_exit or 0) - _EPS
+        cells = [
+            _money(candidate.strike),
+            tc.delta(candidate.delta),
+            _money(candidate.mid_premium) if candidate.mid_premium is not None else "Unavailable",
+            _money(candidate.projected_assignment_pnl) if candidate.projected_assignment_pnl is not None else "Unavailable",
+            "PASS" if meets_min else "FAIL",
+        ]
+        if with_guidance:
+            cells.append(guidance.label if guidance else "-")
         rows.append(
             tc.table_row(
-                [
-                    _money(candidate.strike),
-                    tc.delta(candidate.delta),
-                    _money(candidate.mid_premium) if candidate.mid_premium is not None else "Unavailable",
-                    _money(candidate.projected_assignment_pnl)
-                    if candidate.projected_assignment_pnl is not None
-                    else "Unavailable",
-                    "PASS" if meets_min else "FAIL",
-                ],
-                picked=picked,
-                qualifies=candidate.qualifies,
-                reason=reason,
+                cells, picked=picked, qualifies=candidate.qualifies, reason=reason, reason_label=reason_label
             )
         )
-    return tc.table(
-        ["Strike", "Delta", "Midpoint", "P&L if assigned", "Min exit"],
-        [True, True, True, True, False],
-        rows,
-    )
+    columns = ["Strike", "Delta", "Midpoint", "P&L if assigned", "Min exit"]
+    numeric = [True, True, True, True, False]
+    if with_guidance:
+        columns.append("Resistance")
+        numeric.append(False)
+    return tc.table(columns, numeric, rows)
 
 
 def _allocation_section(result: CcExit) -> dict | None:
@@ -580,6 +810,68 @@ def _calculation_section(result: CcExit) -> dict | None:
     return tc.section("Calculation details", rows=rows)
 
 
+def _zone_text(zone: pricezones.PriceZone | None) -> str:
+    if zone is None:
+        return "None"
+    return f"{tc.price_range(zone.low, zone.high)} ({zone.score:.0f}/100)"
+
+
+def _resistance_block(context: ResistanceContext | None) -> dict | None:
+    """The "Historical resistance" block shown right after "Why this
+    strike?": the zone, its strength, and where the strike sits against it."""
+    if context is None:
+        return None
+    notes = [
+        RESISTANCE_EXPLAINER,
+        f"Based on the last {context.sessions_analyzed} daily sessions. A swing high is the highest daily high "
+        f"within {pricezones.SWING_PIVOT_BARS} sessions either side, followed within "
+        f"{pricezones.REACTION_WINDOW_BARS} sessions by a pullback of at least "
+        f"max({pricezones.SWING_MIN_REACTION_PCT:g}%, {pricezones.SWING_MIN_REACTION_ATR:g} ATR). The score ranks "
+        "past evidence from 0 to 100; it is not a probability.",
+        "Shown for context only: it never changes which strike is recommended.",
+        *context.limitations,
+    ]
+    zone = context.zone
+    if zone is None:
+        return {
+            "title": "Historical resistance",
+            "value": "None found",
+            "badge": None,
+            "text": context.reason,
+            "stats": [],
+            "details": tc.section("About historical resistance", notes=notes),
+        }
+    last_day = zone.touch_days[-1] if zone.touch_days else None
+    rows = [
+        ("Why this zone", (
+            f"The best mix of strength and closeness to the strike among {context.meaningful_zones} zone"
+            f"{'s' if context.meaningful_zones != 1 else ''} scoring {MIN_RESISTANCE_SCORE:g}+ within "
+            f"{MAX_RESISTANCE_DISTANCE_PCT:g}% of it"
+        )),
+        ("Strike to zone", "inside it" if context.relationship == INSIDE_ZONE else f"{context.distance_pct:.1f}%"),
+        ("Swing highs", f"{zone.touches}: " + ", ".join(tc.day(d) for d in zone.touch_days)),
+        ("Last touch", f"{tc.day(last_day)}, {zone.sessions_since_last_touch} sessions ago"),
+        ("Average pullback", f"{zone.avg_reaction_pct:.1f}% (lowest low within {pricezones.REACTION_WINDOW_BARS} sessions)"),
+        ("Closed above since", f"{zone.breaks}x (each halves the score)" if zone.breaks else "Never"),
+        ("Moving averages near", ", ".join(zone.moving_averages_near) or "None"),
+        ("Nearest under the strike", _zone_text(context.below)),
+        ("Around the strike", _zone_text(context.at)),
+        ("Nearest over the strike", _zone_text(context.above)),
+    ]
+    return {
+        "title": "Historical resistance",
+        "value": tc.price_range(zone.low, zone.high),
+        "badge": f"{context.strength_label} · {zone.score:.0f}/100",
+        "text": context.reason,
+        "stats": [
+            tc.item("Recommended strike", _money(context.strike)),
+            tc.item("Nearest resistance", tc.price_range(zone.low, zone.high)),
+            tc.item("Relationship", RELATIONSHIP_LABELS[context.relationship]),
+        ],
+        "details": tc.section("About this resistance", rows=rows, notes=notes),
+    }
+
+
 def tooltip_card(result: CcExit, ticker: str | None = None) -> dict | None:
     """The CC TO EXIT tooltip every table and card shows, built from this
     one result (layout: ``wheel/tooltipcard.py``). ``None`` with no shares:
@@ -627,6 +919,7 @@ def tooltip_card(result: CcExit, ticker: str | None = None) -> dict | None:
             tc.item("Stock P&L at the strike", _money(pick.stock_pnl), "Before any premium"),
         ],
         why=_why(result),
+        context=_resistance_block(result.resistance),
         risk={
             "title": "If assigned",
             "text": (

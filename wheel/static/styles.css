@@ -1368,9 +1368,11 @@ tr.detail > td {
 /* ---- tip cards: the CSP TO ENTER / CC TO EXIT tooltip, one layout for both
    (tipCardNode in app.js; content from wheel/tooltipcard.py) ---- */
 
+/* Wide enough that labels, headings and table cells stay on one line;
+   only full sentences wrap. */
 #tooltip.card {
-  width: min(470px, calc(100vw - 16px));
-  max-width: min(470px, calc(100vw - 16px));
+  width: min(640px, calc(100vw - 16px));
+  max-width: min(640px, calc(100vw - 16px));
   padding: 14px 16px;
   font-size: 13px;
   border-radius: 12px;
@@ -1519,6 +1521,39 @@ tr.detail > td {
   margin-top: 3px;
 }
 
+.tip-card .tc-context-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  margin-bottom: 4px;
+}
+
+.tip-card .tc-context-value {
+  font-size: 16px;
+}
+
+.tip-card .tc-context-badge {
+  font-size: 12px;
+  font-weight: 640;
+  color: var(--text-secondary);
+}
+
+.tip-card .tc-context-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+
+/* The context block's own "About" details sits inside it, so it needs no
+   second divider. */
+.tip-card .tc-context .tc-details {
+  margin-top: 8px;
+  padding-top: 0;
+  border-top: 0;
+}
+
 .tip-card .tc-risk {
   padding: 10px 11px;
   border: 0;
@@ -1576,9 +1611,14 @@ tr.detail > td {
   font-size: 12px;
 }
 
+/* Cells and headings stay on one line (the card is wide enough for them);
+   only a strike's explanation line wraps (.tc-reason). The page's sticky
+   table headings don't apply inside a card. */
 .tip-card .tc-table th,
 .tip-card .tc-table td {
-  padding: 4px 6px;
+  position: static;
+  white-space: nowrap;
+  padding: 4px 5px;
   text-align: left;
   vertical-align: top;
   border-bottom: 1px solid var(--border);
@@ -1587,12 +1627,11 @@ tr.detail > td {
 .tip-card .tc-table th {
   font-weight: 640;
   color: var(--text-secondary);
-  white-space: nowrap;
+  vertical-align: bottom;
 }
 
 .tip-card .tc-table .num {
   text-align: right;
-  white-space: nowrap;
 }
 
 /* A strike's reason line sits under its figures, so the figures' row drops
@@ -1615,6 +1654,16 @@ tr.detail > td {
   font-weight: 640;
 }
 
+/* Its explanation line reads as normal text; only the lead-in is bold. */
+.tip-card .tc-table tr.tc-reason.picked td {
+  font-weight: 400;
+}
+
+.tip-card .tc-table tr.tc-reason strong {
+  font-weight: 640;
+  color: var(--text-primary);
+}
+
 .tip-card .tc-footer {
   margin-top: 12px;
   font-size: 11px;
@@ -1627,7 +1676,8 @@ tr.detail > td {
   }
 
   .tip-card .tc-metrics,
-  .tip-card .tc-risk-stats {
+  .tip-card .tc-risk-stats,
+  .tip-card .tc-context-stats {
     grid-template-columns: minmax(0, 1fr);
   }
 }

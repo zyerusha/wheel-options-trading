@@ -730,7 +730,13 @@ function tipCardTable(spec) {
     // The reason gets its own full-width line so a long one never squeezes the figures.
     if (row.reason) {
       const why = el('tr', { class: 'tc-reason' + (row.picked ? ' picked' : '') });
-      why.appendChild(el('td', { colspan: spec.columns.length }, row.reason));
+      const cell = el('td', { colspan: spec.columns.length });
+      // Optional bold lead-in (e.g. "Below resistance") so each line scans by its status.
+      if (row.reason_label) {
+        cell.appendChild(el('strong', {}, row.reason_label + ': '));
+      }
+      cell.appendChild(document.createTextNode(row.reason));
+      why.appendChild(cell);
       body.appendChild(why);
     }
   }
@@ -793,6 +799,26 @@ function tipCardNode(card) {
     for (const line of card.why) list.appendChild(el('li', {}, line));
     why.appendChild(list);
     root.appendChild(why);
+  }
+
+  // Historical context for the pick (CC TO EXIT's resistance): shown, never
+  // used to choose -- the backend says so in its own notes.
+  if (card.context) {
+    const ctx = card.context;
+    const block = el('section', { class: 'tc-section tc-context' });
+    block.appendChild(el('h4', {}, ctx.title));
+    const head = el('div', { class: 'tc-context-head' });
+    head.appendChild(el('strong', { class: 'tc-context-value' }, ctx.value));
+    if (ctx.badge) head.appendChild(el('span', { class: 'tc-context-badge' }, ctx.badge));
+    block.appendChild(head);
+    block.appendChild(el('p', {}, ctx.text));
+    if (ctx.stats.length) {
+      const stats = el('div', { class: 'tc-context-stats' });
+      for (const stat of ctx.stats) stats.appendChild(tipCardItem(stat, 'tc-stat'));
+      block.appendChild(stats);
+    }
+    if (ctx.details) block.appendChild(tipCardSection(ctx.details));
+    root.appendChild(block);
   }
 
   if (card.risk) {

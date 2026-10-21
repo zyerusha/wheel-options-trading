@@ -354,7 +354,8 @@ class TestExplanation(unittest.TestCase):
             "$135.00 × 1.02 = $137.70, rounded up to $138.00",
             "Target 0.30",
             "$135.00 | 0.30 | $",
-            "| FAIL | Rejected\n  Below the $138.00 minimum exit",
+            # Rejected strikes get no resistance advice ("-") and keep their reason.
+            "| FAIL | - | Rejected\n  Below the $138.00 minimum exit",
             "Recommended call\n$140.00",
         ):
             self.assertIn(expected, text)

@@ -41,12 +41,11 @@ Pipeline, in order:
 from __future__ import annotations
 
 import math
-import statistics
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Sequence
 
-from wheel import optionsmath
+from wheel import optionsmath, pricezones
 from wheel import tooltipcard as tc
 from wheel.ccexit import OPTION_FEE_PER_CONTRACT, OPTION_MULTIPLIER
 from wheel.marketdata import PricePoint
@@ -64,53 +63,17 @@ FULL_CREDIT_ANNUALIZED_RETURN_PCT = 2 * MIN_ANNUALIZED_RETURN_PCT
 
 # ---- support detection -----------------------------------------------------
 
-SUPPORT_LOOKBACK_BARS = 252  # ~12 months of sessions
-SUPPORT_FULL_CONFIDENCE_BARS = 126  # ~6 months; less scales the score down
-# With less history the score is scaled by 0.5 + 0.5 x (sessions / 126): thin
-# history weakens the evidence but never zeroes it on its own.
-HISTORY_CONFIDENCE_FLOOR = 0.5
-SUPPORT_MIN_BARS = 40  # below this there is too little to find swing lows at all
-ATR_PERIOD = 14
-SWING_PIVOT_BARS = 5  # lowest low within this many sessions either side
-BOUNCE_WINDOW_BARS = 20  # bounce measured over the following ~month
-# A swing low needs a bounce of at least max(3%, 1.5 ATR) to count -- a fixed
-# 3% alone would accept noise on a volatile name and reject real turns on a
-# calm one.
-SWING_MIN_BOUNCE_PCT = 3.0
-SWING_MIN_BOUNCE_ATR = 1.5
-# Zone width (how far above a zone's lowest low another low may sit and still
-# join it): 1.5 ATR, kept between 2.5% and 6% of price (2.5% so a $140-$143
-# shelf on a $150 stock reads as one zone even on a calm name).
-ZONE_WIDTH_ATR_MULTIPLE = 1.5
-ZONE_WIDTH_PCT_BOUNDS = (2.5, 6.0)
-TOUCHES_FOR_FULL_CREDIT = 4
-RECENCY_HALF_LIFE_BARS = 63  # a touch ~3 months old counts half as much as today's
-# A bounce of max(4 ATR, 2x the minimum swing bounce) earns full bounce credit;
-# each touch is capped there before averaging so one outsized rally can't
-# carry the zone. The second term keeps a very calm stock's bar meaningful.
-BOUNCE_FULL_CREDIT_ATR = 4.0
-BOUNCE_FULL_CREDIT_MIN_BOUNCES = 2.0
-MA_NEAR_ZONE_FOR_FULL_CREDIT = 2
-# Touch-day volume / median daily volume: 0.5x or less earns nothing, 2x or more full.
-VOLUME_RATIO_RANGE = (0.5, 2.0)
-# Each close-through episode after the first touch halves the zone's score.
-BREAK_PENALTY_FACTOR = 0.5
-
-SUPPORT_WEIGHTS = {
-    "touches": 30.0,
-    "recency": 20.0,
-    "bounce": 20.0,
-    "moving_averages": 15.0,
-    "volume": 10.0,
-    "round_number": 5.0,
-}
-
-MOVING_AVERAGES = (
-    ("21-day EMA", 21, "ema"),
-    ("50-day MA", 50, "sma"),
-    ("100-day MA", 100, "sma"),
-    ("200-day MA", 200, "sma"),
-)
+# The swing-point method and its tunables are shared with CC TO EXIT's
+# resistance (wheel/pricezones.py); these names are this module's view of them.
+SUPPORT_LOOKBACK_BARS = pricezones.LOOKBACK_BARS
+SUPPORT_FULL_CONFIDENCE_BARS = pricezones.FULL_CONFIDENCE_BARS
+HISTORY_CONFIDENCE_FLOOR = pricezones.HISTORY_CONFIDENCE_FLOOR
+SUPPORT_MIN_BARS = pricezones.MIN_BARS
+SWING_PIVOT_BARS = pricezones.SWING_PIVOT_BARS
+BOUNCE_WINDOW_BARS = pricezones.REACTION_WINDOW_BARS
+SWING_MIN_BOUNCE_PCT = pricezones.SWING_MIN_REACTION_PCT
+SWING_MIN_BOUNCE_ATR = pricezones.SWING_MIN_REACTION_ATR
+SUPPORT_WEIGHTS = pricezones.ZONE_WEIGHTS
 
 # ---- relevant zone ---------------------------------------------------------
 
@@ -312,250 +275,42 @@ def pick_expiration(expirations: Sequence[date], today: date) -> date | None:
     return optionsmath.pick_expiration(expirations, today, target_dte=CSP_TARGET_DTE, dte_window=CSP_DTE_WINDOW)
 
 
-# ---- indicators ------------------------------------------------------------
+# ---- support ---------------------------------------------------------------
 
 
 def _clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
 
 
-def average_true_range_pct(bars: Sequence[PricePoint], period: int = ATR_PERIOD) -> float | None:
-    """Simple average of the last ``period`` true ranges, as % of the last
-    close. True range = max(high, prior close) - min(low, prior close)."""
-    if len(bars) < period + 1 or bars[-1].close <= 0:
-        return None
-    ranges = [
-        max(bar.high, prev.close) - min(bar.low, prev.close)
-        for prev, bar in zip(bars[-period - 1 : -1], bars[-period:])
-    ]
-    return 100.0 * (sum(ranges) / period) / bars[-1].close
-
-
-def simple_moving_average(closes: Sequence[float], period: int) -> float | None:
-    return sum(closes[-period:]) / period if len(closes) >= period else None
-
-
-def exponential_moving_average(closes: Sequence[float], period: int) -> float | None:
-    """Seeded with the simple average of the first ``period`` closes, then
-    the standard smoothing 2 / (period + 1) over every close after them."""
-    if len(closes) < period:
-        return None
-    smoothing = 2.0 / (period + 1)
-    ema = sum(closes[:period]) / period
-    for close in closes[period:]:
-        ema += smoothing * (close - ema)
-    return ema
-
-
-def round_number_step(price: float) -> float:
-    """Spacing of "round" prices near ``price``: a quarter of its order of
-    magnitude -- $25 steps around $150 ($125, $150, $175), $2.50 around $45."""
-    return 10 ** math.floor(math.log10(price)) * 0.25
-
-
-def _round_level_in(band_low: float, band_high: float, near: float) -> float | None:
-    step = round_number_step(near)
-    first = math.ceil(round(band_low / step, 6))
-    last = math.floor(round(band_high / step, 6))
-    if first > last:
-        return None
-    return min((n * step for n in range(first, last + 1)), key=lambda level: abs(level - near))
-
-
-# ---- support ---------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class _SwingLow:
-    index: int
-    low: float
-    bounce_pct: float
-    volume: float | None
-
-
-def _swing_lows(bars: Sequence[PricePoint], start: int, min_bounce_pct: float) -> list[_SwingLow]:
-    """Lows inside ``bars[start:]`` that are strictly below the prior
-    ``SWING_PIVOT_BARS`` lows, no higher than the next ``SWING_PIVOT_BARS``
-    (so a flat double-bottom counts once, at its first day), and followed by
-    a bounce of at least ``min_bounce_pct`` within ``BOUNCE_WINDOW_BARS``.
-    The last few sessions can't qualify yet: their right side hasn't formed."""
-    pivots: list[_SwingLow] = []
-    for i in range(start, len(bars) - SWING_PIVOT_BARS):
-        low = bars[i].low
-        left = bars[max(0, i - SWING_PIVOT_BARS) : i]
-        right = bars[i + 1 : i + 1 + SWING_PIVOT_BARS]
-        if low <= 0 or (left and low >= min(bar.low for bar in left)) or low > min(bar.low for bar in right):
-            continue
-        peak = max(bar.high for bar in bars[i + 1 : i + 1 + BOUNCE_WINDOW_BARS])
-        bounce_pct = 100.0 * (peak - low) / low
-        if bounce_pct >= min_bounce_pct:
-            pivots.append(_SwingLow(i, low, bounce_pct, bars[i].volume))
-    return pivots
-
-
-def _cluster(pivots: Sequence[_SwingLow], width_pct: float) -> list[list[_SwingLow]]:
-    """Greedy, lowest first: a low joins the current zone while it sits
-    within ``width_pct`` of that zone's lowest low; otherwise it starts the
-    next zone. Anchoring to the zone's floor (not the previous low) keeps a
-    staircase of lows from chaining into one wide zone."""
-    clusters: list[list[_SwingLow]] = []
-    for pivot in sorted(pivots, key=lambda p: (p.low, p.index)):
-        if clusters and pivot.low <= clusters[-1][0].low * (1 + width_pct / 100):
-            clusters[-1].append(pivot)
-        else:
-            clusters.append([pivot])
-    return clusters
-
-
-def _break_episodes(bars: Sequence[PricePoint], since: int, zone_low: float, width_pct: float) -> int:
-    """Times price closed clearly through the zone (more than one zone width
-    under its bottom) after its first touch. One episode per stretch below,
-    however many sessions it lasts."""
-    line = zone_low * (1 - width_pct / 100)
-    episodes, below = 0, False
-    for bar in bars[since:]:
-        if bar.close < line and not below:
-            episodes += 1
-        below = bar.close < zone_low if below else bar.close < line
-    return episodes
-
-
-def _volume_baseline(bars: Sequence[PricePoint]) -> float | None:
-    """Median daily volume, or ``None`` when fewer than half the sessions
-    carry a positive volume -- too sparse to compare touches against."""
-    volumes = [bar.volume for bar in bars if bar.volume is not None and bar.volume > 0]
-    if len(volumes) < len(bars) / 2:
-        return None
-    return statistics.median(volumes)
-
-
-def _score_zone(
-    members: Sequence[_SwingLow],
-    *,
-    bars: Sequence[PricePoint],
-    width_pct: float,
-    atr_pct: float,
-    min_bounce_pct: float,
-    moving_averages: dict[str, float],
-    volume_baseline: float | None,
-    history_confidence: float,
-) -> SupportZone:
-    lows = [m.low for m in members]
-    zone_low, zone_high = min(lows), max(lows)
-    by_time = sorted(members, key=lambda m: m.index)
-    last_index = len(bars) - 1
-    sessions_since = last_index - by_time[-1].index
-
-    components: dict[str, float] = {}
-    components["touches"] = min(1.0, len(members) / TOUCHES_FOR_FULL_CREDIT)
-    components["recency"] = 0.5 ** (sessions_since / RECENCY_HALF_LIFE_BARS)
-
-    full_bounce = max(BOUNCE_FULL_CREDIT_ATR * atr_pct, BOUNCE_FULL_CREDIT_MIN_BOUNCES * min_bounce_pct)
-    avg_bounce = sum(m.bounce_pct for m in members) / len(members)
-    components["bounce"] = sum(min(m.bounce_pct, full_bounce) for m in members) / len(members) / full_bounce
-
-    # A moving average is confluence only when it sits within one zone width
-    # of the zone itself; one far above or below adds nothing.
-    band_low, band_high = zone_low * (1 - width_pct / 100), zone_high * (1 + width_pct / 100)
-    near = tuple(name for name, value in moving_averages.items() if band_low <= value <= band_high)
-    if moving_averages:
-        components["moving_averages"] = min(1.0, len(near) / MA_NEAR_ZONE_FOR_FULL_CREDIT)
-
-    volume_ratio = None
-    touch_volumes = [m.volume for m in members if m.volume is not None and m.volume > 0]
-    if volume_baseline and touch_volumes:
-        volume_ratio = (sum(touch_volumes) / len(touch_volumes)) / volume_baseline
-        low_ratio, high_ratio = VOLUME_RATIO_RANGE
-        components["volume"] = _clamp((volume_ratio - low_ratio) / (high_ratio - low_ratio), 0.0, 1.0)
-
-    round_level = _round_level_in(
-        zone_low * (1 - width_pct / 200), zone_high * (1 + width_pct / 200), (zone_low + zone_high) / 2
-    )
-    components["round_number"] = 1.0 if round_level is not None else 0.0
-
-    weight_total = sum(SUPPORT_WEIGHTS[name] for name in components)
-    weighted = sum(SUPPORT_WEIGHTS[name] * credit for name, credit in components.items()) / weight_total
-    breaks = _break_episodes(bars, by_time[0].index, zone_low, width_pct)
-    score = 100.0 * weighted * (BREAK_PENALTY_FACTOR**breaks) * history_confidence
-
+def _support_zone(zone: pricezones.PriceZone) -> SupportZone:
     return SupportZone(
-        low=zone_low,
-        high=zone_high,
-        touch_lows=tuple(m.low for m in by_time),
-        touch_days=tuple(bars[m.index].day for m in by_time),
-        sessions_since_last_touch=sessions_since,
-        avg_bounce_pct=avg_bounce,
-        breaks=breaks,
-        moving_averages_near=near,
-        round_level=round_level,
-        volume_ratio=volume_ratio,
-        components=components,
-        score=score,
+        low=zone.low,
+        high=zone.high,
+        touch_lows=zone.touch_levels,
+        touch_days=zone.touch_days,
+        sessions_since_last_touch=zone.sessions_since_last_touch,
+        avg_bounce_pct=zone.avg_reaction_pct,
+        breaks=zone.breaks,
+        moving_averages_near=zone.moving_averages_near,
+        round_level=zone.round_level,
+        volume_ratio=zone.volume_ratio,
+        components=zone.components,
+        score=zone.score,
     )
 
 
 def analyze_support(bars: Sequence[PricePoint]) -> SupportAnalysis:
-    """Every support zone in the last ``SUPPORT_LOOKBACK_BARS`` sessions of
-    ``bars`` (ascending daily bars; ones without a high/low are skipped),
-    strongest first. Short history degrades rather than fails: the score is
-    scaled by sessions / ``SUPPORT_FULL_CONFIDENCE_BARS`` and the shortfall
-    is listed in ``limitations``."""
-    ranged = [bar for bar in bars if bar.has_range and bar.low > 0]
-    closes = [bar.close for bar in bars]
-    limitations: list[str] = []
-    if len(ranged) < len(bars):
-        limitations.append(f"{len(bars) - len(ranged)} session(s) had no daily high/low and were skipped.")
-    if len(ranged) < SUPPORT_MIN_BARS:
-        limitations.append(
-            f"Only {len(ranged)} sessions of daily high/low history; at least {SUPPORT_MIN_BARS} are needed to find support."
-        )
-        return SupportAnalysis(len(ranged), None, None, {}, (), 0.0, tuple(limitations))
-
-    start = max(0, len(ranged) - SUPPORT_LOOKBACK_BARS)
-    sessions = len(ranged) - start
-    coverage = min(1.0, sessions / SUPPORT_FULL_CONFIDENCE_BARS)
-    history_confidence = HISTORY_CONFIDENCE_FLOOR + (1 - HISTORY_CONFIDENCE_FLOOR) * coverage
-    if history_confidence < 1.0:
-        limitations.append(
-            f"Limited history: {sessions} sessions (about {sessions / 21:.0f} months) of the "
-            f"{SUPPORT_FULL_CONFIDENCE_BARS}+ wanted, so strength is scaled to {history_confidence:.0%}."
-        )
-
-    atr_pct = average_true_range_pct(ranged)
-    width_pct = _clamp(ZONE_WIDTH_ATR_MULTIPLE * atr_pct, *ZONE_WIDTH_PCT_BOUNDS)
-    min_bounce_pct = max(SWING_MIN_BOUNCE_PCT, SWING_MIN_BOUNCE_ATR * atr_pct)
-
-    moving_averages: dict[str, float] = {}
-    for name, period, kind in MOVING_AVERAGES:
-        value = exponential_moving_average(closes, period) if kind == "ema" else simple_moving_average(closes, period)
-        if value is not None:
-            moving_averages[name] = value
-    missing = [name for name, _, _ in MOVING_AVERAGES if name not in moving_averages]
-    if missing:
-        limitations.append(f"Not enough history for the {', '.join(missing)}.")
-
-    window = ranged[start:]
-    volume_baseline = _volume_baseline(window)
-    if volume_baseline is None:
-        limitations.append("No reliable volume data; strength uses the other factors.")
-
-    pivots = _swing_lows(ranged, start, min_bounce_pct)
-    zones = [
-        _score_zone(
-            members,
-            bars=ranged,
-            width_pct=width_pct,
-            atr_pct=atr_pct,
-            min_bounce_pct=min_bounce_pct,
-            moving_averages=moving_averages,
-            volume_baseline=volume_baseline,
-            history_confidence=history_confidence,
-        )
-        for members in _cluster(pivots, width_pct)
-    ]
-    zones.sort(key=lambda zone: (-zone.score, -zone.high))
+    """Every support zone in the last ~12 months of ``bars``, strongest
+    first (``wheel.pricezones``, the method CC TO EXIT's resistance shares)."""
+    found = pricezones.analyze(bars, pricezones.SUPPORT)
     return SupportAnalysis(
-        sessions, atr_pct, width_pct, moving_averages, tuple(zones), history_confidence, tuple(limitations)
+        found.sessions_analyzed,
+        found.atr_pct,
+        found.zone_width_pct,
+        found.moving_averages,
+        tuple(_support_zone(zone) for zone in found.zones),
+        found.history_confidence,
+        found.limitations,
     )
 
 
@@ -831,7 +586,7 @@ def _money(value: float) -> str:
 
 
 def zone_text(zone: SupportZone) -> str:
-    return f"{_money(zone.low)} to {_money(zone.high)}"
+    return tc.price_range(zone.low, zone.high)
 
 
 def _zone_position_text(pick: PutCandidate, zone: SupportZone) -> str:
@@ -907,14 +662,95 @@ def _why(entry: CspEntry) -> list[str]:
     ]
 
 
+# ---- per-strike support guidance (advice only) ------------------------------
+
+GUIDE_ABOVE, GUIDE_NEAR, GUIDE_INSIDE, GUIDE_JUST_BELOW, GUIDE_WELL_BELOW, GUIDE_NONE = (
+    "above", "near", "inside", "just_below", "well_below", "none",
+)
+# Short column text, then the bold lead-in of the advice line.
+GUIDANCE_LABELS = {
+    GUIDE_ABOVE: ("Above", "Above support"),
+    GUIDE_NEAR: ("Near", "Near support"),
+    GUIDE_INSIDE: ("Inside", "Inside support zone"),
+    GUIDE_JUST_BELOW: ("Just below", "Just below support"),
+    GUIDE_WELL_BELOW: ("Well below", "Well below support"),
+    GUIDE_NONE: ("None found", "No support found"),
+}
+# The practical question support should prompt for a short put; shown once,
+# under the strike table, rather than in every row.
+SUPPORT_QUESTION = (
+    "Support is a past price area, not a floor. Ask how far the stock can fall before your strike, and "
+    "whether you would be comfortable owning 100 shares there."
+)
+
+
+def strike_guidance(entry: CspEntry, strike: float, qualifying_strikes: Sequence[float]) -> pricezones.StrikeGuidance:
+    """Advice for one qualifying put against the support zone CSP TO ENTER
+    already chose (``entry.zone``). Distances are % of the current price,
+    the same measure as the zone-reach rule; one zone width
+    (``support.zone_width_pct``, the ATR-based width the zones are built
+    with) separates "near" from "above" over the zone and "just" from
+    "well" below it. A lower strike is only suggested when one actually
+    qualifies. Advice only: it never rejects, moves or re-ranks a strike."""
+
+    def make(position: str, text: str) -> pricezones.StrikeGuidance:
+        label, title = GUIDANCE_LABELS[position]
+        return pricezones.StrikeGuidance(strike, position, label, title, text)
+
+    zone, support = entry.zone, entry.support
+    if zone is None or support is None or support.zone_width_pct is None:
+        # select_support_zone never offers a zone the price has already
+        # fallen through, so broken support gets this neutral message too.
+        return make(GUIDE_NONE, "Use the strike metrics without relying on historical support.")
+    width = support.zone_width_pct
+    price = entry.current_price
+    if strike > zone.high + _EPS:
+        gap = 100.0 * (strike - zone.high) / price
+        if gap <= width + _EPS:
+            return make(GUIDE_NEAR, "Only a little above support; check that the limited room fits your risk tolerance.")
+        if any(other < strike - _EPS for other in qualifying_strikes):
+            return make(
+                GUIDE_ABOVE,
+                "The stock could reach support before this strike is tested; a lower qualifying strike gives "
+                "more downside room, usually for less premium.",
+            )
+        return make(GUIDE_ABOVE, "The stock could reach support before this strike is tested, and no lower strike qualifies.")
+    if strike >= zone.low - _EPS:
+        if price <= zone.high + _EPS:
+            return make(GUIDE_INSIDE, "The stock is already trading in this support area; a break below it could lead to assignment.")
+        if any(other < zone.low - _EPS for other in qualifying_strikes):
+            return make(
+                GUIDE_INSIDE,
+                "Within the area where buyers appeared before; a break below it could lead to assignment, and a "
+                "qualifying strike below the zone leaves more room.",
+            )
+        return make(GUIDE_INSIDE, "Within the area where buyers appeared before; a break below it could lead to assignment.")
+    gap = 100.0 * (zone.low - strike) / price
+    if gap <= width + _EPS:
+        return make(GUIDE_JUST_BELOW, "Leaves some room below the support zone before the strike is reached.")
+    return make(GUIDE_WELL_BELOW, "More room below support, but compare the lower premium and return.")
+
+
+def candidate_guidance(entry: CspEntry, candidate: PutCandidate) -> pricezones.StrikeGuidance | None:
+    """Support advice for one listed put: qualifying puts only (a rejected
+    one keeps its rejection reason), judged against every qualifying strike
+    on the chain, not just the ones the table shows."""
+    if not candidate.qualifies:
+        return None
+    qualifying = [c.strike for c in entry.candidates if c.qualifies]
+    return strike_guidance(entry, candidate.strike, qualifying)
+
+
 def _strike_table(entry: CspEntry) -> dict | None:
     rows = []
     for candidate in _nearby_candidates(entry):
         picked = candidate is entry.pick
-        if picked:
+        guidance = candidate_guidance(entry, candidate)
+        reason_label = None
+        if guidance is not None:
+            reason_label, reason = guidance.title, guidance.text
+        elif picked:
             reason = None
-        elif candidate.qualifies:
-            reason = f"Ranked lower: {candidate.score:.0f}/100 vs the pick's {entry.pick.score:.0f}/100"
         else:
             reason = candidate.rejected_reason[:1].upper() + candidate.rejected_reason[1:]
         rows.append(
@@ -924,16 +760,19 @@ def _strike_table(entry: CspEntry) -> dict | None:
                     tc.delta(candidate.delta),
                     _per_contract(candidate.net_premium),
                     tc.pct(candidate.annualized_return_pct),
+                    f"{candidate.downside_to_strike_pct:.1f}%",
                     candidate.spread_check,
+                    guidance.label if guidance else "-",
                 ],
                 picked=picked,
                 qualifies=candidate.qualifies,
                 reason=reason,
+                reason_label=reason_label,
             )
         )
     return tc.table(
-        ["Strike", "Delta", "Net / contract", "Ann. return", "Spread"],
-        [True, True, True, True, False],
+        ["Strike", "Delta", "Net / contract", "Ann. return", "To strike", "Spread", "Support"],
+        [True, True, True, True, True, False, False],
         rows,
     )
 
@@ -1074,6 +913,12 @@ def tooltip_card(entry: CspEntry, ticker: str | None = None) -> dict:
     strikes = tc.section(
         "Strikes near the support zone",
         table=_strike_table(entry) if entry.candidates else None,
+        notes=[
+            "To strike: how far the stock can fall from today's price before reaching the strike.",
+            SUPPORT_QUESTION,
+        ]
+        if entry.candidates
+        else None,
         open_=status != tc.STATUS_QUALIFIES,
     )
     sections = [strikes, _support_section(entry), _quote_section(entry), _calculation_section(entry)]

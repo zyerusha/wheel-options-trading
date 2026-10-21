@@ -467,12 +467,14 @@ class TestTooltipMatchesCanonicalResult(unittest.TestCase):
         table = ce.tooltip_card(entry)["sections"][0]["table"]
         by_strike = {row["cells"][0]: row for row in table["rows"]}
         self.assertTrue(by_strike["$140.00"]["picked"])
-        self.assertEqual((by_strike["$140.00"]["result"], by_strike["$140.00"]["reason"]), ("Selected", None))
+        self.assertEqual(by_strike["$140.00"]["result"], "Selected")
+        # A qualifying strike's line is its support advice.
+        self.assertEqual(by_strike["$140.00"]["reason_label"], "Inside support zone")
         self.assertFalse(by_strike["$135.00"]["picked"])
         self.assertEqual(by_strike["$135.00"]["result"], "Rejected")
         self.assertEqual(by_strike["$135.00"]["reason"], "Bid/ask spread wider than 50% of the mid")
-        self.assertEqual(table["columns"][4], "Spread")
-        self.assertEqual(by_strike["$135.00"]["cells"][4], "FAIL")
+        self.assertEqual(table["columns"][5], "Spread")
+        self.assertEqual(by_strike["$135.00"]["cells"][5], "FAIL")
         self.assertEqual(by_strike["$135.00"]["cells"][-1], "Rejected")
 
     def test_missing_market_data_reads_unverified_not_rejected(self):
@@ -800,6 +802,127 @@ class TestCombinedEntryUsesTheNewestSnapshot(unittest.TestCase):
         self.assertEqual(set(combined), {"ABC", "XYZ", "QQQ"})
         self.assertIs(combined["ABC"], b["ABC"])
 
+
+
+
+class TestSupportGuidance(unittest.TestCase):
+    """Per-strike support advice against the chosen zone ($140 to $143, a
+    3% zone width = $4.50 on a $150 stock). Advice only."""
+
+    def setUp(self):
+        self.entry = recommend(zone(140, 143, 86), (ce.PutQuote(140, 1.95, 2.05, 0.55),))
+        self.assertEqual(self.entry.strike, 140)
+
+    def guide(self, strike, qualifying=(130.0, 134.0, 137.0, 140.0, 141.0, 145.0, 148.0)):
+        return ce.strike_guidance(self.entry, strike, qualifying)
+
+    def test_each_position(self):
+        cases = {
+            148.0: ("above", "Above"),  # 3.3% over the zone top: past one width
+            145.0: ("near", "Near"),  # 1.3% over the top
+            141.0: ("inside", "Inside"),
+            137.0: ("just_below", "Just below"),  # 2.0% under the bottom
+            134.0: ("well_below", "Well below"),  # 4.0% under the bottom
+        }
+        for strike, (position, label) in cases.items():
+            got = self.guide(strike)
+            self.assertEqual((got.position, got.label), (position, label), strike)
+
+    def test_one_zone_width_is_the_boundary(self):
+        # Width 3% of $150 = $4.50: $147.50 is near, a cent more is above;
+        # $135.50 is just below, a cent less is well below.
+        self.assertEqual(self.guide(147.50).position, ce.GUIDE_NEAR)
+        self.assertEqual(self.guide(147.51).position, ce.GUIDE_ABOVE)
+        self.assertEqual(self.guide(135.50).position, ce.GUIDE_JUST_BELOW)
+        self.assertEqual(self.guide(135.49).position, ce.GUIDE_WELL_BELOW)
+
+    def test_a_lower_strike_is_only_suggested_when_one_qualifies(self):
+        self.assertIn("a lower qualifying strike gives more downside room", self.guide(148.0).text)
+        self.assertIn("usually for less premium", self.guide(148.0).text)
+        self.assertIn("no lower strike qualifies", self.guide(148.0, qualifying=(148.0,)).text)
+        self.assertIn("a qualifying strike below the zone", self.guide(141.0).text)
+        self.assertNotIn("qualifying strike", self.guide(141.0, qualifying=(141.0, 142.0)).text)
+
+    def test_inside_never_promises_the_level_holds(self):
+        text = self.guide(141.0).text
+        self.assertIn("a break below it could lead to assignment", text)
+        for promise in ("safe", "guarantee", "will hold", "certain"):
+            self.assertNotIn(promise, text.lower())
+
+    def test_price_already_inside_the_zone_says_so(self):
+        entry = recommend(zone(140, 143, 86), (ce.PutQuote(140, 1.95, 2.05, 0.55),), price=142.0)
+        self.assertEqual(entry.zone_distance_pct, 0.0)
+        got = ce.strike_guidance(entry, 141.0, (141.0,))
+        self.assertEqual(got.position, ce.GUIDE_INSIDE)
+        self.assertIn("already trading in this support area", got.text)
+
+    def test_no_or_broken_support_is_neutral(self):
+        # The only zone is above the price: that support has broken, so it is
+        # never presented as a floor under the strike.
+        broken = recommend(zone(160, 165, 86), (ce.PutQuote(140, 1.95, 2.05, 0.55),))
+        self.assertIsNone(broken.zone)
+        self.assertIn("already broken", broken.reason)
+        got = ce.strike_guidance(broken, 140.0, (140.0,))
+        self.assertEqual((got.position, got.label), (ce.GUIDE_NONE, "None found"))
+        self.assertEqual(got.text, "Use the strike metrics without relying on historical support.")
+
+    def test_sentences_are_short_and_never_repeat_prices_or_evidence(self):
+        for strike in (148.0, 145.0, 141.0, 137.0, 134.0):
+            text = self.guide(strike).text
+            self.assertNotIn("$", text)
+            self.assertNotIn("/100", text)
+            self.assertEqual(text.count("."), 1)
+
+    def test_jxn_example(self):
+        # $131.21 stock, $123.97 to $126.14 zone: $125 is inside it, $120 is
+        # 3.0% of the price under its bottom -- just below with a zone width
+        # of 3.5%, well below with 2.5%.
+        jxn = ce.SupportZone(123.97, 126.14, (123.97, 126.14), (date(2026, 6, 1), date(2026, 9, 1)), 20, 7.0, 0, (), None, None, {}, 70.0)
+        for width, below in ((3.5, ce.GUIDE_JUST_BELOW), (2.5, ce.GUIDE_WELL_BELOW)):
+            entry = ce.recommend_put(
+                current_price=131.21, support=ce.SupportAnalysis(252, 2.0, width, {}, (jxn,), 1.0, ()),
+                expiry=date(2026, 11, 20), today=TODAY,
+                puts=(ce.PutQuote(120, 4.15, 4.25, 0.42), ce.PutQuote(125, 5.5, 5.6, 0.40)), risk_free_rate=0.045,
+            )
+            strikes = by_strike(entry)
+            self.assertTrue(strikes[120].qualifies and strikes[125].qualifies)
+            self.assertEqual(ce.candidate_guidance(entry, strikes[125]).position, ce.GUIDE_INSIDE)
+            self.assertEqual(ce.candidate_guidance(entry, strikes[120]).position, below)
+
+    def test_guidance_never_changes_the_pick_or_the_ranking(self):
+        puts = (ce.PutQuote(145, 3.10, 3.30, 0.55), ce.PutQuote(140, 1.95, 2.05, 0.55), ce.PutQuote(135, 0.50, 2.50, 0.30))
+        entry = recommend(zone(140, 143, 86), puts)
+        best = max((c for c in entry.candidates if c.qualifies), key=lambda c: c.score)
+        self.assertIs(entry.pick, best)
+        table = ce.tooltip_card(entry)["sections"][0]["table"]
+        selected = [row for row in table["rows"] if row["picked"]]
+        self.assertEqual([row["cells"][0] for row in selected], [f"${entry.strike:,.2f}"])
+
+    def test_table_shows_downside_room_and_support_from_the_backend(self):
+        puts = (ce.PutQuote(145, 3.10, 3.30, 0.55), ce.PutQuote(140, 1.95, 2.05, 0.55), ce.PutQuote(135, 0.50, 2.50, 0.30))
+        entry = recommend(zone(140, 143, 86), puts)
+        section = ce.tooltip_card(entry)["sections"][0]
+        table = section["table"]
+        self.assertEqual(table["columns"], ["Strike", "Delta", "Net / contract", "Ann. return", "To strike", "Spread", "Support", "Result"])
+        rows = {row["cells"][0]: row for row in table["rows"]}
+        self.assertEqual(rows["$140.00"]["cells"][4], "6.7%")  # (150 - 140) / 150
+        self.assertEqual(rows["$140.00"]["cells"][6], "Inside")
+        self.assertEqual(rows["$140.00"]["reason_label"], "Inside support zone")
+        # A rejected strike stays rejected and gets no support advice.
+        self.assertEqual((rows["$135.00"]["cells"][6], rows["$135.00"]["result"]), ("-", "Rejected"))
+        self.assertIn("spread", rows["$135.00"]["reason"].lower())
+        self.assertIn("whether you would be comfortable owning 100 shares there", " ".join(section["notes"]))
+        payload = _csp_to_enter_payload(entry)["support_guidance"]
+        self.assertEqual(
+            {item["strike"]: item["label"] for item in payload},
+            {c.strike: ce.candidate_guidance(entry, c).label for c in entry.candidates if c.qualifies},
+        )
+
+    def test_frontend_does_not_classify(self):
+        with open(os.path.join(ROOT, "wheel", "static", "app.js"), encoding="utf-8") as handle:
+            js = handle.read()
+        for backend_only in ("just_below", "well_below", "support_guidance", "zone_width"):
+            self.assertNotIn(backend_only, js)
 
 if __name__ == "__main__":
     unittest.main()
