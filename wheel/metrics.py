@@ -67,8 +67,9 @@ different denominator. Total Position ROI adds ``stock_realized_pl``,
 ``stock_unrealized_pl`` (shares still held, marked to the latest fetched price --
 see :mod:`wheel.marketdata`) and ``dividends_received`` (see
 :func:`dividends_by_cycle`) on top -- everything except an open long option's
-unrealized P/L, which stays ``None`` (``long_leg_unrealized_pl``): no options-quote
-feed exists anywhere in this project to mark one to market.
+unrealized P/L, which stays ``None`` (``long_leg_unrealized_pl``): Total Position
+ROI never reaches for the options-quote feed ``option_open_pl`` uses (see below)
+to keep this figure's denominator-matched pair stable and comparison-friendly.
 
 **Profit Per Day (PPD)** -- the dashboard's headline figure, in dollars rather
 than a percentage: ``PPD = (Realized premium collected - Closeout cost) / Days``,
@@ -264,44 +265,158 @@ def capital_timeline(cycle: Cycle, through: date) -> list[CapitalPoint]:
 # --------------------------------------------------------------------------
 
 
-def net_adjusted_cost_basis(cycle: Cycle, lot: ShareLot) -> float | None:
-    """The wheel's own break-even per share: strike minus every dollar of net
-    option cash flow the cycle has produced, allocated to this lot.
+@dataclass(frozen=True)
+class LotOptionCredit:
+    """Net option cash (credit positive, already fee-net) attributed to each
+    share still held, per share. ``by_lot``: per ``ShareLot.lot_id``;
+    ``untracked``: for each share held from before the oldest loaded export
+    that no lot traces (``Dashboard._untracked_shares_by_cycle``)."""
+
+    by_lot: dict[str, float]
+    untracked: float
+
+
+def _leg_net_cash(leg: OptionLeg, through: date | None = None) -> float:
+    """The leg's net cash, counting only fills on or before ``through``
+    (every fill when ``None``). Every cash figure on a leg is the broker's
+    own Amount, already net of commission and fees (see wheel/parser.py), so
+    no fee term is added."""
+    if through is not None and leg.open_date > through:
+        return 0.0
+    return leg.open_cash + sum(close.cash for close in leg.closes if through is None or close.date <= through)
+
+
+def _legs_by_roll_chain(cycle: Cycle) -> list[list[OptionLeg]]:
+    """Every leg, grouped by ``roll_chains``; a leg never rolled is a chain of one."""
+    by_id = {leg.leg_id: leg for leg in cycle.legs}
+    chained: set[str] = set()
+    groups: list[list[OptionLeg]] = []
+    for chain in roll_chains(cycle):
+        groups.append([by_id[leg_id] for leg_id in chain["leg_ids"]])
+        chained.update(chain["leg_ids"])
+    groups += [[leg] for leg in cycle.legs if leg.leg_id not in chained]
+    return groups
+
+
+def _lot_shares_on(lot: ShareLot, day: date, assignment_dates: set[date]) -> float:
+    """Shares of ``lot`` held while a call opened on ``day`` was written.
+    Assigned shares arrive after the put's expiration close, so a call sold
+    that same day was written against shares already held, never these;
+    bought shares count from their own trade date."""
+    arrived = lot.acquired < day or (lot.acquired == day and lot.acquired not in assignment_dates)
+    if not arrived:
+        return 0.0
+    sold_before = sum(d["shares"] for d in lot.disposals if d["date"] < day)
+    return max(lot.shares - sold_before, 0.0)
+
+
+def _lots_from_put_assignments(cycle: Cycle, assignments: set[tuple[date, float]]) -> list[ShareLot]:
+    """The lots a chain's put assignments created: acquired on the assignment
+    day at that put's strike (an assigned put buys at its strike, whether the
+    engine synthesized the shares or the broker's own fill booked them).
+    Matching the strike too keeps two different puts assigned on the same
+    expiration from pooling each other's premium. A day whose strike matches
+    no lot falls back to every lot acquired that day, so the cash still lands
+    on the shares the assignment brought in rather than vanishing."""
+    found: dict[str, ShareLot] = {}
+    for day, strike in assignments:
+        same_day = [lot for lot in cycle.share_lots if lot.acquired == day and lot.shares > 0]
+        at_strike = [
+            lot for lot in same_day if lot.basis_per_share is not None and abs(lot.basis_per_share - strike) < 0.005
+        ]
+        for lot in at_strike or same_day:
+            found[lot.lot_id] = lot
+    return list(found.values())
+
+
+def lot_option_credit(
+    cycle: Cycle, *, untracked_shares: float = 0.0, through: date | None = None
+) -> LotOptionCredit:
+    """Lot-level option cash: only what each lot's own shares earned, never
+    the whole wheel's history poured onto whichever lot happens to be held.
+
+    - A short-put roll chain that ended in assignment: all of its net cash
+      goes to the lot(s) that assignment created, per share assigned.
+    - A short call: its net cash (open credit plus any buyback) is split
+      evenly over every share held when it was opened, including shares
+      held from before the oldest loaded export (``untracked_shares``,
+      assumed held for the whole cycle since they predate it).
+    - Everything else (puts that expired or were bought back, long hedges)
+      is wheel-level P&L and is not attributed to any lot.
+
+    Every share still held was held at every point since its lot arrived
+    (shares only ever leave), so a call's per-share credit applies in full
+    to each remaining share of each lot that held it.
+
+    ``through``: the credit as it stood at the end of that day (only fills
+    and assignments on or before it), for the Trade Log's per-row history.
+    """
+    assignment_dates = _assignment_lot_dates(cycle)
+    by_lot = {lot.lot_id: 0.0 for lot in cycle.share_lots}
+    untracked = 0.0
+
+    for chain in _legs_by_roll_chain(cycle):
+        assignments = {
+            (close.date, leg.strike)
+            for leg in chain
+            if leg.side == SHORT and leg.right == "P"
+            for close in leg.closes
+            if close.action == ASSIGNED and (through is None or close.date <= through)
+        }
+        if not assignments:
+            continue
+        lots = _lots_from_put_assignments(cycle, assignments)
+        assigned_shares = sum(lot.shares for lot in lots)
+        if assigned_shares <= 0:
+            continue
+        per_share = sum(_leg_net_cash(leg, through) for leg in chain) / assigned_shares
+        for lot in lots:
+            by_lot[lot.lot_id] += per_share
+
+    for leg in cycle.legs:
+        if leg.side != SHORT or leg.right != "C" or (through is not None and leg.open_date > through):
+            continue
+        held = {lot.lot_id: _lot_shares_on(lot, leg.open_date, assignment_dates) for lot in cycle.share_lots}
+        total_held = sum(held.values()) + untracked_shares
+        if total_held <= 1e-9:
+            continue
+        per_share = _leg_net_cash(leg, through) / total_held
+        for lot_id, shares in held.items():
+            if shares > 1e-9:
+                by_lot[lot_id] += per_share
+        if untracked_shares > 1e-9:
+            untracked += per_share
+
+    return LotOptionCredit(by_lot=by_lot, untracked=untracked)
+
+
+def net_adjusted_cost_basis(
+    cycle: Cycle,
+    lot: ShareLot,
+    *,
+    untracked_shares: float = 0.0,
+    credit: LotOptionCredit | None = None,
+) -> float | None:
+    """This lot's own break-even per share: its raw cost less the option
+    cash its own shares earned (``lot_option_credit``).
 
     Distinct from ``lot.basis_per_share`` (the raw tax-lot basis -- the bare
     assignment or purchase price, exactly what a 1099-B would show) which
     this function never touches or reads back into: the two numbers answer
-    different questions and both stay available side by side.
+    different questions and both stay available side by side. The
+    whole-position figure (every dollar the wheel made, over every share)
+    is the Trade Log's ``break_even_price``, not this.
 
-    The formula is ``strike - net premiums/share + fees/share``, but every
-    cash figure already on a leg (``open_cash``, ``LegClose.cash``) is the
-    broker's own Amount, already net of commission and fees -- see
-    ``wheel/parser.py``. Reconstructing gross premium and then subtracting
-    fees back out algebraically collapses to using the already-fee-net total
-    directly (``-gross/share + fees/share == -(gross-fees)/share ==
-    -net/share``), so that is what this does; adding a fee term on top of the
-    already-fee-net total would double the fee's cost, the same trap this
-    module's docstring warns about elsewhere.
-
-    Cumulative and whole-cycle: every roll, every covered call sold after
-    assignment, folds into the same running total, not just the leg that
-    produced this particular lot. When a cycle holds more than one concurrent
-    lot (e.g. two partial assignments at different strikes before either
-    sells), the cycle's net premium is allocated pro-rata by share count,
-    against every share the cycle's lots ever held -- not just what remains
-    today -- so the allocation stays stable as shares are later sold off.
+    ``credit``: a precomputed ``lot_option_credit(cycle, untracked_shares=...)``
+    to reuse across a cycle's lots.
 
     ``None`` when the lot's own basis is unknown (a ``PRE_HISTORY`` lot, see
-    ``wheel/engine.py``): there is no strike to net against.
+    ``wheel/engine.py``): there is no cost to net against.
     """
     if lot.basis_per_share is None or lot.shares <= 0:
         return None
-    total_shares = sum(other.shares for other in cycle.share_lots)
-    if total_shares <= 0:
-        return None
-    net_cash_flow = sum(leg.open_cash + sum(close.cash for close in leg.closes) for leg in cycle.legs)
-    allocated = net_cash_flow * (lot.shares / total_shares)
-    return lot.basis_per_share - allocated / lot.shares
+    credit = credit or lot_option_credit(cycle, untracked_shares=untracked_shares)
+    return lot.basis_per_share - credit.by_lot.get(lot.lot_id, 0.0)
 
 
 # --------------------------------------------------------------------------
@@ -358,6 +473,19 @@ class CycleMetrics:
     wheel_core_realized_pl: float = 0.0  # CSP + covered-call legs only
     hedge_realized_pl: float = 0.0  # protective puts + credit-spread legs (LONG_PUT/LONG_CALL)
     option_open_premium: float = 0.0  # credit held on still-open legs
+    # The short-leg part of option_open_premium only (open CSPs / covered
+    # calls / short hedge legs): premium sold but not yet realized. A long
+    # leg's open debit is excluded -- it's a cost paid, not premium collected.
+    option_open_short_premium: float = 0.0
+    # Marked-to-market P&L on those same open legs: open_premium netted
+    # against today's actual cost to close (a broker Positions snapshot's
+    # Last price), when one is on hand -- see OptionLeg.unrealized_pl. Falls
+    # back to option_open_premium itself (valuing the leg as if it expires
+    # worthless) for any leg with no mark price available.
+    option_open_pl: float = 0.0
+    # True only when every open leg above had a real mark price to use --
+    # i.e. option_open_pl is a true mark, not the open_premium fallback.
+    option_open_pl_marked: bool = False
     stock_realized_pl: float = 0.0
     stock_basis_unknown_shares: float = 0.0
     fees: float = 0.0
@@ -384,9 +512,11 @@ class CycleMetrics:
     # time-weighted average roi_on_avg_wheel_pct/annualized_wheel_roc_pct use.
     dividends_received: float = 0.0
     stock_unrealized_pl: float | None = None  # None: no shares held, or no price available
-    # Mark-to-market for an *open* long put/call is out of scope -- no options
-    # quote feed exists anywhere in this project. Always None; present so a
-    # caller can display "not available" rather than inferring absence.
+    # Mark-to-market for an *open* long put/call, for Total Position ROI
+    # specifically, is out of scope -- see the module docstring. Always None;
+    # present so a caller can display "not available" rather than inferring
+    # absence. option_open_pl below *is* marked to market when a quote is on
+    # hand, and covers long legs too -- it just isn't broken out per-side.
     long_leg_unrealized_pl: None = None
     net_option_yield_pct: float | None = None  # option_realized_pl / initial_collateral
     annualized_net_option_yield_pct: float | None = None
@@ -529,6 +659,7 @@ def cycle_metrics(
     *,
     current_price: float | None = None,
     dividends: float = 0.0,
+    option_mark_prices: dict[str, float] | None = None,
 ) -> CycleMetrics:
     """Compute every headline number for one cycle.
 
@@ -538,6 +669,11 @@ def cycle_metrics(
     Position ROI to reflect open shares and dividends passes the ticker's
     latest close (see ``wheel.marketdata``) and this cycle's own dividend
     total (see ``wheel.cashflow.dividend_transactions``).
+
+    ``option_mark_prices`` (``{occ_symbol: last price}``, e.g. from a broker
+    Positions snapshot) prices every still-open leg to market for
+    ``option_open_pl``; a leg whose symbol is missing from it falls back to
+    valuing that one leg as if it expires worthless, same as before.
     """
     points = capital_timeline(cycle, through)
     end = cycle.end_date or through
@@ -556,7 +692,16 @@ def cycle_metrics(
     wheel_core_realized = sum(leg.realized_pl for leg in cycle.legs if leg.strategy in WHEEL_STRATEGIES)
     hedge_realized = sum(leg.realized_pl for leg in cycle.legs if leg.strategy not in WHEEL_STRATEGIES)
     option_realized = wheel_core_realized + hedge_realized
-    option_open_premium = sum(leg.open_premium for leg in cycle.legs if leg.is_open)
+    open_legs = [leg for leg in cycle.legs if leg.is_open]
+    option_open_premium = sum(leg.open_premium for leg in open_legs)
+    option_open_short_premium = sum(leg.open_premium for leg in open_legs if leg.side == SHORT)
+    option_open_pl_marked = bool(open_legs) and all(leg.occ_symbol in (option_mark_prices or {}) for leg in open_legs)
+    option_open_pl = sum(
+        leg.unrealized_pl(option_mark_prices[leg.occ_symbol])
+        if option_mark_prices and leg.occ_symbol in option_mark_prices
+        else leg.open_premium
+        for leg in open_legs
+    )
 
     stock_realized = 0.0
     unknown_shares = 0.0
@@ -578,7 +723,11 @@ def cycle_metrics(
     # something new later. See roll_chains() for the roll's own verdict.
     wins = sum(1 for leg in closed_legs if leg.realized_pl > 0)
     losses = sum(1 for leg in closed_legs if leg.realized_pl < 0)
-    held = [leg.days_held for leg in closed_legs if leg.days_held is not None]
+    # Floored at 1 day, never 0 -- same same-day-round-trip convention
+    # total_days_held (wheel/api.py's P&L / day held) uses, so Avg days in
+    # trade is computed from the same per-leg day counts that other figure
+    # sums, not the raw (possibly 0) calendar difference.
+    held = [max(1, leg.days_held) for leg in closed_legs if leg.days_held is not None]
 
     # Only a short leg can ever be rolled (engine.py's roll detector only
     # pairs short closes/opens), so a long hedge leg doesn't belong in
@@ -647,6 +796,9 @@ def cycle_metrics(
         wheel_core_realized_pl=wheel_core_realized,
         hedge_realized_pl=hedge_realized,
         option_open_premium=option_open_premium,
+        option_open_short_premium=option_open_short_premium,
+        option_open_pl=option_open_pl,
+        option_open_pl_marked=option_open_pl_marked,
         stock_realized_pl=stock_realized,
         stock_basis_unknown_shares=unknown_shares,
         fees=sum(leg.total_fees for leg in cycle.legs),
@@ -710,11 +862,19 @@ class PortfolioMetrics:
     stock_realized_pl: float = 0.0
     net_realized_pl: float = 0.0
     open_premium: float = 0.0
+    open_short_premium: float = 0.0  # Σ option_open_short_premium
     fees: float = 0.0
 
     capital_deployed_now: float = 0.0
     peak_capital: float = 0.0
     avg_capital: float = 0.0
+    # The actual ROC/yield denominators: the same averages narrowed to wheel
+    # cycles, matching wheel_option_realized_pl in the numerator. avg_capital
+    # above spans every cycle (directional longs included) and is NOT what the
+    # ratios below divide by -- the UI must quote these, not avg_capital.
+    wheel_avg_capital: float = 0.0
+    wheel_avg_active_capital: float = 0.0
+    wheel_initial_collateral: float = 0.0
     annualized_wheel_roc_pct: float | None = None  # the headline Wheel ROC: option P/L only
     roi_on_avg_wheel_pct: float | None = None
     profit_per_day: float = 0.0  # option_realized_pl / days_span -- the dashboard's headline $/day figure
@@ -740,6 +900,13 @@ class PortfolioMetrics:
     total_initial_collateral: float = 0.0
     dividends_received: float = 0.0
     stock_unrealized_pl: float = 0.0
+    # Same marked-to-market convention as CycleMetrics.option_open_pl (today's
+    # real cost to close every still-open leg, when a Positions snapshot has
+    # a price for it; that leg's open_premium otherwise) -- just summed across
+    # every cycle. option_open_pl_marked is True only when every open leg,
+    # account-wide, had a real mark to use.
+    option_open_pl: float = 0.0
+    option_open_pl_marked: bool = False
     net_option_yield_pct: float | None = None
     annualized_net_option_yield_pct: float | None = None
     total_position_roi_pct: float | None = None
@@ -774,6 +941,29 @@ class PortfolioMetrics:
         CycleMetrics.roll_rate_pct, just added up across every cycle.
         """
         return 100.0 * self.rolled_legs / self.rollable_legs if self.rollable_legs else None
+
+    @property
+    def mark_to_market_pl(self) -> float:
+        """Where the whole account really stands right now: every dollar
+        already banked (option_realized_pl, stock_realized_pl,
+        dividends_received), plus every share still held marked to its
+        latest close (stock_unrealized_pl), plus every open option leg
+        marked to what it would actually cost to close today
+        (option_open_pl -- falls back to a worthless-at-expiry valuation,
+        leg by leg, wherever no live price was on hand; see
+        option_open_pl_marked). The same four/five-term sum
+        ``_trade_log_entry`` computes per wheel, just added across every
+        wheel in the account -- so "am I actually profitable" never
+        requires manually reconciling Premium collected against the real
+        account value by hand.
+        """
+        return (
+            self.option_realized_pl
+            + self.stock_realized_pl
+            + self.dividends_received
+            + self.stock_unrealized_pl
+            + self.option_open_pl
+        )
 
 
 def portfolio_capital_series(
@@ -845,6 +1035,7 @@ def portfolio_metrics(
     current_prices: dict[str, float] | None = None,
     dividends_by_cycle: dict[str, float] | None = None,
     capital_through: date | None = None,
+    option_mark_prices: dict[str, float] | None = None,
 ) -> PortfolioMetrics:
     """Roll cycle-level numbers up to the account level.
 
@@ -861,10 +1052,12 @@ def portfolio_metrics(
     average capital rather than by averaging per-cycle percentages, which would
     weight a one-day $1,400 trade the same as a two-month $60,000 one.
 
-    ``current_prices`` (ticker -> latest close) and ``dividends_by_cycle``
-    (cycle_id -> dividends received) feed the same-named ``cycle_metrics``
-    keyword arguments for Total Position ROI; both default to empty, which
-    leaves the dual-track fields at their safe defaults.
+    ``current_prices`` (ticker -> latest close), ``dividends_by_cycle``
+    (cycle_id -> dividends received), and ``option_mark_prices`` ({occ_symbol:
+    last price}, straight off a broker Positions snapshot) feed the same-named
+    ``cycle_metrics`` keyword arguments for Total Position ROI and
+    ``mark_to_market_pl``; all three default to empty, which leaves the
+    dual-track fields at their safe defaults.
 
     ``capital_through``, if given, is used only for the committed-capital
     series (``capital_deployed_now``/``avg_capital``/``peak_capital``) instead
@@ -883,6 +1076,7 @@ def portfolio_metrics(
             through,
             current_price=prices.get(cycle.underlying),
             dividends=dividends.get(cycle.cycle_id, 0.0),
+            option_mark_prices=option_mark_prices,
         )
         for cycle in cycles
     ]
@@ -920,6 +1114,7 @@ def portfolio_metrics(
         result.stock_realized_pl += metric.stock_realized_pl
         result.net_realized_pl += metric.net_realized_pl
         result.open_premium += metric.option_open_premium
+        result.open_short_premium += metric.option_open_short_premium
         result.fees += metric.fees
         result.total_legs += metric.legs_total
         result.open_legs += metric.legs_open
@@ -928,6 +1123,7 @@ def portfolio_metrics(
         result.total_initial_collateral += metric.initial_collateral
         result.dividends_received += metric.dividends_received
         result.stock_unrealized_pl += metric.stock_unrealized_pl or 0.0
+        result.option_open_pl += metric.option_open_pl
         if metric.is_wheel:
             result.wins += metric.wins
             result.losses += metric.losses
@@ -941,6 +1137,13 @@ def portfolio_metrics(
 
     result.wheel_option_realized_pl = wheel_option_realized_pl
     result.profit_per_day = wheel_option_realized_pl / result.days_span
+    # True only when every cycle that has an open leg got a real mark for
+    # all of them -- a single un-marked leg anywhere falls this back to
+    # False, same "any gap taints the whole figure" rule each cycle's own
+    # option_open_pl_marked already applies at the leg level.
+    result.option_open_pl_marked = bool(result.open_legs) and all(
+        metric.option_open_pl_marked for metric in per_cycle if metric.legs_open > 0
+    )
 
     result.capital_deployed_now = series[-1].total if series else 0.0
     result.peak_capital = max((point.total for point in series), default=0.0)
@@ -952,6 +1155,9 @@ def portfolio_metrics(
 
     wheel_avg_capital = time_weighted_average(wheel_series)
     wheel_avg_active_capital = time_weighted_average(wheel_series, lambda point: point.working_capital)
+    result.wheel_avg_capital = wheel_avg_capital
+    result.wheel_avg_active_capital = wheel_avg_active_capital
+    result.wheel_initial_collateral = wheel_initial_collateral
 
     result.roi_on_avg_wheel_pct, result.annualized_wheel_roc_pct = roi_and_annualized(
         wheel_option_realized_pl, wheel_avg_capital, result.days_span
@@ -1112,6 +1318,11 @@ def ticker_summary(
                 "losses": sum(metric.losses for metric in wheel_metrics),
                 "is_wheel": ticker_is_wheel,
                 "avg_capital": average,
+                # The real numerator/denominators behind this row's ratios, so
+                # the UI can quote them instead of the all-cycle totals above.
+                "wheel_option_realized_pl": wheel_option_net,
+                "wheel_avg_capital": wheel_average,
+                "wheel_initial_collateral": wheel_total_initial,
                 "peak_capital": max((point.total for point in series), default=0.0),
                 "capital_now": series[-1].total if series else 0.0,
                 "days_span": span,  # denominator of the 365/span annualizing factor below
@@ -1252,20 +1463,20 @@ def _next_month_start(start: date) -> date:
 
 
 def periodic_pl_series(cycles: Sequence[Cycle], through: date, granularity: str) -> list[dict]:
-    """Net Premium / Closed P/L / Net P/L, one row per ISO week (Monday-anchored)
-    or calendar month -- the Dashboard's "Periodic P/L" histogram, one bucket
-    size shared by both weekly and monthly rows so the frontend can toggle
-    without a refetch.
+    """Option P/L / Stock P/L / Total Realized P/L, one row per ISO week
+    (Monday-anchored) or calendar month -- the Dashboard's "Periodic P/L" card,
+    one bucket size shared by both weekly and monthly rows so the frontend can
+    toggle without a refetch.
 
     Every figure here is a period *flow*, summed from ``cycles`` (typically the
     caller's ticker/date/status-filtered cycles, matching ``pnl_series``
     elsewhere): whatever realized option/stock P/L landed in that bucket -- the
     same event-dated figures :func:`realized_pl_series` reports day by day
     (option legs dated to close, share lots dated to disposal). A quiet bucket
-    is a real $0, not a gap. ``net_premium`` and ``closed_pl`` are the two
-    sources; ``net_pl`` is their sum, deliberately realized-only -- it matches
-    ``net_realized_pl`` everywhere else on the dashboard (the Cycles table,
-    Realized P/L by ticker) rather than blending in an unrealized figure.
+    is a real $0, not a gap. ``option_pl`` and ``stock_pl`` are the two
+    sources; ``total_realized_pl`` is their sum, deliberately realized-only --
+    it matches ``net_realized_pl`` everywhere else on the dashboard (the Cycles
+    table, Realized P/L by ticker) rather than blending in an unrealized figure.
 
     An earlier version of this also carried ``open_pl``, a running
     mark-to-market snapshot of still-held shares -- withdrawn because it isn't
@@ -1302,9 +1513,9 @@ def periodic_pl_series(cycles: Sequence[Cycle], through: date, granularity: str)
 
         row = {
             "period": start.isoformat() if granularity == "week" else f"{start.year:04d}-{start.month:02d}",
-            "net_premium": round(option_pl, 2),
-            "closed_pl": round(stock_pl, 2),
-            "net_pl": round(option_pl + stock_pl, 2),
+            "option_pl": round(option_pl, 2),
+            "stock_pl": round(stock_pl, 2),
+            "total_realized_pl": round(option_pl + stock_pl, 2),
         }
         if granularity == "week":
             row["week_start"] = start.isoformat()

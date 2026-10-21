@@ -78,7 +78,7 @@ def _classify(row: dict[str, Any], earnings_before_expiry: set[str]) -> tuple[st
     ):
         return (
             "take_profit_candidate",
-            f"~{round(captured)}% of the credit banked (est.), {dte}d left",
+            f"about {round(captured)}% of the cash you were paid looks earned, {dte}d left",
         )
 
     # --- Evaluate ------------------------------------------------------------
@@ -138,11 +138,15 @@ def classify_open_legs(
     return {
         "buckets": buckets,
         "rules": [
-            "Attention: in the money with <=7 days to expiry, a protective leg in its "
-            "last week, or held shares below the wheel's break-even.",
-            f"Take-Profit Candidate: an estimated >={int(TAKE_PROFIT_CAPTURED_PCT)}% of the "
-            f"credit already banked (intrinsic-only estimate) with <={TAKE_PROFIT_MAX_DTE} days left.",
-            "Evaluate: earnings before the leg expires, in the money with room left, or "
+            f"Attention: the share price has crossed the option's strike with "
+            f"{ATTENTION_DTE} days or fewer to expiry, a protective option is in its final "
+            "week, or shares are below the price they must reach to cancel out their cost.",
+            f"Take-Profit Candidate: roughly {int(TAKE_PROFIT_CAPTURED_PCT)}% or more of the "
+            f"cash you were paid for the option looks already earned, with "
+            f"{TAKE_PROFIT_MAX_DTE} days or fewer left. Rough, because it ignores any value "
+            "the remaining time still carries.",
+            "Evaluate: an earnings report lands before the option expires, the share price "
+            "has crossed the strike but there is still time left, or the share price is "
             f"within {NEAR_THE_MONEY_PCT:.0f}% of the strike.",
             "Working: everything else.",
         ],

@@ -701,6 +701,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_file("index.html", "text/html; charset=utf-8")
             elif route == "/app.js":
                 self._send_file("app.js", "application/javascript; charset=utf-8")
+            elif route == "/tiplayout.js":
+                self._send_file("tiplayout.js", "application/javascript; charset=utf-8")
             elif route == "/styles.css":
                 self._send_file("styles.css", "text/css; charset=utf-8")
             elif route == "/wheel-strategy.png":

@@ -29,6 +29,7 @@ from wheel.marketdata import (  # noqa: E402
     get_price_series,
     load_cache,
     parse_yahoo_chart,
+    parse_yahoo_option_chain,
     parse_yahoo_quotes,
     price_on_or_before,
     save_cache,
@@ -563,6 +564,128 @@ class TestGetFundamentals(unittest.TestCase):
             cache = os.path.join(tmp, "f.json")
             out, warns = get_fundamentals(["AAA"], fetch=self._boom, cache_path=cache, local_only=True)
             self.assertEqual((out, warns), ({}, []))
+
+
+def _option_chain_payload(
+    ticker: str,
+    expiration: date,
+    *,
+    underlying_price: float | None = 150.0,
+    calls: list[dict] | None = None,
+    puts: list[dict] | None = None,
+    expiration_epoch: int | None = None,
+) -> str:
+    """Build a minimal Yahoo optionChain JSON body for one expiration group."""
+    exp_epoch = expiration_epoch if expiration_epoch is not None else int(
+        datetime(expiration.year, expiration.month, expiration.day, tzinfo=timezone.utc).timestamp()
+    )
+    result = {
+        "underlyingSymbol": ticker,
+        "quote": {"regularMarketPrice": underlying_price, "regularMarketTime": exp_epoch},
+        "options": [
+            {
+                "expirationDate": exp_epoch,
+                "calls": calls or [],
+                "puts": puts or [],
+            }
+        ],
+    }
+    return json.dumps({"optionChain": {"result": [result], "error": None}})
+
+
+def _contract(
+    strike: float,
+    *,
+    iv: float | None = 0.32,
+    bid=1.0,
+    ask=1.2,
+    last=1.1,
+    itm=False,
+    symbol="AAPL260619C00150000",
+    last_trade_epoch: int | None = None,
+):
+    return {
+        "contractSymbol": symbol,
+        "strike": strike,
+        "bid": bid,
+        "ask": ask,
+        "lastPrice": last,
+        "lastTradeDate": last_trade_epoch,
+        "impliedVolatility": iv,
+        "inTheMoney": itm,
+    }
+
+
+class TestParseYahooOptionChain(unittest.TestCase):
+    EXPIRY = date(2026, 6, 19)
+
+    def test_parses_calls_and_puts_with_matching_expiration(self):
+        payload = _option_chain_payload(
+            "AAPL",
+            self.EXPIRY,
+            calls=[_contract(150.0, iv=0.31, itm=True)],
+            puts=[_contract(150.0, iv=0.29, symbol="AAPL260619P00150000")],
+        )
+        snap = parse_yahoo_option_chain(payload, self.EXPIRY)
+        self.assertEqual(snap.ticker, "AAPL")
+        self.assertEqual(snap.expiration, self.EXPIRY)
+        self.assertEqual(snap.underlying_price, 150.0)
+        call = snap.contract(150.0, "C")
+        put = snap.contract(150.0, "P")
+        self.assertIsNotNone(call)
+        self.assertIsNotNone(put)
+        self.assertEqual(call.implied_volatility, 0.31)
+        self.assertTrue(call.in_the_money)
+        self.assertEqual(put.implied_volatility, 0.29)
+
+    def test_no_matching_expiration_group_raises(self):
+        payload = _option_chain_payload("AAPL", date(2026, 1, 16), calls=[_contract(150.0)])
+        with self.assertRaises(MarketDataError):
+            parse_yahoo_option_chain(payload, self.EXPIRY)
+
+    def test_unknown_strike_returns_none_not_a_guess(self):
+        payload = _option_chain_payload("AAPL", self.EXPIRY, calls=[_contract(150.0)])
+        snap = parse_yahoo_option_chain(payload, self.EXPIRY)
+        self.assertIsNone(snap.contract(200.0, "C"))
+
+    def test_missing_implied_volatility_is_none_not_zero(self):
+        payload = _option_chain_payload("AAPL", self.EXPIRY, calls=[_contract(150.0, iv=None)])
+        snap = parse_yahoo_option_chain(payload, self.EXPIRY)
+        self.assertIsNone(snap.contract(150.0, "C").implied_volatility)
+
+    def test_last_trade_date_is_parsed_for_staleness_checks(self):
+        epoch = int(datetime(2026, 6, 1, 15, 0, tzinfo=timezone.utc).timestamp())
+        payload = _option_chain_payload("AAPL", self.EXPIRY, calls=[_contract(150.0, last_trade_epoch=epoch)])
+        snap = parse_yahoo_option_chain(payload, self.EXPIRY)
+        self.assertEqual(snap.contract(150.0, "C").last_trade_date, datetime(2026, 6, 1, 15, 0, tzinfo=timezone.utc))
+
+    def test_open_interest_and_volume_are_parsed_when_present(self):
+        raw = {**_contract(150.0), "openInterest": 1234, "volume": 56}
+        snap = parse_yahoo_option_chain(_option_chain_payload("AAPL", self.EXPIRY, calls=[raw]), self.EXPIRY)
+        contract = snap.contract(150.0, "C")
+        self.assertEqual((contract.open_interest, contract.volume), (1234, 56))
+
+    def test_missing_or_invalid_liquidity_fields_are_none_not_zero(self):
+        raw = {**_contract(150.0), "openInterest": -3, "volume": True}
+        snap = parse_yahoo_option_chain(_option_chain_payload("AAPL", self.EXPIRY, calls=[raw]), self.EXPIRY)
+        contract = snap.contract(150.0, "C")
+        self.assertIsNone(contract.open_interest)
+        self.assertIsNone(contract.volume)
+        bare = parse_yahoo_option_chain(_option_chain_payload("AAPL", self.EXPIRY, calls=[_contract(150.0)]), self.EXPIRY)
+        self.assertIsNone(bare.contract(150.0, "C").open_interest)
+
+    def test_missing_last_trade_date_is_none(self):
+        payload = _option_chain_payload("AAPL", self.EXPIRY, calls=[_contract(150.0)])
+        snap = parse_yahoo_option_chain(payload, self.EXPIRY)
+        self.assertIsNone(snap.contract(150.0, "C").last_trade_date)
+
+    def test_malformed_response_raises(self):
+        with self.assertRaises(MarketDataError):
+            parse_yahoo_option_chain("{not json", self.EXPIRY)
+
+    def test_empty_result_raises(self):
+        with self.assertRaises(MarketDataError):
+            parse_yahoo_option_chain(json.dumps({"optionChain": {"result": [], "error": None}}), self.EXPIRY)
 
 
 if __name__ == "__main__":

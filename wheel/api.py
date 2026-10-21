@@ -12,42 +12,52 @@ import math
 import os
 import re
 import statistics
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field, replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Sequence
 
 from wheel import assignment as assignment_mod
 from wheel import benchmark as bm
+from wheel import ccexit
+from wheel import cspentry
 from wheel import cashflow as cf
 from wheel import expiration as expiration_mod
 from wheel import marketdata
+from wheel import pricezones
 from wheel import workflow as workflow_mod
 from wheel.engine import (
+    CLOSED,
     COVERED_CALL,
     CSP,
+    FROM_PRE_HISTORY,
     FROM_PURCHASE,
     FROM_PUT_ASSIGNMENT,
     LONG,
     SHORT,
     Cycle,
+    OptionLeg,
     WheelEngine,
     build_cycles,
 )
 from wheel.fileio import peek_text
 from wheel.insights import portfolio_insights, wheel_insights
+from wheel.optionsmath import black_scholes_greeks, intrinsic_value_per_share
 from wheel.metrics import (
     capital_timeline,
     cycle_metrics,
     dividends_by_cycle,
     leg_rows,
+    lot_option_credit,
     net_adjusted_cost_basis,
     periodic_pl_series,
     portfolio_capital_series,
     portfolio_metrics,
     realized_pl_series,
+    roll_chains,
     ticker_summary,
     weekly_ppd_series,
     wheel_cash_flow_events,
@@ -75,6 +85,7 @@ from wheel.parser import (
 from wheel.paths import DISCOVERY_DIRS
 from wheel.positions import (
     EQUITY,
+    OPTION,
     discover_position_snapshots,
     latest_snapshot,
     latest_snapshot_per_account,
@@ -163,14 +174,17 @@ def _earnings_modifier(days_to_earnings: int | None) -> tuple[float, str]:
     if d is None or d < 0:
         return 0.0, "no earnings date on file"
     if d <= 7:
-        return -1.8, f"earnings in {d}d — gap risk, no time to react"
+        return -1.8, f"earnings in {d} days: the stock can jump overnight, no time to react"
     if d <= 14:
-        return -0.3, f"earnings in {d}d — a little close"
+        return -0.3, f"earnings in {d} days: a little close for comfort"
     if d <= 28:
-        return 0.5, f"earnings in {d}d — sell into elevated IV, clears before a ~30-45 DTE put"
+        return 0.5, (
+            f"earnings in {d} days: options sell for more before a report, and it is past "
+            f"before a put sold 30 to 45 days out expires"
+        )
     if d <= 45:
-        return 0.2, f"earnings in {d}d"
-    return 0.0, f"earnings in {d}d — too far to matter"
+        return 0.2, f"earnings in {d} days"
+    return 0.0, f"earnings in {d} days: too far away to matter here"
 
 
 def _sector_modifier(current_weight: float | None, sector: str | None) -> tuple[float, str]:
@@ -180,14 +194,20 @@ def _sector_modifier(current_weight: float | None, sector: str | None) -> tuple[
         return 0.0, "sector unknown"
     w = current_weight or 0.0
     if w <= 0.02:
-        return 0.5, f"{sector}: not in the book yet — diversifies"
+        return 0.5, f"{sector}: nothing here yet, so it spreads the risk wider"
     if w < 0.15:
-        return 0.2, f"{sector}: lightly held ({w * 100:.0f}% of committed capital)"
+        return 0.2, f"{sector}: lightly held, {w * 100:.0f}% of the money you have committed"
     if w < 0.30:
-        return 0.0, f"{sector}: {w * 100:.0f}% of committed capital"
+        return 0.0, f"{sector}: {w * 100:.0f}% of the money you have committed"
     if w < 0.45:
-        return -0.3, f"{sector}: already {w * 100:.0f}% of the book — concentration"
-    return -0.6, f"{sector}: already {w * 100:.0f}% of the book — heavy concentration"
+        return -0.3, (
+            f"{sector}: already {w * 100:.0f}% of the money you have committed, piling more "
+            f"into one place"
+        )
+    return -0.6, (
+        f"{sector}: already {w * 100:.0f}% of the money you have committed, heavily piled "
+        f"into one place"
+    )
 
 
 def csp_star_score(
@@ -223,10 +243,11 @@ def csp_star_score(
     sector_mod, sector_note = _sector_modifier(sector_current_weight, comp.get("sector"))
 
     raw_stars = max(0.0, min(5.0, base_stars + earn_mod + sector_mod))
-    # Whole stars, 0-5. `raw_stars` is the absolute score; the dashboard
-    # re-grades it on a curve across only the tickers it actually shows (those
-    # the current free cash can sell a contract on) -- see `spreadStars` in
-    # app.js -- so the displayed 0-5 range tracks this list, not the whole book.
+    # Whole stars, 0-5: the absolute score rounded, and exactly what every
+    # table displays. It depends on this ticker's own inputs and its sector's
+    # weight in the book only, never on which other tickers are listed, so
+    # adding or dropping a candidate can't move another one's stars. Ordering
+    # within a star level reads the finer `raw_stars`.
     stars = int(round(raw_stars))
 
     return {
@@ -269,6 +290,158 @@ def sector_exposure(wheels: Sequence[dict[str, Any]]) -> dict[str, float]:
         by_sector[key] = by_sector.get(key, 0.0) + capital
         total += capital
     return {key: value / total for key, value in by_sector.items()} if total else {}
+
+
+# One ticker's raw past-wheel totals, the only input the candidate signals
+# are computed from. Kept as sums (never as already-averaged rates) so totals
+# from several accounts merge exactly: ``merge_csp_history`` adds them and
+# ``csp_candidate_signals`` derives every rate the same way for one account
+# or many.
+_CSP_HISTORY_SUMS = (
+    "net_realized_pl", "wheels", "roc_sum", "roc_n", "gross_premium", "option_pl",
+    "avg_collateral", "days", "wins", "losses",
+)
+
+
+def _empty_csp_history() -> dict[str, Any]:
+    return {
+        "net_realized_pl": 0.0,
+        "wheels": 0,
+        "roc_sum": 0.0,
+        "roc_n": 0,
+        "gross_premium": 0.0,
+        "option_pl": 0.0,
+        "avg_collateral": 0.0,
+        "days": 0,
+        "wins": 0,
+        "losses": 0,
+        "last_dt": None,
+    }
+
+
+def aggregate_csp_history(wheels: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """``{TICKER: raw totals}`` over every wheel on each ticker, profitable
+    or not. Full wheels *and* bare option cycles (a CSP sold and closed,
+    never assigned) count -- a put that had to be bought back at a loss is
+    exactly the history that should drag a ticker's rating down. Pure
+    buy-and-hold stock cycles (no premium either way) don't. ``wheels`` (and
+    the consistency sub-score) counts only true wheels, so tacking on a
+    losing CSP can't *raise* the score via consistency."""
+    by_ticker: dict[str, dict[str, Any]] = {}
+    for wheel in wheels:
+        is_wheel = bool(wheel.get("is_wheel"))
+        has_options = bool(wheel.get("gross_premium_received") or wheel.get("option_realized_pl"))
+        if not is_wheel and not has_options:
+            continue
+        agg = by_ticker.setdefault(wheel["underlying"], _empty_csp_history())
+        agg["net_realized_pl"] += wheel.get("net_realized_pl") or 0.0
+        if is_wheel:
+            agg["wheels"] += 1
+        roc = wheel.get("annualized_wheel_roc_pct")
+        if roc is not None:
+            agg["roc_sum"] += roc
+            agg["roc_n"] += 1
+        agg["gross_premium"] += wheel.get("gross_premium_received") or 0.0
+        agg["option_pl"] += wheel.get("option_realized_pl") or 0.0
+        agg["avg_collateral"] += wheel.get("avg_collateral") or 0.0
+        agg["days"] += wheel.get("days_active") or 0
+        agg["wins"] += wheel.get("wins") or 0
+        agg["losses"] += wheel.get("losses") or 0
+        edge = wheel.get("end_date") or wheel.get("start_date")
+        if edge and (agg["last_dt"] is None or edge > agg["last_dt"]):
+            agg["last_dt"] = edge
+    return by_ticker
+
+
+def merge_csp_history(histories: Sequence[dict[str, dict[str, Any]] | None]) -> dict[str, dict[str, Any]]:
+    """Several accounts' ``aggregate_csp_history`` results added per ticker
+    (sums summed, the latest wheel date kept), losing accounts included."""
+    merged: dict[str, dict[str, Any]] = {}
+    for history in histories:
+        for ticker, agg in (history or {}).items():
+            into = merged.setdefault(ticker, _empty_csp_history())
+            for key in _CSP_HISTORY_SUMS:
+                into[key] += agg.get(key) or 0
+            edge = agg.get("last_dt")
+            if edge and (into["last_dt"] is None or edge > into["last_dt"]):
+                into["last_dt"] = edge
+    return merged
+
+
+def is_csp_history_winner(agg: dict[str, Any]) -> bool:
+    """Wheeled at least once (one true wheel) and net-positive once every
+    option cycle on the ticker is counted."""
+    return agg["wheels"] >= 1 and agg["net_realized_pl"] > 0
+
+
+def csp_candidate_signals(agg: dict[str, Any], today: date) -> dict[str, Any]:
+    """The rate signals behind a candidate's stars, from its raw totals."""
+    avg_collateral, days = agg["avg_collateral"], agg["days"]
+    ppd = agg["option_pl"] / days if days else None
+    decided = agg["wins"] + agg["losses"]
+    return {
+        "avg_roc": round(agg["roc_sum"] / agg["roc_n"], 2) if agg["roc_n"] else None,
+        "monthly_premium_pct": (
+            round(100.0 * agg["gross_premium"] / avg_collateral * (30.0 / max(days, 1)), 2)
+            if avg_collateral > 1e-9
+            else None
+        ),
+        "ppd": ppd,
+        "ppd_yield_pct": (
+            round(365.0 * ppd / avg_collateral * 100.0, 2) if avg_collateral > 1e-9 and ppd is not None else None
+        ),
+        "win_rate": agg["wins"] / decided if decided > 0 else None,
+        "days_since": max((today - date.fromisoformat(agg["last_dt"])).days, 0) if agg["last_dt"] else None,
+    }
+
+
+def csp_candidate_row(
+    ticker: str, agg: dict[str, Any], facts: dict[str, Any], sector_weight: float, today: date
+) -> dict[str, Any]:
+    """One CSP-candidates row: the ticker's raw history ``agg``, its ticker
+    facts (``name``, ``last_close``, ``sector``, ``earnings_date``,
+    ``days_to_earnings``, ``vol_annual_pct``, ``price_position``,
+    ``vetting``) and the book's current weight in its sector. The one place
+    a row is built, for a single account and for a merged view alike."""
+    signals = csp_candidate_signals(agg, today)
+    comp = {
+        "roc_pct": signals["avg_roc"],
+        "monthly_premium_pct": signals["monthly_premium_pct"],
+        "ppd_yield_pct": signals["ppd_yield_pct"],
+        "net_realized_pl": agg["net_realized_pl"],
+        "win_rate": signals["win_rate"],
+        "wheels": agg["wheels"],
+        "days_since_last_wheel": signals["days_since"],
+        "vol_annual_pct": facts.get("vol_annual_pct"),
+        "price_position": facts.get("price_position"),
+        "sector": facts.get("sector"),
+    }
+    scored = csp_star_score(comp, sector_weight, facts.get("days_to_earnings"))
+    win_rate = signals["win_rate"]
+    return {
+        "underlying": ticker,
+        "name": facts.get("name"),
+        "wheels": agg["wheels"],
+        "net_realized_pl": _money(agg["net_realized_pl"]),
+        "avg_annualized_roc_pct": signals["avg_roc"],
+        "monthly_premium_pct": signals["monthly_premium_pct"],
+        "ppd": _money(signals["ppd"]),
+        "last_close": facts.get("last_close"),
+        "sector": facts.get("sector"),
+        "earnings_date": facts.get("earnings_date"),
+        "days_to_earnings": facts.get("days_to_earnings"),
+        "stars": scored["stars"],
+        "star_breakdown": scored,
+        "vetting": facts.get("vetting"),
+        "roc_pct": signals["avg_roc"],
+        "ppd_yield_pct": signals["ppd_yield_pct"],
+        "win_rate": round(win_rate, 4) if win_rate is not None else None,
+        "wins": agg["wins"],
+        "losses": agg["losses"],
+        "days_since_last_wheel": signals["days_since"],
+        "vol_annual_pct": facts.get("vol_annual_pct"),
+        "price_position": facts.get("price_position"),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -336,6 +509,26 @@ def _csp_ticker_verdict(
     if last_price is None:
         notes.append("last price unknown")
     return None, notes
+
+
+CSP_ELIGIBILITY_QUALIFIED = "qualified"
+CSP_ELIGIBILITY_UNVERIFIED = "unverified"
+
+
+def _csp_vetting(unvetted: list[str], fund: dict[str, Any]) -> dict[str, Any]:
+    """A shown candidate's eligibility record. ``status`` is QUALIFIED when
+    every eligibility check (security type, price, market cap, volume) had
+    data and passed, UNVERIFIED when none failed but at least one couldn't be
+    checked (named in ``unvetted``). An excluded ticker never gets a row.
+    Eligibility is not company quality: nothing loaded here (no earnings,
+    profitability, debt or valuation data) can assess the business."""
+    return {
+        "status": CSP_ELIGIBILITY_UNVERIFIED if unvetted else CSP_ELIGIBILITY_QUALIFIED,
+        "unvetted": unvetted,
+        "type": fund.get("type"),
+        "market_cap_b": fund.get("market_cap_b"),
+        "avg_vol_10d_m": fund.get("avg_vol_10d_m"),
+    }
 
 
 def _find_history_header(path: str) -> str | None:
@@ -467,13 +660,11 @@ class Filters:
 # Serialization helpers
 # --------------------------------------------------------------------------
 
-# Wheel target economics: how far past the CC strike floor the profitable-exit
-# cushion sits, and how deep OTM the CSP entry cushion should sit. See
-# _profit_target / _cc_strike_floor / _preferred_csp_entry_explanation below --
-# three distinct concepts (profitability threshold, market-facing strike
-# floor, preferred entry), never blended into one number.
+# Wheel target economics: how far above the cost/break-even floor the
+# profitable-exit cushion sits. See _profit_target below. CC TO EXIT
+# (wheel/ccexit.py) and CSP TO ENTER (wheel/cspentry.py) are separate
+# concepts with their own rules, never blended into it.
 PROFIT_TARGET_CUSHION_PCT = 2.0
-CSP_ENTRY_OTM_PCT = 93.0
 
 
 def _money(value: float | None) -> float | None:
@@ -484,20 +675,82 @@ def _iso(value: date | None) -> str | None:
     return value.isoformat() if value else None
 
 
-def _round_up_half(value: float) -> float:
-    """Real strikes sit on 0.50-or-wider increments; round up so a floor
-    stays a floor (never below what it's built from)."""
-    return math.ceil(round(value / 0.5, 4)) * 0.5
+def _iso_dt(value: datetime | None) -> str | None:
+    return value.isoformat() if value else None
 
 
-def _cc_strike_floor_fundamentals(
+def _not_yet_in_snapshot(transaction: Transaction, snapshot_day: date) -> bool:
+    """Whether a ledger row happened too late to be reflected in a Positions
+    snapshot taken on ``snapshot_day``.
+
+    Assignment rows carry their true date inline ("AS OF 09-18-26"), parsed
+    into ``as_of_date``; ordinary rows have none and are judged by
+    ``run_date``, which for them *is* the real posting day. ``>=`` for the
+    former, plain ``>`` for the latter: a same-day assignment settles after
+    the close, so a snapshot dated that day can't contain it yet, while an
+    ordinary same-day trade is assumed already in the snapshot and must not
+    be counted twice. The ledger has dates only, so a trade placed later in
+    the day than an intraday snapshot is the one case this can miss.
+    """
+    if transaction.as_of_date is not None:
+        return transaction.as_of_date >= snapshot_day
+    return transaction.run_date > snapshot_day
+
+
+def _leg_result(leg: OptionLeg) -> str | None:
+    """"WIN"/"LOSS"/"FLAT" for a closed leg, by its own realized_pl -- the
+    same three-way split win_rate_pct's wins/losses counters use (a leg
+    closed at exactly $0 counts toward neither). None while still open: the
+    ledger's Result column should show a dash, never guess a premature
+    verdict on a leg that hasn't finished closing.
+    """
+    if leg.is_open:
+        return None
+    if leg.realized_pl > 1e-9:
+        return "WIN"
+    if leg.realized_pl < -1e-9:
+        return "LOSS"
+    return "FLAT"
+
+
+def _roll_chain_membership(cycle: Cycle) -> tuple[dict[str, tuple[str, str]], list[dict[str, Any]]]:
+    """``{leg_id: (chain_id, chain_status)}`` for every leg any roll chain
+    (see :func:`wheel.metrics.roll_chains`) ever touched, plus
+    ``open_chain_credits``: ``{chain_id, net_cash}`` for every still-open
+    chain -- a per-chain breakdown of the headline ``open_roll_credit``
+    total, for when more than one chain is open at once. ``chain_id`` is just
+    this chain's rank in ``roll_chains``' own (deterministic) discovery
+    order, stable within one build, not a persistent identity across them.
+    Feeds the ledger rows' own Roll chain column (``_trade_log_engine_rows``),
+    the leg list the Trade Log's Wheel timeline chart draws
+    (``_trade_log_entry``'s ``legs``), and the Roll rate summary cell, so
+    none of the three can ever disagree about which chain a leg belongs to.
+    """
+    chain_of: dict[str, tuple[str, str]] = {}
+    open_chain_credits: list[dict[str, Any]] = []
+    for i, chain in enumerate(roll_chains(cycle)):
+        chain_id = f"RC{i + 1}"
+        for leg_id in chain["leg_ids"]:
+            chain_of[leg_id] = (chain_id, chain["status"])
+        if chain["status"] == "OPEN":
+            open_chain_credits.append({"chain_id": chain_id, "net_cash": _money(chain["net_cash"])})
+    return chain_of, open_chain_credits
+
+
+_round_up_half = ccexit.round_up_to_half_dollar
+
+
+def _profit_target_fundamentals(
     cost_basis: float | None,
     position_breakeven: float | None,
     wheel_breakeven: float | None,
 ) -> list[tuple[str, float]]:
     """The non-``None`` cost/breakeven inputs to the profit-target floor,
     labeled -- shared by `_profit_target_floor` and its explanation so the two
-    can never disagree about which candidates actually fed it."""
+    can never disagree about which candidates actually fed it. Labels match
+    this row's own Cost Basis / Breakeven / Wheel Breakeven columns verbatim
+    (standard trader vocabulary, not a paraphrase) so a tooltip reader can
+    match these numbers to the row without translating terms."""
     candidates = [
         ("cost basis", cost_basis),
         ("breakeven", position_breakeven),
@@ -511,39 +764,12 @@ def _profit_target_floor(
     position_breakeven: float | None,
     wheel_breakeven: float | None,
 ) -> float | None:
-    """The raw (uncushioned) floor both Profit Target and CC TO EXIT are
-    built from: the highest of whichever of cost basis / position breakeven /
-    wheel breakeven are known. Deliberately excludes current price -- see
-    `_cc_strike_floor` for the one place price enters."""
-    fundamentals = _cc_strike_floor_fundamentals(cost_basis, position_breakeven, wheel_breakeven)
+    """The raw (uncushioned) floor Profit Target is built from: the highest
+    of whichever of cost basis / position breakeven / wheel breakeven are
+    known. Deliberately excludes current price, so Profit Target stays a
+    fixed line the price can close in on."""
+    fundamentals = _profit_target_fundamentals(cost_basis, position_breakeven, wheel_breakeven)
     return max(value for _, value in fundamentals) if fundamentals else None
-
-
-def _cc_strike_floor(
-    cost_basis: float | None,
-    position_breakeven: float | None,
-    wheel_breakeven: float | None,
-    current_price: float | None,
-    cushion_pct: float = PROFIT_TARGET_CUSHION_PCT,
-) -> float | None:
-    """The lowest strike worth writing a call at right now: never below the
-    cushioned Profit Target floor (`_profit_target_floor`, then the same
-    cushion `_profit_target` applies) -- a call struck below that price would
-    lock in a below-target exit if assigned, defeating the point of a
-    "floor" -- and never below the current price either, so a rallied stock
-    still gets a market-reactive number. Whichever of the two is higher
-    wins, rounded up to the next $0.50. A floor, not a recommendation -- it
-    says nothing about where the premium is richest. The one shared
-    implementation of this formula: `_build_cc_candidates`' `target_cc_strike`
-    and the wheel-level `cc_strike_floor` both call it, and because it shares
-    `_profit_target_floor` with Profit Target itself, CC TO EXIT can never
-    come out below it."""
-    floor = _profit_target_floor(cost_basis, position_breakeven, wheel_breakeven)
-    cushioned_floor = floor * (1 + cushion_pct / 100) if floor is not None else None
-    candidates = [v for v in (cushioned_floor, current_price) if v is not None]
-    if not candidates:
-        return None
-    return _money(_round_up_half(max(candidates)))
 
 
 def _profit_target(floor: float, cushion_pct: float = PROFIT_TARGET_CUSHION_PCT) -> float:
@@ -553,53 +779,27 @@ def _profit_target(floor: float, cushion_pct: float = PROFIT_TARGET_CUSHION_PCT)
     return _money(_round_up_half(floor * (1 + cushion_pct / 100)))
 
 
-def _profit_target_explanation(floor: float, target: float) -> str:
-    """Same 4-part shape as `_cc_strike_floor_explanation`: a formula line,
-    the substitution, the result, then a one-line caveat."""
-    return (
-        f"Profit Target = highest of cost basis, breakeven, wheel breakeven, "
-        f"+{PROFIT_TARGET_CUSHION_PCT:g}%, rounded up to $0.50\n"
-        f"= ${floor:.2f} + {PROFIT_TARGET_CUSHION_PCT:g}%\n"
-        f"= ${target:.2f}\n\n"
-        f"A profitable-exit threshold; never reacts to price."
-    )
-
-
-def _preferred_csp_entry_explanation(current_price: float, entry: float) -> str:
-    """Same shape as the client's live cspEntryTargetTooltip (app.js) --
-    this fixed-93% figure isn't shown anywhere in the UI right now (every
-    surface uses the adjustable client-side version instead), but is kept
-    in the same format in case a future surface reads it."""
-    return (
-        f"Preferred CSP entry = {CSP_ENTRY_OTM_PCT:g}% of last close, rounded down to $0.50\n"
-        f"= {CSP_ENTRY_OTM_PCT:g}% × ${current_price:.2f}\n"
-        f"= ${entry:.2f}\n\n"
-        f"A conservative entry floor."
-    )
-
-
-def _cc_strike_floor_explanation(
-    strike: float,
-    cost_basis: float | None,
-    position_breakeven: float | None,
-    wheel_breakeven: float | None,
-    current_price: float | None,
+def _profit_target_explanation(
+    floor: float,
+    target: float,
+    cost_basis: float | None = None,
+    position_breakeven: float | None = None,
+    wheel_breakeven: float | None = None,
 ) -> str:
-    """Short and simple, like the client's CSP TO ENTER tooltip
-    (cspEntryTargetTooltip in app.js) -- not a line-by-line accounting of
-    every input. Profit Target is the one figure worth naming, since it's
-    already the adjacent column and its own tooltip has the cost basis /
-    breakeven / wheel breakeven math behind it; repeating that here would
-    just be the same numbers twice."""
-    floor = _profit_target_floor(cost_basis, position_breakeven, wheel_breakeven)
-    profit_target = _profit_target(floor) if floor is not None else None
-    target_text = f"${profit_target:.2f}" if profit_target is not None else "n/a"
-    price_text = f"${current_price:.2f}" if current_price is not None else "n/a"
+    """A formula line, the substitution, the result, then a one-line caveat. Equation-first,
+    standard trader vocabulary (cost basis / breakeven / wheel breakeven,
+    matching their own columns) per feedback_concise_tooltips -- this is a
+    hover tooltip for an experienced options trader, not a beginner
+    explainer, so it leads with the math rather than paraphrasing it."""
+    fundamentals = _profit_target_fundamentals(cost_basis, position_breakeven, wheel_breakeven)
+    labels = ", ".join(label for label, _ in fundamentals)
+    values = ", ".join(f"${value:.2f}" for _, value in fundamentals)
+    multiplier = 1 + PROFIT_TARGET_CUSHION_PCT / 100
     return (
-        f"CC TO EXIT = higher of Profit Target and last price, rounded up to $0.50\n"
-        f"= higher of {target_text} and {price_text}\n"
-        f"= ${strike:.2f}\n\n"
-        f"A floor, not a recommendation."
+        f"Profit Target = max({labels}) × {multiplier:.2f}, rounded up to $0.50\n"
+        f"Floor = max({values}) = ${floor:.2f}\n"
+        f"= ${floor:.2f} × {multiplier:.2f} = ${target:.2f}\n\n"
+        f"Fixed; doesn't move with the share price."
     )
 
 
@@ -643,6 +843,7 @@ def _cached_cycle_metrics(
     *,
     current_price: float | None,
     dividends: float,
+    option_mark_prices: dict[str, float] | None = None,
 ) -> Any:
     """cycle_metrics(), memoized by ``cache`` when the caller supplies one.
 
@@ -651,16 +852,107 @@ def _cached_cycle_metrics(
     (cycle, through, current_price, dividends) -- without this, that's the
     same cycle_metrics()/roll_chains() work redone 2-3 times per cycle for
     an identical result. ``cache=None`` (tests, one-off callers) just calls
-    straight through with no memoization.
+    straight through with no memoization. ``option_mark_prices`` isn't part
+    of the cache key: it comes from the one Positions snapshot a whole
+    dashboard build shares, so it never varies across these calls within a
+    single build.
     """
     if cache is None:
-        return cycle_metrics(cycle, through, current_price=current_price, dividends=dividends)
+        return cycle_metrics(
+            cycle, through, current_price=current_price, dividends=dividends, option_mark_prices=option_mark_prices
+        )
     key = (cycle.cycle_id, through, current_price, dividends)
     result = cache.get(key)
     if result is None:
-        result = cycle_metrics(cycle, through, current_price=current_price, dividends=dividends)
+        result = cycle_metrics(
+            cycle, through, current_price=current_price, dividends=dividends, option_mark_prices=option_mark_prices
+        )
         cache[key] = result
     return result
+
+
+def _roll_events_payload(cycle: Cycle) -> list[dict[str, Any]]:
+    """Every same-day roll on this cycle, each roll's own net credit/debit
+    and direction (up/down/out), plus exactly which legs it closed and
+    opened. Shared by the cycle payload (the Dashboard's Wheel timelines
+    chart, cycle drill-down) and the Trade Log entry (its Wheel timeline
+    chart), so both ever read the same roll bookkeeping.
+    """
+    return [
+        {
+            "roll_id": roll.roll_id,
+            "date": _iso(roll.date),
+            "right": roll.right,
+            "direction": roll.direction,
+            "net_credit": _money(roll.net_credit),
+            "closed": [
+                {**item, "expiry": _iso(item["expiry"]), "cash": _money(item["cash"])} for item in roll.closed
+            ],
+            "opened": [
+                {**item, "expiry": _iso(item["expiry"]), "cash": _money(item["cash"])} for item in roll.opened
+            ],
+        }
+        for roll in cycle.rolls
+    ]
+
+
+def _assignment_events_payload(cycle: Cycle) -> list[dict[str, Any]]:
+    """Every option assignment / call-away on this cycle, the share
+    movement it caused. Shared by the cycle payload and the Trade Log
+    entry's Wheel timeline chart, which uses it to tell an assigned share
+    lot apart from an ordinary purchase (see drawTimelineStock in app.js).
+    """
+    return [
+        {
+            "date": _iso(item.date),
+            "symbol": item.occ_symbol,
+            "right": item.right,
+            "strike": item.strike,
+            "contracts": item.contracts,
+            "shares": item.shares,
+            "direction": item.direction,
+            "cash": _money(item.cash),
+            "synthetic": item.synthetic,
+            "note": item.note,
+        }
+        for item in cycle.assignments
+    ]
+
+
+def _share_lots_payload(cycle: Cycle, *, untracked_shares: float = 0.0) -> list[dict[str, Any]]:
+    """Every share lot this cycle ever held, with its full disposal
+    history, so a timeline chart can draw each lot's holding period and
+    mark its sale(s) / call-away(s). Shared by the cycle payload and the
+    Trade Log entry's Wheel timeline chart. ``untracked_shares``: see
+    ``metrics.lot_option_credit`` (a call's premium is split over them too).
+    """
+    credit = lot_option_credit(cycle, untracked_shares=untracked_shares)
+    return [
+        {
+            "lot_id": lot.lot_id,
+            "acquired": _iso(lot.acquired),
+            "shares": lot.shares,
+            "basis_per_share": lot.basis_per_share,  # tax basis: raw assignment/purchase price
+            "net_adjusted_cost_basis": _money(net_adjusted_cost_basis(cycle, lot, credit=credit)),
+            "remaining": lot.remaining,
+            "source": lot.source,
+            "synthetic": lot.synthetic,
+            "basis_known": lot.basis_known,
+            "cost": _money(lot.cost),
+            # When shares from this lot left, so the timeline can draw the
+            # holding period and mark each sale/call-away.
+            "disposals": [
+                {
+                    "date": _iso(d["date"]),
+                    "shares": d["shares"],
+                    "price": round(d["proceeds"] / d["shares"], 4) if d["shares"] else None,
+                    "realized": _money(d["realized"]),
+                }
+                for d in lot.disposals
+            ],
+        }
+        for lot in cycle.share_lots
+    ]
 
 
 def _cycle_payload(
@@ -682,63 +974,9 @@ def _cycle_payload(
     # CycleMetrics already exposes integer `rolls` / `assignments` counts, so the
     # detail lists take distinct names rather than shadowing them.
     payload["legs"] = leg_rows(cycle)
-    payload["roll_events"] = [
-        {
-            "roll_id": roll.roll_id,
-            "date": _iso(roll.date),
-            "right": roll.right,
-            "direction": roll.direction,
-            "net_credit": _money(roll.net_credit),
-            "closed": [
-                {**item, "expiry": _iso(item["expiry"]), "cash": _money(item["cash"])} for item in roll.closed
-            ],
-            "opened": [
-                {**item, "expiry": _iso(item["expiry"]), "cash": _money(item["cash"])} for item in roll.opened
-            ],
-        }
-        for roll in cycle.rolls
-    ]
-    payload["assignment_events"] = [
-        {
-            "date": _iso(item.date),
-            "symbol": item.occ_symbol,
-            "right": item.right,
-            "strike": item.strike,
-            "contracts": item.contracts,
-            "shares": item.shares,
-            "direction": item.direction,
-            "cash": _money(item.cash),
-            "synthetic": item.synthetic,
-            "note": item.note,
-        }
-        for item in cycle.assignments
-    ]
-    payload["share_lots"] = [
-        {
-            "lot_id": lot.lot_id,
-            "acquired": _iso(lot.acquired),
-            "shares": lot.shares,
-            "basis_per_share": lot.basis_per_share,  # tax basis: raw assignment/purchase price
-            "net_adjusted_cost_basis": _money(net_adjusted_cost_basis(cycle, lot)),
-            "remaining": lot.remaining,
-            "source": lot.source,
-            "synthetic": lot.synthetic,
-            "basis_known": lot.basis_known,
-            "cost": _money(lot.cost),
-            # When shares from this lot left, so the timeline can draw the
-            # holding period and mark each sale/call-away.
-            "disposals": [
-                {
-                    "date": _iso(d["date"]),
-                    "shares": d["shares"],
-                    "price": round(d["proceeds"] / d["shares"], 4) if d["shares"] else None,
-                    "realized": _money(d["realized"]),
-                }
-                for d in lot.disposals
-            ],
-        }
-        for lot in cycle.share_lots
-    ]
+    payload["roll_events"] = _roll_events_payload(cycle)
+    payload["assignment_events"] = _assignment_events_payload(cycle)
+    payload["share_lots"] = _share_lots_payload(cycle)
     payload["spreads"] = [
         {
             "spread_id": spread.spread_id,
@@ -793,8 +1031,6 @@ _CLOSE_TYPE = {
 }
 
 
-_CLOSING_ACTIONS = frozenset({BTC, STC, EXPIRED, ASSIGNED})
-
 # Trade Log row types that move shares on or off the book (never contracts) --
 # used to carry a running share count down the ledger for the break-even column.
 _SHARE_ROW_TYPES = frozenset(
@@ -816,6 +1052,13 @@ HEDGE_DEEP_ITM_COST_FRACTION = 0.5
 # timing into each of these indices. SPY stays first (and keeps the legacy
 # ``benchmark`` payload key to itself); the rest are additional lines.
 BENCHMARK_TICKERS = ("SPY", "QQQ")
+
+# Yahoo's free quote feed carries no risk-free rate, so the Black-Scholes
+# Greeks on the directional (LC/LP) Trade Log card use this as a fixed stand-in
+# (roughly a recent short-term T-bill yield) -- a documented assumption, not a
+# fetched one. It has only a second-order effect on delta/gamma/vega and a
+# small one on theta; it is never presented to the user as a live rate.
+DIRECTIONAL_RISK_FREE_RATE_ASSUMPTION = 0.045
 
 
 def _close_return_pct(open_price: float | None, close_price: float | None, side: str) -> float | None:
@@ -925,19 +1168,32 @@ def _trade_log_raw_row(
         # highlighted for as long as it stays unpaired.
         "is_open_long": is_open_long,
         "synthetic": False,
+        # Not an option leg -- no win/loss verdict, no roll chain.
+        "result": None,
+        "chain_id": None,
+        "chain_status": None,
         "_sort": (transaction.event_date, 1, transaction.row_id),
     }
 
 
-def _trade_log_engine_rows(cycle: Cycle) -> list[dict[str, Any]]:
+def _trade_log_engine_rows(cycle: Cycle, chain_of: dict[str, tuple[str, str]]) -> list[dict[str, Any]]:
     """Rows for one cycle taken from the engine's own structures -- exact
-    ``cycle_id`` attribution, no date-boundary ambiguity. Commission and fees
-    are combined on a leg, so those rows report a single Fees figure.
+    ``cycle_id`` attribution, no date-boundary ambiguity, and (unlike a raw
+    broker row) always exactly one leg: a single BTC that FIFO-closes two
+    separately-opened lots at once becomes two rows here, one per lot, each
+    with its own Return %/Result instead of one row blending both. Commission
+    and fees are combined on a leg (the engine never tracks them separately
+    per lot), so those rows report a single Fees figure. ``chain_id``/
+    ``chain_status`` (from :func:`_roll_chain_membership`) are stamped on
+    every row for a leg that belongs to a roll chain, open or close alike;
+    ``result`` (this leg's own win/loss verdict -- see :func:`_leg_result`)
+    only ever appears on the close row where the leg actually finishes.
     """
     rows: list[dict[str, Any]] = []
     for leg in cycle.legs:
         is_csp_open = leg.open_action == STO and leg.right == "P"
         csp = leg.strike * OPTION_MULTIPLIER * leg.contracts if is_csp_open else None
+        chain_id, chain_status = chain_of.get(leg.leg_id, (None, None))
         rows.append(
             {
                 "type": _OPEN_TYPE.get((leg.open_action, leg.right), "Other"),
@@ -956,6 +1212,9 @@ def _trade_log_engine_rows(cycle: Cycle) -> list[dict[str, Any]]:
                 "is_settled": not leg.is_open,
                 "is_open_long": leg.is_open and leg.side == LONG,
                 "synthetic": False,
+                "result": None,  # not known at open
+                "chain_id": chain_id,
+                "chain_status": chain_status,
                 "_sort": (leg.open_date, 0, 0),
             }
         )
@@ -979,6 +1238,11 @@ def _trade_log_engine_rows(cycle: Cycle) -> list[dict[str, Any]]:
                     "is_settled": not leg.is_open,
                     "is_open_long": False,
                     "synthetic": False,
+                    # None until the leg's *last* contract closes (a partial
+                    # close leaves it still open, with no verdict yet).
+                    "result": _leg_result(leg),
+                    "chain_id": chain_id,
+                    "chain_status": chain_status,
                     "_sort": (close.date, 1, 0),
                 }
             )
@@ -1004,8 +1268,278 @@ def _trade_log_assignment_row(assignment, *, is_settled: bool) -> dict[str, Any]
         "is_settled": is_settled,
         "is_open_long": False,
         "synthetic": assignment.synthetic,
+        "result": None,
+        "chain_id": None,
+        "chain_status": None,
         "_sort": (assignment.date, 2, 0),
     }
+
+
+def _open_covered_call_shares(cycle: Cycle) -> float:
+    """Shares already backing a call: 100 per still-open short covered-call
+    contract. Expired, bought-back and assigned contracts are closed, so
+    they no longer count."""
+    return sum(
+        leg.remaining_contracts * OPTION_MULTIPLIER
+        for leg in cycle.legs
+        if leg.is_open and leg.side == SHORT and leg.strategy == COVERED_CALL
+    )
+
+
+def _cc_exit_share_blocks(
+    cycle: Cycle,
+    untracked_shares: float,
+    untracked_cost_per_share: float | None,
+    lot_credit,
+) -> list[ccexit.ShareBlock]:
+    """Every share held, oldest first, the order the engine sells lots in
+    (FIFO). Shares from before the oldest loaded export come first; then
+    each tracked lot in the order it was acquired."""
+    blocks: list[ccexit.ShareBlock] = []
+    if untracked_shares > 1e-9:
+        blocks.append(ccexit.ShareBlock(untracked_shares, untracked_cost_per_share, lot_credit.untracked))
+    for lot in cycle.share_lots:
+        if lot.remaining > 1e-9:
+            cost = lot.basis_per_share if lot.basis_known else None
+            blocks.append(ccexit.ShareBlock(lot.remaining, cost, lot_credit.by_lot.get(lot.lot_id, 0.0)))
+    return blocks
+
+
+def _lot_break_even_on(
+    cycle: Cycle, day: date, untracked_shares: float, *, same_day_lots_arrived: bool
+) -> float | None:
+    """The per-lot Breakeven as it stood on ``day``: each tracked lot held
+    then, at its raw cost less the option cash it had earned by then
+    (``metrics.lot_option_credit``), weighted by shares held. The same figure
+    the summary's ``break_even_per_share`` is today; feeds the Trade Log's
+    running Profit Target. ``same_day_lots_arrived``: whether the ledger has
+    reached the share row that brings in a lot acquired on ``day`` (earlier
+    rows that day, e.g. the option side of an assignment, come before it)."""
+    credit = lot_option_credit(cycle, untracked_shares=untracked_shares, through=day)
+    weighted: list[tuple[float, float]] = []
+    for lot in cycle.share_lots:
+        arrived = lot.acquired < day or (lot.acquired == day and same_day_lots_arrived)
+        if not arrived or lot.basis_per_share is None or lot.shares <= 0:
+            continue
+        held = lot.shares - sum(d["shares"] for d in lot.disposals if d["date"] <= day)
+        if held > 1e-9:
+            weighted.append((held, lot.basis_per_share - credit.by_lot.get(lot.lot_id, 0.0)))
+    total = sum(qty for qty, _ in weighted)
+    return sum(qty * value for qty, value in weighted) / total if total > 1e-9 else None
+
+
+def _cc_exit_payload(result: ccexit.CcExit, ticker: str | None = None) -> dict[str, Any]:
+    """The CC TO EXIT fields every table copies verbatim from its wheel.
+    ``cc_to_exit`` is the strike (sortable), ``None`` unless one qualified;
+    ``cc_to_exit_label`` is what to show instead (ALL SHARES COVERED / NO
+    QUALIFYING CC), ``None`` when there's a strike or no shares at all."""
+    pick = result.pick
+    return {
+        "cc_to_exit": _money(result.strike),
+        "cc_to_exit_status": result.status,
+        "cc_to_exit_label": ccexit.STATUS_LABELS.get(result.status),
+        # The tooltip, as a structured card (wheel/tooltipcard.py); None with no shares.
+        "cc_to_exit_card": ccexit.tooltip_card(result, ticker),
+        "cc_to_exit_detail": {
+            "shares_held": round(result.shares_held, 4),
+            "covered_shares": round(result.covered_shares, 4),
+            "uncovered_shares": round(result.uncovered_shares, 4),
+            "contracts": result.contracts,
+            "lot_cost": _money(result.lot_cost),
+            "preferred_min_exit": result.preferred_min_exit,
+            "expiry": _iso(result.expiry),
+            "days_to_expiry": result.days_to_expiry,
+            "delta": round(pick.delta, 4) if pick else None,
+            "mid_premium": _money(pick.mid_premium) if pick else None,
+            "net_premium": _money(pick.net_premium) if pick else None,
+            # Three distinct figures, never blended: the stock-only gain/loss
+            # at the strike, the option cash these same shares already earned
+            # (metrics.lot_option_credit), and the lot-level P&L if assigned
+            # (stock + new call net premium + that earlier cash - sale fee).
+            # The whole-wheel realized P&L is a separate Trade Log field.
+            "stock_pnl_if_assigned": _money(pick.stock_pnl) if pick else None,
+            "prior_option_credit": _money(result.prior_credit),
+            "sale_fee_if_assigned": _money(pick.sale_fee) if pick else None,
+            "projected_assignment_pnl": _money(pick.projected_assignment_pnl) if pick else None,
+            "expiry_in_window": result.expiry_in_window,
+            "option_fee_per_contract": round(result.fees.option_fee_per_contract, 4),
+            "option_fee_source": result.fees.option_fee_source,
+            "sale_fee_rate_per_million": round(result.fees.sale_fee_rate * 1_000_000, 4),
+            "sale_fee_source": result.fees.sale_fee_source,
+            "reason": result.reason,
+            # The one chain snapshot and calculation every display of this
+            # result shares: Yahoo's market time on the chain, when this app
+            # fetched it, and when this build computed CC TO EXIT.
+            "quotes_as_of": _iso_dt(result.quotes_as_of),
+            "chain_fetched_at": _iso_dt(result.fetched_at),
+            "calculated_at": _iso_dt(result.calculated_at),
+            # Historical resistance around the pick: context, never a
+            # selection input. None without a recommended strike.
+            "resistance": _resistance_payload(result),
+        },
+    }
+
+
+def _price_zone_payload(zone: pricezones.PriceZone | None) -> dict[str, Any] | None:
+    if zone is None:
+        return None
+    return {
+        "low": _money(zone.low),
+        "high": _money(zone.high),
+        "score": round(zone.score, 1),
+        "touches": zone.touches,
+        "touch_days": [_iso(day) for day in zone.touch_days],
+        "sessions_since_last_touch": zone.sessions_since_last_touch,
+        "avg_reaction_pct": round(zone.avg_reaction_pct, 2),
+        "breaks": zone.breaks,
+        "moving_averages_near": list(zone.moving_averages_near),
+    }
+
+
+def _resistance_payload(result: ccexit.CcExit) -> dict[str, Any] | None:
+    """CC TO EXIT's one resistance result (``ccexit.resistance_context``):
+    the most useful zone, where the strike sits against it, the nearest
+    zone under / around / over the strike, and the advice for every
+    qualifying strike (``ccexit.candidate_guidance``). ``zone`` is None with
+    ``reason`` saying why there is no meaningful resistance."""
+    context = result.resistance
+    if context is None:
+        return None
+    guidance = [ccexit.candidate_guidance(result, candidate) for candidate in result.candidates]
+    return {
+        "found": context.zone is not None,
+        "zone": _price_zone_payload(context.zone),
+        "strength_label": context.strength_label,
+        "relationship": context.relationship,
+        "distance_from_strike_pct": round(context.distance_pct, 2) if context.distance_pct is not None else None,
+        "near": context.near,
+        "reason": context.reason,
+        "meaningful_zones": context.meaningful_zones,
+        "nearest_below_strike": _price_zone_payload(context.below),
+        "around_strike": _price_zone_payload(context.at),
+        "nearest_above_strike": _price_zone_payload(context.above),
+        "sessions_analyzed": context.sessions_analyzed,
+        "limitations": list(context.limitations),
+        "strike_guidance": [
+            {"strike": item.strike, "position": item.position, "label": item.label, "text": item.text}
+            for item in guidance
+            if item is not None
+        ],
+    }
+
+
+CC_EXIT_FIELDS = (
+    "cc_to_exit",
+    "cc_to_exit_status",
+    "cc_to_exit_label",
+    "cc_to_exit_card",
+    "cc_to_exit_detail",
+)
+
+
+def _cc_exit_fields(wheel: dict[str, Any] | None) -> dict[str, Any]:
+    """A Trade Log wheel's CC TO EXIT fields, copied as-is onto any other
+    table's row -- the only way a table gets them, so none can disagree."""
+    wheel = wheel or {}
+    return {key: wheel.get(key) for key in CC_EXIT_FIELDS}
+
+
+def _csp_to_enter_payload(result: cspentry.CspEntry, ticker: str | None = None) -> dict[str, Any]:
+    """One ticker's CSP TO ENTER, as every table, card and tooltip reads it
+    (by ticker, from the payload's top-level ``csp_to_enter`` map).
+    ``recommended_strike`` is ``None`` unless a put qualified; ``label`` is
+    then what to show instead (NO QUALIFYING CSP). ``card`` is the tooltip
+    (``cspentry.tooltip_card``, already formatted) and ``reason`` its
+    one-line "why", both built from this same result -- the frontend only
+    displays them, it never recomputes."""
+    pick, zone = result.pick, result.zone
+    return {
+        "status": result.status,
+        "label": cspentry.STATUS_LABELS.get(result.status),
+        "recommended_strike": _money(result.strike),
+        # Cash one contract at that strike ties up (strike x 100), the same
+        # collateral definition as an open CSP; None with no strike.
+        "collateral_per_contract": (
+            _money(result.strike * OPTION_MULTIPLIER) if result.strike is not None else None
+        ),
+        "current_price": _money(result.current_price),
+        "expiry": _iso(result.expiry),
+        "days_to_expiry": result.days_to_expiry,
+        # False: nothing was listed 30-45 days out, so the closest to 35 was used.
+        "expiry_in_window": result.expiry_in_window,
+        "support_zone": {"low": _money(zone.low), "high": _money(zone.high)} if zone else None,
+        "support_score": round(zone.score, 1) if zone else None,
+        "support_levels": [_money(low) for low in zone.touch_lows] if zone else [],
+        "support_distance_pct": (
+            round(result.zone_distance_pct, 2) if result.zone_distance_pct is not None else None
+        ),
+        # The historical evidence behind the zone's score (a relative 0-100
+        # ranking, never a probability): its swing lows, when they were, how
+        # long since the last, the average bounce and close-through episodes.
+        "support_evidence": (
+            {
+                "touches": zone.touches,
+                "touch_days": [_iso(day) for day in zone.touch_days],
+                "sessions_since_last_touch": zone.sessions_since_last_touch,
+                "avg_bounce_pct": round(zone.avg_bounce_pct, 2),
+                "breaks": zone.breaks,
+                "moving_averages_near": list(zone.moving_averages_near),
+            }
+            if zone
+            else None
+        ),
+        "zone_position": pick.zone_position if pick else None,
+        "delta": round(pick.delta, 4) if pick else None,
+        # The ranking's target, versus the hard limits a put must sit inside.
+        "delta_target": cspentry.TARGET_DELTA,
+        "delta_allowed_range": list(cspentry.ACCEPTABLE_DELTA_RANGE),
+        "bid": pick.bid if pick else None,
+        "ask": pick.ask if pick else None,
+        "open_interest": pick.open_interest if pick else None,
+        "option_volume": pick.volume if pick else None,
+        "premium": round(pick.mid_premium, 4) if pick else None,  # per share, bid/ask mid
+        "net_premium": round(pick.net_premium, 4) if pick else None,  # per share, after the fee
+        "net_premium_per_contract": _money(pick.net_premium * OPTION_MULTIPLIER) if pick else None,
+        # A screening figure (net premium / collateral, annualized), not an
+        # expected or guaranteed yearly return.
+        "annualized_roi_pct": round(pick.annualized_return_pct, 2) if pick else None,
+        "effective_purchase_price": _money(pick.effective_purchase_price) if pick else None,
+        "effective_discount_pct": round(pick.effective_discount_pct, 2) if pick else None,
+        "downside_to_strike_pct": round(pick.downside_to_strike_pct, 2) if pick else None,
+        "recommendation_score": round(pick.score, 1) if pick else None,
+        "reason": result.reason,
+        "limitations": list(result.support.limitations) if result.support else [],
+        "card": cspentry.tooltip_card(result, ticker),
+        # Advice for every qualifying put against the chosen support zone
+        # (cspentry.candidate_guidance): context, never a ranking input.
+        "support_guidance": [
+            {"strike": item.strike, "position": item.position, "label": item.label, "text": item.text}
+            for item in (cspentry.candidate_guidance(result, candidate) for candidate in result.candidates)
+            if item is not None
+        ],
+        "quotes_as_of": _iso_dt(result.quotes_as_of),
+        "chain_fetched_at": _iso_dt(result.fetched_at),
+        "calculated_at": _iso_dt(result.calculated_at),
+        # False when a market input was unavailable (price, history, listed
+        # expirations, the chain); the result is then NO QUALIFYING CSP for
+        # lack of data, not because every put failed the rules.
+        "market_data_complete": not result.market_data_missing,
+    }
+
+
+def wheel_target_gap_pct(
+    wheel: dict[str, Any], csp_to_enter: dict[str, Any] | None, last_close: float | None
+) -> float | None:
+    """Gap to Target, %: (phase target - last price) / last price. The
+    target is Profit Target in the CC phase and the ticker's CSP TO ENTER
+    strike in the CSP phase; ``None`` when either side is unknown."""
+    if wheel.get("wheel_phase") == "cc":
+        target = wheel.get("profit_target")
+    else:
+        target = (csp_to_enter or {}).get("recommended_strike")
+    if target is None or not last_close:
+        return None
+    return round(100.0 * (target - last_close) / last_close, 2)
 
 
 def _trade_log_entry(
@@ -1016,12 +1550,40 @@ def _trade_log_entry(
     name: str | None,
     dividend_row_ids: set[int],
     dividends: float,
-    engine_exact: bool,
     current_price: float | None = None,
     also_tickers: frozenset[str] | set[str] = frozenset(),
     metrics_cache: dict[tuple[str, date, float | None, float], Any] | None = None,
+    option_mark_prices: dict[str, float] | None = None,
+    untracked_shares: float = 0.0,
+    untracked_cost_per_share: float | None = None,
+    exit_chain: ccexit.ExitChain | None = None,
+    calculated_at: datetime | None = None,
+    cc_exit_fees: ccexit.FeeModel | None = None,
 ) -> dict[str, Any]:
-    metrics = _cached_cycle_metrics(metrics_cache, cycle, through, current_price=current_price, dividends=dividends)
+    """``untracked_shares``: real shares the broker reports on this wheel's
+    ticker beyond what its own lots trace (bought before the oldest loaded
+    export, see ``Dashboard._untracked_shares_by_cycle``). They always count
+    toward the wheel's phase -- it's holding stock and writing calls.
+
+    ``untracked_cost_per_share``: the broker's own average cost for the
+    ticker (``Dashboard._untracked_cost_per_share``), the only cost on
+    file for those shares. When given, the untracked shares join cost basis,
+    break-even price and Profit Target at that cost, flagged in the payload
+    as ``untracked_cost_per_share`` so the UI can say where it came from.
+    They stay out of the per-lot position breakeven (it averages the
+    tracked lots' own break-evens) and out of mark-to-market P&L, whose stock
+    leg is the engine's own, lot-by-lot figure.
+
+    ``exit_chain``: the option chain CC TO EXIT is chosen from
+    (``Dashboard._cc_exit_chains``); ``None`` when this wheel needs none."""
+    metrics = _cached_cycle_metrics(
+        metrics_cache,
+        cycle,
+        through,
+        current_price=current_price,
+        dividends=dividends,
+        option_mark_prices=option_mark_prices,
+    )
 
     # A cycle holding no shares right now -- the fallback when a share-acquiring
     # row can't be matched to its own lot below.
@@ -1052,105 +1614,80 @@ def _trade_log_entry(
             return True  # a call-away / sale is complete on arrival
         return _acquire_row_settled(_assignment_disposed, assignment.date, assignment.shares)
 
-    if engine_exact:
-        rows = _trade_log_engine_rows(cycle)
-        rows += [
-            _trade_log_assignment_row(a, is_settled=_assignment_settled(a)) for a in cycle.assignments
-        ]
-        # Dividends are not an engine structure, so the leg/close/assignment
-        # derivation above misses them -- pull them from the raw ledger by the
-        # same underlying + inclusive-window rule the common path uses, so the
-        # cash column (and the running break-even) stays complete.
-        end = cycle.end_date or through
-        rows += [
-            _trade_log_raw_row(t, "Dividend", is_settled=True)
-            for t in transactions
-            if t.row_id in dividend_row_ids
-            and (t.underlying == cycle.underlying or t.underlying in also_tickers)
-            and cycle.start_date <= t.event_date <= end
-        ]
-        attribution_note = (
-            "Same-day close/reopen on this ticker: rows are attributed via the "
-            "engine, and Fees combines commission + fees."
-        )
-    else:
-        end = cycle.end_date or through
-        # Contract-weighted opening price + side per (symbol, close-day), taken
-        # from the engine's own FIFO matching, so a raw closing fill can report
-        # its return against the premium it actually opened at -- even after a
-        # roll or a scaled entry at several prices.
-        close_ref: dict[tuple[str, date], list[tuple[float, float, str]]] = {}
-        # Whether the leg a raw fill belongs to is fully closed -- so its open
-        # row is greyed together with its closes once the position is done.
-        open_settled: dict[tuple[str, date], bool] = {}
-        close_settled: dict[tuple[str, date], bool] = {}
-        open_long_keys: set[tuple[str, date]] = {
-            (leg.occ_symbol, leg.open_date)
-            for leg in cycle.legs
-            if leg.is_open and leg.side == LONG
+    def _stock_or_dividend_settled(t: Transaction) -> bool:
+        if t.row_id in dividend_row_ids or t.action == SELL_STOCK:
+            return True  # cash received / a sale is complete on arrival
+        return _acquire_row_settled(_purchase_disposed, t.event_date, t.contracts)
+
+    # Every option row comes from the engine's own legs/closes -- exact
+    # cycle_id attribution, no date-boundary ambiguity, and a single BTC that
+    # FIFO-closes two separately-opened lots at once becomes two rows, one
+    # per lot, each with its own Return %/Result rather than one row
+    # blending both (see _trade_log_engine_rows). `chain_of` is computed once
+    # here and shared by those rows and open_chain_credits below, so the
+    # ledger and the Roll rate summary can never disagree about which chain
+    # a leg belongs to.
+    chain_of, open_chain_credits = _roll_chain_membership(cycle)
+    rows = _trade_log_engine_rows(cycle, chain_of)
+    # Every leg this wheel ever had -- not just the ones a roll touched --
+    # stamped with the same chain_id/chain_status the ledger rows above
+    # carry, so the Wheel timeline chart can draw the whole history (shares
+    # and every option leg) and still color/connect the rolled ones
+    # consistently with the rest of the page.
+    timeline_legs = leg_rows(cycle)
+    for leg in timeline_legs:
+        leg["chain_id"], leg["chain_status"] = chain_of.get(leg["leg_id"], (None, None))
+    # A broker export that carries the equity leg already yields a real
+    # Buy/Sell Shares row below; only the synthesized legs need adding here.
+    rows += [
+        _trade_log_assignment_row(a, is_settled=_assignment_settled(a))
+        for a in cycle.assignments
+        if a.synthetic
+    ]
+    end = cycle.end_date or through
+    # Shares and dividends are not engine structures, so the leg/close/
+    # assignment derivation above misses them -- pulled from the raw ledger
+    # by the same underlying + inclusive-window rule as everything else.
+    # Fees/commission are combined here too (into Fees), matching every
+    # option row above -- a column that's only ever populated on some rows
+    # would be more confusing than informative.
+    rows += [
+        {
+            **_trade_log_raw_row(t, _trade_log_txn_type(t, dividend_row_ids), is_settled=_stock_or_dividend_settled(t)),
+            "fees": _money(t.total_fees),
+            "commission": None,
         }
-        for leg in cycle.legs:
-            open_settled[(leg.occ_symbol, leg.open_date)] = not leg.is_open
-            for close in leg.closes:
-                close_ref.setdefault((leg.occ_symbol, close.date), []).append(
-                    (close.contracts, leg.open_price, leg.side)
-                )
-                close_settled[(leg.occ_symbol, close.date)] = not leg.is_open
-
-        def _raw_close_pct(t: Transaction) -> float | None:
-            if t.action not in _CLOSING_ACTIONS:
-                return None
-            items = [i for i in close_ref.get((t.occ_symbol, t.event_date), []) if i[1]]
-            total = sum(qty for qty, _op, _sd in items)
-            if total <= 0:
-                return None
-            wavg_open = sum(qty * op for qty, op, _sd in items) / total
-            return _close_return_pct(wavg_open, t.price, items[0][2])
-
-        def _raw_settled(t: Transaction) -> bool:
-            if t.row_id in dividend_row_ids:
-                return True  # a dividend is cash received, complete on arrival
-            if t.action in (STO, BTO):
-                return open_settled.get((t.occ_symbol, t.event_date), False)
-            if t.action in _CLOSING_ACTIONS:
-                return close_settled.get((t.occ_symbol, t.event_date), True)
-            if t.action == SELL_STOCK:
-                return True
-            if t.action == BUY_STOCK:
-                return _acquire_row_settled(_purchase_disposed, t.event_date, t.contracts)
-            return False
-
-        rows = [
-            _trade_log_raw_row(
-                t,
-                _trade_log_txn_type(t, dividend_row_ids),
-                _raw_close_pct(t),
-                is_settled=_raw_settled(t),
-                is_open_long=(
-                    t.action == BTO and (t.occ_symbol, t.event_date) in open_long_keys
-                ),
-            )
-            for t in transactions
-            if (t.underlying == cycle.underlying or t.underlying in also_tickers)
-            and cycle.start_date <= t.event_date <= end
-            and (
-                t.action in OPTION_ACTIONS
-                or t.action in (BUY_STOCK, SELL_STOCK)
-                or t.row_id in dividend_row_ids
-            )
-        ]
-        # A broker export that carries the equity leg already yields a real
-        # Buy/Sell Shares row above; only the synthesized legs need adding.
-        rows += [
-            _trade_log_assignment_row(a, is_settled=_assignment_settled(a))
-            for a in cycle.assignments
-            if a.synthetic
-        ]
-        attribution_note = None
+        for t in transactions
+        if (t.underlying == cycle.underlying or t.underlying in also_tickers)
+        and cycle.start_date <= t.event_date <= end
+        and (t.action in (BUY_STOCK, SELL_STOCK) or t.row_id in dividend_row_ids)
+    ]
+    attribution_note = (
+        "The Fees column adds the broker's commission and its fees together. If one broker "
+        "order closed contracts that were opened at different times, each of those groups "
+        "gets its own row here rather than one row for the whole order, and each row shows "
+        "only its own money."
+    )
 
     rows.sort(key=lambda row: row.pop("_sort"))
+    untracked_costed = untracked_shares > 1e-9 and untracked_cost_per_share is not None
+    # Shares already held before the oldest loaded export (`untracked_shares`,
+    # costed at the broker's average) have no buy row to replay, so the
+    # running break-even below starts out holding them, as if bought at that
+    # cost when the wheel began. Pre-history shares this wheel later sold or
+    # had called away (synthesized PRE_HISTORY lots, disposed at once) were
+    # held at the start too, so they're added back here and leave again on
+    # their own sale rows, ending exactly at today's untracked count. Their
+    # true cost is unknown; the broker average stands in for it, which only
+    # touches the rows before such a sale (the last row is pinned below).
+    opening_shares = 0.0
+    if untracked_costed:
+        opening_shares = untracked_shares + sum(
+            lot.shares - lot.remaining for lot in cycle.share_lots if lot.source == FROM_PRE_HISTORY
+        )
+    opening_cost = opening_shares * untracked_cost_per_share if opening_shares else 0.0
     running = 0.0
-    shares_running = 0.0
+    shares_running = opening_shares
     last_break_even_idx = None
     # FIFO cost-basis replay, mirroring the engine's own _sell_shares_fifo: a
     # queue of [remaining, basis_price] lots in acquisition order, so a running
@@ -1160,7 +1697,11 @@ def _trade_log_entry(
     # An unpriced acquisition (basis_price None) tracks its shares for the
     # count but is excluded from the weighted average, same as an unknown-
     # basis lot is excluded from the summary's cost_basis.
-    lot_queue: list[list[float | None]] = []
+    lot_queue: list[list[float | None]] = (
+        [[opening_shares, untracked_cost_per_share]] if opening_shares else []
+    )
+    # Dates whose share-buying row the replay below has already reached.
+    share_arrival_dates: set[str] = set()
     for idx, row in enumerate(rows):
         running += row.get("net_cash_flow") or 0.0
         row["running_cash_flow"] = _money(running)
@@ -1169,6 +1710,7 @@ def _trade_log_entry(
             shares_running += qty
             if qty > 0:
                 lot_queue.append([qty, row.get("price")])
+                share_arrival_dates.add(row["date"])
             elif qty < 0:
                 to_remove = -qty
                 while to_remove > 1e-9 and lot_queue:
@@ -1196,38 +1738,55 @@ def _trade_log_entry(
         # a whole share: a break-even on fractional DRIP dust is meaningless and
         # divides a tiny denominator into noise.
         if shares_running >= 1.0 - 1e-9:
-            row_be = -running / shares_running
+            # `opening_cost`: the opening shares' cost, which no cash row carries.
+            row_be = (opening_cost - running) / shares_running
             # <= 0 means premium/gains already banked exceed what's still held
             # -- there is no price left to reach (an insight covers it), not a
             # negative stock price. Same guard the summary's break_even_price
             # already applies; this row-level figure never had it.
             row["running_break_even"] = _money(row_be) if row_be > 0 else None
-            # Profit Target's floor is the higher of running cost basis and
-            # running break-even -- same two-way max the summary's
-            # profit_target uses (see below), so the line this builds
-            # shouldn't jump against the pinned final point the way a
-            # break-even-only floor did. Never negative/zero: enough banked
-            # premium to push the floor at or below $0 means there's no price
-            # left to reach yet at this row (an insight covers it at the
-            # summary level), not a negative target.
-            floor_candidates = [v for v in (running_cost_basis, row_be) if v is not None]
+            # Profit Target's floor, as of this row: the highest of running
+            # cost basis, the lot break-even (tracked lots' own break-evens
+            # as of this date) and running break-even -- the same three-way
+            # max the summary's profit_target uses (see below), so the line
+            # this builds agrees with the pinned final point. Never
+            # negative/zero: enough banked premium to push the floor at or
+            # below $0 means there's no price left to reach yet at this row
+            # (an insight covers it at the summary level), not a negative
+            # target.
+            lot_be = _lot_break_even_on(
+                cycle,
+                date.fromisoformat(row["date"]),
+                untracked_shares,
+                same_day_lots_arrived=row["date"] in share_arrival_dates,
+            )
+            row["running_lot_break_even"] = _money(lot_be)
+            floor_candidates = [v for v in (running_cost_basis, lot_be, row_be) if v is not None]
             row_floor = max(floor_candidates) if floor_candidates else None
             row["running_profit_target"] = _profit_target(row_floor) if row_floor and row_floor > 0 else None
             last_break_even_idx = idx
         else:
             row["running_break_even"] = None
+            row["running_lot_break_even"] = None
             row["running_profit_target"] = None
 
     held_lots = [lot for lot in cycle.share_lots if lot.remaining > 1e-9]
     known = [lot for lot in held_lots if lot.basis_known and lot.basis_per_share is not None]
     shares_held = sum(lot.remaining for lot in held_lots)
-    cost_basis = (
-        sum(lot.basis_per_share * lot.remaining for lot in known) / sum(lot.remaining for lot in known)
-        if known
-        else None
+    # Shares with a cost on file: the known-basis lots, plus untracked shares
+    # at the broker's average cost when there is one.
+    costed_qty = sum(lot.remaining for lot in known) + (untracked_shares if untracked_costed else 0.0)
+    costed_total = sum(lot.basis_per_share * lot.remaining for lot in known) + (
+        untracked_shares * untracked_cost_per_share if untracked_costed else 0.0
     )
+    cost_basis = costed_total / costed_qty if costed_qty > 1e-9 else None
+    # Every share the break-even price is spread over: all tracked lots (an
+    # unknown-basis one is carried at the known lots' average, as before)
+    # plus untracked shares once they have a cost.
+    break_even_shares = shares_held + (untracked_shares if untracked_costed else 0.0)
+    lot_credit = lot_option_credit(cycle, untracked_shares=untracked_shares)
     break_even_lots = [
-        (lot.remaining, net_adjusted_cost_basis(cycle, lot))
+        (lot.remaining, net_adjusted_cost_basis(cycle, lot, credit=lot_credit))
         for lot in held_lots
     ]
     break_even_lots = [(qty, value) for qty, value in break_even_lots if value is not None]
@@ -1242,12 +1801,18 @@ def _trade_log_entry(
 
     # P&L per day a position was actually held: total realized P&L of every
     # completed open->close leg (roll segments included) over the sum of their
-    # holding days. Open legs have no finished pair yet.
+    # holding days. Open legs have no finished pair yet. Each leg is floored
+    # at 1 day (never 0): a same-day open+close round trip still held capital
+    # for part of a day, and letting it contribute 0 would inflate this ratio
+    # for free instead of diluting it -- so total_days_held can run higher
+    # than the naive sum of (close date - open date) across legs whenever one
+    # of them was a same-day round trip.
     closed_legs = [leg for leg in cycle.legs if not leg.is_open]
     leg_days = [max(1, leg.days_held or 0) for leg in closed_legs]
     closed_leg_pl = sum(leg.realized_pl for leg in closed_legs)
     total_days_held = sum(leg_days)
     pl_per_day_held = closed_leg_pl / total_days_held if total_days_held else None
+    open_roll_chains_count = len(open_chain_credits)
 
     # A lone directional/long-only cycle keeps its real P&L below but is not
     # running the wheel, so the wheel-framed ratios are withheld -- see
@@ -1257,64 +1822,89 @@ def _trade_log_entry(
     if not cycle.is_wheel:
         pl_per_day_held = None
 
-    # Where the campaign really stands right now, vs the misleading realized-only
-    # figure. Open option legs are valued at expiry (`option_open_premium`: a
-    # long put's whole debit is a loss, a short call's whole credit a gain) --
-    # their remaining time value is not marked, so a held protective put makes
-    # this conservative. `stock_unrealized_pl` marks held shares to the latest
-    # close (None when there is no price / no shares).
-    open_option_pl = metrics.option_open_premium
-    non_stock_pl = metrics.option_realized_pl + metrics.stock_realized_pl + dividends + open_option_pl
+    # Open option legs are valued at expiry for break-even/profit-target
+    # purposes (`option_open_premium`: a long put's whole debit is a loss, a
+    # short call's whole credit a gain, remaining time value never marked) --
+    # deliberately conservative and deliberately *not* reactive to today's
+    # option price, so those two stay fixed lines the stock can actually
+    # close in on (see profit_target below).
+    open_option_pl_at_expiry = metrics.option_open_premium
+    non_stock_pl = metrics.option_realized_pl + metrics.stock_realized_pl + dividends + open_option_pl_at_expiry
     stock_unrealized = metrics.stock_unrealized_pl
+    # Where the campaign really stands right now, vs both the realized-only
+    # figure and the conservative break-even above: each open leg is priced
+    # at its actual current cost to close (`option_open_pl`, from a broker
+    # Positions snapshot's Last price -- see OptionLeg.unrealized_pl), which
+    # matters a lot once a short put/call is ITM and would cost real money to
+    # buy back. A leg with no live mark on hand still falls back to the
+    # expiry valuation, leg by leg. `stock_unrealized_pl` marks held shares to
+    # the latest close (None when there is no price / no shares).
+    non_stock_pl_marked = metrics.option_realized_pl + metrics.stock_realized_pl + dividends + metrics.option_open_pl
     mark_to_market_pl = (
         None
         if shares_held > 1e-9 and stock_unrealized is None
-        else non_stock_pl + (stock_unrealized or 0.0)
+        else non_stock_pl_marked + (stock_unrealized or 0.0)
     )
     # The stock price at which the whole campaign nets to $0: raw cost of the
     # shares still held, less every other dollar the campaign has banked or paid.
     # <= 0 means the premium/profit already banked exceeds the share cost -- there
     # is no "price to reach", so it is reported as None (an insight covers it).
     break_even_price = (
-        cost_basis - non_stock_pl / shares_held
-        if shares_held > 1e-9 and cost_basis is not None
+        cost_basis - non_stock_pl / break_even_shares
+        if break_even_shares > 1e-9 and cost_basis is not None
         else None
     )
     if break_even_price is not None and break_even_price <= 0:
         break_even_price = None
 
-    # Three distinct, phase-gated concepts -- never blended into one number:
+    # Two distinct, phase-gated concepts -- never blended into one number:
     #   wheel_phase == "cc"  (holding shares): profit_target (a stable,
     #     cost-basis-anchored profitable-exit threshold -- deliberately NOT
     #     including current_price/last_close, so it stays a fixed line price
-    #     can actually close in on and cross) and cc_strike_floor (the
-    #     lowest strike worth writing a call at *right now*, reusing
-    #     _build_cc_candidates' target_cc_strike formula exactly, current
-    #     price included -- a market-facing floor, not a recommendation).
-    #   wheel_phase == "csp" (no shares yet): preferred_csp_entry (a
-    #     cushion off today's last close for a fresh put).
+    #     can actually close in on and cross).
+    #   wheel_phase == "csp" (no shares yet): the next step is a fresh put;
+    #     its strike is CSP TO ENTER, a per-ticker figure (wheel/cspentry.py)
+    #     read from the payload's top-level ``csp_to_enter`` map, not stored
+    #     on the wheel.
+    # The phase follows every share really held, untracked ones included; the
+    # targets can still only be anchored to the tracked shares' known cost.
+    # CC TO EXIT (below) is separate again: the next call's strike for the
+    # uncovered shares alone, never this whole-position cost or break-even.
     wheel_phase = None
     profit_target = profit_target_explanation = None
-    preferred_csp_entry = preferred_csp_entry_explanation = None
-    cc_strike_floor = cc_strike_floor_explanation = None
-    if shares_held > 1e-9:
+    holding_shares = shares_held + untracked_shares > 1e-9
+    cc_exit = ccexit.calculate_cc_to_exit(
+        share_blocks=_cc_exit_share_blocks(
+            cycle, untracked_shares, untracked_cost_per_share if untracked_costed else None, lot_credit
+        ),
+        covered_shares=_open_covered_call_shares(cycle),
+        current_price=current_price,
+        expiry=exit_chain.expiry if exit_chain else None,
+        today=exit_chain.today if exit_chain else through,
+        calls=exit_chain.calls if exit_chain else None,
+        chain_unavailable_reason=exit_chain.unavailable_reason if exit_chain else None,
+        risk_free_rate=DIRECTIONAL_RISK_FREE_RATE_ASSUMPTION,
+        quotes_as_of=exit_chain.quotes_as_of if exit_chain else None,
+        fetched_at=exit_chain.fetched_at if exit_chain else None,
+        calculated_at=calculated_at,
+        fees=cc_exit_fees or ccexit.FeeModel(),
+        resistance=exit_chain.resistance if exit_chain else None,
+    )
+    if holding_shares:
         wheel_phase = "cc"
         floor = _profit_target_floor(cost_basis, break_even, break_even_price)
         if floor is not None:
             profit_target = _profit_target(floor)
-            profit_target_explanation = _profit_target_explanation(floor, profit_target)
-        strike_floor = _cc_strike_floor(cost_basis, break_even, break_even_price, current_price)
-        if strike_floor is not None:
-            cc_strike_floor = strike_floor
-            cc_strike_floor_explanation = _cc_strike_floor_explanation(
-                strike_floor, cost_basis, break_even, break_even_price, current_price
+            profit_target_explanation = _profit_target_explanation(
+                floor, profit_target, cost_basis, break_even, break_even_price
+            )
+        else:
+            profit_target_explanation = (
+                "No profit target: these shares were bought before your oldest loaded "
+                "history file, so what you paid for them is unknown."
             )
     elif current_price is not None:
         wheel_phase = "csp"
-        preferred_csp_entry = _money(
-            math.floor(round(current_price * (CSP_ENTRY_OTM_PCT / 100), 4) / 0.5) * 0.5
-        )
-        preferred_csp_entry_explanation = _preferred_csp_entry_explanation(current_price, preferred_csp_entry)
 
     # If the wheel still holds shares, pin the last share-holding row of the
     # ledger exactly to the summary's Break-even price. The running figure above
@@ -1326,13 +1916,13 @@ def _trade_log_entry(
     # cost) the row follows it to a dash. A wheel that is flat now keeps its
     # earlier rows untouched -- they are the historical progression, and the
     # summary's dash is only about the present.
-    if last_break_even_idx is not None and shares_held > 1e-9:
+    if last_break_even_idx is not None and break_even_shares > 1e-9:
         rows[last_break_even_idx]["running_break_even"] = _money(break_even_price)
         rows[last_break_even_idx]["running_profit_target"] = profit_target
         rows[last_break_even_idx]["running_cost_basis"] = _money(cost_basis)
 
     dollars_to_break_even = (
-        shares_held * (break_even_price - current_price)
+        break_even_shares * (break_even_price - current_price)
         if break_even_price is not None and current_price is not None
         else None
     )
@@ -1362,8 +1952,11 @@ def _trade_log_entry(
         _step("Shares sold/away", metrics.stock_realized_pl)
     if dividends:
         _step("Dividends", dividends)
-    if open_option_pl:
-        _step("Open options", open_option_pl)
+    if metrics.option_open_pl:
+        _step(
+            "Open options" if metrics.option_open_pl_marked else "Open options (est.)",
+            metrics.option_open_pl,
+        )
     shares_priced = not (shares_held > 1e-9 and stock_unrealized is None)
     if stock_unrealized:
         _step("Held shares P&L", stock_unrealized)
@@ -1382,13 +1975,18 @@ def _trade_log_entry(
         "cost_basis_per_share": _money(cost_basis),
         "break_even_per_share": _money(break_even),
         "shares_held": round(shares_held, 4),
+        "shares_untracked": round(untracked_shares, 4) if untracked_shares > 1e-6 else None,
+        # The broker's average cost the untracked shares were costed at; None
+        # when there are none, or the broker file has no cost for them.
+        "untracked_cost_per_share": _money(untracked_cost_per_share) if untracked_costed else None,
         "open_contracts": round(sum(leg.remaining_contracts for leg in cycle.legs if leg.is_open), 4),
         "gross_premium_received": _money(metrics.premium_received),
         "option_realized_pl": _money(metrics.option_realized_pl),
         "stock_realized_pl": _money(metrics.stock_realized_pl),
         "net_realized_pl": _money(metrics.net_realized_pl),
         "stock_unrealized_pl": _money(stock_unrealized),
-        "open_option_pl": _money(open_option_pl),
+        "open_option_pl": _money(metrics.option_open_pl),
+        "open_option_pl_marked": metrics.option_open_pl_marked,
         "mark_to_market_pl": _money(mark_to_market_pl),
         "current_price": _money(current_price),
         "break_even_price": _money(break_even_price),
@@ -1397,10 +1995,7 @@ def _trade_log_entry(
         "profit_target": profit_target,
         "profit_target_explanation": profit_target_explanation,
         "profit_target_cushion_pct": PROFIT_TARGET_CUSHION_PCT,
-        "preferred_csp_entry": preferred_csp_entry,
-        "preferred_csp_entry_explanation": preferred_csp_entry_explanation,
-        "cc_strike_floor": cc_strike_floor,
-        "cc_strike_floor_explanation": cc_strike_floor_explanation,
+        **_cc_exit_payload(cc_exit, cycle.underlying),
         "pl_bridge": pl_bridge,
         "insights": wheel_insights(
             cycle,
@@ -1410,6 +2005,7 @@ def _trade_log_entry(
             dividends=dividends,
             break_even_price=break_even_price,
             mark_to_market_pl=mark_to_market_pl,
+            pre_history_cost_known=untracked_costed,
         ),
         "dividends": _money(dividends),
         "total_fees_commissions": _money(total_fees_commissions),
@@ -1430,6 +2026,19 @@ def _trade_log_entry(
         "open_roll_credit": _money(metrics.open_roll_credit),
         "resolved_roll_wins": metrics.resolved_roll_wins,
         "resolved_roll_losses": metrics.resolved_roll_losses,
+        "open_roll_chains": open_roll_chains_count,
+        "open_chain_credits": open_chain_credits,
+        # Every leg and share lot this wheel ever had, plus every same-day
+        # roll and assignment -- everything the Wheel timeline chart needs
+        # to draw the whole wheel (shares, every option leg, and the rolls
+        # connecting one leg to the next) in one picture, independent of
+        # the Dashboard's own date-filtered cycle list (see _cycle_payload,
+        # which the Trade Log never reads: a wheel here must render end to
+        # end even when it's outside the dashboard's current filter).
+        "legs": timeline_legs,
+        "share_lots": _share_lots_payload(cycle, untracked_shares=untracked_shares),
+        "assignment_events": _assignment_events_payload(cycle),
+        "roll_events": _roll_events_payload(cycle),
         "avg_days_in_trade": metrics.avg_days_in_trade,
         "avg_collateral": _money(metrics.avg_collateral),
         "roi_on_avg_wheel_pct": metrics.roi_on_avg_wheel_pct,
@@ -1446,14 +2055,433 @@ def _trade_log_entry(
     }
 
 
+# --------------------------------------------------------------------------
+# Directional (LC/LP) Trade Log card -- every long call/long put leg a
+# cycle has, bought as a synthetic-stock bet or a protective hedge. Shown
+# alongside the wheel card whenever a cycle has at least one long leg, not
+# only for a lone ``kind == "directional"`` cycle -- an ordinary covered-
+# call wheel that also bought a protective put gets both cards: its own
+# wheel card unchanged, plus this one for the put (see
+# _build_directional_card). Reuses the same OptionLeg economics every
+# wheel card already relies on (fees already netted into every cash figure,
+# see wheel.parser.Transaction.amount); the only genuinely new inputs are the
+# live option-chain quote (implied volatility) and the Black-Scholes Greeks
+# derived from it in wheel.optionsmath. Every leg is reported on its own --
+# strike, expiration, cost, breakeven -- in the per-leg rows; DTE and
+# strike/expiration are never blended across legs. The whole position's own
+# breakeven (_position_breakeven below) is the exception: it is a genuine,
+# exact figure -- not an approximation -- whenever every open leg shares the
+# same option type and expiration (the common case: one contract bought
+# across several fills, or several strikes of the same type), and is
+# withheld (None) only when legs mix calls and puts or carry different
+# expirations, where no single "at expiration" price is well-defined.
+# --------------------------------------------------------------------------
+
+
+def _call_payoff_breakeven(strike_weights: Sequence[tuple[float, float]], total_cost: float) -> float | None:
+    """Stock price ``S`` where ``sum(weight * max(S - strike, 0)) ==
+    total_cost`` -- the combined payoff of one or more long calls (or, via
+    :func:`_position_breakeven`'s sign flip, long puts) nets to exactly
+    zero. ``strike_weights`` is ``(strike, shares)`` pairs, ``shares > 0``
+    (duplicate strikes are summed together first).
+
+    The combined payoff is piecewise-linear in ``S``: flat at ``-total_cost``
+    up to the lowest strike, then its slope increases by that strike's
+    ``shares`` every time ``S`` crosses a strike. That makes it convex and
+    non-decreasing, so (given at least one strike with positive weight and
+    ``total_cost`` is what was actually paid, hence > 0) it crosses zero
+    exactly once -- found here by walking the strikes left to right and
+    linearly interpolating within the segment where the sign flips.
+    """
+    groups: dict[float, float] = {}
+    for strike, weight in strike_weights:
+        groups[strike] = groups.get(strike, 0.0) + weight
+    if not groups:
+        return None
+
+    strikes = sorted(groups)
+    value = -total_cost  # the payoff for any S at or below the lowest strike
+    slope = 0.0
+    for index, strike in enumerate(strikes):
+        slope += groups[strike]  # this strike's shares are ITM for every S >= strike
+        next_strike = strikes[index + 1] if index + 1 < len(strikes) else None
+        if next_strike is None:
+            return strike + (-value) / slope if slope > 1e-9 else None
+        next_value = value + slope * (next_strike - strike)
+        if value <= 1e-9 and next_value >= -1e-9 and slope > 1e-9:
+            return strike + (-value) / slope
+        value = next_value
+    return None
+
+
+def _position_breakeven(open_legs: Sequence[dict[str, Any]], total_cost_basis_open: float) -> float | None:
+    """The whole position's own breakeven at expiration, or ``None`` when
+    that isn't a single well-defined price (mixed calls and puts, or
+    legs expiring on different dates -- see the per-leg ``breakeven_price``
+    on each row instead). ``open_legs`` are the already-built per-leg
+    dicts from :func:`_directional_leg_row`.
+    """
+    if not open_legs:
+        return None
+    rights = {leg["right"] for leg in open_legs}
+    expirations = {leg["expiration"] for leg in open_legs}
+    if len(rights) != 1 or len(expirations) != 1:
+        return None
+    right = next(iter(rights))
+    pairs = [(leg["strike"], leg["contracts_open"] * OPTION_MULTIPLIER) for leg in open_legs]
+    if right == "P":
+        # intrinsic_put(S, K) == intrinsic_call(-S, -K): solve the mirrored
+        # call problem on the negated strikes, then negate the root back.
+        pairs = [(-strike, weight) for strike, weight in pairs]
+    root = _call_payoff_breakeven(pairs, total_cost_basis_open)
+    if root is None:
+        return None
+    return -root if right == "P" else root
+
+
+def _directional_leg_row(
+    leg: OptionLeg,
+    *,
+    through: date,
+    current_price: float | None,
+    option_mark_prices: dict[str, float],
+    chain_quotes: dict[tuple[str, date, float, str], marketdata.OptionContractQuote],
+) -> dict[str, Any]:
+    """One long leg of a directional cycle. ``cost_basis_open``/
+    ``capital_committed``/``max_loss_remaining`` all equal the same number
+    for a standalone long option (what's still paid in on the open portion)
+    -- they are reported as separate fields because they answer different
+    questions on the card (cost basis, capital tied up, worst case), not
+    because they are computed differently.
+    """
+    is_put = leg.right == "P"
+    type_code = "LP" if is_put else "LC"
+    is_open = leg.is_open
+    contracts_open = leg.remaining_contracts
+
+    cost_per_contract = abs(leg.cash_per_contract)  # already fee-net, see Transaction.amount
+    cost_per_share = cost_per_contract / OPTION_MULTIPLIER
+    cost_basis_open = cost_per_contract * contracts_open  # == abs(leg.open_premium)
+    cost_basis_total = abs(leg.open_cash)  # the whole leg's original cost, closed contracts included
+
+    mark_price = option_mark_prices.get(leg.occ_symbol) if is_open else None
+    market_value = mark_price * OPTION_MULTIPLIER * contracts_open if mark_price is not None else None
+    is_marked = market_value is not None
+    # Conservative fallback for an open leg with no live mark (expires
+    # worthless) -- the same convention cycle_metrics.option_open_pl already
+    # uses for the wheel card; None (not 0) once the leg is fully closed,
+    # since there is nothing left open to mark.
+    unrealized_pl = (
+        leg.unrealized_pl(mark_price) if is_marked else (leg.open_premium if is_open else None)
+    )
+    realized_pl = leg.realized_pl  # closed portion only; 0.0 until anything closes
+    total_pl = realized_pl + (unrealized_pl or 0.0)
+
+    breakeven = (leg.strike - cost_per_share) if is_put else (leg.strike + cost_per_share)
+    distance_to_breakeven = current_price - breakeven if current_price is not None else None
+    distance_to_breakeven_pct = (
+        100.0 * distance_to_breakeven / current_price
+        if distance_to_breakeven is not None and current_price
+        else None
+    )
+
+    intrinsic_total = extrinsic_value = extrinsic_value_pct = None
+    if current_price is not None:
+        intrinsic_total = (
+            intrinsic_value_per_share(spot=current_price, strike=leg.strike, right=leg.right)
+            * OPTION_MULTIPLIER
+            * contracts_open
+        )
+        if market_value is not None:
+            extrinsic_value = market_value - intrinsic_total
+            extrinsic_value_pct = 100.0 * extrinsic_value / market_value if market_value > 1e-9 else None
+
+    days_to_expiry = (leg.expiry - through).days
+    quote = chain_quotes.get((leg.underlying, leg.expiry, leg.strike, leg.right)) if is_open else None
+    implied_volatility = quote.implied_volatility if quote else None
+    # Liquidity read for the roll/exit checklist -- the same chain quote
+    # already fetched for implied volatility, just two more of its fields.
+    bid = quote.bid if quote else None
+    ask = quote.ask if quote else None
+    bid_ask_spread_pct = (
+        100.0 * (ask - bid) / ask if bid is not None and ask is not None and ask > 1e-9 else None
+    )
+
+    greeks = None
+    greeks_unavailable_reason = None
+    if not is_open:
+        greeks_unavailable_reason = "position is closed"
+    elif days_to_expiry <= 0:
+        greeks_unavailable_reason = "contract has expired"
+    elif current_price is None:
+        greeks_unavailable_reason = "no current stock price"
+    elif implied_volatility is None:
+        greeks_unavailable_reason = "implied volatility unavailable"
+    else:
+        greeks = black_scholes_greeks(
+            spot=current_price,
+            strike=leg.strike,
+            days_to_expiry=days_to_expiry,
+            implied_volatility=implied_volatility,
+            right=leg.right,
+            risk_free_rate=DIRECTIONAL_RISK_FREE_RATE_ASSUMPTION,
+        )
+        if greeks is None:
+            greeks_unavailable_reason = "model inputs out of range"
+
+    delta = greeks.delta if greeks else None
+    delta_adjusted_shares = delta * OPTION_MULTIPLIER * contracts_open if delta is not None else None
+    delta_adjusted_dollars = (
+        delta_adjusted_shares * current_price
+        if delta_adjusted_shares is not None and current_price is not None
+        else None
+    )
+
+    capital_committed = leg.collateral_on(through)  # == cost_basis_open for a long leg
+
+    return {
+        "leg_id": leg.leg_id,
+        "type_code": type_code,
+        "right": leg.right,
+        "strike": leg.strike,
+        "expiration": _iso(leg.expiry),
+        "days_to_expiry": days_to_expiry,
+        "open_date": _iso(leg.open_date),
+        "close_date": _iso(leg.close_date),
+        "days_held": leg.days_held if not is_open else (through - leg.open_date).days,
+        "is_open": is_open,
+        "outcome": leg.outcome,
+        "contracts_opened": round(leg.contracts, 4),
+        "contracts_open": round(contracts_open, 4),
+        "contracts_closed": round(leg.closed_contracts, 4),
+        "cost_per_contract": _money(cost_per_contract),
+        "cost_per_share": _money(cost_per_share),
+        "cost_basis_open": _money(cost_basis_open),
+        "cost_basis_total": _money(cost_basis_total),
+        "market_value": _money(market_value),
+        "market_value_is_live_mark": is_marked,
+        "unrealized_pl": _money(unrealized_pl),
+        "unrealized_pl_pct": (
+            round(100.0 * unrealized_pl / cost_basis_open, 2)
+            if unrealized_pl is not None and cost_basis_open > 1e-9
+            else None
+        ),
+        "realized_pl": _money(realized_pl),
+        "total_pl": _money(total_pl),
+        "breakeven_price": _money(breakeven),
+        "distance_to_breakeven": _money(distance_to_breakeven),
+        "distance_to_breakeven_pct": (
+            round(distance_to_breakeven_pct, 2) if distance_to_breakeven_pct is not None else None
+        ),
+        "intrinsic_value": _money(intrinsic_total) if intrinsic_total is not None else None,
+        "extrinsic_value": _money(extrinsic_value),
+        "extrinsic_value_pct": round(extrinsic_value_pct, 1) if extrinsic_value_pct is not None else None,
+        "implied_volatility_pct": (
+            round(implied_volatility * 100.0, 1) if implied_volatility is not None else None
+        ),
+        "quote_last_trade": _iso_dt(quote.last_trade_date) if quote else None,
+        "bid": _money(bid),
+        "ask": _money(ask),
+        "bid_ask_spread_pct": round(bid_ask_spread_pct, 1) if bid_ask_spread_pct is not None else None,
+        "delta": round(delta, 4) if delta is not None else None,
+        "delta_adjusted_shares": round(delta_adjusted_shares, 2) if delta_adjusted_shares is not None else None,
+        "delta_adjusted_dollars": _money(delta_adjusted_dollars),
+        "delta_pct_of_100_shares": round(delta * 100.0, 1) if delta is not None else None,
+        "gamma": round(greeks.gamma, 5) if greeks else None,
+        "theta_per_day": _money(greeks.theta * OPTION_MULTIPLIER * contracts_open) if greeks else None,
+        "vega": _money(greeks.vega * OPTION_MULTIPLIER * contracts_open) if greeks else None,
+        "greeks_unavailable_reason": greeks_unavailable_reason,
+        "capital_committed": _money(capital_committed),
+        "max_loss_remaining": _money(cost_basis_open),
+    }
+
+
+def _build_directional_card(
+    cycle: Cycle,
+    through: date,
+    *,
+    current_price: float | None,
+    option_mark_prices: dict[str, float],
+    chain_quotes: dict[tuple[str, date, float, str], marketdata.OptionContractQuote],
+    account_total_value: float | None,
+) -> dict[str, Any] | None:
+    """The directional (LC/LP) Trade Log card payload for every *long* leg
+    this cycle has -- ``None`` only when it has none at all. This used to
+    gate on ``cycle.kind == "directional"`` (a lone bought-options cycle
+    with no CSP/covered-call ever sold), which hid the card for an
+    otherwise-ordinary wheel that also carries a long hedge leg (e.g. a
+    protective put bought alongside covered calls, still ``kind ==
+    "wheel"`` because of those calls). The card now attaches whenever the
+    cycle has at least one long leg, period -- short legs are filtered out
+    here (never fed to :func:`_directional_leg_row`, whose cost/breakeven/
+    max-loss formulas assume a bought, not sold, option) and stay the
+    wheel card's own concern entirely; the two cards can both be shown for
+    the same cycle. Per-leg detail from :func:`_directional_leg_row`, plus
+    a position-level total that sums only the figures that are safe to sum
+    across legs at different strikes or expirations (cost, market value,
+    P&L, delta exposure, capital committed) -- never a single breakeven/
+    DTE/strike blended across unlike contracts.
+    """
+    long_legs = [leg for leg in cycle.legs if leg.side == LONG]
+    if not long_legs:
+        return None
+
+    legs = [
+        _directional_leg_row(
+            leg,
+            through=through,
+            current_price=current_price,
+            option_mark_prices=option_mark_prices,
+            chain_quotes=chain_quotes,
+        )
+        for leg in sorted(long_legs, key=lambda leg: (leg.open_date, leg.leg_id))
+    ]
+    open_legs = [row for row in legs if row["is_open"]]
+
+    distinct_codes = {row["type_code"] for row in open_legs} or {row["type_code"] for row in legs}
+    position_type = next(iter(distinct_codes)) if len(distinct_codes) == 1 else "MULTI"
+
+    def _sum(field: str, rows: Sequence[dict[str, Any]] = legs) -> float:
+        return sum(row[field] for row in rows if row.get(field) is not None)
+
+    total_cost_basis_open = _sum("cost_basis_open", open_legs)
+    total_market_value = (
+        _sum("market_value", open_legs) if any(r["market_value"] is not None for r in open_legs) else None
+    )
+    any_unmarked_open_leg = any(r["is_open"] and not r["market_value_is_live_mark"] for r in open_legs)
+    total_unrealized_pl = (
+        _sum("unrealized_pl", open_legs) if any(r["unrealized_pl"] is not None for r in open_legs) else None
+    )
+    total_realized_pl = _sum("realized_pl")
+    total_pl = total_realized_pl + (total_unrealized_pl or 0.0)
+    # Everything ever paid across every leg, open or closed -- the base for
+    # a closed position's return on cost (total P&L ÷ total paid), since a
+    # closed position has no open cost basis left to divide by.
+    total_cost_basis_all = _sum("cost_basis_total")
+    first_open_date = min((row["open_date"] for row in legs if row["open_date"]), default=None)
+    last_close_date = (
+        max((row["close_date"] for row in legs if row["close_date"]), default=None) if not open_legs else None
+    )
+
+    # Summed only over legs whose delta is actually known -- a leg with no
+    # usable quote/IV contributes nothing, never a guessed value. That makes
+    # the net figure an understatement whenever it's not every open leg, so
+    # `net_delta_known_for_all_open_legs` says whether it is the *whole*
+    # position's exposure or only part of it; the card must show that
+    # caveat rather than present a partial sum as the complete answer.
+    any_delta_known = any(r["delta_adjusted_shares"] is not None for r in open_legs)
+    net_delta_known_for_all_open_legs = bool(open_legs) and all(
+        r["delta_adjusted_shares"] is not None for r in open_legs
+    )
+    net_delta_adjusted_shares = _sum("delta_adjusted_shares", open_legs) if any_delta_known else None
+    net_delta_adjusted_dollars = (
+        _sum("delta_adjusted_dollars", open_legs)
+        if any(r["delta_adjusted_dollars"] is not None for r in open_legs)
+        else None
+    )
+    capital_committed = _sum("capital_committed", open_legs)
+    max_loss_remaining = _sum("max_loss_remaining", open_legs)
+    capital_committed_pct_of_account = (
+        round(100.0 * capital_committed / account_total_value, 2)
+        if account_total_value and capital_committed
+        else None
+    )
+    # Magnitude only -- a put's delta-adjusted $ is negative (downside
+    # exposure), but this ratio answers "how much stock-like movement per
+    # dollar paid in," which is a size question, not a direction one; the
+    # signed cells above already carry the bullish/bearish distinction.
+    # Computed from the unrounded sums above, never from the `_money()`-
+    # rounded dict values, so it always reconciles exactly with
+    # net_delta_adjusted_dollars / capital_committed at full precision.
+    exposure_to_capital_ratio = (
+        round(abs(net_delta_adjusted_dollars) / capital_committed, 4)
+        if net_delta_adjusted_dollars is not None and capital_committed > 1e-9
+        else None
+    )
+
+    position_breakeven = _position_breakeven(open_legs, total_cost_basis_open)
+    position_breakeven_distance = (
+        current_price - position_breakeven if position_breakeven is not None and current_price is not None else None
+    )
+    position_breakeven_distance_pct = (
+        100.0 * position_breakeven_distance / current_price
+        if position_breakeven_distance is not None and current_price
+        else None
+    )
+
+    return {
+        "position_type": position_type,
+        "status": "OPEN" if open_legs else "CLOSED",
+        "legs": legs,
+        "open_leg_count": len(open_legs),
+        "total_leg_count": len(legs),
+        "current_price": _money(current_price),
+        "total_cost_basis_open": _money(total_cost_basis_open),
+        "total_market_value": _money(total_market_value),
+        "market_value_is_live_mark": bool(open_legs) and not any_unmarked_open_leg,
+        "total_unrealized_pl": _money(total_unrealized_pl),
+        "total_unrealized_pl_pct": (
+            round(100.0 * total_unrealized_pl / total_cost_basis_open, 2)
+            if total_unrealized_pl is not None and total_cost_basis_open > 1e-9
+            else None
+        ),
+        "total_realized_pl": _money(total_realized_pl),
+        "total_pl": _money(total_pl),
+        "total_cost_basis_all": _money(total_cost_basis_all),
+        "total_return_on_cost_pct": (
+            round(100.0 * total_pl / total_cost_basis_all, 2) if total_cost_basis_all > 1e-9 else None
+        ),
+        "first_open_date": first_open_date,
+        "last_close_date": last_close_date,
+        "net_delta_adjusted_shares": (
+            round(net_delta_adjusted_shares, 2) if net_delta_adjusted_shares is not None else None
+        ),
+        "net_delta_adjusted_dollars": _money(net_delta_adjusted_dollars),
+        "net_delta_known_for_all_open_legs": net_delta_known_for_all_open_legs,
+        "capital_committed": _money(capital_committed),
+        "max_loss_remaining": _money(max_loss_remaining),
+        "capital_committed_pct_of_account": capital_committed_pct_of_account,
+        "exposure_to_capital_ratio": exposure_to_capital_ratio,
+        "position_breakeven": _money(position_breakeven),
+        "position_breakeven_distance": _money(position_breakeven_distance),
+        "position_breakeven_distance_pct": (
+            round(position_breakeven_distance_pct, 2) if position_breakeven_distance_pct is not None else None
+        ),
+    }
+
+
 def _hedge_pl_phrase(value: float | None) -> str:
     if value is None:
-        return "at an unknown mark"
+        return "at an unknown value, because there is no current share price"
     if value > 1:
         return f"up +${value:,.0f}"
     if value < -1:
-        return f"down -${abs(value):,.0f}"
-    return "roughly flat"
+        return f"down ${abs(value):,.0f}"
+    return "roughly even"
+
+
+def _merge_same_contract_legs(legs: Sequence[OptionLeg]) -> OptionLeg:
+    """Fold multiple open long legs for the very same contract (same right,
+    strike and expiry) into one -- a hedge built up over separate buys, or
+    one order that filled in pieces, is a single position to a viewer, not
+    several identical-looking hedge cards. Mirrors ``_merge_same_contract_rows``,
+    the open-positions-table equivalent, but at the leg level so the merged
+    leg's own properties (``remaining_contracts``, ``cash_per_contract``, ...)
+    stay correct for ``_open_hedge_entry`` to read -- including the rare case
+    where one of the fills has since been partially closed.
+    """
+    if len(legs) == 1:
+        return legs[0]
+    base = legs[0]
+    return replace(
+        base,
+        leg_id="+".join(leg.leg_id for leg in legs),
+        contracts=sum(leg.contracts for leg in legs),
+        open_date=min(leg.open_date for leg in legs),
+        open_cash=sum(leg.open_cash for leg in legs),
+        open_fees=sum(leg.open_fees for leg in legs),
+        closes=[close for leg in legs for close in leg.closes],
+    )
 
 
 def _open_hedge_entry(
@@ -1560,13 +2588,15 @@ def _open_hedge_entry(
         if not cycle.is_wheel:
             if phase == "runway":
                 message = (
-                    f"Directional {kind}, no wheel premium behind it. Theta eats its cost daily; "
-                    f"cut it or keep the exposure on purpose."
+                    f"A {kind} bought outright as a bet on the share price, with no cash from "
+                    f"sold options paying for it. It loses a little value every day simply "
+                    f"because time is passing. Sell it, or keep the bet on purpose."
                 )
             else:
                 message = (
-                    f"Directional {kind}, {days_to_expiry}d left. Close for time value or hold "
-                    f"for the move, it finances nothing."
+                    f"A {kind} bought outright as a bet on the share price, {days_to_expiry} "
+                    f"days left. Sell it while part of its price still pays for the time "
+                    f"remaining, or hold it for the move; no sold options cover its cost."
                 )
         else:
             # Wheel-attached, but intrinsic value now dwarfs the original
@@ -1574,36 +2604,45 @@ def _open_hedge_entry(
             # hedge itself, not cheap insurance with runway left to sell
             # puts against.
             message = (
-                f"${intrinsic:,.0f} of this ${cost:,.0f} hedge is already intrinsic value, not "
-                f"time decay: it's trading like a directional {kind} now, not insurance with "
-                f"runway left. Close it to lock in the move, or hold it on purpose for more."
+                f"This protective {kind} cost ${cost:,.0f}, and ${intrinsic:,.0f} of its value "
+                f"is now just the gap between its strike and the share price, not payment for "
+                f"the time it has left. It behaves like a bet on the share price rather than "
+                f"insurance. Sell it to bank the move, or keep it on purpose for more."
             )
         phase = "directional"
     elif phase == "runway":
         headline = f"RUNWAY · {days_to_expiry}d"
         if losing:
             message = (
-                f"Wheel is {pl_phrase}"
-                f"{' with shares below cost' if shares_held > 1e-9 else ''}. Keep this hedge "
-                f"and keep selling puts to carry its cost. Do not close it while the wheel "
-                f"is underwater."
+                f"This position is {pl_phrase}"
+                f"{' with shares worth less than they cost' if shares_held > 1e-9 else ''}. "
+                f"Keep this protective {kind} and keep selling options to pay for it. Do not "
+                f"close it while the position is behind."
             )
         else:
             message = (
-                f"Runway left to sell puts against this hedge, plan to sell it around two "
-                f"months out to salvage its time value."
+                f"{days_to_expiry} days left on this protective {kind}, enough time to keep "
+                f"selling options while it covers you. Plan to sell it with about two months "
+                f"left, while part of its price still pays for the time remaining."
             )
     elif phase == "wind_down":
         headline = f"WIND DOWN · {days_to_expiry}d"
         message = (
-            f"{days_to_expiry}d left, inside two months. Sell the hedge now to recover its "
-            f"time value{intrinsic_phrase}, then stop adding puts against it."
+            f"{days_to_expiry} days left, under two months. Sell this protective {kind} now "
+            f"while part of its price still pays for the time remaining{intrinsic_phrase}, "
+            f"then stop selling new options against it."
         )
         if losing:
-            message += f" Wheel is {pl_phrase}; roll to a later expiry if you still want protection."
+            message += (
+                f" This position is {pl_phrase}; replace it with one expiring later if you "
+                f"still want the cover."
+            )
     else:  # expiring
         headline = f"EXPIRING · {days_to_expiry}d"
-        message = f"{days_to_expiry}d left, time value nearly gone{intrinsic_phrase}. Close it or let it lapse."
+        message = (
+            f"{days_to_expiry} days left, so almost none of its price still pays for time "
+            f"remaining{intrinsic_phrase}. Sell it, or let it expire."
+        )
 
     return {
         "cycle_id": cycle.cycle_id,
@@ -1686,10 +2725,7 @@ def _open_position_row(
     wheel_phase: str | None = None,
     profit_target: float | None = None,
     profit_target_explanation: str | None = None,
-    preferred_csp_entry: float | None = None,
-    preferred_csp_entry_explanation: str | None = None,
-    cc_strike_floor: float | None = None,
-    cc_strike_floor_explanation: str | None = None,
+    cc_exit_fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One open option leg -- a short covered call / cash-secured put, or a long
     put / call (a protective hedge or a directional punt) -- framed the way the
@@ -1805,10 +2841,7 @@ def _open_position_row(
         "wheel_phase": wheel_phase,
         "profit_target": _money(profit_target),
         "profit_target_explanation": profit_target_explanation,
-        "preferred_csp_entry": _money(preferred_csp_entry),
-        "preferred_csp_entry_explanation": preferred_csp_entry_explanation,
-        "cc_strike_floor": _money(cc_strike_floor),
-        "cc_strike_floor_explanation": cc_strike_floor_explanation,
+        **(cc_exit_fields or _cc_exit_fields(None)),
         "moneyness_pct": round(moneyness_pct, 2) if moneyness_pct is not None else None,
         "in_the_money": in_the_money,
         "last_close": _money(last_close),
@@ -1945,8 +2978,9 @@ def _btc_targets(row: dict[str, Any]) -> list[float] | None:
 
 
 # Target annualized return a rolled contract needs to clear for the roll
-# itself to be worth doing, versus just taking the assignment/call-away.
-_ROLL_TARGET_ANNUALIZED_YIELD = 0.30
+# itself to be worth doing, versus just taking the assignment/call-away. The
+# same wheel minimum a new CSP has to clear (CSP TO ENTER), one constant.
+_ROLL_TARGET_ANNUALIZED_YIELD = cspentry.MIN_ANNUALIZED_RETURN_PCT / 100
 
 
 def _next_week_friday(today: date) -> date:
@@ -2085,10 +3119,7 @@ def _no_contract_open_position_row(
         "wheel_phase": wheel.get("wheel_phase"),
         "profit_target": wheel.get("profit_target"),
         "profit_target_explanation": wheel.get("profit_target_explanation"),
-        "preferred_csp_entry": wheel.get("preferred_csp_entry"),
-        "preferred_csp_entry_explanation": wheel.get("preferred_csp_entry_explanation"),
-        "cc_strike_floor": wheel.get("cc_strike_floor"),
-        "cc_strike_floor_explanation": wheel.get("cc_strike_floor_explanation"),
+        **_cc_exit_fields(wheel),
         "moneyness_pct": None,
         "in_the_money": None,
         "last_close": _money(current_price),
@@ -2167,12 +3198,12 @@ def _reconciliation(
         ),
         "synthetic_assignment_cash": _money(synthetic),
         "note": (
-            "Option cash comes verbatim from the broker's Amount column."
+            "Cash from option trades is taken exactly as your broker reported it."
             + (
-                f" {len(equity_rows)} equity rows supply real share fills."
+                f" {len(equity_rows)} share trades in the file supply the real share prices."
                 if equity_rows
-                else " Assignment share movements are synthesized at the strike, "
-                "because this export contains no equity rows."
+                else " Your file lists no share trades, so when an option was exercised the "
+                "share purchase or sale is worked out at the option's strike price instead."
             )
         ),
     }
@@ -2190,6 +3221,14 @@ def _reconciliation(
 # LIVE_PRICE_POLL_MS (wheel/static/app.js) so its periodic poll actually
 # lands a fresh quote each time instead of re-reading this cache.
 _LIVE_PRICE_TTL_SECONDS = 15.0
+
+# Option-chain snapshots, shared by every Dashboard in the process (see
+# Dashboard._option_chains): {(ticker, expiry): (monotonic fetch time,
+# snapshot | None, warning | None, UTC fetch time)}. The lock guards the dict
+# only; fetches run outside it, so two concurrent builds can at worst fetch
+# the same stale pair twice.
+_OPTION_CHAIN_CACHE: dict[tuple[str, date], tuple[float, Any, str | None, datetime]] = {}
+_OPTION_CHAIN_CACHE_LOCK = threading.Lock()
 
 
 class Dashboard:
@@ -2314,6 +3353,9 @@ class Dashboard:
         self._open_positions: list[dict[str, Any]] | None = None
         self._cc_candidates: list[dict[str, Any]] | None = None
         self._csp_candidates: list[dict[str, Any]] | None = None
+        # {TICKER: CSP TO ENTER payload}: built once per price refresh and
+        # read by every surface, so they can only ever agree.
+        self._csp_to_enter: dict[str, dict[str, Any]] | None = None
         # _cycle_metrics (below) is called 2-3 times per cycle per build --
         # the cycle list, the trade log, and the hedge banner each want it --
         # always with the same (cycle, through, current_price, dividends)
@@ -2549,7 +3591,10 @@ class Dashboard:
             return {
                 "available": False,
                 "warnings": list(self.position_warnings)
-                + ["no Portfolio Positions snapshot found for this account"],
+                + [
+                    "Add a Fidelity Portfolio Positions export for this account to see what "
+                    "it holds and what it is worth."
+                ],
                 "snapshot_files": [],
             }
 
@@ -2569,24 +3614,14 @@ class Dashboard:
         # predates -- an assignment/call-away posts to the transaction history
         # on the next business day, two calendar days late across a weekend,
         # so a snapshot taken right around expiry can look stale by that same
-        # money days after it has actually already arrived. Assignment rows
-        # carry their true date inline ("AS OF 09-18-26"), parsed into
-        # `as_of_date`; ordinary rows have none and are judged by `run_date`,
-        # which for them *is* the real posting day (no assignment-style lag).
-        # `>=` for the former, plain `>` for the latter: a same-day assignment
-        # can't be told apart from one that posted hours before that evening's
-        # snapshot, so it stays conservatively flagged, while an ordinary
-        # same-day trade -- already settled and in the snapshot's own cash
-        # total by definition -- must not be double-counted here too. `amount`
-        # is the authoritative net cash flow for every row (already net of
+        # money days after it has actually already arrived (see
+        # _not_yet_in_snapshot for the date rule). `amount` is the
+        # authoritative net cash flow for every row (already net of
         # commissions and fees), so this sum is an exact answer, not an
         # estimate. Compared to `total_value` below to flag it only when it is
         # large enough to matter.
-        def _not_yet_reflected(t: Transaction) -> bool:
-            return t.as_of_date >= as_of_day if t.as_of_date is not None else t.run_date > as_of_day
-
         cash_pending_since_snapshot = round(
-            sum(t.amount for t in self.transactions if _not_yet_reflected(t)), 2
+            sum(t.amount for t in self.transactions if _not_yet_in_snapshot(t, as_of_day)), 2
         )
 
         wheel_tickers = {cycle.underlying for cycle in self.all_cycles}
@@ -2607,8 +3642,8 @@ class Dashboard:
         # snapshot still reports its full market value in `equity_value` (and
         # therefore `total_value`), but with no real share count to attach a
         # cost basis to, `wheel_capital_deployed` counts essentially none of
-        # it -- the single biggest reason "True capital deployed" can
-        # undercount `total_value` by a wide margin even for a fully-tracked
+        # it -- the single biggest reason "Capital at risk" can undercount
+        # `total_value` by a wide margin even for a fully-tracked
         # wheel. Compared per ticker so a *partially* tracked position (e.g.
         # 30 of 60 real shares visible) only contributes its untracked
         # fraction, not the whole position.
@@ -2697,7 +3732,10 @@ class Dashboard:
         if not self.snapshots:
             return {
                 "available": False,
-                "warnings": ["no Portfolio Positions snapshot found for this account"],
+                "warnings": [
+                    "Add a Fidelity Portfolio Positions export for this account to compare "
+                    "its growth against an index."
+                ],
             }
 
         primary_account = latest_snapshot(self.snapshots).account_number
@@ -2728,10 +3766,10 @@ class Dashboard:
             return {
                 "available": False,
                 "warnings": [
-                    "at least two Portfolio Positions snapshots, taken on different dates, are "
-                    "needed to compute a return, only one is available so far (or add an "
-                    "'opening_balances' entry for this account to data/accounts.json to supply "
-                    "an earlier starting point manually)"
+                    "Two Portfolio Positions exports taken on different dates are needed to "
+                    "work out a return, and only one is on file so far. Add a second export, "
+                    "or set an 'opening_balances' entry for this account in "
+                    "data/accounts.json to supply an earlier starting value by hand."
                 ],
             }
 
@@ -2920,15 +3958,18 @@ class Dashboard:
         filter, the same "a wheel is a historical unit" reasoning
         ``_build_wheel_return`` / ``_build_net_worth`` follow.
 
-        Transaction attribution is by underlying + inclusive date span, which is
-        only safe while a ticker's cycles are strictly separated in time. The
-        engine can legally close one cycle and open the next on the same day, so
-        any same-ticker pair that touches (or, defensively, overlaps) switches to
-        engine-exact attribution instead -- see ``_trade_log_entry``.
+        Every option row is attributed via the engine's own legs/closes, not
+        by replaying raw transactions against a date span -- exact even when
+        the engine legally closes one cycle and opens the next on the same
+        day -- see ``_trade_log_entry``. Only share/dividend rows still need
+        the underlying + inclusive-date-span filter, since shares aren't an
+        engine structure.
         """
         through = self.last_date or date.today()
         dividend_row_ids = {t.row_id for t in cf.dividend_transactions(self.transactions)}
         dividends = dividends_by_cycle(self.all_cycles, self.transactions)
+        option_mark_prices = self._option_mark_prices()
+        chain_quotes = self._directional_chain_quotes()
 
         by_underlying: dict[str, list[Cycle]] = {}
         for cycle in self.all_cycles:
@@ -2942,20 +3983,27 @@ class Dashboard:
         for old, new in getattr(self.engine, "_ticker_alias", {}).items():
             former_of.setdefault(new, set()).add(old)
 
-        engine_exact: set[str] = set()
+        # A genuine time overlap between two same-ticker cycles is a data-
+        # quality anomaly worth flagging -- row attribution itself no longer
+        # depends on it (every wheel is engine-attributed, see
+        # _trade_log_entry), but it's still unusual enough to call out.
         warnings: list[str] = []
         for group in by_underlying.values():
             ordered = sorted(group, key=lambda cycle: cycle.start_date)
             for prev, nxt in zip(ordered, ordered[1:]):
-                prev_end = prev.end_date or through
-                if nxt.start_date <= prev_end:
-                    engine_exact.update((prev.cycle_id, nxt.cycle_id))
-                    if prev.end_date is not None and nxt.start_date < prev.end_date:
-                        warnings.append(
-                            f"{prev.underlying}: cycles {prev.cycle_id} and {nxt.cycle_id} "
-                            "overlap in time, Trade Log attributed them via the engine"
-                        )
+                if prev.end_date is not None and nxt.start_date < prev.end_date:
+                    warnings.append(
+                        f"{prev.underlying}: cycles {prev.cycle_id} and {nxt.cycle_id} overlap in time"
+                    )
 
+        ordered_cycles = sorted(self.all_cycles, key=lambda cycle: (cycle.start_date, cycle.underlying))
+        untracked_by_cycle = self._untracked_shares_by_cycle()
+        broker_share_costs = self._broker_share_costs_by_symbol()
+        exit_chains = self._cc_exit_chains(current_prices, untracked_by_cycle)
+        cc_exit_fees = self._cc_exit_fee_model()
+        # One stamp for the whole build: every wheel's CC TO EXIT, and every
+        # table that copies it, reports the same calculation time.
+        cc_exit_calculated_at = datetime.now(timezone.utc)
         wheels = [
             _trade_log_entry(
                 cycle,
@@ -2964,27 +4012,49 @@ class Dashboard:
                 name=self._company_names.get(cycle.underlying),
                 dividend_row_ids=dividend_row_ids,
                 dividends=dividends.get(cycle.cycle_id, 0.0),
-                engine_exact=cycle.cycle_id in engine_exact,
                 current_price=current_prices.get(cycle.underlying),
                 also_tickers=former_of.get(cycle.underlying, frozenset()),
                 metrics_cache=self._cycle_metrics_cache,
+                option_mark_prices=option_mark_prices,
+                untracked_shares=untracked_by_cycle.get(cycle.cycle_id, 0.0),
+                untracked_cost_per_share=self._untracked_cost_per_share(cycle, broker_share_costs),
+                exit_chain=exit_chains.get(cycle.cycle_id),
+                calculated_at=cc_exit_calculated_at,
+                cc_exit_fees=cc_exit_fees,
             )
-            for cycle in sorted(self.all_cycles, key=lambda cycle: (cycle.start_date, cycle.underlying))
+            for cycle in ordered_cycles
         ]
 
         # Each wheel's currently-committed capital as a share of the account:
         # of total account value when a Positions snapshot is on hand, otherwise
         # of the capital committed across every wheel right now.
         net_worth = getattr(self, "_net_worth", None) or {}
-        if net_worth.get("available") and net_worth.get("total_value"):
-            denom, denom_label = net_worth["total_value"], "account value"
+        account_total_value = net_worth.get("total_value") if net_worth.get("available") else None
+        if account_total_value:
+            denom, denom_label = account_total_value, "the total account value"
         else:
             denom = sum(w["capital_committed_now"] or 0.0 for w in wheels)
-            denom_label = "capital in wheels"
+            denom_label = "the cash tied up across every wheel"
         for wheel in wheels:
             cap = wheel["capital_committed_now"] or 0.0
             wheel["capital_committed_pct"] = round(100.0 * cap / denom, 1) if denom and cap else None
             wheel["capital_committed_pct_of"] = denom_label
+
+        # Any cycle with at least one long (LC/LP) leg additionally gets the
+        # card payload built in _build_directional_card -- a lone
+        # directional cycle, or an ordinary wheel that also bought a
+        # protective put/call alongside its CSPs/covered calls. None when
+        # there is no long leg at all (a plain wheel, or a buy-and-hold);
+        # the existing wheel-card fields above are never touched by this.
+        for wheel, cycle in zip(wheels, ordered_cycles):
+            wheel["directional"] = _build_directional_card(
+                cycle,
+                through,
+                current_price=current_prices.get(cycle.underlying),
+                option_mark_prices=option_mark_prices,
+                chain_quotes=chain_quotes,
+                account_total_value=account_total_value,
+            )
 
         return {"wheels": wheels, "warnings": warnings}
 
@@ -2995,7 +4065,11 @@ class Dashboard:
         Filter-independent, like the Trade Log: a hedge needs managing whatever
         date window is on screen. A leg paired into a same-day ``Spread`` is
         excluded -- its risk is already defined, there is nothing to "wind down."
-        Sorted soonest-expiry first, so the most urgent row leads the banner.
+        Two or more open legs on the very same contract (same right, strike,
+        expiry) within a cycle are merged into one entry first, via
+        ``_merge_same_contract_legs`` -- e.g. a hedge built up across separate
+        buys -- so the banner doesn't show the same hedge twice. Sorted
+        soonest-expiry first, so the most urgent row leads the banner.
         """
         through = self.last_date or date.today()
         dividends = dividends_by_cycle(self.all_cycles, self.transactions)
@@ -3005,15 +4079,23 @@ class Dashboard:
             for spread in cycle.spreads:
                 spread_leg_ids.add(spread.short_leg_id)
                 spread_leg_ids.add(spread.long_leg_id)
+            groups: dict[tuple[str, float, date], list[OptionLeg]] = {}
+            order: list[tuple[str, float, date]] = []
             for leg in cycle.legs:
                 if not leg.is_open or leg.side != LONG or leg.expiry is None:
                     continue
                 if leg.leg_id in spread_leg_ids:
                     continue
+                key = (leg.right, leg.strike, leg.expiry)
+                if key not in groups:
+                    groups[key] = []
+                    order.append(key)
+                groups[key].append(leg)
+            for key in order:
                 hedges.append(
                     _open_hedge_entry(
                         cycle,
-                        leg,
+                        _merge_same_contract_legs(groups[key]),
                         through,
                         name=self._company_names.get(cycle.underlying),
                         current_price=current_prices.get(cycle.underlying),
@@ -3050,17 +4132,10 @@ class Dashboard:
         wheel_target = {w["cycle_id"]: w for w in wheels}
         rows: list[dict[str, Any]] = []
         for cycle in self.all_cycles:
-            held = [
-                lot
-                for lot in cycle.share_lots
-                if lot.remaining > 1e-9 and lot.basis_known and lot.basis_per_share is not None
-            ]
-            cost_basis = (
-                sum(lot.basis_per_share * lot.remaining for lot in held)
-                / sum(lot.remaining for lot in held)
-                if held
-                else None
-            )
+            # The Trade Log's own figure, so the two can't disagree: the
+            # known-basis lots, plus any untracked shares at the broker's
+            # average cost (see _trade_log_entry).
+            cost_basis = wheel_target.get(cycle.cycle_id, {}).get("cost_basis_per_share")
             for leg in cycle.legs:
                 if not leg.is_open or leg.expiry is None:
                     continue
@@ -3082,14 +4157,7 @@ class Dashboard:
                         profit_target_explanation=wheel_target.get(cycle.cycle_id, {}).get(
                             "profit_target_explanation"
                         ),
-                        preferred_csp_entry=wheel_target.get(cycle.cycle_id, {}).get("preferred_csp_entry"),
-                        preferred_csp_entry_explanation=wheel_target.get(cycle.cycle_id, {}).get(
-                            "preferred_csp_entry_explanation"
-                        ),
-                        cc_strike_floor=wheel_target.get(cycle.cycle_id, {}).get("cc_strike_floor"),
-                        cc_strike_floor_explanation=wheel_target.get(cycle.cycle_id, {}).get(
-                            "cc_strike_floor_explanation"
-                        ),
+                        cc_exit_fields=_cc_exit_fields(wheel_target.get(cycle.cycle_id)),
                     )
                 )
         rows = _merge_same_contract_rows(rows)
@@ -3178,13 +4246,16 @@ class Dashboard:
         }
 
     def _real_share_quantities(self) -> dict[str, float]:
-        """Each ticker's real total share count, straight off the latest
-        Portfolio Positions snapshot -- the broker's own count, unfiltered by
-        how much of it the wheel/cycle model can trace to a known lot. Shared
+        """Each ticker's real total share count as of the latest ledger row:
+        the latest Portfolio Positions snapshot's count -- the broker's own,
+        unfiltered by how much of it the wheel/cycle model can trace to a
+        known lot -- rolled forward by every share-moving ledger row the
+        snapshot predates (a buy, sale, assignment/call-away settlement or
+        dividend reinvestment downloaded after the Positions file). Shared
         by `_build_cc_candidates` below (a covered call can be written
         against shares with no known cost basis just as well as ones with
-        one -- the broker doesn't check) and by the Open option positions
-        payload's `shares_untracked` enrichment (build()); `{}` when there's
+        one -- the broker doesn't check) and by the Open option positions /
+        Trade Log `shares_untracked` enrichment (build()); `{}` when there's
         no Positions snapshot to read at all.
         """
         if not self._net_worth.get("available"):
@@ -3193,41 +4264,414 @@ class Dashboard:
         for row in self._net_worth.get("positions", []):
             if row.get("kind") == EQUITY and row.get("symbol"):
                 totals[row["symbol"]] = totals.get(row["symbol"], 0.0) + (row.get("quantity") or 0.0)
+        snapshot_day = datetime.fromisoformat(self._net_worth["as_of"]).date()
+        for transaction in self.transactions:
+            # Every non-option row's Quantity is its signed share change (0 on
+            # a plain dividend or fee), so no action whitelist is needed: a
+            # reinvestment or share transfer moves the count just like a buy.
+            if transaction.is_option or not transaction.contracts or not transaction.underlying:
+                continue
+            if _not_yet_in_snapshot(transaction, snapshot_day):
+                totals[transaction.underlying] = totals.get(transaction.underlying, 0.0) + transaction.contracts
         return totals
 
-    def _build_cc_candidates(
+    def _broker_share_costs_by_symbol(self) -> dict[str, tuple[float, float, float]]:
+        """``{ticker: (cost basis total, costed shares, uncosted shares)}``
+        over every equity row the latest Positions snapshot reports for that
+        ticker (e.g. separate Cash and Margin lots). A row with no cost basis
+        (Fidelity shows "--" for shares just bought or assigned, until they
+        settle) adds to the uncosted count. A ticker with a zero or short
+        row is left out entirely: there's no average to take over it.
+        """
+        if not self._net_worth.get("available"):
+            return {}
+        totals: dict[str, tuple[float, float, float]] = {}
+        unusable: set[str] = set()
+        for row in self._net_worth.get("positions", []):
+            symbol = row.get("symbol")
+            if row.get("kind") != EQUITY or not symbol:
+                continue
+            quantity = row.get("quantity") or 0.0
+            if quantity <= 0:
+                unusable.add(symbol)
+                continue
+            cost, costed, uncosted = totals.get(symbol, (0.0, 0.0, 0.0))
+            if row.get("cost_basis_total") is None:
+                totals[symbol] = (cost, costed, uncosted + quantity)
+            else:
+                totals[symbol] = (cost + row["cost_basis_total"], costed + quantity, uncosted)
+        return {symbol: costs for symbol, costs in totals.items() if symbol not in unusable}
+
+    @staticmethod
+    def _untracked_cost_per_share(
+        cycle: Cycle, broker_share_costs: dict[str, tuple[float, float, float]]
+    ) -> float | None:
+        """The broker's average cost per share for ``cycle``'s ticker, the
+        only cost on file for shares bought before the oldest loaded export.
+        Averaged over the rows that carry a cost. Rows without one are
+        accepted only when every such share is one this wheel's own lots
+        already trace (e.g. the IRA's JXN: 300 old shares at $58.12 plus
+        100 just assigned at $135, which the broker still shows as "--");
+        those are costed from the ledger, not from this average. Otherwise
+        the uncosted shares could be the untracked ones, and averaging over
+        just the rows that have a cost would misprice them, so ``None``.
+        """
+        costs = broker_share_costs.get(cycle.underlying)
+        if costs is None:
+            return None
+        cost_total, costed_shares, uncosted_shares = costs
+        if costed_shares <= 1e-9:
+            return None
+        tracked_shares = sum(lot.remaining for lot in cycle.share_lots if lot.remaining > 1e-9)
+        if uncosted_shares > tracked_shares + 1e-6:
+            return None
+        return cost_total / costed_shares
+
+    def _untracked_shares_by_cycle(self) -> dict[str, float]:
+        """``{cycle_id: shares}`` -- real shares (``_real_share_quantities``)
+        beyond what each wheel's own lots trace, e.g. JXN: 0 tracked, 300 real,
+        all bought before the oldest loaded export. A wheel claims the gap only
+        while it still holds tracked shares or isn't CLOSED: a ticker keeps at
+        most one open cycle at a time, and a closed one has sold out in the
+        model's own terms, so the same real shares can't land on two wheels.
+        Never negative: a real count below the tracked one (a snapshot that
+        disagrees with the ledger) is left to the reconciliation warnings, not
+        netted off here.
+        """
+        real_qty_by_symbol = self._real_share_quantities()
+        untracked: dict[str, float] = {}
+        for cycle in self.all_cycles:
+            tracked = sum(lot.remaining for lot in cycle.share_lots if lot.remaining > 1e-9)
+            if tracked <= 1e-9 and cycle.status == CLOSED:
+                continue
+            real_qty = real_qty_by_symbol.get(cycle.underlying)
+            if real_qty is not None and real_qty - tracked > 1e-6:
+                untracked[cycle.cycle_id] = real_qty - tracked
+        return untracked
+
+    def _option_mark_prices(self) -> dict[str, float]:
+        """``{occ_symbol: Last price}`` for every OPTION row across the
+        latest Positions snapshot of each account, straight off the broker's
+        own export -- the only options-quote feed this project has. Feeds
+        ``mark_to_market_pl`` (see ``_trade_log_entry``/``cycle_metrics``),
+        which uses it to price each still-open leg at what it would actually
+        cost to close today instead of assuming it expires worthless.
+        ``{}`` when there's no Positions snapshot to read at all; a leg whose
+        symbol isn't a key here (snapshot predates it, or was never
+        downloaded) falls back to that expiry valuation, leg by leg.
+        """
+        if not self.snapshots:
+            return {}
+        prices: dict[str, float] = {}
+        for snapshot in latest_snapshot_per_account(self.snapshots).values():
+            for row in snapshot.rows:
+                if row.kind == OPTION and row.occ_symbol and row.last_price is not None:
+                    prices[row.occ_symbol] = row.last_price
+        return prices
+
+    def _option_chains(
+        self, pairs: set[tuple[str, date]]
+    ) -> dict[tuple[str, date], tuple[marketdata.OptionChainSnapshot | None, str | None]]:
+        """``{(ticker, expiry): (chain, warning)}`` -- one Yahoo chain fetch per
+        pair, run in parallel the same way ``_current_prices()`` fans out its
+        daily-close misses, and cached per pair for ``_LIVE_PRICE_TTL_SECONDS``
+        so a quote is never refetched more often than the live stock price.
+        A failed fetch comes back as ``(None, warning)``; callers treat that as
+        unavailable and never substitute a stale or invented value. Shared by
+        the directional card, CC TO EXIT and CSP TO ENTER, so the same pair is
+        fetched once -- and process-wide (``_OPTION_CHAIN_CACHE``), so every
+        account's Dashboard in a Combined build reads the same snapshot
+        instead of refetching it once per account.
+        """
+        now = time.monotonic()
+        cache = getattr(self, "_option_chain_cache", None)
+        if cache is None:
+            cache = self._option_chain_cache = _OPTION_CHAIN_CACHE
+        if not hasattr(self, "_option_chain_fetched_at"):
+            self._option_chain_fetched_at: dict[tuple[str, date], datetime] = {}
+        with _OPTION_CHAIN_CACHE_LOCK:
+            stale = sorted(
+                pair for pair in pairs if pair not in cache or now - cache[pair][0] >= _LIVE_PRICE_TTL_SECONDS
+            )
+
+        def _fetch_one(
+            pair: tuple[str, date]
+        ) -> tuple[tuple[str, date], marketdata.OptionChainSnapshot | None, str | None]:
+            ticker, expiry = pair
+            try:
+                text = marketdata.fetch_yahoo_option_chain(ticker, expiry)
+                return pair, marketdata.parse_yahoo_option_chain(text, expiry), None
+            except marketdata.MarketDataError as error:
+                return pair, None, f"could not fetch option chain for {ticker} {expiry.isoformat()}: {error}"
+
+        if stale:
+            with ThreadPoolExecutor(max_workers=min(8, len(stale))) as pool:
+                fetched = list(pool.map(_fetch_one, stale))
+            fetched_at = datetime.now(timezone.utc)
+            with _OPTION_CHAIN_CACHE_LOCK:
+                for pair, snapshot, warning in fetched:
+                    cache[pair] = (now, snapshot, warning, fetched_at)
+        with _OPTION_CHAIN_CACHE_LOCK:
+            entries = {pair: cache[pair] for pair in pairs}
+        for pair, entry in entries.items():
+            self._option_chain_fetched_at[pair] = entry[3]
+        return {pair: (entry[1], entry[2]) for pair, entry in entries.items()}
+
+    def _directional_chain_quotes(self) -> dict[tuple[str, date, float, str], marketdata.OptionContractQuote]:
+        """Live bid/ask/implied-volatility for every still-open long leg --
+        a lone directional cycle's own legs, and any long hedge leg sitting
+        inside an otherwise-ordinary wheel cycle (e.g. a protective put
+        alongside covered calls) -- keyed by ``(underlying, expiry, strike,
+        right)``, the input ``wheel.optionsmath`` needs to derive delta/
+        gamma/theta/vega for the directional card (see
+        ``_build_directional_card``, which attaches to *any* cycle that has
+        at least one long leg, not only a ``kind == "directional"`` one).
+        A pair whose fetch fails, or whose response has no matching strike,
+        simply has no entry here; callers read a missing key as
+        "unavailable," never substitute a stale or invented value.
+        """
+        pairs: set[tuple[str, date]] = {
+            (cycle.underlying, leg.expiry)
+            for cycle in self.all_cycles
+            for leg in cycle.legs
+            if leg.is_open and leg.side == LONG
+        }
+        quotes: dict[tuple[str, date, float, str], marketdata.OptionContractQuote] = {}
+        warnings: list[str] = []
+        for (ticker, expiry), (snapshot, warning) in sorted(self._option_chains(pairs).items()):
+            if snapshot is None:
+                warnings.append(warning)
+                continue
+            for contract in snapshot.contracts:
+                quotes[(ticker, expiry, contract.strike, contract.right)] = contract
+        self._chain_quote_warnings = warnings
+        return quotes
+
+    def _cc_exit_fee_model(self) -> ccexit.FeeModel:
+        """The fees CC TO EXIT charges a new covered call, measured from this
+        account's own ledger (the broker's Commission + Fees columns):
+
+        - Per contract to sell the call: the contract-weighted average over
+          every call this account has sold to open. Fidelity's $0.65
+          commission only when there is none to measure.
+        - On the stock sale if assigned: fees / proceeds on the account's
+          most recent stock sale date. Fidelity passes on the SEC's
+          per-dollar fee on sales, and that rate changes over time, so the
+          latest sale is the one that reflects today's rate.
+          ``ccexit.SALE_FEE_RATE_FALLBACK`` only when the account has never
+          sold stock.
+        """
+        call_contracts = call_fees = 0.0
+        sales_by_day: dict[date, list[float]] = {}
+        for t in self.transactions:
+            if t.action == STO and t.right == "C" and t.contracts:
+                call_contracts += abs(t.contracts)
+                call_fees += t.total_fees
+            elif t.action == SELL_STOCK and t.contracts and t.price:
+                proceeds = abs(t.contracts) * t.price
+                day = sales_by_day.setdefault(t.event_date, [0.0, 0.0])
+                day[0] += t.total_fees
+                day[1] += proceeds
+        option_fee, option_source = ccexit.OPTION_FEE_PER_CONTRACT, "Fidelity's $0.65 commission; no call sales to measure"
+        if call_contracts > 0:
+            option_fee = call_fees / call_contracts
+            option_source = f"your average over {call_contracts:,.0f} call contracts sold"
+        sale_rate, sale_source = ccexit.SALE_FEE_RATE_FALLBACK, ccexit.SALE_FEE_FALLBACK_SOURCE
+        if sales_by_day:
+            latest = max(sales_by_day)
+            fees_paid, proceeds = sales_by_day[latest]
+            if proceeds > 0:
+                sale_rate = fees_paid / proceeds
+                when = latest.strftime("%b %d, %Y").replace(" 0", " ")
+                # A measured $0 is real data, but say so: it most likely means
+                # the broker showed no fee on that sale, not that none applies.
+                sale_source = (
+                    f"the rate on your latest stock sale, {when}"
+                    if fees_paid > 0
+                    else f"your latest stock sale, {when}, showed no fee, so none is counted"
+                )
+        return ccexit.FeeModel(option_fee, option_source, sale_rate, sale_source)
+
+    def _cc_exit_chains(
         self,
-        wheels: Sequence[dict[str, Any]],
-        open_positions: Sequence[dict[str, Any]],
-        real_qty_by_symbol: dict[str, float],
-    ) -> list[dict[str, Any]]:
-        """Every position holding shares with no covered call currently written
-        against it. Positions with >= 100 shares are the actionable ones -- a
-        covered call could be written -- and carry a ``target_cc_strike`` and a
-        (negative) ``contracts_available``. Positions under 100 shares are still
-        listed for visibility, with those two fields ``None``. Built from the
-        already-assembled Trade Log ``wheels`` (share count, cost basis, both
-        break-evens, last close) and ``open_positions`` (which cycles already
-        have a live CC leg); filter-independent like both.
+        current_prices: dict[str, float | None],
+        untracked_by_cycle: dict[str, float],
+    ) -> dict[str, ccexit.ExitChain]:
+        """``{cycle_id: ExitChain}`` for every wheel with at least one call's
+        worth (100) of uncovered shares and a live price -- the only wheels
+        CC TO EXIT needs option prices for. One expiration per ticker
+        (``ccexit.pick_expiration``), counted from the real calendar today,
+        not the last export date. A ticker with no listed expirations or a
+        failed chain fetch still gets an entry, with the reason, so the
+        result says why instead of going quiet. Each entry also carries the
+        ticker's historical resistance zones (``pricezones``, from the same
+        daily-history cache CSP TO ENTER's support reads), context for the
+        strike CC TO EXIT picks, never an input to the pick.
+        """
+        today = date.today()
+        needs: dict[str, str] = {}  # cycle_id -> ticker
+        for cycle in self.all_cycles:
+            held = sum(lot.remaining for lot in cycle.share_lots if lot.remaining > 1e-9)
+            held += untracked_by_cycle.get(cycle.cycle_id, 0.0)
+            uncovered = held - _open_covered_call_shares(cycle)
+            if uncovered >= OPTION_MULTIPLIER - 1e-6 and current_prices.get(cycle.underlying) is not None:
+                needs[cycle.cycle_id] = cycle.underlying
+        if not needs:
+            return {}
 
-        The 100-share threshold (and ``contracts_available``) is checked
-        against ``real_qty_by_symbol`` -- the broker's real count -- not just
-        ``wheel["shares_held"]`` (the model's own, cost-basis-traceable
-        count): writing a covered call needs real shares in the account, not
-        a provable cost basis on them. A ticker with more real shares than
-        tracked ones carries the gap as ``shares_untracked``; the tracked
-        count still drives ``target_cc_strike`` and the P&L columns, since
-        there is no cost basis to price the untracked shares against.
+        expirations = self._option_expirations(sorted(set(needs.values())))
+        expiry_of = {ticker: ccexit.pick_expiration(expirations.get(ticker, []), today) for ticker in set(needs.values())}
+        chains = self._option_chains({(t, e) for t, e in expiry_of.items() if e is not None})
+        for snapshot, warning in chains.values():
+            if warning:
+                self._price_warnings.append(warning)
+        bars = self._daily_bars(sorted(set(needs.values())))
+        resistance = {
+            ticker: pricezones.analyze(bars.get(ticker, []), pricezones.RESISTANCE) for ticker in set(needs.values())
+        }
 
-        ``target_cc_strike`` is the lowest strike worth writing a call at: the
-        greatest of the share cost basis, the position break-even (cost basis
-        net of premium already banked on these lots), the whole-wheel
-        break-even, and the last close, then rounded **up** to the next $0.50
-        (real strikes sit on 0.50-or-wider increments, and rounding up keeps it
-        a valid floor). At or above it an assignment sells the stock for at
-        least what it cost, on top of every premium already collected, and
-        never below the current market. It is a floor, not a recommendation --
-        it says nothing about where the premium is richest.
+        out: dict[str, ccexit.ExitChain] = {}
+        for cycle_id, ticker in needs.items():
+            expiry = expiry_of[ticker]
+            if expiry is None:
+                out[cycle_id] = ccexit.ExitChain(
+                    today, None, None, f"No upcoming option expirations for {ticker} could be loaded.",
+                    resistance=resistance[ticker],
+                )
+                continue
+            snapshot, _ = chains[(ticker, expiry)]
+            if snapshot is None:
+                out[cycle_id] = ccexit.ExitChain(
+                    today, expiry, None, f"Option prices for {ticker} {expiry.isoformat()} couldn't be loaded.",
+                    resistance=resistance[ticker],
+                )
+                continue
+            calls = tuple(
+                ccexit.CallQuote(c.strike, c.bid, c.ask, c.implied_volatility)
+                for c in snapshot.contracts
+                if c.right == "C"
+            )
+            out[cycle_id] = ccexit.ExitChain(
+                today,
+                expiry,
+                calls,
+                quotes_as_of=snapshot.quote_time,
+                fetched_at=self._option_chain_fetched_at.get((ticker, expiry)),
+                resistance=resistance[ticker],
+            )
+        return out
+
+    def _daily_bars(self, tickers: Sequence[str]) -> dict[str, list[marketdata.PricePoint]]:
+        """Daily OHLCV history per ticker -- the same cache/memo first, then
+        thread-pool fetch ``_price_stats`` documents, but asking for daily
+        high/low (``require_ranges``) so a close-only cache is refetched once.
+        Fetch warnings append to ``self._price_warnings``."""
+        out: dict[str, list[marketdata.PricePoint]] = {}
+        misses: list[str] = []
+        for ticker in tickers:
+            local = marketdata.get_price_series(ticker, local_only=True, require_ranges=True)
+            if local is None:
+                misses.append(ticker)
+                continue
+            points, warns = local
+            self._price_warnings.extend(warns)
+            out[ticker] = points
+        if misses:
+            with ThreadPoolExecutor(max_workers=min(8, len(misses))) as pool:
+                fetched = pool.map(lambda t: marketdata.get_price_series(t, require_ranges=True), misses)
+                for ticker, (points, warns) in zip(misses, fetched):
+                    self._price_warnings.extend(warns)
+                    out[ticker] = points
+        return out
+
+    def _build_csp_to_enter(self, prices: dict[str, float | None]) -> dict[str, dict[str, Any]]:
+        """``{TICKER: payload}``: the canonical CSP TO ENTER for each ticker
+        (``wheel/cspentry.py``), from its daily history, ``prices[ticker]``
+        and the put side of one expiration's chain. The expiration is CSP TO
+        ENTER's own pick (``cspentry.pick_expiration``), independent of CC TO
+        EXIT's; the chain comes from the shared, process-wide
+        ``_option_chains`` cache, so when both pick the same date a ticker
+        needing both still costs one fetch. A ticker whose history shows no
+        relevant support skips the chain fetch entirely: no put could
+        qualify. Missing data never raises; it comes back as NO QUALIFYING
+        CSP with the reason. Every result carries the chain's quote and
+        fetch time and this build's one calculation time.
+        """
+        tickers = sorted(t for t in prices if t)
+        if not tickers:
+            return {}
+        today = date.today()
+        calculated_at = datetime.now(timezone.utc)
+        priced = [t for t in tickers if prices[t] is not None and prices[t] > 0]
+        bars = self._daily_bars(priced)
+        support = {t: cspentry.analyze_support(bars.get(t, [])) for t in priced}
+        needs_chain = sorted(
+            t for t in priced if cspentry.select_support_zone(support[t], prices[t])[0] is not None
+        )
+        expirations = self._option_expirations(needs_chain) if needs_chain else {}
+        expiry_of = {t: cspentry.pick_expiration(expirations.get(t, []), today) for t in needs_chain}
+        chains = self._option_chains({(t, e) for t, e in expiry_of.items() if e is not None})
+        for _, warning in chains.values():
+            if warning and warning not in self._price_warnings:
+                self._price_warnings.append(warning)
+
+        out: dict[str, dict[str, Any]] = {}
+        for ticker in tickers:
+            if ticker not in support:
+                result = cspentry.calculate_csp_to_enter(
+                    current_price=prices[ticker], bars=[], expiry=None, today=today, puts=None,
+                    calculated_at=calculated_at,
+                )
+                out[ticker] = _csp_to_enter_payload(result, ticker)
+                continue
+            expiry = expiry_of.get(ticker)
+            puts: tuple[cspentry.PutQuote, ...] | None = None
+            unavailable = None
+            quotes_as_of = None
+            if ticker in expiry_of:
+                snapshot = chains[(ticker, expiry)][0] if expiry is not None else None
+                if expiry is None:
+                    unavailable = f"No upcoming option expirations for {ticker} could be loaded."
+                elif snapshot is None:
+                    unavailable = f"Option prices for {ticker} {expiry.isoformat()} couldn't be loaded."
+                else:
+                    puts = tuple(
+                        cspentry.PutQuote(
+                            c.strike, c.bid, c.ask, c.implied_volatility, c.open_interest, c.volume
+                        )
+                        for c in snapshot.contracts
+                        if c.right == "P"
+                    )
+                    quotes_as_of = snapshot.quote_time
+            result = cspentry.recommend_put(
+                current_price=prices[ticker],
+                support=support[ticker],
+                expiry=expiry,
+                today=today,
+                puts=puts,
+                chain_unavailable_reason=unavailable,
+                risk_free_rate=DIRECTIONAL_RISK_FREE_RATE_ASSUMPTION,
+                quotes_as_of=quotes_as_of,
+                fetched_at=getattr(self, "_option_chain_fetched_at", {}).get((ticker, expiry)) if puts is not None else None,
+                calculated_at=calculated_at,
+            )
+            out[ticker] = _csp_to_enter_payload(result, ticker)
+        return out
+
+    def _build_cc_candidates(self, wheels: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Every position holding shares not yet covered by an open covered
+        call. Positions with >= 100 uncovered shares are the actionable ones
+        -- a covered call could be written -- and carry a (negative)
+        ``contracts_available``; positions under 100 are still listed for
+        visibility, with it ``None``. Built entirely from the already-
+        assembled Trade Log ``wheels``; filter-independent like them.
+
+        Share counts (held, covered, uncovered) and the CC TO EXIT fields
+        are the wheel's own ``cc_to_exit_detail`` / ``cc_to_exit*`` -- the
+        one CC TO EXIT calculation (``wheel/ccexit.py``), so this table can
+        never disagree with any other. Held counts every real share, the
+        broker's untracked ones included: writing a call needs real shares in
+        the account, not a provable cost basis on them.
 
         ``unrealized_pl`` / ``unrealized_pl_pct`` are the shares' total gain or
         loss against their raw average cost basis (premium already banked is
@@ -3235,60 +4679,44 @@ class Dashboard:
         comes from ``wheel.reference``; ``earnings_date`` / ``days_to_earnings``
         from :meth:`_fundamentals` (Yahoo, cached, hand-file override).
         """
-        cc_cycle_ids = {p["cycle_id"] for p in open_positions if p.get("type") == "CC"}
-        # Same "tracked or real" share count the row loop below computes,
-        # just ahead of time -- a wheel with 0 tracked shares but a real,
-        # open position (JXN) still needs its sector/earnings prefetched.
+        # Same "tracked + untracked" share count the row loop below uses, just
+        # ahead of time -- a wheel with 0 tracked shares but a real position
+        # (JXN) still needs its sector/earnings prefetched.
         fundamentals = self._fundamentals(
             [
                 w["underlying"]
                 for w in wheels
-                if (w.get("shares_held") or 0.0) > 1e-9
-                or (w.get("status") != "CLOSED" and (real_qty_by_symbol.get(w["underlying"]) or 0.0) > 1e-9)
+                if (w.get("shares_held") or 0.0) + (w.get("shares_untracked") or 0.0) > 1e-9
             ]
         )
         today = date.today()
         rows: list[dict[str, Any]] = []
         for wheel in wheels:
-            if wheel["cycle_id"] in cc_cycle_ids:
-                continue
             tracked_shares = wheel.get("shares_held") or 0.0
-            # The real count wins when it's larger -- e.g. shares bought
-            # before every loaded export begins still exist in the account
-            # and can still back a call, even with no cost basis on file for
-            # them, or (JXN: 0 tracked, 300 real) an assignment the engine
-            # never saw at all. It never loses to the tracked count: a real
-            # snapshot that's simply older than the latest trades
-            # undercounting would wrongly hide an otherwise-actionable
-            # position. Only an open cycle can claim the real count -- a
-            # CLOSED wheel has sold out in the model's own terms, and a
-            # ticker keeps at most one open cycle at a time, so this can't
-            # double-count the same real shares onto two rows.
-            real_shares = real_qty_by_symbol.get(wheel["underlying"])
-            is_open = wheel.get("status") != "CLOSED"
-            shares = (
-                real_shares
-                if is_open and real_shares is not None and real_shares > tracked_shares
-                else tracked_shares
-            )
-            if shares <= 1e-9:
+            untracked_shares = wheel.get("shares_untracked") or 0.0
+            # Every share really held (tracked + the broker's untracked count,
+            # see Dashboard._untracked_shares_by_cycle) and how many of them
+            # open calls already cover, straight from CC TO EXIT's own result.
+            detail = wheel.get("cc_to_exit_detail") or {}
+            shares = detail.get("shares_held") or 0.0
+            covered_shares = detail.get("covered_shares") or 0.0
+            uncovered_shares = detail.get("uncovered_shares") or 0.0
+            if uncovered_shares <= 1e-9:
                 continue
-            untracked_shares = shares - tracked_shares if shares > tracked_shares else 0.0
-            meets_threshold = shares >= 100 - 1e-9
+            meets_threshold = uncovered_shares >= OPTION_MULTIPLIER - 1e-9
             cost_basis = wheel.get("cost_basis_per_share")
             last_close = wheel.get("current_price")
-            target = (
-                _cc_strike_floor(cost_basis, wheel.get("break_even_per_share"), wheel.get("break_even_price"), last_close)
-                if meets_threshold
-                else None
+            # Total unrealized gain/loss on the shares with a cost on file vs.
+            # their raw average cost basis (not a break-even -- premium already
+            # banked is not netted in here), marked to the last close. Untracked
+            # shares count once the broker file gives their cost
+            # (`untracked_cost_per_share`, already blended into cost_basis);
+            # without it there is nothing to measure them against.
+            priced_shares = tracked_shares + (
+                untracked_shares if wheel.get("untracked_cost_per_share") is not None else 0.0
             )
-            # Total unrealized gain/loss on the *tracked* shares vs. their raw
-            # average cost basis (not a break-even -- premium already banked
-            # is not netted in here), marked to the last close. Left off the
-            # untracked ones: there is no cost basis on file to measure a
-            # gain or loss against.
             has_marks = cost_basis is not None and last_close is not None
-            gain = round(tracked_shares * (last_close - cost_basis), 2) if has_marks else None
+            gain = round(priced_shares * (last_close - cost_basis), 2) if has_marks else None
             gain_pct = (
                 round(100.0 * (last_close - cost_basis) / cost_basis, 2)
                 if has_marks and cost_basis
@@ -3304,16 +4732,22 @@ class Dashboard:
                     "wheel": wheel["cycle_id"] if wheel.get("is_wheel") else None,
                     "shares_held": round(shares, 4),
                     "shares_untracked": round(untracked_shares, 4) if untracked_shares > 1e-6 else None,
+                    # Broker's average cost the untracked shares are priced at.
+                    "untracked_cost_per_share": wheel.get("untracked_cost_per_share"),
+                    # Already backing an open covered call; None when no call is open.
+                    "shares_covered": round(covered_shares, 4) if covered_shares > 1e-6 else None,
                     "meets_threshold": meets_threshold,
                     # The covered-call position that could be opened, so it reads
                     # negative (a short call), e.g. 175 shares -> -1. None when
                     # there aren't 100 shares to cover a contract.
-                    "contracts_available": -(int(shares // 100)) if meets_threshold else None,
+                    "contracts_available": (
+                        -(int(uncovered_shares // OPTION_MULTIPLIER)) if meets_threshold else None
+                    ),
                     "cost_basis_per_share": cost_basis,
                     "breakeven": wheel.get("break_even_per_share"),
                     "wheel_breakeven": wheel.get("break_even_price"),
                     "last_close": last_close,
-                    "target_cc_strike": target,
+                    **_cc_exit_fields(wheel),
                     "unrealized_pl": gain,
                     "unrealized_pl_pct": gain_pct,
                     "sector": sector_of(wheel["underlying"]),
@@ -3346,56 +4780,7 @@ class Dashboard:
         :func:`csp_star_score`. ``exposure`` is :func:`sector_exposure` for the
         book, feeding the diversification nudge.
         """
-        by_ticker: dict[str, dict[str, Any]] = {}
-        for wheel in wheels:
-            is_wheel = bool(wheel.get("is_wheel"))
-            has_options = bool(wheel.get("gross_premium_received") or wheel.get("option_realized_pl"))
-            # Full wheels *and* bare option cycles (a CSP sold and closed, never
-            # assigned) both count -- a put that had to be bought back at a loss
-            # is exactly the history that should drag a ticker's rating down.
-            # Pure buy-and-hold stock cycles (no premium either way) don't.
-            if not is_wheel and not has_options:
-                continue
-            agg = by_ticker.setdefault(
-                wheel["underlying"],
-                {
-                    "net_realized_pl": 0.0,
-                    "wheels": 0,
-                    "roc_sum": 0.0,
-                    "roc_n": 0,
-                    "gross_premium": 0.0,
-                    "option_pl": 0.0,
-                    "avg_collateral": 0.0,
-                    "days": 0,
-                    "wins": 0,
-                    "losses": 0,
-                    "last_dt": None,
-                },
-            )
-            agg["net_realized_pl"] += wheel.get("net_realized_pl") or 0.0
-            # "wheels" (and the consistency sub-score) counts only true wheels,
-            # so tacking on a losing CSP can't *raise* the score via consistency.
-            if is_wheel:
-                agg["wheels"] += 1
-            roc = wheel.get("annualized_wheel_roc_pct")
-            if roc is not None:
-                agg["roc_sum"] += roc
-                agg["roc_n"] += 1
-            agg["gross_premium"] += wheel.get("gross_premium_received") or 0.0
-            agg["option_pl"] += wheel.get("option_realized_pl") or 0.0
-            agg["avg_collateral"] += wheel.get("avg_collateral") or 0.0
-            agg["days"] += wheel.get("days_active") or 0
-            agg["wins"] += wheel.get("wins") or 0
-            agg["losses"] += wheel.get("losses") or 0
-            edge = wheel.get("end_date") or wheel.get("start_date")
-            if edge and (agg["last_dt"] is None or edge > agg["last_dt"]):
-                agg["last_dt"] = edge
-
-        # Keep names actually wheeled at least once (>= 1 true wheel) and
-        # net-positive once every option cycle on them is counted.
-        winners = {
-            t: a for t, a in by_ticker.items() if a["wheels"] >= 1 and a["net_realized_pl"] > 0
-        }
+        winners = {t: a for t, a in aggregate_csp_history(wheels).items() if is_csp_history_winner(a)}
         fundamentals = self._fundamentals(sorted(winners))
         # Drop the outright-ineligible (non-common, LP in the name) before
         # paying for a price fetch; the price-band check waits for last close.
@@ -3409,110 +4794,46 @@ class Dashboard:
 
         rows: list[dict[str, Any]] = []
         for ticker, agg in winners.items():
-            reason, unvetted = _csp_ticker_verdict(
-                ticker, self._company_names.get(ticker), stats.get(ticker, {}).get("last"),
-                fundamentals.get(ticker),
-            )
+            fund = fundamentals.get(ticker) or {}
+            stat = stats.get(ticker, {})
+            reason, unvetted = _csp_ticker_verdict(ticker, self._company_names.get(ticker), stat.get("last"), fund)
             if reason:  # price now known: outside the $10-$350 band, or a known thin/small name
                 continue
-            avg_roc = round(agg["roc_sum"] / agg["roc_n"], 2) if agg["roc_n"] else None
-            monthly_premium_pct = (
-                round(100.0 * agg["gross_premium"] / agg["avg_collateral"] * (30.0 / max(agg["days"], 1)), 2)
-                if agg["avg_collateral"] > 1e-9
-                else None
-            )
-            ppd = agg["option_pl"] / agg["days"] if agg["days"] else None
-            ppd_yield_pct = (
-                round(365.0 * (ppd or 0.0) / agg["avg_collateral"] * 100.0, 2)
-                if agg["avg_collateral"] > 1e-9 and ppd is not None
-                else None
-            )
-            win_rate = (
-                agg["wins"] / (agg["wins"] + agg["losses"])
-                if (agg["wins"] + agg["losses"]) > 0
-                else None
-            )
-            days_since = (
-                max((today - date.fromisoformat(agg["last_dt"])).days, 0) if agg["last_dt"] else None
-            )
-            stat = stats.get(ticker, {})
             sector = sector_of(ticker)
-            earn = (fundamentals.get(ticker) or {}).get("earnings_date")
-            dte = (earn - today).days if earn else None
-
-            comp = {
-                "roc_pct": avg_roc,
-                "monthly_premium_pct": monthly_premium_pct,
-                "ppd_yield_pct": ppd_yield_pct,
-                "net_realized_pl": agg["net_realized_pl"],
-                "win_rate": win_rate,
-                "wheels": agg["wheels"],
-                "days_since_last_wheel": days_since,
+            earn = fund.get("earnings_date")
+            facts = {
+                "name": self._company_names.get(ticker),
+                "last_close": _money(stat.get("last")),
+                "sector": sector,
+                "earnings_date": earn.isoformat() if earn else None,
+                "days_to_earnings": (earn - today).days if earn else None,
                 "vol_annual_pct": stat.get("vol_annual_pct"),
                 "price_position": stat.get("price_position"),
-                "sector": sector,
+                "vetting": _csp_vetting(unvetted, fund),
             }
-            scored = csp_star_score(comp, exposure.get(sector or "Unknown", 0.0), dte)
-
-            rows.append(
-                {
-                    "underlying": ticker,
-                    "name": self._company_names.get(ticker),
-                    "wheels": agg["wheels"],
-                    "net_realized_pl": _money(agg["net_realized_pl"]),
-                    "avg_annualized_roc_pct": avg_roc,
-                    "monthly_premium_pct": monthly_premium_pct,
-                    "ppd": _money(ppd),
-                    "last_close": _money(stat.get("last")),
-                    "sector": sector,
-                    "earnings_date": earn.isoformat() if earn else None,
-                    "days_to_earnings": dte,
-                    "stars": scored["stars"],
-                    "star_breakdown": scored,
-                    "vetting": {
-                        "unvetted": unvetted,
-                        "type": (fundamentals.get(ticker) or {}).get("type"),
-                        "market_cap_b": (fundamentals.get(ticker) or {}).get("market_cap_b"),
-                        "avg_vol_10d_m": (fundamentals.get(ticker) or {}).get("avg_vol_10d_m"),
-                    },
-                    # Raw signal inputs, carried so the Combined view can
-                    # re-aggregate and re-score without the underlying wheels.
-                    "roc_pct": avg_roc,
-                    "ppd_yield_pct": ppd_yield_pct,
-                    "win_rate": round(win_rate, 4) if win_rate is not None else None,
-                    "wins": agg["wins"],
-                    "losses": agg["losses"],
-                    "days_since_last_wheel": days_since,
-                    "vol_annual_pct": stat.get("vol_annual_pct"),
-                    "price_position": stat.get("price_position"),
-                }
-            )
-        rows.sort(key=lambda r: (-r["stars"], -(r["net_realized_pl"] or 0.0)))
+            rows.append(csp_candidate_row(ticker, agg, facts, exposure.get(sector or "Unknown", 0.0), today))
+        rows.sort(key=lambda r: (-r["star_breakdown"]["raw_stars"], -(r["net_realized_pl"] or 0.0)))
         return rows
 
-    def _build_wheel_targets_banner(self, wheels: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _build_wheel_targets_banner(
+        self, wheels: Sequence[dict[str, Any]], csp_to_enter: dict[str, dict[str, Any]] | None = None
+    ) -> list[dict[str, Any]]:
         """Running wheels with a phase-specific target to aim for right now,
-        for the Dashboard's price-target banner. ``profit_target`` /
-        ``preferred_csp_entry`` / ``cc_strike_floor`` (plus their
-        explanations) are already computed once, in ``_trade_log_entry`` --
-        this just filters to open wheels with a known phase and sorts the
-        wheel closest to its phase-appropriate target first (same "surface
-        what needs attention" spirit as the open-hedge banner). ``gap_pct``
-        is against whichever of profit_target/preferred_csp_entry applies to
-        that wheel's phase -- a sort key only, not a stand-in "primary value"
-        field (the frontend still picks between the two full fields itself).
+        for the Dashboard's price-target banner. ``profit_target`` and the
+        ``cc_to_exit`` fields (plus their explanations) are already computed
+        once, in ``_trade_log_entry``; CSP TO ENTER once per ticker, in
+        ``csp_to_enter`` (``_build_csp_to_enter``) -- this just filters to
+        open wheels with a known phase and sorts the wheel closest to its
+        phase-appropriate target first (same "surface what needs attention"
+        spirit as the open-hedge banner). ``gap_pct``: see
+        ``wheel_target_gap_pct``.
         """
         rows: list[dict[str, Any]] = []
         for w in wheels:
             if not w.get("is_wheel") or not w.get("is_open") or w.get("wheel_phase") is None:
                 continue
             last_close = w.get("current_price")
-            primary = w.get("profit_target") if w.get("wheel_phase") == "cc" else w.get("preferred_csp_entry")
-            gap_pct = (
-                100.0 * (primary - last_close) / last_close
-                if primary is not None and last_close
-                else None
-            )
+            gap_pct = wheel_target_gap_pct(w, (csp_to_enter or {}).get(w["underlying"]), last_close)
             rows.append(
                 {
                     "cycle_id": w["cycle_id"],
@@ -3521,13 +4842,11 @@ class Dashboard:
                     "wheel_phase": w.get("wheel_phase"),
                     "profit_target": w.get("profit_target"),
                     "profit_target_explanation": w.get("profit_target_explanation"),
-                    "preferred_csp_entry": w.get("preferred_csp_entry"),
-                    "preferred_csp_entry_explanation": w.get("preferred_csp_entry_explanation"),
-                    "cc_strike_floor": w.get("cc_strike_floor"),
-                    "cc_strike_floor_explanation": w.get("cc_strike_floor_explanation"),
+                    **_cc_exit_fields(w),
                     "last_close": last_close,
                     "shares_held": w.get("shares_held"),
-                    "gap_pct": round(gap_pct, 2) if gap_pct is not None else None,
+                    "shares_untracked": w.get("shares_untracked"),
+                    "gap_pct": gap_pct,
                 }
             )
         rows.sort(key=lambda r: (abs(r["gap_pct"]) if r["gap_pct"] is not None else float("inf"), r["underlying"]))
@@ -3622,6 +4941,7 @@ class Dashboard:
             self._open_positions = None
             self._cc_candidates = None
             self._csp_candidates = None
+            self._csp_to_enter = None
             self._cycle_metrics_cache = {}
         dividends = dividends_by_cycle(cycles, transactions)
         if self._wheel_return is None:
@@ -3635,14 +4955,17 @@ class Dashboard:
                 current_prices, self._prev_closes, (self._trade_log or {}).get("wheels", [])
             )
         if self._cc_candidates is None:
-            self._cc_candidates = self._build_cc_candidates(
-                (self._trade_log or {}).get("wheels", []),
-                self._open_positions or [],
-                self._real_share_quantities(),
-            )
+            self._cc_candidates = self._build_cc_candidates((self._trade_log or {}).get("wheels", []))
         if self._csp_candidates is None:
             _wheels = (self._trade_log or {}).get("wheels", [])
             self._csp_candidates = self._build_csp_candidates(_wheels, sector_exposure(_wheels))
+        if self._csp_to_enter is None:
+            # Every ticker any surface shows CSP TO ENTER for: open positions /
+            # wheels (the live marks) and the CSP candidates (their own last
+            # price, same live-quote source). The live mark wins on overlap.
+            entry_prices = {row["underlying"]: row.get("last_close") for row in self._csp_candidates or []}
+            entry_prices.update(current_prices)
+            self._csp_to_enter = self._build_csp_to_enter(entry_prices)
         self._price_marked_at = self._price_cache_at
         earnings_in_view = self._build_earnings_in_view(
             self._open_positions or [], (self._trade_log or {}).get("wheels", []), through
@@ -3684,7 +5007,7 @@ class Dashboard:
         # to the payload copy built at the end of this method, not here.
         _wheels = (self._trade_log or {}).get("wheels", [])
         _wheels_by_cycle = {w["cycle_id"]: w for w in _wheels}
-        wheel_targets_banner = self._build_wheel_targets_banner(_wheels)
+        wheel_targets_banner = self._build_wheel_targets_banner(_wheels, self._csp_to_enter)
         _wt_by_cycle = {w["cycle_id"]: w for w in wheel_targets_banner}
         for _row in self._open_positions or []:
             _wt = _wt_by_cycle.get(_row["cycle_id"])
@@ -3718,18 +5041,8 @@ class Dashboard:
             _real_qty = _real_qty_by_symbol.get(_row.get("underlying"))
             if _real_qty is not None and _real_qty - _held > 1e-6:
                 _row["shares_untracked"] = round(_real_qty - _held, 4)
-        # Same cross-reference, folded onto the Trade Log's own wheel entries
-        # (`_wheels` is `self._trade_log["wheels"]` itself, mutated in place)
-        # so a wheel currently in its Covered Call phase shows the broker's
-        # real share count there too, not just in the Open option positions
-        # table above.
-        for _w in _wheels:
-            _held = _w.get("shares_held") or 0.0
-            if _held <= 1e-9:
-                continue
-            _real_qty = _real_qty_by_symbol.get(_w.get("underlying"))
-            if _real_qty is not None and _real_qty - _held > 1e-6:
-                _w["shares_untracked"] = round(_real_qty - _held, 4)
+        # (The Trade Log's own wheel entries already carry `shares_untracked`
+        # from _build_trade_log -- see _untracked_shares_by_cycle.)
         assignment_risk = assignment_mod.assignment_risk(
             self._open_positions or [], self._net_worth
         )
@@ -3757,6 +5070,7 @@ class Dashboard:
             current_prices=current_prices,
             dividends_by_cycle=dividends,
             capital_through=capital_through,
+            option_mark_prices=self._option_mark_prices(),
         )
         capital = portfolio_capital_series(capital_cycles, capital_through, since)
         # "Right now," not "since": uses capital_cycles directly (uncropped by
@@ -3803,6 +5117,7 @@ class Dashboard:
             "last_date": _iso(portfolio.last_date),
             "win_rate_pct": portfolio.win_rate_pct,
             "roll_rate_pct": portfolio.roll_rate_pct,
+            "mark_to_market_pl": _money(portfolio.mark_to_market_pl),
         }
         dashboard_insights = portfolio_insights(
             portfolio_payload,
@@ -3905,6 +5220,11 @@ class Dashboard:
             "open_positions": _open_positions_for_payload,
             "cc_candidates": self._cc_candidates,
             "csp_candidates": self._csp_candidates,
+            # Raw past-wheel totals for every ticker, profitable or not, so a
+            # cross-account merge (accounts._combine_csp_candidates) counts a
+            # losing account's history instead of only the winners' rows.
+            "csp_candidate_history": aggregate_csp_history((self._trade_log or {}).get("wheels", [])),
+            "csp_to_enter": self._csp_to_enter or {},
             "earnings_in_view": earnings_in_view,
             "assignment_risk": assignment_risk,
             "expiration_calendar": expiration_calendar,

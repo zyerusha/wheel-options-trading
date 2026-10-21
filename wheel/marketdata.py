@@ -59,8 +59,19 @@ class MarketDataError(RuntimeError):
 
 @dataclass(frozen=True)
 class PricePoint:
+    """One daily bar. ``high``/``low``/``volume`` are ``None`` when the
+    source row lacked them (a cache written before they were stored, or a
+    session Yahoo only reports a close for) -- never filled with the close."""
+
     day: date
     close: float
+    high: float | None = None
+    low: float | None = None
+    volume: float | None = None
+
+    @property
+    def has_range(self) -> bool:
+        return self.high is not None and self.low is not None
 
 
 def yahoo_chart_url(ticker: str, *, period2: int | None = None) -> str:
@@ -127,14 +138,32 @@ def parse_yahoo_chart(text: str) -> list[PricePoint]:
     try:
         result = json.loads(text)["chart"]["result"][0]
         timestamps = result["timestamp"]
-        closes = result["indicators"]["quote"][0]["close"]
+        quote = result["indicators"]["quote"][0]
+        closes = quote["close"]
         meta = result.get("meta") or {}
     except (json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
         raise MarketDataError(f"unrecognized Yahoo Finance chart response: {error}") from error
 
+    # High/low/volume ride along in the same response; any of them may be
+    # absent (or null on a given day) without making the close unusable.
+    def _column(name: str) -> list:
+        values = quote.get(name)
+        return values if isinstance(values, list) and len(values) == len(closes) else [None] * len(closes)
+
+    highs, lows, volumes = _column("high"), _column("low"), _column("volume")
+
+    def _number(value: object) -> float | None:
+        return float(value) if isinstance(value, (int, float)) else None
+
     points = [
-        PricePoint(day=datetime.fromtimestamp(ts, tz=timezone.utc).date(), close=close)
-        for ts, close in zip(timestamps, closes)
+        PricePoint(
+            day=datetime.fromtimestamp(ts, tz=timezone.utc).date(),
+            close=close,
+            high=_number(high),
+            low=_number(low),
+            volume=_number(volume),
+        )
+        for ts, close, high, low, volume in zip(timestamps, closes, highs, lows, volumes)
         if close is not None
     ]
 
@@ -155,28 +184,53 @@ def parse_yahoo_chart(text: str) -> list[PricePoint]:
 
 
 def load_cache(cache_path: str) -> list[PricePoint]:
+    """Reads both cache layouts: the original ``date,close`` and the current
+    ``date,close,high,low,volume`` (close stays second so either reads the
+    same close). An empty extra cell is ``None``, not zero."""
     if not os.path.isfile(cache_path):
         return []
     points: list[PricePoint] = []
     with open(cache_path, "r", encoding="utf-8") as handle:
         for line in handle:
             cells = line.strip().split(",")
-            if len(cells) != 2:
+            if len(cells) not in (2, 5):
                 continue
             day = _parse_date(cells[0])
             close = _num(cells[1])
             if day is None or close is None:
                 continue
-            points.append(PricePoint(day=day, close=close))
+            high = low = volume = None
+            if len(cells) == 5:
+                high, low, volume = (_num(cell) if cell else None for cell in cells[2:5])
+            points.append(PricePoint(day=day, close=close, high=high, low=low, volume=volume))
     points.sort(key=lambda point: point.day)
     return points
 
 
 def save_cache(points: Sequence[PricePoint], cache_path: str) -> None:
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+
+    def _cell(value: float | None) -> str:
+        return "" if value is None else str(value)
+
     with open(cache_path, "w", encoding="utf-8") as handle:
         for point in sorted(points, key=lambda p: p.day):
-            handle.write(f"{point.day.isoformat()},{point.close}\n")
+            if point.high is None and point.low is None and point.volume is None:
+                handle.write(f"{point.day.isoformat()},{point.close}\n")
+            else:
+                handle.write(
+                    f"{point.day.isoformat()},{point.close},{_cell(point.high)},{_cell(point.low)},{_cell(point.volume)}\n"
+                )
+
+
+# A cache with no high/low on any of its most recent bars predates OHLC
+# storage. Callers that need daily ranges (support detection) treat it as
+# stale so it is refetched once, rather than reading closes as lows.
+_OHLC_PROBE_BARS = 5
+
+
+def _has_daily_ranges(points: Sequence[PricePoint]) -> bool:
+    return any(point.has_range for point in points[-_OHLC_PROBE_BARS:])
 
 
 # --------------------------------------------------------------------------
@@ -258,9 +312,16 @@ def get_price_series(
     max_age_days: int = 1,
     force_refresh: bool = False,
     local_only: bool = False,
+    require_ranges: bool = False,
 ) -> tuple[list[PricePoint], list[str]] | None:
     """The best available daily-close series for ``ticker``, refreshing the
     cache when stale.
+
+    ``require_ranges``: also treat a cache (or memo) with no daily high/low
+    on its latest bars as stale -- one written before those were stored --
+    so callers that need ranges get a single refetch instead of closes only.
+    If that refetch fails the close-only series is still returned, with a
+    warning, exactly like any other failed refresh.
 
     With ``local_only=True`` the network is never touched: returns the resolved
     series when it can be answered from the in-process memo or a still-fresh
@@ -299,7 +360,7 @@ def get_price_series(
 
     if memoable:
         memo = _SERIES_MEMO.get(path)
-        if memo is not None and memo[0] == session_day:
+        if memo is not None and memo[0] == session_day and (not require_ranges or _has_daily_ranges(memo[1])):
             return list(memo[1]), []
 
     cached = load_cache(path)
@@ -307,6 +368,7 @@ def get_price_series(
         force_refresh
         or not cached
         or _sessions_elapsed(cached[-1].day, session_day) > max_age_days
+        or (require_ranges and not _has_daily_ranges(cached))
     )
     if not stale:
         if memoable:
@@ -412,6 +474,13 @@ def _leverage_kind(name: str | None, quote_type: str | None) -> str | None:
 def _epoch_to_date(value: object) -> date | None:
     try:
         return datetime.fromtimestamp(float(value), tz=timezone.utc).date()  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _epoch_to_datetime(value: object) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)  # type: ignore[arg-type]
     except (TypeError, ValueError, OverflowError, OSError):
         return None
 
@@ -795,6 +864,155 @@ def has_weekly_options(expirations: Sequence[date], today: date, *, horizon_days
     if len(near_term) < 2:
         return None
     return any((b - a).days <= 10 for a, b in zip(near_term, near_term[1:]))
+
+
+# --------------------------------------------------------------------------
+# Option chain quotes -- strike-level bid/ask/implied-volatility, the input
+# wheel.optionsmath needs to derive Greeks for a long DITM position. Same
+# endpoint as the expiration-dates fetch above, just read further and with
+# an explicit ``date`` so Yahoo returns one specific expiration's strikes
+# instead of only the nearest one. Deliberately *not* cached to disk or
+# memoized here, mirroring get_last_prices: a quote (and the Greeks derived
+# from it) is only ever "fresh right now," so there is nothing meaningful to
+# persist across requests. A caller wanting to avoid refetching within a
+# short window (a long-lived Dashboard serving many page loads) is
+# responsible for its own short-TTL cache around this call, exactly as
+# Dashboard._current_prices() already is for the live stock price.
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class OptionContractQuote:
+    """One contract's live quote off Yahoo's option-chain endpoint. Any of
+    ``bid``/``ask``/``last_price``/``implied_volatility`` may be ``None`` --
+    Yahoo omits a field for a contract with no recent trade or quote."""
+
+    contract_symbol: str
+    strike: float
+    right: str  # "C" | "P"
+    bid: float | None
+    ask: float | None
+    last_price: float | None
+    last_trade_date: datetime | None
+    implied_volatility: float | None
+    in_the_money: bool | None
+    # Contract-level liquidity, when Yahoo carries it: open contracts (as of
+    # the prior session) and contracts traded today. Yahoo omits ``volume``
+    # for a contract with no trade yet today, so ``None`` means "not
+    # reported", never zero.
+    open_interest: int | None = None
+    volume: int | None = None
+
+
+@dataclass(frozen=True)
+class OptionChainSnapshot:
+    """One ticker's full chain for one expiration date, as of the moment it
+    was fetched."""
+
+    ticker: str
+    expiration: date
+    underlying_price: float | None
+    quote_time: datetime | None
+    contracts: tuple[OptionContractQuote, ...]
+
+    def contract(self, strike: float, right: str) -> OptionContractQuote | None:
+        for candidate in self.contracts:
+            if candidate.right == right and abs(candidate.strike - strike) < 0.005:
+                return candidate
+        return None
+
+
+def fetch_yahoo_option_chain(ticker: str, expiration: date, timeout: float = 10.0) -> str:
+    """Raw JSON text for one ticker's option chain on one expiration date.
+    Yahoo snaps the ``date`` query param to whichever listed expiration it
+    lands on (not a documented exact contract), so :func:`parse_yahoo_option_chain`
+    confirms which date actually came back rather than trusting this to have
+    asked for the right one. MarketDataError on any transport failure (the
+    crumb handshake included), the same as every other fetch in this module.
+    """
+    epoch = int(datetime.combine(expiration, datetime.min.time(), tzinfo=timezone.utc).timestamp())
+    url = _OPTIONS_URL_TMPL.format(ticker=urllib.parse.quote(ticker.upper()))
+    return _yahoo_get(
+        url,
+        {"date": str(epoch)},
+        timeout=timeout,
+        error_context=f"option chain for {ticker} {expiration.isoformat()}",
+    )
+
+
+def _parse_option_contract(raw: dict, right: str) -> OptionContractQuote | None:
+    strike = raw.get("strike")
+    symbol = raw.get("contractSymbol")
+    if not isinstance(strike, (int, float)) or not symbol:
+        return None
+    iv = raw.get("impliedVolatility")
+    return OptionContractQuote(
+        contract_symbol=str(symbol),
+        strike=float(strike),
+        right=right,
+        bid=float(raw["bid"]) if isinstance(raw.get("bid"), (int, float)) else None,
+        ask=float(raw["ask"]) if isinstance(raw.get("ask"), (int, float)) else None,
+        last_price=float(raw["lastPrice"]) if isinstance(raw.get("lastPrice"), (int, float)) else None,
+        last_trade_date=_epoch_to_datetime(raw.get("lastTradeDate")),
+        implied_volatility=float(iv) if isinstance(iv, (int, float)) and iv > 0 else None,
+        in_the_money=bool(raw["inTheMoney"]) if isinstance(raw.get("inTheMoney"), bool) else None,
+        open_interest=_non_negative_count(raw.get("openInterest")),
+        volume=_non_negative_count(raw.get("volume")),
+    )
+
+
+def _non_negative_count(raw: object) -> int | None:
+    """A contract count from the chain, or ``None`` when missing or not a
+    sensible count (``bool`` is excluded: it is an ``int`` subclass)."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw < 0 or raw != raw:
+        return None
+    return int(raw)
+
+
+def parse_yahoo_option_chain(text: str, expiration: date) -> OptionChainSnapshot:
+    """Yahoo's ``optionChain.result[0]`` -> the one ``options`` group whose
+    own ``expirationDate`` resolves closest to ``expiration`` (a response can
+    carry more than one date's worth of strikes; which one Yahoo treats as
+    "the" match for the requested ``date`` isn't documented, so the closest
+    group is picked explicitly rather than assumed to be ``options[0]``).
+    MarketDataError on an unparseable response, or when no group resolves
+    within a day of ``expiration`` (a delisted ticker, or a contract that has
+    already expired and dropped off the chain).
+    """
+    try:
+        result = json.loads(text)["optionChain"]["result"]
+    except (json.JSONDecodeError, KeyError, TypeError) as error:
+        raise MarketDataError(f"unrecognized Yahoo options response: {error}") from error
+    if not result:
+        raise MarketDataError("no options chain in Yahoo's response")
+    chain = result[0]
+
+    best_group, best_gap = None, None
+    for group in chain.get("options") or []:
+        group_date = _epoch_to_date(group.get("expirationDate"))
+        if group_date is None:
+            continue
+        gap = abs((group_date - expiration).days)
+        if best_gap is None or gap < best_gap:
+            best_group, best_gap = group, gap
+    if best_group is None or best_gap > 1:
+        raise MarketDataError(
+            f"no option chain group found for {chain.get('underlyingSymbol')} expiring {expiration.isoformat()}"
+        )
+
+    calls = [q for raw in best_group.get("calls") or [] if (q := _parse_option_contract(raw, "C")) is not None]
+    puts = [q for raw in best_group.get("puts") or [] if (q := _parse_option_contract(raw, "P")) is not None]
+
+    quote = chain.get("quote") or {}
+    underlying_price = quote.get("regularMarketPrice")
+
+    return OptionChainSnapshot(
+        ticker=str(chain.get("underlyingSymbol") or "").upper(),
+        expiration=expiration,
+        underlying_price=float(underlying_price) if isinstance(underlying_price, (int, float)) else None,
+        quote_time=_epoch_to_datetime(quote.get("regularMarketTime")),
+        contracts=tuple(calls + puts),
+    )
 
 
 def get_fundamentals(

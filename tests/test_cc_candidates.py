@@ -14,28 +14,43 @@ from wheel.accounts import _combine_cc_candidates  # noqa: E402
 from wheel.api import Dashboard  # noqa: E402
 
 
-def _wheel(cycle_id, underlying, *, shares, cost=None, be=None, whlbe=None, last=None, is_wheel=True):
+def _wheel(
+    cycle_id, underlying, *, shares, cost=None, be=None, whlbe=None, last=None, is_wheel=True, covered=0.0, untracked=0.0
+):
+    """A Trade Log wheel as `_trade_log_entry` shapes it, including the
+    CC TO EXIT share counts the candidates table reads (`cc_to_exit_detail`)."""
+    held = shares + untracked
     return {
         "cycle_id": cycle_id,
         "underlying": underlying,
         "name": f"{underlying} Inc",
         "is_wheel": is_wheel,
         "shares_held": shares,
+        "shares_untracked": untracked or None,
         "cost_basis_per_share": cost,
         "break_even_per_share": be,
         "break_even_price": whlbe,
         "current_price": last,
+        "cc_to_exit": 140.0,
+        "cc_to_exit_status": "recommended",
+        "cc_to_exit_label": None,
+        "cc_to_exit_card": {"strategy": "CC TO EXIT"},
+        "cc_to_exit_detail": {
+            "shares_held": held,
+            "covered_shares": covered,
+            "uncovered_shares": max(held - covered, 0.0),
+        },
     }
 
 
-def _candidates(wheels, open_positions=(), earnings=None):
+def _candidates(wheels, earnings=None):
     earns = earnings or {}
     dash = Dashboard.__new__(Dashboard)
     dash._fundamentals = lambda tickers: {
         t: {"type": None, "market_cap_b": None, "avg_vol_10d_m": None, "earnings_date": earns.get(t)}
         for t in tickers
     }
-    return Dashboard._build_cc_candidates(dash, wheels, open_positions)
+    return Dashboard._build_cc_candidates(dash, wheels)
 
 
 class TestSelection(unittest.TestCase):
@@ -60,7 +75,6 @@ class TestSelection(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         row = rows[0]
         self.assertFalse(row["meets_threshold"])
-        self.assertIsNone(row["target_cc_strike"])
         self.assertIsNone(row["contracts_available"])
         # the other columns are still populated
         self.assertEqual(row["shares_held"], 99)
@@ -81,15 +95,37 @@ class TestSelection(unittest.TestCase):
         self.assertTrue(rows[0]["meets_threshold"])
         self.assertFalse(rows[1]["meets_threshold"])
 
-    def test_cycle_with_an_open_covered_call_is_excluded(self):
-        wheels = [_wheel("SPCX-2026-1", "SPCX", shares=100, cost=140.0)]
-        open_positions = [{"cycle_id": "SPCX-2026-1", "type": "CC"}]
-        self.assertEqual(_candidates(wheels, open_positions), [])
+    def test_cycle_fully_covered_by_an_open_covered_call_is_excluded(self):
+        wheels = [_wheel("SPCX-2026-1", "SPCX", shares=100, cost=140.0, covered=100)]
+        self.assertEqual(_candidates(wheels), [])
+
+    def test_shares_beyond_an_open_covered_call_are_still_a_candidate(self):
+        # JXN: 300 shares, one call open on 100 of them -> 200 free, 2 contracts.
+        wheels = [_wheel("JXN-2026-1", "JXN", shares=300, cost=58.0, last=132.0, covered=100)]
+        (row,) = _candidates(wheels)
+        self.assertEqual(row["shares_held"], 300)
+        self.assertEqual(row["shares_covered"], 100)
+        self.assertTrue(row["meets_threshold"])
+        self.assertEqual(row["contracts_available"], -2)
+
+    def test_under_100_free_shares_beyond_an_open_call_is_not_actionable(self):
+        wheels = [_wheel("MU-1", "MU", shares=150, cost=100.0, last=110.0, covered=100)]
+        (row,) = _candidates(wheels)
+        self.assertFalse(row["meets_threshold"])
+        self.assertIsNone(row["contracts_available"])
+
+    def test_untracked_shares_count_toward_the_free_shares(self):
+        # 0 shares traced through the history, 300 real (bought before it began).
+        wheel = _wheel("JXN-2026-1", "JXN", shares=0.0, last=132.0, untracked=300.0, covered=100)
+        (row,) = _candidates([wheel])
+        self.assertEqual(row["shares_held"], 300)
+        self.assertEqual(row["shares_untracked"], 300)
+        self.assertEqual(row["contracts_available"], -2)
 
     def test_open_csp_does_not_exclude_the_shares(self):
+        # An open put ties up cash, not shares, so it never counts as cover.
         wheels = [_wheel("SPCX-2026-1", "SPCX", shares=100, cost=140.0, last=150.0)]
-        open_positions = [{"cycle_id": "SPCX-2026-1", "type": "CSP"}]
-        self.assertEqual(len(_candidates(wheels, open_positions)), 1)
+        self.assertEqual(len(_candidates(wheels)), 1)
 
     def test_buy_and_hold_shows_with_no_wheel(self):
         rows = _candidates([_wheel("VOO-2025-1", "VOO", shares=300, cost=500.0, is_wheel=False)])
@@ -135,58 +171,16 @@ class TestUnrealizedPl(unittest.TestCase):
         self.assertIsNone(no_basis[0]["unrealized_pl_pct"])
 
 
-class TestTargetPrice(unittest.TestCase):
-    # target_cc_strike is `_cc_strike_floor`: the higher of the cushioned
-    # Profit Target floor (+2%, same cushion `_profit_target` applies to
-    # cost basis / breakeven / wheel breakeven) and the last close, rounded
-    # up to $0.50 -- never the raw, uncushioned max of those alone, so this
-    # can never come out below the wheel's own Profit Target (see
-    # test_trade_log.py's CC-strike-floor tests for that guarantee directly).
-
-    def test_target_is_the_greatest_of_cost_basis_break_evens_and_last_close(self):
-        # premium already banked pulls both break-evens below cost basis;
-        # last close sits below cost basis too, so cost basis wins -- cushioned
-        # +2% = 102.0, already on the $0.50 grid
-        rows = _candidates([_wheel("MU-1", "MU", shares=100, cost=100.0, be=92.0, whlbe=88.0, last=95.0)])
-        self.assertEqual(rows[0]["target_cc_strike"], 102.0)
-
-    def test_target_never_dips_below_a_break_even_that_sits_above_cost(self):
-        # a loss elsewhere in the cycle lifted the wheel break-even past cost;
-        # 105 cushioned +2% = 107.1, rounded up to 107.5
-        rows = _candidates([_wheel("MU-1", "MU", shares=100, cost=100.0, be=101.0, whlbe=105.0, last=90.0)])
-        self.assertEqual(rows[0]["target_cc_strike"], 107.5)
-
-    def test_target_never_dips_below_the_last_close(self):
-        # stock has run well past every cushioned cost figure -- don't write a call under market
-        rows = _candidates([_wheel("MU-1", "MU", shares=100, cost=90.0, be=85.0, whlbe=80.0, last=120.0)])
-        self.assertEqual(rows[0]["target_cc_strike"], 120.0)
-
-    def test_target_falls_back_to_last_close_when_basis_is_unknown(self):
-        rows = _candidates([_wheel("MU-1", "MU", shares=100, cost=None, be=None, whlbe=None, last=42.0)])
-        self.assertEqual(rows[0]["target_cc_strike"], 42.0)
-
-    def test_target_is_null_only_when_nothing_at_all_is_known(self):
-        rows = _candidates([_wheel("MU-1", "MU", shares=100, cost=None, be=None, whlbe=None, last=None)])
-        self.assertEqual(len(rows), 1)
-        self.assertIsNone(rows[0]["target_cc_strike"])
-
-    def test_target_ignores_a_missing_break_even(self):
-        # 50 cushioned +2% = 51.0, already on the $0.50 grid
-        rows = _candidates([_wheel("MU-1", "MU", shares=100, cost=50.0, be=None, whlbe=48.0, last=45.0)])
-        self.assertEqual(rows[0]["target_cc_strike"], 51.0)
-
-    def test_target_is_rounded_up_to_the_next_half_dollar(self):
-        # 175.12 cushioned +2% = 178.6224, rounded up to 179.0
-        rows = _candidates([_wheel("MU-1", "MU", shares=100, cost=175.12, be=170.0, whlbe=168.0, last=174.0)])
-        self.assertEqual(rows[0]["target_cc_strike"], 179.0)
-
-    def test_target_already_on_a_half_dollar_is_unchanged(self):
-        # cushioned floor lands exactly on the $0.50 grid -- rounding must not
-        # bump it further: 250 * 1.02 = 255.0, 300 * 1.02 = 306.0
-        rows = _candidates([_wheel("MU-1", "MU", shares=100, cost=250.0, be=1.0, whlbe=1.0, last=1.0)])
-        self.assertEqual(rows[0]["target_cc_strike"], 255.0)
-        rows = _candidates([_wheel("MU-1", "MU", shares=100, cost=300.0, be=1.0, whlbe=1.0, last=1.0)])
-        self.assertEqual(rows[0]["target_cc_strike"], 306.0)
+class TestCcToExit(unittest.TestCase):
+    def test_cc_to_exit_fields_are_the_wheels_own(self):
+        # One calculation (wheel/ccexit.py, run in _trade_log_entry); this
+        # table copies it rather than computing its own target.
+        wheel = _wheel("MU-1", "MU", shares=100, cost=100.0, last=110.0)
+        wheel.update(cc_to_exit=None, cc_to_exit_status="no_qualifying", cc_to_exit_label="NO QUALIFYING CC")
+        (row,) = _candidates([wheel])
+        for key in ("cc_to_exit", "cc_to_exit_status", "cc_to_exit_label", "cc_to_exit_card", "cc_to_exit_detail"):
+            self.assertEqual(row[key], wheel[key])
+        self.assertNotIn("target_cc_strike", row)
 
 
 class TestSectorAndEarnings(unittest.TestCase):

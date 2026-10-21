@@ -100,7 +100,7 @@ class TestBucketing(unittest.TestCase):
         )
         p = out["days"][0]["positions"][0]
         self.assertTrue(p["at_a_loss"])
-        self.assertIn("break-even", p["loss_note"])
+        self.assertIn("must reach to cancel out their cost", p["loss_note"])
         self.assertTrue(out["days"][0]["has_loss"])
 
     def test_loss_verdict_cc_strike_above_wheel_breakeven_is_fine(self):

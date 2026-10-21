@@ -5,24 +5,75 @@ from __future__ import annotations
 import os
 import sys
 import unittest
-from datetime import date
+from datetime import date, datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tests.test_engine import tx  # noqa: E402
-from wheel.api import Dashboard, _cc_strike_floor, _profit_target, _trade_log_entry  # noqa: E402
+from wheel import ccexit  # noqa: E402
+from wheel.api import Dashboard, _no_contract_open_position_row, _profit_target, _trade_log_entry  # noqa: E402
 from wheel.engine import build_cycles  # noqa: E402
-from wheel.parser import ASSIGNED, BTC, BTO, BUY_STOCK, EXPIRED, OTHER, SELL_STOCK, STC, STO  # noqa: E402
+from wheel.parser import ASSIGNED, BTC, BTO, BUY_STOCK, EXPIRED, OTHER, SELL_STOCK, STC, STO, parse_occ_symbol  # noqa: E402
+from wheel.positions import AccountSnapshot, OPTION, PositionRow  # noqa: E402
 
 
-def _trade_log(transactions, names=None, prices=None) -> dict:
+def _option_row(symbol: str, last_price: float) -> PositionRow:
+    """A minimal OPTION Positions row -- just enough for _option_mark_prices
+    to find this contract's occ_symbol and Last price; the other broker-export
+    fields this test doesn't care about are left at a harmless default."""
+    underlying, right, strike, expiry = parse_occ_symbol(symbol)
+    return PositionRow(
+        account_number="Z1",
+        account_name="IRA",
+        symbol_raw=symbol,
+        symbol=symbol,
+        description="",
+        quantity=-1,
+        last_price=last_price,
+        current_value=None,
+        today_gain_dollar=None,
+        today_gain_pct=None,
+        total_gain_dollar=None,
+        total_gain_pct=None,
+        percent_of_account=None,
+        cost_basis_total=None,
+        average_cost_basis=None,
+        account_type="Margin",
+        kind=OPTION,
+        underlying=underlying,
+        right=right,
+        strike=strike,
+        expiry=expiry,
+        occ_symbol=symbol.lstrip("-").upper(),
+    )
+
+
+def _trade_log(transactions, names=None, prices=None, snapshots=None, exit_chains=None, dashboard_out=None) -> dict:
     """Run ``Dashboard._build_trade_log`` against a hand-built transaction list,
     without touching disk or the network (the ``__init__`` pipeline).
+
+    ``snapshots`` (a list of ``PositionSnapshot``) lets a test supply a
+    Positions export so ``_option_mark_prices`` has something to mark open
+    legs against; omitted, it behaves as if no Positions file was ever
+    downloaded. ``exit_chains``: ``{ticker: ccexit.ExitChain}`` standing in
+    for the live option chains CC TO EXIT is chosen from; omitted, no chain
+    is available. ``dashboard_out``: a list the Dashboard is appended to.
     """
     dashboard = Dashboard.__new__(Dashboard)
+    dashboard._cc_exit_chains = lambda prices, untracked: {
+        cycle.cycle_id: (exit_chains or {})[cycle.underlying]
+        for cycle in dashboard.all_cycles
+        if cycle.underlying in (exit_chains or {})
+    }
+    if dashboard_out is not None:
+        dashboard_out.append(dashboard)
     dashboard.transactions = transactions
     dashboard.all_cycles, dashboard.engine = build_cycles(transactions)
     dashboard._company_names = names or {}
+    dashboard.snapshots = snapshots or []
+    dashboard._cycle_metrics_cache = {}
+    # No real share counts: every wheel's shares are the ones its own lots trace.
+    dashboard._net_worth = {"available": False}
     return Dashboard._build_trade_log(dashboard, prices or {})
 
 
@@ -43,9 +94,10 @@ class TestTransactionRows(unittest.TestCase):
         self.assertEqual(sell["signed_quantity"], -2)
         self.assertEqual(buy["signed_quantity"], 2)
         self.assertEqual(sell["quantity"], 2)
-        # Fees and commissions stay in their own columns.
-        self.assertEqual(sell["fees"], 0.02)
-        self.assertEqual(sell["commission"], 1.30)
+        # Every row is engine-attributed now, so fees + commission are always
+        # combined into one Fees figure; Commission is always None.
+        self.assertAlmostEqual(sell["fees"], 1.32)
+        self.assertIsNone(sell["commission"])
         # Initial CSP collateral is set only on the cash-secured-put open.
         self.assertEqual(sell["initial_csp_collateral"], 100 * 100 * 2)
         self.assertIsNone(buy["initial_csp_collateral"])
@@ -163,6 +215,35 @@ class TestTransactionRows(unittest.TestCase):
         # total P&L / total days held: 237.36 / 15
         self.assertAlmostEqual(wheel["pl_per_day_held"], 15.82, places=2)
 
+    def test_avg_days_in_trade_matches_total_days_held_leg_count(self):
+        """avg_days_in_trade and total_days_held must come from the same
+        floored-at-1 per-leg day counts: a same-day round trip (0 calendar
+        days) counts as 1 day in both, so avg_days_in_trade always equals
+        total_days_held / closed_leg_count exactly -- never a looser number
+        computed from the raw, unfloored calendar difference.
+        """
+        rows = _trade_log(
+            [
+                # 5-day short put.
+                tx("2025-01-01", STO, "-MU250110P100", -1, 1.0, 99.34, row_id=1),
+                tx("2025-01-06", BTC, "-MU250110P100", 1, 0.10, -10.66, row_id=2),
+                # 10-day short put.
+                tx("2025-02-01", STO, "-MU250228P100", -1, 2.0, 199.34, row_id=3),
+                tx("2025-02-11", BTC, "-MU250228P100", 1, 0.50, -50.66, row_id=4),
+                # Same-day round trip: 0 raw calendar days, floored to 1.
+                tx("2025-03-01", STO, "-MU250301P90", -1, 1.0, 99.34, row_id=5),
+                tx("2025-03-01", BTC, "-MU250301P90", 1, 0.10, -10.66, row_id=6),
+            ]
+        )
+        (wheel,) = rows["wheels"]
+        self.assertEqual(wheel["closed_leg_count"], 3)
+        # Floored day counts: 5 + 10 + 1 = 16 (not the unfloored 5 + 10 + 0 = 15).
+        self.assertEqual(wheel["total_days_held"], 16)
+        self.assertAlmostEqual(
+            wheel["avg_days_in_trade"], wheel["total_days_held"] / wheel["closed_leg_count"], places=6
+        )
+        self.assertAlmostEqual(wheel["avg_days_in_trade"], 16 / 3, places=6)
+
     def test_lone_directional_long_is_flagged_non_wheel_and_withholds_ratios(self):
         """A single bought-and-expired long option is not a wheel: its loss is
         real (closed_leg_pl, net_realized_pl) but the wheel-framed ratios --
@@ -212,6 +293,42 @@ class TestTransactionRows(unittest.TestCase):
         self.assertAlmostEqual(
             wheel["mark_to_market_pl"], 100.0 * (92.0 - wheel["break_even_price"]), places=2
         )
+
+    def test_mark_to_market_pl_nets_cost_to_close_for_itm_open_puts(self):
+        """The bug report this guards against: two still-open CSPs that have
+        gone ITM. Without a live mark, P&L (mark-to-market) would credit the
+        full $550 premium as if both puts expire worthless -- wildly
+        optimistic once they're deep ITM. With a Positions snapshot giving
+        each put's actual Last price, it instead nets the premium already
+        collected against what it would really cost to buy them back today.
+        """
+        snapshot = AccountSnapshot(
+            account_number="Z1",
+            account_name="IRA",
+            as_of=datetime(2025, 10, 1, 17, 0),
+            as_of_source="footer",
+            rows=[
+                _option_row("-AVAV251219P100", last_price=18.0),
+                _option_row("-AVAV251219P95", last_price=15.0),
+            ],
+        )
+        rows = _trade_log(
+            [
+                tx("2025-09-02", STO, "-AVAV251219P100", -1, 3.0, 300.0, row_id=1),
+                tx("2025-09-02", STO, "-AVAV251219P95", -1, 2.5, 250.0, row_id=2),
+            ],
+            snapshots=[snapshot],
+        )
+        (wheel,) = rows["wheels"]
+        # Realized P&L alone (nothing closed yet) stays $0 either way.
+        self.assertAlmostEqual(wheel["net_realized_pl"], 0.0, places=2)
+        # Marked: $550 collected minus $3,300 it would cost to close both now.
+        self.assertAlmostEqual(wheel["open_option_pl"], 550.0 - 3300.0, places=2)
+        self.assertTrue(wheel["open_option_pl_marked"])
+        self.assertAlmostEqual(wheel["mark_to_market_pl"], 550.0 - 3300.0, places=2)
+        # Confirms this is really a fix, not a no-op: the old, unmarked
+        # premium-only figure would have read +$550, the opposite sign.
+        self.assertGreater(0.0, wheel["mark_to_market_pl"])
 
     def test_running_break_even_progression_and_final_row(self):
         # STO put +$300 -> assigned 100 sh @ $100 -> STO covered call +$150,
@@ -301,87 +418,173 @@ class TestTransactionRows(unittest.TestCase):
             )
             self.assertAlmostEqual(wheel["profit_target"], _profit_target(floor), places=2)
 
-    def test_cc_strike_floor_available_with_an_open_cc(self):
-        # This wheel holds shares AND already has an open covered call (the
-        # STO call above is never bought back) -- unlike _build_cc_candidates'
-        # target_cc_strike, which would exclude a wheel like this one entirely
-        # (its cc_cycle_ids filter), cc_strike_floor is still populated: it's
-        # useful for planning the *next* roll of an already-open call.
+    def test_cc_to_exit_is_all_covered_when_the_open_call_covers_every_share(self):
+        # 100 shares, one open call against them: nothing left to write against.
         (wheel,) = self._cc_phase_fixture(92.0)["wheels"]
-        self.assertIsNotNone(wheel["cc_strike_floor"])
+        self.assertIsNone(wheel["cc_to_exit"])
+        self.assertEqual(wheel["cc_to_exit_status"], ccexit.STATUS_ALL_COVERED)
+        self.assertEqual(wheel["cc_to_exit_label"], "ALL SHARES COVERED")
+        self.assertEqual(wheel["cc_to_exit_detail"]["covered_shares"], 100)
 
-    def test_cc_strike_floor_matches_shared_helper(self):
-        (wheel,) = self._cc_phase_fixture(92.0)["wheels"]
-        expected = _cc_strike_floor(
-            wheel["cost_basis_per_share"],
-            wheel["break_even_per_share"],
-            wheel["break_even_price"],
-            92.0,
-        )
-        self.assertAlmostEqual(wheel["cc_strike_floor"], expected, places=2)
-
-    def test_cc_strike_floor_never_below_profit_target(self):
-        # Regression: cc_strike_floor used to compare cost basis / breakeven /
-        # wheel breakeven against the current price with no cushion, while
-        # profit_target cushioned that same floor by +2% -- so whenever the
-        # price hadn't rallied past cost basis, CC TO EXIT (cc_strike_floor)
-        # came out *below* Profit Target. A call struck there and assigned
-        # would lock in a below-target exit, defeating the point of a floor.
-        # Price sits below cost basis here so the price term never dominates.
-        for price in (85.0, 91.9, 92.0):
-            rows = _trade_log(
-                [tx("2025-07-18", BUY_STOCK, "BFH", 100, 92.0, -100 * 92.0, row_id=1)],
-                prices={"BFH": price},
-            )
-            (wheel,) = rows["wheels"]
-            self.assertGreaterEqual(wheel["cc_strike_floor"], wheel["profit_target"])
-
-    def test_cc_strike_floor_applies_the_same_cushion_as_profit_target(self):
-        # Cost basis $92 cushioned +2% = $93.84, rounded up to $94.00 -- both
-        # figures land on it when the price (here $85) doesn't dominate.
-        rows = _trade_log(
-            [tx("2025-07-18", BUY_STOCK, "BFH", 100, 92.0, -100 * 92.0, row_id=1)],
-            prices={"BFH": 85.0},
-        )
-        (wheel,) = rows["wheels"]
-        self.assertAlmostEqual(wheel["profit_target"], 94.0, places=2)
-        self.assertAlmostEqual(wheel["cc_strike_floor"], 94.0, places=2)
-
-    def test_crox_style_price_rally_case(self):
-        # A plain share buy (no premium banked yet) at ~$95.43, price now
-        # ~$112.48 -- reproduces the real CROX numbers that exposed the
-        # original "stuck target" problem: Profit Target stays low/stable,
-        # CC Strike Floor tracks the current price, and they differ.
+    def test_cc_to_exit_never_falls_back_to_the_stock_price(self):
+        # The CROX numbers: a plain share buy at $95.43, price now $112.48.
+        # The old formula answered $112.50 (the last price rounded up); with
+        # no option chain to check strikes against, the answer is NO
+        # QUALIFYING CC with the reason, never a price-derived number.
         rows = _trade_log(
             [tx("2025-07-18", BUY_STOCK, "CROX", 290, 95.43, -290 * 95.43, row_id=1)],
             prices={"CROX": 112.48},
         )
         (wheel,) = rows["wheels"]
+        self.assertIsNone(wheel["cc_to_exit"])
+        self.assertEqual(wheel["cc_to_exit_status"], ccexit.STATUS_NO_QUALIFYING)
+        self.assertEqual(wheel["cc_to_exit_label"], "NO QUALIFYING CC")
+        self.assertEqual(wheel["cc_to_exit_card"]["summary"], wheel["cc_to_exit_detail"]["reason"])
+        # Profit Target is a separate concept and is unaffected.
         self.assertAlmostEqual(wheel["profit_target"], 97.5, places=2)
-        self.assertAlmostEqual(wheel["cc_strike_floor"], 112.5, places=2)
-        self.assertNotAlmostEqual(wheel["profit_target"], wheel["cc_strike_floor"], places=2)
 
-    def test_csp_preferred_entry_formula(self):
+    def _assigned_then_chain(self, extra=(), chain_calls=None, price=130.58):
+        """100 shares assigned at $135 (put premium $339.34), no call open,
+        with a chain whose deltas come from ``chain_calls`` [(strike, iv)]."""
+        transactions = [
+            *extra,
+            tx("2026-09-17", STO, "-JXN261016P135", -1, 3.40, 339.34, row_id=10),
+            tx("2026-10-16", ASSIGNED, "-JXN261016P135", 1, None, 0.0, row_id=11, as_of="2026-10-16"),
+        ]
+        calls = tuple(
+            ccexit.CallQuote(strike, 2.0, 2.2, iv) for strike, iv in (chain_calls or [(135, 0.30), (140, 0.30), (145, 0.30)])
+        )
+        chain = ccexit.ExitChain(date(2026, 10, 17), date(2026, 11, 20), calls)
+        return _trade_log(transactions, prices={"JXN": price}, exit_chains={"JXN": chain})
+
+    def test_cc_to_exit_recommends_a_strike_at_or_above_the_minimum_exit(self):
+        (wheel,) = self._assigned_then_chain()["wheels"]
+        detail = wheel["cc_to_exit_detail"]
+        self.assertEqual(wheel["cc_to_exit_status"], ccexit.STATUS_RECOMMENDED)
+        self.assertEqual(detail["lot_cost"], 135.0)
+        self.assertEqual(detail["preferred_min_exit"], 138.0)
+        self.assertEqual(wheel["cc_to_exit"], 140.0)
+        self.assertIsNone(wheel["cc_to_exit_label"])
+        self.assertEqual(wheel["cc_to_exit_card"]["headline"]["value"], "$140.00")
+
+    def test_whole_position_break_even_is_independent_of_cc_to_exit(self):
+        # Test 7: an earlier put that expired adds $500 of wheel-level premium.
+        # It lowers the whole-position break-even, but it is not these shares'
+        # own cash, so CC TO EXIT (built from the lot alone) doesn't move.
+        earlier_put = (
+            tx("2026-06-01", STO, "-JXN260618P120", -1, 5.00, 500.0, row_id=1),
+            tx("2026-06-18", EXPIRED, "-JXN260618P120", 1, None, 0.0, row_id=2, as_of="2026-06-18"),
+        )
+        (plain,) = self._assigned_then_chain()["wheels"]
+        (with_put,) = self._assigned_then_chain(extra=earlier_put)["wheels"]
+        self.assertAlmostEqual(plain["break_even_price"] - with_put["break_even_price"], 5.0, places=2)
+        self.assertEqual(plain["cc_to_exit"], with_put["cc_to_exit"])
+        # Two separate builds: everything matches but the calculation time.
+        strip = lambda detail: {k: v for k, v in detail.items() if k != "calculated_at"}  # noqa: E731
+        self.assertEqual(strip(plain["cc_to_exit_detail"]), strip(with_put["cc_to_exit_detail"]))
+
+    def test_cc_to_exit_does_not_change_the_break_even(self):
+        # The reverse: a different chain changes the pick, never the break-even.
+        (a,) = self._assigned_then_chain(chain_calls=[(140, 0.30)])["wheels"]
+        (b,) = self._assigned_then_chain(chain_calls=[(145, 0.60)])["wheels"]
+        self.assertNotEqual(a["cc_to_exit"], b["cc_to_exit"])
+        self.assertEqual(a["break_even_price"], b["break_even_price"])
+        self.assertEqual(a["profit_target"], b["profit_target"])
+
+    def test_every_table_shows_the_same_cc_to_exit(self):
+        dashboards: list = []
+        trade_log = _trade_log(
+            [
+                tx("2026-09-17", STO, "-JXN261016P135", -1, 3.40, 339.34, row_id=10),
+                tx("2026-10-16", ASSIGNED, "-JXN261016P135", 1, None, 0.0, row_id=11, as_of="2026-10-16"),
+            ],
+            prices={"JXN": 130.58},
+            exit_chains={
+                "JXN": ccexit.ExitChain(
+                    date(2026, 10, 17),
+                    date(2026, 11, 20),
+                    (ccexit.CallQuote(140, 2.0, 2.2, 0.30),),
+                    quotes_as_of=datetime(2026, 10, 17, 19, 59, tzinfo=timezone.utc),
+                    fetched_at=datetime(2026, 10, 17, 20, 5, tzinfo=timezone.utc),
+                )
+            },
+            dashboard_out=dashboards,
+        )
+        (wheel,) = trade_log["wheels"]
+        dashboard = dashboards[0]
+        dashboard._fundamentals = lambda tickers: {}
+        (candidate,) = Dashboard._build_cc_candidates(dashboard, [wheel])
+        (target,) = Dashboard._build_wheel_targets_banner(dashboard, [wheel])
+        no_contract = _no_contract_open_position_row(wheel, None, None, date(2026, 10, 17), None)
+        fields = ("cc_to_exit", "cc_to_exit_status", "cc_to_exit_label", "cc_to_exit_card", "cc_to_exit_detail")
+        for row in (candidate, target, no_contract):
+            self.assertEqual({k: row[k] for k in fields}, {k: wheel[k] for k in fields})
+        self.assertEqual(wheel["cc_to_exit"], 140.0)
+        # Same chain snapshot and calculation time on every display.
+        detail = wheel["cc_to_exit_detail"]
+        self.assertEqual(detail["quotes_as_of"], "2026-10-17T19:59:00+00:00")
+        self.assertEqual(detail["chain_fetched_at"], "2026-10-17T20:05:00+00:00")
+        self.assertIsNotNone(detail["calculated_at"])
+        self.assertTrue(wheel["cc_to_exit_card"]["quoted"].startswith("Option prices as of"))
+
+    def test_csp_phase_carries_no_per_wheel_put_strike(self):
+        # CSP TO ENTER is one per-ticker result (the payload's csp_to_enter
+        # map, wheel/cspentry.py); the wheel only says it is in the CSP phase,
+        # so no wheel can hold a second, different strike for the same ticker.
         rows = _trade_log(
             [tx("2025-01-02", STO, "-MU250117P100", -1, 3.0, 300.0, row_id=1)],
             prices={"MU": 120.0},
         )
         (wheel,) = rows["wheels"]
         self.assertEqual(wheel["wheel_phase"], "csp")
-        self.assertAlmostEqual(wheel["preferred_csp_entry"], 111.5, places=2)  # floor(120*0.93 -> $0.50)
+        self.assertNotIn("preferred_csp_entry", wheel)
+        self.assertNotIn("preferred_csp_entry_explanation", wheel)
 
-    def test_csp_phase_has_no_cc_strike_floor(self):
+    def test_csp_phase_has_no_cc_to_exit(self):
+        # No shares: nothing to write a call against, and no last-price stand-in.
         rows = _trade_log(
             [tx("2025-01-02", STO, "-MU250117P100", -1, 3.0, 300.0, row_id=1)],
-            prices={"MU": 120.0},
+            prices={"MU": 120.2},
         )
         (wheel,) = rows["wheels"]
-        self.assertIsNone(wheel["cc_strike_floor"])
+        self.assertEqual(wheel["wheel_phase"], "csp")
+        self.assertIsNone(wheel["cc_to_exit"])
+        self.assertEqual(wheel["cc_to_exit_status"], ccexit.STATUS_NO_SHARES)
+        self.assertIsNone(wheel["cc_to_exit_label"])
 
-    def test_cc_phase_has_no_preferred_csp_entry(self):
+    def test_cc_phase_carries_no_per_wheel_put_strike(self):
         (wheel,) = self._cc_phase_fixture(92.0)["wheels"]
         self.assertEqual(wheel["wheel_phase"], "cc")
-        self.assertIsNone(wheel["preferred_csp_entry"])
+        self.assertNotIn("preferred_csp_entry", wheel)
+
+    def test_running_profit_target_uses_the_summarys_three_way_floor(self):
+        # The summary's Profit Target = max(cost basis, lot break-even, wheel
+        # break-even) x 1.02. Here the lot break-even is the highest: a call
+        # bought back at a loss raised it to $104.50, while an expired put
+        # (wheel-level only) keeps the wheel break-even lower. The running line
+        # used to take only max(cost basis, running break-even) = $102.
+        rows = _trade_log(
+            [
+                tx("2025-01-02", STO, "-MU250110P95", -1, 5.0, 500.0, row_id=1),
+                tx("2025-01-10", EXPIRED, "-MU250110P95", 1, None, 0.0, row_id=2, as_of="2025-01-10"),
+                tx("2025-01-13", STO, "-MU250117P100", -1, 3.0, 300.0, row_id=3),
+                tx("2025-01-17", ASSIGNED, "-MU250117P100", 1, None, 0.0, row_id=4, as_of="2025-01-17"),
+                tx("2025-01-20", STO, "-MU250221C105", -1, 1.5, 150.0, row_id=5),
+                tx("2025-02-03", BTC, "-MU250221C105", 1, 9.0, -900.0, row_id=6),
+                tx("2025-02-10", STO, "-MU250321C110", -1, 0.5, 50.0, row_id=7),
+            ],
+            prices={"MU": 90.0},
+        )
+        (wheel,) = rows["wheels"]
+        by_row = {r["date"]: r for r in wheel["transactions"]}
+        # After the buyback: lot break-even 100 - (300 + 150 - 900)/100 = 104.50
+        # -> 104.50 x 1.02 = 106.59, rounded up to 107.00.
+        self.assertAlmostEqual(by_row["2025-02-03"]["running_profit_target"], 107.0, places=2)
+        # After the last call: 100 - (300 + 150 - 900 + 50)/100 = 104.00 -> 106.50,
+        # the summary's own Profit Target.
+        self.assertAlmostEqual(wheel["break_even_per_share"], 104.0, places=2)
+        self.assertAlmostEqual(wheel["profit_target"], 106.5, places=2)
+        self.assertAlmostEqual(by_row["2025-02-10"]["running_profit_target"], wheel["profit_target"], places=2)
 
     def test_historical_running_profit_target_unchanged(self):
         # Same fixture/expectations as test_running_break_even_progression_
@@ -421,16 +624,14 @@ class TestTransactionRows(unittest.TestCase):
         # Stage 1: CSP only, no shares yet.
         (wheel1,) = _trade_log(all_txns[:1], prices={"MU": 240.0})["wheels"]
         self.assertEqual(wheel1["wheel_phase"], "csp")
-        self.assertAlmostEqual(wheel1["preferred_csp_entry"], 223.0, places=2)  # floor(240*0.93 -> $0.50)
         self.assertIsNone(wheel1["profit_target"])
-        self.assertIsNone(wheel1["cc_strike_floor"])
+        self.assertEqual(wheel1["cc_to_exit_status"], ccexit.STATUS_NO_SHARES)
 
         # Stage 2: assigned, holding shares, no CC written yet.
         (wheel2,) = _trade_log(all_txns[:2], prices={"MU": 232.0})["wheels"]
         self.assertEqual(wheel2["wheel_phase"], "cc")
         self.assertIsNotNone(wheel2["profit_target"])
-        self.assertIsNotNone(wheel2["cc_strike_floor"])
-        self.assertIsNone(wheel2["preferred_csp_entry"])
+        self.assertEqual(wheel2["cc_to_exit_detail"]["uncovered_shares"], 100)
 
         # Stage 3: CC written and called away -- cycle closes, flat again.
         # wheel_phase reports "csp" for this now-closed cycle too (is_open
@@ -439,9 +640,8 @@ class TestTransactionRows(unittest.TestCase):
         (wheel3,) = _trade_log(all_txns, prices={"MU": 236.0})["wheels"]
         self.assertFalse(wheel3["is_open"])
         self.assertEqual(wheel3["wheel_phase"], "csp")
-        self.assertIsNotNone(wheel3["preferred_csp_entry"])
         self.assertIsNone(wheel3["profit_target"])
-        self.assertIsNone(wheel3["cc_strike_floor"])
+        self.assertEqual(wheel3["cc_to_exit_status"], ccexit.STATUS_NO_SHARES)
 
     def test_pl_bridge_sums_to_mark_to_market(self):
         rows = _trade_log(
@@ -508,8 +708,183 @@ class TestTransactionRows(unittest.TestCase):
         self.assertEqual(rows["wheels"][0]["underlying"], "MU")
 
 
-class TestEngineExactPath(unittest.TestCase):
-    def test_engine_exact_entry_combines_fees_and_notes_it(self):
+def _find_row(wheel, date_str, type_, strike=None):
+    """The one ledger row (wheel['transactions']) matching date/type/strike --
+    unique in every fixture these drill-down tests build."""
+    matches = [
+        r
+        for r in wheel["transactions"]
+        if r["date"] == date_str and r["type"] == type_ and (strike is None or r["strike"] == strike)
+    ]
+    assert len(matches) == 1, f"expected exactly one match, got {matches}"
+    return matches[0]
+
+
+class TestCcExitFeeModel(unittest.TestCase):
+    """Dashboard._cc_exit_fee_model: CC TO EXIT's fees, measured from the
+    account's own ledger (Commission + Fees columns)."""
+
+    def _model(self, transactions):
+        dashboard = Dashboard.__new__(Dashboard)
+        dashboard.transactions = transactions
+        return Dashboard._cc_exit_fee_model(dashboard)
+
+    def test_call_fee_is_the_contract_weighted_average(self):
+        model = self._model(
+            [
+                tx("2026-08-07", STO, "-JXN260918C140", -3, 3.06, 915.99, row_id=1, commission=1.95, fees=0.06),
+                tx("2026-10-14", STO, "-JXN261120C135", -1, 4.86, 485.32, row_id=2, commission=0.65, fees=0.03),
+                # A put sale is not a covered call; it doesn't count.
+                tx("2026-09-09", STO, "-JXN260918P135", -1, 2.30, 229.34, row_id=3, commission=0.65, fees=0.01),
+            ]
+        )
+        self.assertAlmostEqual(model.option_fee_per_contract, (2.01 + 0.68) / 4)
+        self.assertIn("4 call contracts", model.option_fee_source)
+
+    def test_sale_fee_rate_comes_from_the_latest_stock_sale_date(self):
+        model = self._model(
+            [
+                # An old sale at a different rate is ignored.
+                tx("2025-09-22", SELL_STOCK, "BHF", -100, 50.0, 5000.0, row_id=1),
+                tx("2026-04-20", SELL_STOCK, "MU", -100, 425.0, 42499.12, row_id=2, fees=0.88),
+                tx("2026-04-20", SELL_STOCK, "MU", -22, 440.0, 9679.80, row_id=3, fees=0.20),
+            ]
+        )
+        self.assertAlmostEqual(model.sale_fee_rate, (0.88 + 0.20) / (42500.0 + 9680.0))
+        self.assertIn("Apr 20, 2026", model.sale_fee_source)
+
+    def test_fallbacks_say_so_when_there_is_nothing_to_measure(self):
+        model = self._model([tx("2026-06-01", STO, "-JXN260618P100", -1, 2.5, 249.33, row_id=1)])
+        self.assertEqual(model.option_fee_per_contract, ccexit.OPTION_FEE_PER_CONTRACT)
+        self.assertIn("no call sales", model.option_fee_source)
+        self.assertEqual(model.sale_fee_rate, ccexit.SALE_FEE_RATE_FALLBACK)
+        self.assertIn("no stock sales", model.sale_fee_source)
+
+
+class TestWinRateAndRollChainDrillDown(unittest.TestCase):
+    """Covers a real user-reported confusion: a single BTC closing several
+    separately-opened lots at once can't be reconciled into Win Rate's
+    per-leg count from the transaction table alone, and Roll Rate's
+    "0W / 0L resolved" can read as "no realized wins/losses exist" when it
+    really means "no roll chain has fully closed out yet." Both figures were
+    correct; neither was auditable. These tests lock in the reconciliation
+    now exposed directly on the ledger's own Result / Roll chain columns
+    (see TestEngineAttributedRows for the ledger-row-splitting case itself).
+    """
+
+    def test_a_shared_close_splits_back_into_its_separate_opening_legs(self):
+        """Two separate STO orders at the same strike/expiry (1 contract,
+        then 2 more a few days later) closed by one 3-contract BTC must stay
+        two legs, FIFO-allocated, not collapse into "one trade" -- that is
+        exactly what inflated the user's by-hand count from 6 legs to 5.
+        """
+        rows = _trade_log(
+            [
+                # A clean, independent win -- not entangled in the split below.
+                tx("2025-04-01", STO, "-TST250401P110", -1, 3.0, 300.0, row_id=1),
+                tx("2025-04-01", BTC, "-TST250401P110", 1, 0.5, -50.0, row_id=2),
+                # Lot 1: opened alone.
+                tx("2025-05-01", STO, "-TST250601P100", -1, 3.0, 300.0, row_id=3),
+                # Lot 2: a separate order, four days later, same strike/expiry.
+                tx("2025-05-05", STO, "-TST250601P100", -2, 2.5, 500.0, row_id=4),
+                # One BTC closes all 3 contracts (lot 1 + lot 2) at once.
+                tx("2025-05-10", BTC, "-TST250601P100", 3, 4.0, -1200.0, row_id=5),
+            ]
+        )
+        (wheel,) = rows["wheels"]
+        closes = [r for r in wheel["transactions"] if r["type"] == "Buy Put" and r["strike"] == 100]
+        self.assertEqual(len(closes), 2)  # not 1 -- the shared BTC splits into its two lots
+        by_qty = {r["quantity"]: r for r in closes}
+        # FIFO: lot 1 (1 contract) absorbs 1/3 of the close; lot 2 (2 contracts) 2/3.
+        self.assertAlmostEqual(by_qty[1]["net_cash_flow"] + 300.0, -100.0, places=2)
+        self.assertEqual(by_qty[1]["result"], "LOSS")
+        self.assertAlmostEqual(by_qty[2]["net_cash_flow"] + 500.0, -300.0, places=2)
+        self.assertEqual(by_qty[2]["result"], "LOSS")
+        # Win Rate counts all 3 legs, not the 2 "trades" a by-hand read would see.
+        self.assertEqual(wheel["wins"], 1)
+        self.assertEqual(wheel["losses"], 2)
+        self.assertAlmostEqual(wheel["win_rate_pct"], 100.0 / 3, places=2)
+
+    def test_open_roll_chains_are_excluded_from_resolved_win_loss_and_reported_separately(self):
+        """One roll chain fully closes out (and should count as a resolved
+        win); a second is still open and must NOT be folded into "0W/0L" --
+        nor should either chain's bookkeeping erase the plain Win Rate record,
+        which is unaffected by whether a leg's chain ever resolves.
+        """
+        rows = _trade_log(
+            [
+                # Chain 1: P1 (win) rolls into P2 (loss) -- P2 never rolls again,
+                # so the whole chain is CLOSED and nets to a resolved win
+                # (+200 - 50 = +150), even though P2 itself was a losing leg.
+                tx("2025-01-02", STO, "-TST250110P90", -1, 3.0, 300.0, row_id=1),
+                tx("2025-01-03", BTC, "-TST250110P90", 1, 1.0, -100.0, row_id=2),
+                tx("2025-01-03", STO, "-TST250117P100", -1, 3.0, 300.0, row_id=3),
+                tx("2025-01-04", BTC, "-TST250117P100", 1, 3.5, -350.0, row_id=4),
+                # Chain 2: Q1 (win) rolls into Q2, which is still open today --
+                # the whole chain stays OPEN no matter how Q1 resolved alone.
+                tx("2025-02-01", STO, "-TST250210P200", -1, 3.0, 300.0, row_id=5),
+                tx("2025-02-02", BTC, "-TST250210P200", 1, 1.0, -100.0, row_id=6),
+                tx("2025-02-02", STO, "-TST250217P210", -1, 3.0, 300.0, row_id=7),
+                # A plain, standalone loss with no same-day activity at all --
+                # never touched by the roll detector, but still a real leg.
+                tx("2025-03-01", STO, "-TST250310P150", -1, 3.0, 300.0, row_id=8),
+                tx("2025-03-02", BTC, "-TST250310P150", 1, 5.0, -500.0, row_id=9),
+            ]
+        )
+        (wheel,) = rows["wheels"]
+        # Plain Win Rate: 4 closed legs (P1, P2, Q1, the standalone loss),
+        # 2 wins / 2 losses -- unaffected by any chain still being open.
+        self.assertEqual(wheel["wins"], 2)
+        self.assertEqual(wheel["losses"], 2)
+        self.assertAlmostEqual(wheel["win_rate_pct"], 50.0, places=2)
+        # Roll Rate: P1, P2, Q1 and the standalone loss are all closed SHORT
+        # legs (rollable); P1 and Q1 are the ones whose *close* rolled forward.
+        self.assertEqual(wheel["rollable_legs"], 4)
+        self.assertEqual(wheel["rolled_legs"], 2)
+        self.assertAlmostEqual(wheel["roll_rate_pct"], 50.0, places=2)
+        # The chain-level verdict: exactly one chain has fully closed out
+        # (net +150, a win), and it must not be reported as still open.
+        self.assertEqual(wheel["resolved_roll_wins"], 1)
+        self.assertEqual(wheel["resolved_roll_losses"], 0)
+        # The other chain is still open -- its credit is reported on its own,
+        # separate from the resolved chain's P/L, never summed into it.
+        self.assertEqual(wheel["open_roll_chains"], 1)
+        self.assertAlmostEqual(wheel["open_roll_credit"], 500.0, places=2)
+        # Per-chain breakdown of that open credit (only one chain here, so it
+        # isn't surfaced separately in the UI, but the data is still right).
+        self.assertEqual(len(wheel["open_chain_credits"]), 1)
+        self.assertAlmostEqual(wheel["open_chain_credits"][0]["net_cash"], 500.0, places=2)
+
+        # The ledger itself carries the same chain_id/chain_status/result on
+        # every row for a leg -- no separate drill-down needed, and no leg is
+        # ever repeated across two tables.
+        p1_close = _find_row(wheel, "2025-01-03", "Buy Put", strike=90)
+        p2_open = _find_row(wheel, "2025-01-03", "Sell Put", strike=100)
+        p2_close = _find_row(wheel, "2025-01-04", "Buy Put", strike=100)
+        self.assertEqual(p1_close["chain_id"], p2_open["chain_id"])
+        self.assertEqual(p1_close["chain_id"], p2_close["chain_id"])
+        self.assertEqual(p1_close["chain_status"], "WIN")
+        self.assertEqual(p2_close["chain_status"], "WIN")
+        self.assertEqual(p1_close["result"], "WIN")
+        self.assertEqual(p2_close["result"], "LOSS")  # resolved as a winning chain, despite a losing leg in it
+
+        q1_close = _find_row(wheel, "2025-02-02", "Buy Put", strike=200)
+        q2_open = _find_row(wheel, "2025-02-02", "Sell Put", strike=210)
+        self.assertEqual(q1_close["chain_id"], q2_open["chain_id"])
+        self.assertEqual(q1_close["chain_status"], "OPEN")
+        self.assertEqual(q2_open["chain_status"], "OPEN")
+        self.assertIsNone(q2_open["result"])  # still open -- no verdict yet
+
+        # The standalone loss was never touched by the roll detector: present
+        # in the ledger (Win Rate's record), but with no chain at all.
+        standalone_close = _find_row(wheel, "2025-03-02", "Buy Put", strike=150)
+        self.assertEqual(standalone_close["result"], "LOSS")
+        self.assertIsNone(standalone_close["chain_id"])
+        self.assertIsNone(standalone_close["chain_status"])
+
+
+class TestEngineAttributedRows(unittest.TestCase):
+    def test_entry_combines_fees_and_notes_it(self):
         cycles, _ = build_cycles(
             [
                 tx("2025-01-06", STO, "-MU250117P100", -1, 2.00, 199.33, row_id=1, commission=0.65, fees=0.02),
@@ -518,24 +893,23 @@ class TestEngineExactPath(unittest.TestCase):
         )
         entry = _trade_log_entry(
             cycles[0],
-            [],  # engine-exact path never reads the raw list
+            [],  # every option row comes from the engine; nothing here reads the raw list
             date(2025, 1, 17),
             name=None,
             dividend_row_ids=set(),
             dividends=0.0,
-            engine_exact=True,
         )
         self.assertIsNotNone(entry["attribution_note"])
         self.assertEqual([r["type"] for r in entry["transactions"]], ["Sell Put", "Buy Put"])
         for row in entry["transactions"]:
-            self.assertIsNone(row["commission"])  # folded into fees on this path
+            self.assertIsNone(row["commission"])  # always folded into fees
         # open leg fee is commission + fees combined
         self.assertAlmostEqual(entry["transactions"][0]["fees"], 0.67)
 
-    def test_engine_exact_entry_still_carries_dividend_rows(self):
-        # Engine-exact derivation is legs/closes/assignments only; a dividend is
-        # not an engine structure, so it has to be pulled from the raw ledger or
-        # the cash column (and the running break-even) would drop it.
+    def test_entry_still_carries_dividend_rows(self):
+        # The engine's legs/closes/assignments have no notion of a dividend --
+        # it has to be pulled from the raw ledger or the cash column (and the
+        # running break-even) would drop it.
         div = tx("2025-01-08", OTHER, "MU", 0, None, 12.34, row_id=9, action_raw="DIVIDEND RECEIVED MICRON")
         cycles, _ = build_cycles(
             [
@@ -550,11 +924,43 @@ class TestEngineExactPath(unittest.TestCase):
             name=None,
             dividend_row_ids={9},
             dividends=12.34,
-            engine_exact=True,
         )
         div_rows = [r for r in entry["transactions"] if r["type"] == "Dividend"]
         self.assertEqual(len(div_rows), 1)
         self.assertEqual(div_rows[0]["net_cash_flow"], 12.34)
+
+    def test_a_shared_close_splits_into_two_rows_each_with_its_own_result_and_chain(self):
+        """The ledger-level counterpart to the leg-level reconciliation tests
+        above: one BTC that FIFO-closes two separately-opened lots must show
+        up here as two rows, not one blended row, each with its own Return %
+        and Result -- and, since both legs roll forward into the same new
+        leg, the same Roll chain.
+        """
+        cycles, _ = build_cycles(
+            [
+                tx("2025-05-01", STO, "-MU250601P100", -1, 3.0, 300.0, row_id=1),
+                tx("2025-05-05", STO, "-MU250601P100", -2, 2.5, 500.0, row_id=2),
+                # Closes both lots at once, same day a new leg opens (a roll).
+                tx("2025-05-10", BTC, "-MU250601P100", 3, 4.0, -1200.0, row_id=3),
+                tx("2025-05-10", STO, "-MU250610P100", -3, 5.0, 1500.0, row_id=4),
+            ]
+        )
+        entry = _trade_log_entry(
+            cycles[0], [], date(2025, 5, 10), name=None, dividend_row_ids=set(), dividends=0.0
+        )
+        closes = [r for r in entry["transactions"] if r["type"] == "Buy Put"]
+        self.assertEqual(len(closes), 2)
+        by_qty = {r["quantity"]: r for r in closes}
+        self.assertEqual(set(by_qty), {1, 2})
+        # Each lot's own return, not one blended across both.
+        self.assertAlmostEqual(by_qty[1]["close_return_pct"], (3.0 - 4.0) / 3.0 * 100, places=2)
+        self.assertAlmostEqual(by_qty[2]["close_return_pct"], (2.5 - 4.0) / 2.5 * 100, places=2)
+        self.assertEqual(by_qty[1]["result"], "LOSS")
+        self.assertEqual(by_qty[2]["result"], "LOSS")
+        # Both lots rolled into the same new leg -- same chain.
+        self.assertIsNotNone(by_qty[1]["chain_id"])
+        self.assertEqual(by_qty[1]["chain_id"], by_qty[2]["chain_id"])
+        self.assertEqual(by_qty[1]["chain_status"], "OPEN")
 
 
 class TestBuildPayload(unittest.TestCase):

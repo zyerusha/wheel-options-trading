@@ -19,6 +19,7 @@ from wheel.metrics import (  # noqa: E402
     capital_timeline,
     cycle_metrics,
     dividends_by_cycle,
+    lot_option_credit,
     net_adjusted_cost_basis,
     portfolio_capital_series,
     portfolio_metrics,
@@ -310,12 +311,10 @@ class TestNetAdjustedCostBasis(unittest.TestCase):
         basis_lower_net = net_adjusted_cost_basis(lower_net[0], lower_net[0].share_lots[0])
         self.assertGreater(basis_lower_net, basis_higher_net)
 
-    def test_concurrent_lots_split_the_cycles_net_premium_pro_rata(self):
-        """Two partial assignments at different strikes, neither sold yet: the
-        cycle's total net premium is allocated by share count, not "whichever
-        leg happened to produce this lot" -- both lots get the same $/share
-        adjustment here since both are 100-share lots.
-        """
+    def test_each_assigned_lot_keeps_its_own_puts_premium(self):
+        """Two assignments at different strikes, neither sold yet: each lot is
+        netted against the put that produced it, not a pooled split of the
+        whole cycle's premium."""
         cycles, _ = build_cycles(
             [
                 tx("2025-01-01", STO, "-XYZ250201P100", -1, 3.00, 300.0, row_id=1),
@@ -328,9 +327,8 @@ class TestNetAdjustedCostBasis(unittest.TestCase):
         self.assertEqual(len(cycle.share_lots), 2)
         lot_100 = next(lot for lot in cycle.share_lots if lot.basis_per_share == 100.0)
         lot_105 = next(lot for lot in cycle.share_lots if lot.basis_per_share == 105.0)
-        # (300 + 200) split 50/50 across two 100-share lots = 250 each.
-        self.assertAlmostEqual(net_adjusted_cost_basis(cycle, lot_100), 100.0 - 250.0 / 100.0, places=4)
-        self.assertAlmostEqual(net_adjusted_cost_basis(cycle, lot_105), 105.0 - 250.0 / 100.0, places=4)
+        self.assertAlmostEqual(net_adjusted_cost_basis(cycle, lot_100), 100.0 - 3.00, places=4)
+        self.assertAlmostEqual(net_adjusted_cost_basis(cycle, lot_105), 105.0 - 2.00, places=4)
 
     def test_unknown_basis_lot_returns_none(self):
         """A PRE_HISTORY lot (stock the export never saw bought) has no strike
@@ -345,6 +343,120 @@ class TestNetAdjustedCostBasis(unittest.TestCase):
         cycle = cycles[0]
         lot = next(lot for lot in cycle.share_lots if lot.basis_per_share is None)
         self.assertIsNone(net_adjusted_cost_basis(cycle, lot))
+
+
+class TestLotOptionCredit(unittest.TestCase):
+    """Test 6: option cash earned on other shares never lands on the newest
+    lot. Modeled on the IRA's JXN: 300 shares held from before the history
+    starts, calls written against them, then a put assigned 100 more."""
+
+    def setUp(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2026-09-01", STO, "-JXN261016P135", -1, 3.40, 339.34, row_id=1),
+                tx("2026-10-01", STO, "-JXN261106C140", -3, 3.00, 900.00, row_id=2),
+                tx("2026-10-16", ASSIGNED, "-JXN261016P135", 1, None, 0.0, row_id=3, as_of="2026-10-16"),
+                # Same day as the assignment: written against the old shares,
+                # since assigned shares only arrive after the expiration close.
+                tx("2026-10-16", STO, "-JXN261120C145", -2, 3.74, 748.65, row_id=4),
+                tx("2026-10-20", STO, "-JXN261120C150", -1, 4.85, 485.32, row_id=5),
+            ]
+        )
+        self.cycle = cycles[0]
+        (self.lot,) = [lot for lot in self.cycle.share_lots if lot.remaining > 0]
+        self.credit = lot_option_credit(self.cycle, untracked_shares=300)
+
+    def test_new_lot_gets_its_own_put_and_only_calls_written_while_it_was_held(self):
+        # $339.34 put / 100 shares, plus the 10/20 call split over all 400.
+        expected = 339.34 / 100 + 485.32 / 400
+        self.assertAlmostEqual(self.credit.by_lot[self.lot.lot_id], expected, places=6)
+        self.assertAlmostEqual(
+            net_adjusted_cost_basis(self.cycle, self.lot, untracked_shares=300), 135.0 - expected, places=6
+        )
+
+    def test_old_shares_keep_the_calls_written_against_them(self):
+        expected = 900.00 / 300 + 748.65 / 300 + 485.32 / 400
+        self.assertAlmostEqual(self.credit.untracked, expected, places=6)
+
+    def test_every_attributed_dollar_reconciles_to_the_legs(self):
+        attributed = self.credit.by_lot[self.lot.lot_id] * 100 + self.credit.untracked * 300
+        self.assertAlmostEqual(attributed, 339.34 + 900.00 + 748.65 + 485.32, places=6)
+
+    def test_a_rolled_put_chain_goes_to_the_lot_it_assigned(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2026-09-09", STO, "-JXN260918P130", -1, 2.30, 229.34, row_id=1),
+                tx("2026-09-17", BTC, "-JXN260918P130", 1, 0.50, -50.01, row_id=2),
+                tx("2026-09-17", STO, "-JXN261016P135", -1, 3.40, 339.34, row_id=3),
+                tx("2026-10-16", ASSIGNED, "-JXN261016P135", 1, None, 0.0, row_id=4, as_of="2026-10-16"),
+            ]
+        )
+        cycle = cycles[0]
+        self.assertTrue(cycle.rolls, "the same-day close/reopen should be detected as a roll")
+        (lot,) = cycle.share_lots
+        credit = lot_option_credit(cycle)
+        self.assertAlmostEqual(credit.by_lot[lot.lot_id], (229.34 - 50.01 + 339.34) / 100, places=6)
+
+    def test_a_put_that_expired_stays_wheel_level(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2026-06-01", STO, "-JXN260618P120", -1, 2.50, 249.33, row_id=1),
+                tx("2026-06-18", EXPIRED, "-JXN260618P120", 1, None, 0.0, row_id=2, as_of="2026-06-18"),
+                tx("2026-09-01", STO, "-JXN261016P135", -1, 3.40, 339.34, row_id=3),
+                tx("2026-10-16", ASSIGNED, "-JXN261016P135", 1, None, 0.0, row_id=4, as_of="2026-10-16"),
+            ]
+        )
+        cycle = cycles[0]
+        (lot,) = cycle.share_lots
+        self.assertAlmostEqual(lot_option_credit(cycle).by_lot[lot.lot_id], 339.34 / 100, places=6)
+
+
+class TestLotOptionCreditAllocation(unittest.TestCase):
+    """Regression: put cash follows the lot its own assignment created, and
+    every attributed dollar reconciles to the legs."""
+
+    def test_two_puts_assigned_the_same_day_keep_their_own_premium(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-02", STO, "-XYZ250201P100", -1, 3.00, 300.0, row_id=1),
+                tx("2025-01-03", STO, "-XYZ250201P90", -1, 1.00, 100.0, row_id=2),
+                tx("2025-02-01", ASSIGNED, "-XYZ250201P100", 1, None, 0.0, row_id=3, as_of="2025-02-01"),
+                tx("2025-02-01", ASSIGNED, "-XYZ250201P90", 1, None, 0.0, row_id=4, as_of="2025-02-01"),
+            ]
+        )
+        cycle = cycles[0]
+        credit = lot_option_credit(cycle)
+        by_strike = {lot.basis_per_share: credit.by_lot[lot.lot_id] for lot in cycle.share_lots}
+        # Not the pooled $2.00 each.
+        self.assertAlmostEqual(by_strike[100.0], 3.00, places=6)
+        self.assertAlmostEqual(by_strike[90.0], 1.00, places=6)
+
+    def test_representative_wheel_reconciles(self):
+        """An expired CSP (wheel-level), a rolled put that ended in
+        assignment, a covered call, then the shares called away."""
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-02", STO, "-XYZ250117P100", -1, 3.00, 300.0, row_id=1),
+                tx("2025-01-17", EXPIRED, "-XYZ250117P100", 1, None, 0.0, row_id=2, as_of="2025-01-17"),
+                tx("2025-01-21", STO, "-XYZ250221P95", -1, 2.00, 200.0, row_id=3),
+                tx("2025-02-14", BTC, "-XYZ250221P95", 1, 0.60, -60.0, row_id=4),
+                tx("2025-02-14", STO, "-XYZ250321P90", -1, 2.50, 250.0, row_id=5),
+                tx("2025-03-21", ASSIGNED, "-XYZ250321P90", 1, None, 0.0, row_id=6, as_of="2025-03-21"),
+                tx("2025-03-24", STO, "-XYZ250417C95", -1, 1.80, 180.0, row_id=7),
+                tx("2025-04-17", ASSIGNED, "-XYZ250417C95", 1, None, 0.0, row_id=8, as_of="2025-04-17"),
+            ]
+        )
+        cycle = cycles[0]
+        (lot,) = cycle.share_lots
+        self.assertEqual(lot.remaining, 0)  # called away
+        credit = lot_option_credit(cycle)
+        chain_cash, call_cash, expired_put_cash = 200.0 - 60.0 + 250.0, 180.0, 300.0
+        self.assertAlmostEqual(credit.by_lot[lot.lot_id], (chain_cash + call_cash) / 100, places=6)
+        self.assertAlmostEqual(net_adjusted_cost_basis(cycle, lot), 90.0 - (chain_cash + call_cash) / 100, places=6)
+        # Lot-level + wheel-level = every option dollar, each counted once.
+        every_leg = sum(leg.open_cash + sum(c.cash for c in leg.closes) for leg in cycle.legs)
+        attributed = credit.by_lot[lot.lot_id] * lot.shares + credit.untracked
+        self.assertAlmostEqual(every_leg, attributed + expired_put_cash, places=6)
 
 
 class TestDividendAttribution(unittest.TestCase):
@@ -695,6 +807,28 @@ class TestReturnMath(unittest.TestCase):
         self.assertIsNotNone(metrics.roi_pct)  # long premium counts as capital
         self.assertGreater(metrics.net_realized_pl, 0)
 
+    def test_avg_days_in_trade_floors_a_same_day_round_trip_at_one_day(self):
+        """avg_days_in_trade must use the same per-leg day-flooring
+        total_days_held (wheel/api.py's P&L / day held) already does -- a
+        same-day open+close is 1 day held, never 0, so the two figures stay
+        reconcilable (e.g. AVAV's 6 legs: 22 total days held / 6 = 3.67, not
+        the unfloored 21 / 6 = 3.5 the raw calendar difference would give).
+        """
+        cycles, _ = build_cycles(
+            [
+                # 2 days held.
+                tx("2025-09-14", STO, "-MU250916P150", -1, 3.0, 300.0, row_id=1),
+                tx("2025-09-16", BTC, "-MU250916P150", 1, 1.0, -100.0, row_id=2),
+                # Same-day round trip: 0 raw calendar days, floored to 1.
+                tx("2025-09-14", STO, "-MU250914P142", -1, 3.0, 300.0, row_id=3),
+                tx("2025-09-14", BTC, "-MU250914P142", 1, 1.0, -100.0, row_id=4),
+            ]
+        )
+        metrics = cycle_metrics(cycles[0], date(2025, 9, 16))
+        self.assertEqual(metrics.wins + metrics.losses, 2)
+        # Raw calendar days would be 2 + 0 = 2 -> mean 1.0; floored, it's 2 + 1 = 3 -> mean 1.5.
+        self.assertAlmostEqual(metrics.avg_days_in_trade, 1.5, places=6)
+
     def test_open_cycle_measures_through_the_as_of_date(self):
         cycles, _ = build_cycles([tx("2025-09-19", STO, "-MU251226P150", -1, 3.35, 334.33)])
         metrics = cycle_metrics(cycles[0], date(2025, 10, 19))
@@ -704,6 +838,42 @@ class TestReturnMath(unittest.TestCase):
         # Nothing is realized while the leg is still open.
         self.assertAlmostEqual(metrics.net_realized_pl, 0.0)
         self.assertAlmostEqual(metrics.option_open_premium, 334.33, places=2)
+
+    def test_option_open_pl_falls_back_to_premium_without_a_mark(self):
+        cycles, _ = build_cycles([tx("2025-09-19", STO, "-MU251226P150", -1, 3.35, 334.33)])
+        metrics = cycle_metrics(cycles[0], date(2025, 10, 19))
+        self.assertAlmostEqual(metrics.option_open_pl, metrics.option_open_premium)
+        self.assertFalse(metrics.option_open_pl_marked)
+
+    def test_option_open_pl_marks_an_itm_short_put_to_its_cost_to_close(self):
+        """The crux of the mark-to-market fix: a short put that went ITM is
+        still credited its full $334.33 premium by option_open_premium, but
+        option_open_pl nets that against what it would really cost ($18.00/sh)
+        to buy back today."""
+        cycles, _ = build_cycles([tx("2025-09-19", STO, "-MU251226P150", -1, 3.35, 334.33)])
+        metrics = cycle_metrics(
+            cycles[0], date(2025, 10, 19), option_mark_prices={"MU251226P150": 18.0}
+        )
+        self.assertAlmostEqual(metrics.option_open_premium, 334.33, places=2)
+        self.assertAlmostEqual(metrics.option_open_pl, 334.33 - 1800.0, places=2)
+        self.assertTrue(metrics.option_open_pl_marked)
+
+    def test_option_open_pl_marked_is_false_when_any_open_leg_is_unpriced(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-09-19", STO, "-MU251226P150", -1, 3.35, 334.33, row_id=1),
+                tx("2025-09-19", STO, "-MU251226P140", -1, 2.00, 199.33, row_id=2),
+            ]
+        )
+        metrics = cycle_metrics(
+            cycles[0], date(2025, 10, 19), option_mark_prices={"MU251226P150": 18.0}
+        )
+        self.assertFalse(metrics.option_open_pl_marked)
+        # Still marks the leg it has a price for and falls back for the other.
+        unpriced_leg = next(leg for leg in cycles[0].legs if leg.occ_symbol == "MU251226P140")
+        self.assertAlmostEqual(
+            metrics.option_open_pl, (334.33 - 1800.0) + unpriced_leg.open_premium, places=2
+        )
 
 
 class TestPortfolioRollup(unittest.TestCase):
@@ -729,6 +899,20 @@ class TestPortfolioRollup(unittest.TestCase):
         self.assertEqual(result.active_cycles, 0)
         self.assertAlmostEqual(result.net_realized_pl, 334.33 + 49.31, places=2)
         self.assertAlmostEqual(result.premium_received, 334.33 + 99.33, places=2)
+
+    def test_open_short_premium_leaves_out_open_long_legs(self):
+        # Dashboard "Premium collected (net)" tile, "Still open" line: credit on
+        # open short options only. An open long put's debit is a cost paid, not
+        # premium collected; it stays in open_premium (the at-expiry valuation
+        # other formulas use) but never in open_short_premium.
+        transactions = [
+            tx("2025-09-19", STO, "-MU251017P150", -1, 3.00, 299.33, row_id=1),
+            tx("2025-09-19", BTO, "-MU251017P140", 1, 1.00, -100.67, row_id=2),
+        ]
+        cycles, _ = build_cycles(transactions)
+        result = portfolio_metrics(cycles, date(2025, 9, 26))
+        self.assertAlmostEqual(result.open_short_premium, 299.33, places=2)
+        self.assertAlmostEqual(result.open_premium, 299.33 - 100.67, places=2)
 
     def test_annualized_uses_portfolio_capital_not_averaged_percentages(self):
         result = portfolio_metrics(self.cycles, self.through)

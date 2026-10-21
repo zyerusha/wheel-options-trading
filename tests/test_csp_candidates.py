@@ -14,7 +14,7 @@ from datetime import date
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from wheel.accounts import _combine_csp_candidates  # noqa: E402
-from wheel.api import Dashboard, csp_star_score, sector_exposure  # noqa: E402
+from wheel.api import Dashboard, aggregate_csp_history, csp_star_score, sector_exposure  # noqa: E402
 from wheel.reference import load_earnings, load_fundamentals, sector_of  # noqa: E402
 
 
@@ -322,63 +322,102 @@ class TestReference(unittest.TestCase):
         self.assertEqual(load_fundamentals(["/no/such/dir/anywhere"]), {})
 
 
+class TestEligibilityStatus(unittest.TestCase):
+    """QUALIFIED only when every eligibility check had data and passed;
+    missing data reads UNVERIFIED, never as a pass."""
+
+    def _vetting(self, fundamentals):
+        (row,) = _candidates(
+            [_w("MU", pl=5000.0, roc=40.0)],
+            stats={"MU": {"last": 100.0}},
+            fundamentals={"MU": fundamentals},
+        )
+        return row["vetting"]
+
+    def test_every_check_known_is_qualified(self):
+        vetting = self._vetting({"type": "common", "market_cap_b": 120.0, "avg_vol_10d_m": 20.0})
+        self.assertEqual((vetting["status"], vetting["unvetted"]), ("qualified", []))
+
+    def test_missing_fundamentals_are_unverified_and_named(self):
+        vetting = self._vetting({"type": "common", "market_cap_b": None, "avg_vol_10d_m": None})
+        self.assertEqual(vetting["status"], "unverified")
+        self.assertEqual(vetting["unvetted"], ["market cap unknown", "10d volume unknown"])
+
+
+STATS = {
+    "MU": {"last": 100.0, "vol_annual_pct": 40.0, "price_position": 0.6},
+    "KO": {"last": 60.0, "vol_annual_pct": 18.0, "price_position": 0.5},
+}
+
+
+def _account(wheels):
+    """One account's payload slice as Dashboard.build serves it."""
+    return {
+        "csp_candidates": _candidates(wheels, stats=STATS),
+        "csp_candidate_history": aggregate_csp_history(wheels),
+    }
+
+
+def _mu(pl, roc, **kw):
+    return _w("MU", pl=pl, roc=roc, gross_premium=600.0, option_pl=500.0, avg_collateral=10000.0,
+              days=40, wins=3, losses=1, **kw)
+
+
 class TestCombine(unittest.TestCase):
-    def _row(self, underlying, **kw):
-        base = {
-            "underlying": underlying,
-            "name": "X",
-            "wheels": 2,
-            "net_realized_pl": 4000.0,
-            "avg_annualized_roc_pct": 30.0,
-            "monthly_premium_pct": 2.0,
-            "ppd": 15.0,
-            "last_close": 100.0,
-            "sector": "Technology",
-            "earnings_date": "2026-10-15",
-            "days_to_earnings": 20,
-            "stars": 3.5,
-            "star_breakdown": {},
-            "roc_pct": 30.0,
-            "ppd_yield_pct": 18.0,
-            "win_rate": 0.8,
-            "wins": 8,
-            "losses": 2,
-            "days_since_last_wheel": 40,
-            "vol_annual_pct": 38.0,
-            "price_position": 0.6,
-        }
-        base.update(kw)
-        return base
-
-    def test_same_ticker_across_accounts_is_merged_and_re_scored(self):
-        payloads = {
-            "IRA": {"csp_candidates": [self._row("MU", wheels=2, net_realized_pl=3000.0, roc_pct=30.0, wins=6, losses=1)]},
-            "Joint": {"csp_candidates": [self._row("MU", wheels=1, net_realized_pl=1000.0, roc_pct=60.0, wins=3, losses=0)]},
-        }
-        combined = _combine_csp_candidates(payloads, {})
+    def test_merged_row_equals_one_account_holding_every_wheel(self):
+        """Merging must derive every rate from the pooled totals, exactly as
+        one account holding all the same wheels would."""
+        ira = [_mu(2000.0, 30.0, cycle_id="MU-1"), _mu(1000.0, 30.0, cycle_id="MU-2")]
+        joint = [_mu(1000.0, 60.0, cycle_id="MU-3", end_date="2024-09-01")]
+        combined = _combine_csp_candidates({"IRA": _account(ira), "Joint": _account(joint)}, {})
+        pooled = _candidates(ira + joint, stats=STATS)
         self.assertEqual(len(combined), 1)
-        row = combined[0]
-        self.assertEqual(row["wheels"], 3)
-        self.assertEqual(row["net_realized_pl"], 4000.0)
-        self.assertEqual(row["avg_annualized_roc_pct"], 40.0)  # (30*2 + 60*1) / 3
-        self.assertEqual(row["wins"], 9)
-        self.assertEqual(row["sector"], "Technology")
-        self.assertIn("stars", row)
-        self.assertIn("star_breakdown", row)
+        self.assertEqual(combined[0], pooled[0])
+        self.assertEqual(combined[0]["avg_annualized_roc_pct"], 40.0)  # (30 + 30 + 60) / 3 wheels
+        self.assertEqual(combined[0]["wheels"], 3)
 
-    def test_recency_is_the_soonest_across_accounts(self):
-        payloads = {
-            "IRA": {"csp_candidates": [self._row("MU", days_since_last_wheel=400)]},
-            "Joint": {"csp_candidates": [self._row("MU", days_since_last_wheel=12)]},
-        }
-        self.assertEqual(_combine_csp_candidates(payloads, {})[0]["days_since_last_wheel"], 12)
+    def test_a_losing_accounts_history_is_counted(self):
+        """Joint lost money on MU, so it lists no MU row of its own; the
+        merge must still subtract that loss and count its losing legs."""
+        ira = [_mu(3000.0, 30.0)]
+        joint = [_w("MU", pl=-1000.0, roc=-20.0, option_pl=-1000.0, wins=0, losses=2, cycle_id="MU-9")]
+        payloads = {"IRA": _account(ira), "Joint": _account(joint)}
+        self.assertEqual(payloads["Joint"]["csp_candidates"], [])
+        (row,) = _combine_csp_candidates(payloads, {})
+        self.assertEqual(row["net_realized_pl"], 2000.0)
+        self.assertEqual((row["wins"], row["losses"]), (3, 3))
 
     def test_ticker_net_negative_after_merge_is_dropped(self):
-        payloads = {
-            "IRA": {"csp_candidates": [self._row("MU", net_realized_pl=1000.0)]},
-            "Joint": {"csp_candidates": [self._row("MU", net_realized_pl=-3000.0)]},
-        }
-        self.assertEqual(_combine_csp_candidates(payloads, {}), [])
+        ira = [_mu(1000.0, 30.0)]
+        joint = [_w("MU", pl=-3000.0, roc=-50.0, option_pl=-3000.0, losses=3, cycle_id="MU-9")]
+        self.assertEqual(_combine_csp_candidates({"IRA": _account(ira), "Joint": _account(joint)}, {}), [])
+
+    def test_recency_is_the_latest_wheel_across_accounts(self):
+        ira = [_mu(1000.0, 30.0, end_date="2023-01-01")]
+        joint = [_mu(1000.0, 30.0, end_date="2024-06-01", cycle_id="MU-2")]
+        (row,) = _combine_csp_candidates({"IRA": _account(ira), "Joint": _account(joint)}, {})
+        (latest,) = _candidates(joint, stats=STATS)
+        self.assertEqual(row["days_since_last_wheel"], latest["days_since_last_wheel"])
+
+    def test_adding_an_unrelated_candidate_never_moves_another_tickers_stars(self):
+        ira = [_mu(3000.0, 30.0)]
+        alone = _combine_csp_candidates({"IRA": _account(ira)}, {})
+        with_ko = _combine_csp_candidates(
+            {"IRA": _account(ira), "Joint": _account([_w("KO", pl=50.0, roc=5.0, cycle_id="KO-1")])}, {}
+        )
+        mu_alone = next(r for r in alone if r["underlying"] == "MU")
+        mu_with = next(r for r in with_ko if r["underlying"] == "MU")
+        self.assertIn("KO", {r["underlying"] for r in with_ko})
+        self.assertEqual(mu_with["stars"], mu_alone["stars"])
+        self.assertEqual(mu_with["star_breakdown"], mu_alone["star_breakdown"])
+
+    def test_sector_exposure_passed_in_is_the_one_scored_against(self):
+        ira = [_mu(3000.0, 30.0)]
+        sector = sector_of("MU") or "Unknown"
+        light = _combine_csp_candidates({"IRA": _account(ira)}, {})[0]
+        heavy = _combine_csp_candidates({"IRA": _account(ira)}, {sector: 0.6})[0]
+        self.assertGreater(light["star_breakdown"]["modifiers"]["sector"]["stars"],
+                           heavy["star_breakdown"]["modifiers"]["sector"]["stars"])
 
     def test_tolerates_missing_key(self):
         self.assertEqual(_combine_csp_candidates({"IRA": {}}, {}), [])

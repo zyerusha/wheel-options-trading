@@ -175,6 +175,19 @@ class OptionLeg:
         """Cash still at risk on the un-closed portion (credit positive)."""
         return self.cash_per_contract * self.remaining_contracts
 
+    def unrealized_pl(self, mark_price: float) -> float:
+        """Mark-to-market P&L on the un-closed portion at today's per-share
+        option price ``mark_price`` (e.g. a broker Positions snapshot's Last
+        price): the credit/debit already booked (``open_premium``) plus the
+        position's value right now -- a short's value is *negative* what it
+        would cost to buy back, a long's is *positive* what it would fetch to
+        sell. Unlike ``open_premium`` (which values an open leg as if it
+        expires worthless), this reflects a leg that is ITM and would actually
+        cost real money to close.
+        """
+        market_value = mark_price * OPTION_MULTIPLIER * self.remaining_contracts
+        return self.open_premium + (market_value if self.side == LONG else -market_value)
+
     @property
     def gross_premium(self) -> float:
         """Credit received at open (0 for long legs) before any buy-back."""
@@ -763,7 +776,10 @@ class WheelEngine:
                     "action": row.action,
                     "contracts": wanted,
                     "cash": round(row.amount, 2),
-                    "reason": "no open lot -- position opened before this window",
+                    "reason": (
+                        "no matching contract is open; it was opened before the oldest file "
+                        "you loaded"
+                    ),
                 }
             )
             if row.action == ASSIGNED:
@@ -796,8 +812,8 @@ class WheelEngine:
                     "contracts": excess_contracts,
                     "cash": round(excess_cash, 2),
                     "reason": (
-                        "close exceeds open position; its pro-rata share of cash "
-                        "has no matching lot and is excluded from any leg's P/L"
+                        "this close covers more contracts than were open, so its share of "
+                        "the cash is counted here instead of against any trade"
                     ),
                 }
             )
@@ -869,8 +885,8 @@ class WheelEngine:
 
         former, legs = next(iter(matches.items()))
         message = (
-            f"{row.event_date}: {row.occ_symbol} matched open lots of {legs[0].occ_symbol}; "
-            f"treating {former} -> {row.underlying} as a ticker change"
+            f"{row.event_date}: {row.occ_symbol} matched open contracts of {legs[0].occ_symbol}; "
+            f"treating this as {former} having been renamed to {row.underlying}"
         )
         self.warnings.append(message)
         # Fold the former ticker's campaign into the new one so the wheel stays
@@ -934,7 +950,7 @@ class WheelEngine:
         settlement = self._claim_settlement(underlying, direction, shares, row.event_date, row.strike)
         if settlement:
             posted = ", ".join(sorted({str(item.run_date) for item in settlement}))
-            rows_note = f"{len(settlement)} broker rows" if len(settlement) > 1 else "broker row"
+            settled_verb = "bought" if direction == "ACQUIRE" else "sold"
             cycle.assignments.append(
                 Assignment(
                     date=row.event_date,
@@ -949,8 +965,8 @@ class WheelEngine:
                     cash=sum(item.amount for item in settlement),
                     synthetic=False,
                     note=(
-                        f"{direction.lower()}d {shares:g} shares at {row.strike:g}; "
-                        f"share leg from {rows_note} posted {posted}"
+                        f"{settled_verb} {shares:g} shares at ${row.strike:g} each; your "
+                        f"broker's own record of the share trade is dated {posted}"
                     ),
                 )
             )
@@ -961,7 +977,11 @@ class WheelEngine:
             self._add_share_lot(
                 cycle, underlying, row.event_date, shares, row.strike, FROM_PUT_ASSIGNMENT, synthetic=True
             )
-            note = f"short {row.right} assigned: acquired {shares:g} shares at {row.strike:g}"
+            right_word = "put" if row.right == "P" else "call"
+            note = (
+                f"a {right_word} you sold was exercised: bought {shares:g} shares at "
+                f"${row.strike:g} each"
+            )
         else:
             cash = row.strike * shares
             note = self._dispose_shares(underlying, row.event_date, shares, row.strike, synthetic=True, cycle=cycle)
@@ -985,7 +1005,9 @@ class WheelEngine:
     def _handle_assignment_without_leg(self, underlying: str, row: Transaction, contracts: float) -> None:
         cycle = self._cycle_for(underlying, row.event_date)
         cycle.warnings.append(
-            f"{row.event_date}: assignment of {row.occ_symbol} has no matching open leg in this export"
+            f"{row.event_date}: {row.occ_symbol} was exercised, but no file you loaded shows "
+            "that contract being sold or bought, so it was probably opened before those files "
+            "start. Load an earlier transaction export to fill in the gap."
         )
         self._settle_assignment(cycle, underlying, row, contracts, SHORT)
 
@@ -1049,8 +1071,10 @@ class WheelEngine:
             )
             lot.basis_known = False
             target.warnings.append(
-                f"{when}: {deficit:g} shares called away were acquired before this export; "
-                "cost basis unknown, stock P/L excluded"
+                f"{when}: {deficit:g} shares were bought from you when a call you sold was "
+                "exercised, but they were purchased before the oldest file you loaded, so "
+                "what you paid for them is unknown and their gain or loss is left out. Load "
+                "an earlier transaction export to fix it."
             )
             lots.append(lot)
 
@@ -1083,9 +1107,15 @@ class WheelEngine:
             )
             remaining -= take
 
-        note = f"sold {shares:g} shares at {price:g}; realized {realized:,.2f}"
+        note = (
+            f"sold {shares:g} shares at ${price:g} each, a gain or loss of ${realized:,.2f} "
+            f"against what they cost"
+        )
         if basis_unknown:
-            note += f" ({basis_unknown:g} shares of unknown basis excluded)"
+            note += (
+                f" ({basis_unknown:g} shares left out, their purchase price is not in any "
+                f"loaded file)"
+            )
         return note
 
     # ---------------- rolls ----------------
@@ -1171,10 +1201,12 @@ class WheelEngine:
 
             cycle = self._active_cycle.get(underlying) or self._cycle_for(underlying, when)
             if len(shorts) > 1 or len(longs) > 1:
+                kind_word = "put" if right == "P" else "call"
                 cycle.warnings.append(
-                    f"{when}: {len(shorts)} short and {len(longs)} long {right} legs on "
-                    f"{underlying} expiring {expiry} opened the same day -- which pairs "
-                    "with which is ambiguous, so none were paired into a spread"
+                    f"{when}: on {underlying}, {len(shorts)} {kind_word}s were sold and "
+                    f"{len(longs)} bought the same day, all expiring {expiry}. There is no "
+                    "way to tell which sale goes with which purchase, so they are counted "
+                    "separately rather than grouped into pairs."
                 )
                 continue
 

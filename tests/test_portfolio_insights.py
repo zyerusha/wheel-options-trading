@@ -47,7 +47,7 @@ class TestStrengths(unittest.TestCase):
         low = portfolio_insights({"win_rate_pct": 90.0, "wins": 9, "losses": 1}, [], [])
         self.assertEqual(low["strengths"], [])
         ok = portfolio_insights({"win_rate_pct": 85.0, "wins": 30, "losses": 6}, [], [])
-        self.assertTrue(any("85% win rate" in s for s in ok["strengths"]))
+        self.assertTrue(any("85% across every account shown" in s for s in ok["strengths"]))
 
     def test_dividends_strength(self):
         r = portfolio_insights({"dividends_received": 7132.0}, [], [])
@@ -57,7 +57,7 @@ class TestStrengths(unittest.TestCase):
         r = portfolio_insights(
             {}, [], [{"underlying": "SPCX", "phase": "runway", "days_to_expiry": 81}]
         )
-        self.assertTrue(any("hedge" in s.lower() and "runway" in s.lower() for s in r["strengths"]))
+        self.assertTrue(any("protective option(s) are open with months still left" in s for s in r["strengths"]))
 
 
 class TestImprovements(unittest.TestCase):
@@ -86,7 +86,7 @@ class TestImprovements(unittest.TestCase):
         ]
         r = portfolio_insights({}, wheels, [])
         imp = " ".join(r["improvements"])
-        self.assertIn("2 active positions are underwater", imp)
+        self.assertIn("2 active positions would lose", imp)
         self.assertIn("-$16,588", imp)  # -14397.5 + -2190.0, rounded
         self.assertIn("TIGR", imp)
         self.assertNotIn("CLSD", imp)  # closed wheel excluded
@@ -98,7 +98,7 @@ class TestImprovements(unittest.TestCase):
             [],
             wheel_state={"buckets": {"holding": {"amount": 255324.0, "cycles": 18}}},
         )
-        self.assertTrue(any("no covered call written" in s for s in r["improvements"]))
+        self.assertTrue(any("no covered call sold against them" in s for s in r["improvements"]))
         self.assertIn("$255,324", " ".join(r["improvements"]))
 
     def test_concentration_needs_size_and_share(self):
@@ -130,7 +130,7 @@ class TestImprovements(unittest.TestCase):
         ]
         r = portfolio_insights({}, wheels, [])
         joined = " ".join(r["improvements"]).lower()
-        self.assertIn("directional (non-wheel) option trades", joined)
+        self.assertIn("options bought outright as bets on the share price", joined)
         # Only the directional -$398 counts -- the buy-and-hold -$900 does not.
         self.assertIn("-$398", " ".join(r["improvements"]))
         self.assertNotIn("-$1,298", " ".join(r["improvements"]))
@@ -139,7 +139,7 @@ class TestImprovements(unittest.TestCase):
         r = portfolio_insights(
             {}, [], [{"underlying": "SPCX", "phase": "wind_down", "days_to_expiry": 40}]
         )
-        self.assertTrue(any("wind-down window" in s for s in r["improvements"]))
+        self.assertTrue(any("protective option(s) expire soon" in s for s in r["improvements"]))
 
     def test_capital_estimated_caveat(self):
         wheels = [
@@ -147,7 +147,7 @@ class TestImprovements(unittest.TestCase):
             {"underlying": "QQQ", "status": "ACTIVE", "capital_estimated": True},
         ]
         r = portfolio_insights({}, wheels, [])
-        self.assertTrue(any("strike-based" in s and "approximate" in s for s in r["improvements"]))
+        self.assertTrue(any("the strike price stands in" in s and "approximations" in s for s in r["improvements"]))
 
 
 class TestShape(unittest.TestCase):
@@ -199,7 +199,7 @@ class TestShape(unittest.TestCase):
             [],
             wheel_state={"buckets": {"holding": {"amount": 60000.0, "cycles": 4}}},
         )
-        self.assertIn("underwater", r["improvements"][0])
+        self.assertIn("would lose", r["improvements"][0])
         self.assertIn("BIG", r["improvements"][0])
 
 
