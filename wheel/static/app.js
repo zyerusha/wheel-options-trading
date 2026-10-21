@@ -351,6 +351,12 @@ function pct(value, digits = 1) {
  * dedicated block below the row readout. Raw, directly-sourced values (a
  * strike, a contract count, a broker-reported price) get no formula: there is
  * nothing to explain.
+ *
+ * Both are laid out by tiplayout.js, which reads the lines by the convention
+ * documented at its top ("Name = formula", indented qualifiers, "= values",
+ * "= result", a blank line between calculations). Follow it and a new tip
+ * gets the shared title / calculation / result / notes layout for free; a
+ * layout it can't express goes through `setTipSpec` instead.
  */
 function formula(lines) {
   return lines.join('\n');
@@ -522,9 +528,22 @@ function renderTooltip(title, rows, formula) {
     line.appendChild(el('span', { class: 'tt-val' + (row.valueClass ? ' ' + row.valueClass : '') }, row.value));
     tooltip.appendChild(line);
   }
+  // The formula is laid out by the shared tooltip renderer (tiplayout.js),
+  // the same one a T-opened text tip uses; under a readout it sits below a
+  // divider, in the readout's smaller type.
   if (formula) {
-    tooltip.appendChild(el('div', { class: rows.length || title ? 'tt-formula' : 'tt-text' }, formula));
+    const body = TipLayout.render(formula);
+    if (rows.length || title) body.classList.add('tt-formula');
+    tooltip.appendChild(body);
   }
+  tooltip.scrollTop = 0;
+}
+
+/** Show a structured tip (see `setTipSpec`) in the page tooltip. */
+function renderTipSpec(spec) {
+  clear(tooltip);
+  tooltip.classList.remove('card');
+  tooltip.appendChild(TipLayout.renderSpec(spec));
   tooltip.scrollTop = 0;
 }
 
@@ -571,6 +590,8 @@ function pinTooltip() {
       clear(tooltip);
       tooltip.appendChild(tipCardNode(tip.card));
       tooltip.classList.add('card');
+    } else if (tip.spec) {
+      renderTipSpec(tip.spec);
     } else {
       renderTooltip('', [], tip.text);
     }
@@ -696,11 +717,22 @@ function setTipCard(node, card) {
   if (card) tipCards.set(node, card);
 }
 
-/** The nearest tip at or above `start`: `{card}` or `{text}`, else null. */
+/* Tip specs: a tooltip whose layout the text convention can't express (a
+ * table, a meter), built by code as a TipLayout model and drawn by the same
+ * renderer and classes as every text tip. Takes precedence over the node's
+ * text tip, which stays as the fallback when no spec was set. */
+const tipSpecs = new WeakMap();
+
+function setTipSpec(node, spec) {
+  if (spec) tipSpecs.set(node, spec);
+}
+
+/** The nearest tip at or above `start`: `{card}`, `{spec}` or `{text}`, else null. */
 function nearestTip(start) {
   for (let node = start; node && node !== document; node = node.parentNode) {
     if (node.nodeType !== Node.ELEMENT_NODE || node === tooltip) continue;
     if (tipCards.has(node)) return { card: tipCards.get(node) };
+    if (tipSpecs.has(node)) return { spec: tipSpecs.get(node) };
     if (node.dataset && node.dataset.tip) return { text: node.dataset.tip };
   }
   return null;
@@ -9584,48 +9616,75 @@ function starWidget(stars) {
   return wrap;
 }
 
-/** The plain-text breakdown behind a Signal rating (see `csp_star_score`). */
+/** The breakdown behind a Signal rating (see `csp_star_score`), as a
+ * TipLayout spec: each factor's value, its 0-1 score (figure plus a bar that
+ * pictures it) and its weight, in aligned columns. */
 function cspStarTooltip(bk) {
   if (!bk) return null;
   const v = bk.values || {};
   const c = bk.components || {};
-  const bar = (score) => {
-    const n = Math.max(0, Math.min(10, Math.round((score || 0) * 10)));
-    return '█'.repeat(n) + '░'.repeat(10 - n);
-  };
-  const line = (label, valueText, keyName) => {
+  const factor = (label, valueText, keyName) => {
     const comp = c[keyName] || { score: 0, weight: 0 };
-    return `  ${label.padEnd(15)}${String(valueText).padStart(9)}  ${bar(comp.score)}  ${comp.score.toFixed(2)} ·${Math.round(comp.weight * 100)}%`;
+    return [
+      label,
+      String(valueText),
+      { meter: comp.score || 0, text: comp.score.toFixed(2) },
+      `${Math.round(comp.weight * 100)}%`,
+    ];
   };
+  const factorTable = (heading, rows) => ({
+    type: 'table',
+    heading,
+    columns: [
+      { label: '' },
+      { label: 'Value', num: true },
+      { label: 'Score', num: true },
+      { label: 'Weight', num: true },
+    ],
+    rows,
+  });
   const mod = (x) => (x > 0 ? `+${x.toFixed(1)}` : x < 0 ? `-${Math.abs(x).toFixed(1)}` : '±0');
   const inline = (x) => (x > 0 ? ` + ${x.toFixed(1)}` : x < 0 ? ` - ${Math.abs(x).toFixed(1)}` : '');
   const em = bk.modifiers && bk.modifiers.earnings ? bk.modifiers.earnings : { stars: 0, note: '' };
   const sm = bk.modifiers && bk.modifiers.sector ? bk.modifiers.sector : { stars: 0, note: '' };
   const pct1 = (x) => (x === null || x === undefined ? '—' : x.toFixed(1) + '%');
-  const rawLine = `  base ${bk.base_stars}${inline(em.stars)}${inline(sm.stars)} = ${bk.raw_stars}, rounded`;
-  return formula([
-    `Signal ${bk.stars} / 5`,
-    rawLine,
-    "  A rating of your past wheels on this ticker and today's market; not a chance of profit.",
-    '  It does not rate the company: no profit, debt or valuation data is loaded.',
-    '',
-    'Past wheels',
-    line('ROC', pct(v.roc_pct), 'roc'),
-    line('Monthly prem', pct(v.monthly_premium_pct, 2), 'monthly_premium'),
-    line('PPD yield', pct1(v.ppd_yield_pct), 'ppd_yield'),
-    line('Realized P/L', money(v.net_realized_pl), 'profit'),
-    line('Win rate', v.win_rate === null || v.win_rate === undefined ? '—' : Math.round(v.win_rate * 100) + '%', 'win_rate'),
-    line('Consistency', (v.wheels || 0) + ' wh', 'consistency'),
-    line('Recency', v.days_since_last_wheel === null || v.days_since_last_wheel === undefined ? '—' : v.days_since_last_wheel + 'd', 'recency'),
-    '',
-    'Market now',
-    line('Volatility', v.vol_annual_pct === null || v.vol_annual_pct === undefined ? '—' : Math.round(v.vol_annual_pct) + '%/y', 'volatility'),
-    line('Price pos.', v.price_position === null || v.price_position === undefined ? '—' : v.price_position.toFixed(2), 'price_position'),
-    '',
-    'Adjustments',
-    `  ${mod(em.stars).padEnd(6)} ${em.note || ''}`,
-    `  ${mod(sm.stars).padEnd(6)} ${sm.note || ''}`,
-  ]);
+  return {
+    title: `Signal ${bk.stars} / 5`,
+    sections: [
+      [
+        { type: 'text', text: `Base ${bk.base_stars}${inline(em.stars)}${inline(sm.stars)} = ${bk.raw_stars}, rounded` },
+        { type: 'note', text: "A rating of your past wheels on this ticker and today's market; not a chance of profit." },
+        { type: 'note', text: 'It does not rate the company: no profit, debt or valuation data is loaded.' },
+      ],
+      [
+        factorTable('Past wheels', [
+          factor('ROC', pct(v.roc_pct), 'roc'),
+          factor('Monthly prem', pct(v.monthly_premium_pct, 2), 'monthly_premium'),
+          factor('PPD yield', pct1(v.ppd_yield_pct), 'ppd_yield'),
+          factor('Realized P/L', money(v.net_realized_pl), 'profit'),
+          factor('Win rate', v.win_rate === null || v.win_rate === undefined ? '—' : Math.round(v.win_rate * 100) + '%', 'win_rate'),
+          factor('Consistency', (v.wheels || 0) + ' wh', 'consistency'),
+          factor('Recency', v.days_since_last_wheel === null || v.days_since_last_wheel === undefined ? '—' : v.days_since_last_wheel + 'd', 'recency'),
+        ]),
+      ],
+      [
+        factorTable('Market now', [
+          factor('Volatility', v.vol_annual_pct === null || v.vol_annual_pct === undefined ? '—' : Math.round(v.vol_annual_pct) + '%/y', 'volatility'),
+          factor('Price pos.', v.price_position === null || v.price_position === undefined ? '—' : v.price_position.toFixed(2), 'price_position'),
+        ]),
+      ],
+      [
+        {
+          type: 'rows',
+          heading: 'Adjustments',
+          rows: [
+            { label: em.note || '', value: mod(em.stars), sub: null },
+            { label: sm.note || '', value: mod(sm.stars), sub: null },
+          ],
+        },
+      ],
+    ],
+  };
 }
 
 /**
@@ -9746,11 +9805,8 @@ function renderCspCandidates(available) {
 
     const sigCell = el('td', { class: 'num csp-star' });
     sigCell.appendChild(starWidget(row.stars));
-    setFormula(
-      sigCell,
-      cspStarTooltip(row.star_breakdown) ||
-        `Signal ${row.stars === null || row.stars === undefined ? '—' : row.stars} / 5`
-    );
+    setFormula(sigCell, `Signal ${row.stars === null || row.stars === undefined ? '—' : row.stars} / 5`);
+    setTipSpec(sigCell, cspStarTooltip(row.star_breakdown));
     tr.appendChild(sigCell);
 
     tr.appendChild(cspToEnterCell(row.underlying));

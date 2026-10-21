@@ -468,6 +468,25 @@ calendar days from the calculation date (`CspEntry.today`, the server's local da
 which can be after the quote time (a weekend or holiday); the tooltip names that date
 ("34 DTE from Oct 17") and the annualized return uses the same DTE.
 
+### Text tooltips
+
+Every other tooltip is text: a `title` / `setFormula` tip, or a chart readout's
+`formula`. One renderer, `wheel/static/tiplayout.js`, lays all of them out, so they share
+one hierarchy: the metric's name (bold), its formula with named inputs, the substituted
+values, the result (bold, under a hairline, never a bigger size or a colour), then
+qualifiers in smaller secondary text. A plain sum (`A + B - C` over `= $1 + $2 - $3`)
+becomes labeled rows with right-aligned figures; subtracted rows read "less". Blank-line
+separated calculations get a divider; hard-wrapped prose is joined back into sentences;
+`Label: $value` lines become aligned rows.
+
+It is presentation only: the renderer reads the line convention documented at the top
+of `tiplayout.js` and shows every label and figure exactly as authored. The one
+rewrite is `+ -$5` / `- -$5` in a substitution line, shown as `- $5` / `+ $5` (the same
+arithmetic). A tip the convention can't express (the CSP candidates' Signal breakdown,
+a table with score bars) is built as a TipLayout model and attached with `setTipSpec`,
+drawn by the same renderer and classes. All three tooltip kinds (text, readout, card)
+share the `#tooltip` container and its `--tip-*` tokens.
+
 ### CSP TO ENTER / CC TO EXIT tooltip cards
 
 Both tooltips are one component: a structured **card** built next to each calculation

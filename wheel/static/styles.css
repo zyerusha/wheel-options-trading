@@ -1306,20 +1306,33 @@ tr.detail > td {
 /* ---------------- tooltip ---------------- */
 
 #tooltip {
+  /* One container for every tooltip: text tips, chart readouts and the
+     CSP/CC tip cards share these tokens, so they read as one component. */
+  --tip-radius: var(--radius);
+  --tip-pad-y: 9px;
+  --tip-pad-x: 12px;
+  --tip-rule: 1px solid var(--border);
+  --tip-section-gap: 9px;
+  --tip-line-gap: 2px;
+  --tip-note-size: 0.88em;
   position: fixed;
   z-index: 60;
   pointer-events: none;
   background: var(--surface-1);
+  color: var(--text-primary);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--tip-radius);
   box-shadow: 0 6px 22px rgba(0, 0, 0, 0.18);
-  padding: 9px 11px;
+  padding: var(--tip-pad-y) var(--tip-pad-x);
   font-size: 12px;
+  line-height: 1.45;
+  font-variant-numeric: tabular-nums;
   min-width: 150px;
   /* Never clipped: long text wraps, and a tip taller than the window scrolls
      inside itself. */
   max-width: min(440px, calc(100vw - 16px));
   max-height: calc(100vh - 16px);
+  overflow-x: hidden;
   overflow-y: auto;
   overflow-wrap: anywhere;
   opacity: 0;
@@ -1334,14 +1347,13 @@ tr.detail > td {
    reader can scroll it and select its text -- and reads larger. The readout
    that follows the mouse over a chart must not, or it would block the chart. */
 #tooltip.pinned {
+  --tip-pad-y: 12px;
+  --tip-pad-x: 14px;
+  --tip-section-gap: 11px;
   pointer-events: auto;
   font-size: 14px;
+  min-width: min(260px, calc(100vw - 16px));
   max-width: min(560px, calc(100vw - 16px));
-  padding: 12px 14px;
-}
-
-#tooltip.pinned .tt-formula {
-  font-size: 13px;
 }
 
 #tooltip.on::after {
@@ -1358,11 +1370,211 @@ tr.detail > td {
   font-size: 11px;
 }
 
-#tooltip .tt-text {
-  white-space: pre-line;
+/* ---- text tips: the shared layout (tiplayout.js) for every title /
+   setFormula tip and every chart readout's formula. Hierarchy: title, then
+   the calculation (formula, substituted values, result), then notes. ---- */
+
+.tip {
+  display: grid;
+  gap: var(--tip-section-gap);
+  min-width: 0;
+}
+
+/* A blank line in the source starts a section; sections after the first
+   get a hairline so separate calculations don't run together. */
+.tip-section {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tip-section + .tip-section {
+  padding-top: var(--tip-section-gap);
+  border-top: var(--tip-rule);
+}
+
+.tip-title,
+.tip-calc-name {
+  font-weight: 640;
   color: var(--text-primary);
-  line-height: 1.45;
-  font-variant-numeric: tabular-nums;
+}
+
+.tip-heading {
+  margin-bottom: 3px;
+  font-size: var(--tip-note-size);
+  font-weight: 640;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.tip-text,
+.tip-note {
+  margin: 0;
+}
+
+.tip-note {
+  font-size: var(--tip-note-size);
+  color: var(--text-secondary);
+}
+
+.tip-calc {
+  display: grid;
+  gap: var(--tip-line-gap);
+  min-width: 0;
+}
+
+/* Notes under a calculation sit a little apart from its figures. */
+.tip-calc > .tip-note:first-of-type,
+.tip-calc > :is(.tip-grid, .tip-result) + :is(.tip-note, .tip-rows-block, .tip-list-block) {
+  margin-top: 4px;
+}
+
+.tip-formula {
+  color: var(--text-secondary);
+}
+
+.tip-formula-cont {
+  padding-left: 1em;
+}
+
+.tip-step {
+  padding-left: 0.6em;
+  color: var(--text-primary);
+}
+
+.tip-rel,
+.tip-less {
+  color: var(--text-secondary);
+}
+
+.tip-step-name {
+  color: var(--text-secondary);
+}
+
+/* Label / value rows: labels wrap, figures stay whole and line up on the
+   right edge (tabular digits). */
+.tip-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 16px;
+  row-gap: var(--tip-line-gap);
+  align-items: baseline;
+}
+
+.tip-label {
+  min-width: 0;
+}
+
+.tip-sub {
+  display: block;
+  font-size: var(--tip-note-size);
+  font-weight: 400;
+  color: var(--text-secondary);
+}
+
+.tip-value {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.tip-strong {
+  font-weight: 640;
+}
+
+.tip-qualifier {
+  color: var(--text-secondary);
+}
+
+/* The result: same size as the lines above, set apart by weight and a
+   hairline, never by colour. In a breakdown the hairline spans both
+   columns. */
+.tip-result {
+  margin-top: 3px;
+  padding-top: 4px;
+  border-top: var(--tip-rule);
+}
+
+.tip-rule {
+  grid-column: 1 / -1;
+  margin: 3px 0 1px;
+  border-top: var(--tip-rule);
+}
+
+.tip-result {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 16px;
+  align-items: baseline;
+}
+
+.tip-total,
+.tip-result .tip-label {
+  font-weight: 640;
+}
+
+.tip-list {
+  margin: 2px 0 0;
+  padding-left: 1.1em;
+}
+
+.tip-list li + li {
+  margin-top: 1px;
+}
+
+/* Fixed layout so consecutive tables (Signal's "Past wheels" and "Market
+   now") share column positions. */
+.tip-table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+}
+
+.tip-table th:first-child,
+.tip-table td:first-child {
+  width: 30%;
+}
+
+.tip-table th,
+.tip-table td {
+  position: static;
+  padding: 1px 0 1px 12px;
+  text-align: left;
+  white-space: nowrap;
+  font-weight: 400;
+}
+
+.tip-table th:first-child,
+.tip-table td:first-child {
+  padding-left: 0;
+  white-space: normal;
+}
+
+.tip-table th {
+  font-size: var(--tip-note-size);
+  color: var(--text-secondary);
+}
+
+.tip-table .num {
+  text-align: right;
+}
+
+.tip-meter {
+  display: inline-block;
+  width: 44px;
+  height: 5px;
+  margin-right: 6px;
+  vertical-align: middle;
+  border-radius: 3px;
+  background: var(--ghost);
+  box-shadow: inset 0 0 0 1px var(--border);
+  overflow: hidden;
+}
+
+.tip-meter > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
 }
 
 /* ---- tip cards: the CSP TO ENTER / CC TO EXIT tooltip, one layout for both
@@ -1371,11 +1583,11 @@ tr.detail > td {
 /* Wide enough that labels, headings and table cells stay on one line;
    only full sentences wrap. */
 #tooltip.card {
+  --tip-pad-y: 14px;
+  --tip-pad-x: 16px;
   width: min(640px, calc(100vw - 16px));
   max-width: min(640px, calc(100vw - 16px));
-  padding: 14px 16px;
   font-size: 13px;
-  border-radius: 12px;
 }
 
 .tip-card {
@@ -1500,7 +1712,7 @@ tr.detail > td {
 .tip-card .tc-details {
   margin-top: 12px;
   padding-top: 10px;
-  border-top: 1px solid var(--border);
+  border-top: var(--tip-rule);
 }
 
 .tip-card h4 {
@@ -1672,7 +1884,8 @@ tr.detail > td {
 
 @media (max-width: 380px) {
   #tooltip.card {
-    padding: 12px;
+    --tip-pad-y: 12px;
+    --tip-pad-x: 12px;
   }
 
   .tip-card .tc-metrics,
@@ -1724,15 +1937,17 @@ tr.detail > td {
   color: var(--critical);
 }
 
+/* A chart readout's formula, under its rows: the same text-tip layout,
+   one step smaller, below a divider. */
 #tooltip .tt-formula {
   margin-top: 6px;
   padding-top: 6px;
-  border-top: 1px solid var(--border);
-  white-space: pre-line;
-  color: var(--text-secondary);
+  border-top: var(--tip-rule);
   font-size: 11px;
-  line-height: 1.45;
-  font-variant-numeric: tabular-nums;
+}
+
+#tooltip.pinned .tt-formula {
+  font-size: 13px;
 }
 
 /* ---------------- notices ---------------- */
