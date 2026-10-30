@@ -212,6 +212,28 @@ class TestAccountRegistry(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0], {"ira", "taxable"})  # every account fed in, not just the one asked for
 
+    def test_single_account_view_does_not_fully_build_other_accounts(self):
+        built = []
+        real_build = Dashboard.build
+
+        def counting_build(dashboard, filters=None):
+            built.append(dashboard)
+            return real_build(dashboard, filters)
+
+        with mock.patch.object(Dashboard, "build", counting_build):
+            self.registry.build("ira")
+        self.assertEqual(built, [self.registry.get("ira")])
+
+    def test_candidate_inputs_match_a_full_build(self):
+        # The single-account view reads these from the other accounts in
+        # place of a full build, so they must be exactly what build() returns.
+        dashboard = self.registry.get("taxable")
+        payload = dashboard.build()
+        inputs = dashboard.csp_candidate_inputs()
+        self.assertEqual(set(inputs), {"csp_candidates", "csp_candidate_history", "csp_to_enter"})
+        for key, value in inputs.items():
+            self.assertEqual(value, payload[key], key)
+
     def test_combined_cycles_are_concatenated_not_merged(self):
         combined = self.registry.build("combined")
         self.assertEqual(combined["portfolio"]["cycles"], 2)

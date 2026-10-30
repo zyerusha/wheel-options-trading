@@ -81,6 +81,37 @@ class TestCapitalTimeline(unittest.TestCase):
         self.assertAlmostEqual(after_call.call_collateral, 0.0)
         self.assertAlmostEqual(after_call.total, 23000.0)
 
+    def test_every_day_matches_each_leg_and_lot_on_its_own(self):
+        # capital_timeline skips legs not yet open or fully closed and lots
+        # not yet bought or sold out; every day must still equal the sum of
+        # each leg's and lot's own capital for that day.
+        cycles, _ = build_cycles(
+            [
+                tx("2025-11-03", STO, "-MU251107P220", -2, 4.00, 798.66, row_id=1),
+                tx("2025-11-04", BTC, "-MU251107P220", 1, 2.00, -200.67, row_id=2),
+                tx("2025-11-07", ASSIGNED, "-MU251107P220", 1, None, 0.0, row_id=3, as_of="2025-11-06"),
+                tx("2025-11-10", STO, "-MU251114C235", -1, 2.00, 199.33, row_id=4),
+                tx("2025-11-14", ASSIGNED, "-MU251114C235", 1, None, 0.0, row_id=5, as_of="2025-11-13"),
+            ]
+        )
+        cycle = cycles[0]
+        points = capital_timeline(cycle, date(2025, 11, 20))
+        self.assertTrue(points)
+        self.assertTrue(any(lot.disposals for lot in cycle.share_lots))
+        for point in points:
+            expected_puts = sum(
+                leg.remaining_contracts_on(point.day) * leg.collateral_per_contract
+                for leg in cycle.legs
+                if leg.strategy == CSP
+            )
+            expected_stock = sum(lot.capital_on(point.day) for lot in cycle.share_lots)
+            self.assertAlmostEqual(point.put_collateral, expected_puts, msg=point.day)
+            self.assertAlmostEqual(point.stock_basis, expected_stock, msg=point.day)
+        by_day = {point.day: point for point in points}
+        self.assertAlmostEqual(by_day[date(2025, 11, 3)].put_collateral, 44000.0)
+        self.assertAlmostEqual(by_day[date(2025, 11, 4)].put_collateral, 22000.0)
+        self.assertAlmostEqual(by_day[date(2025, 11, 10)].stock_basis, 22000.0)
+
     def test_short_call_without_shares_uses_strike_proxy(self):
         cycles, _ = build_cycles([tx("2025-09-15", STO, "-QQQ251017C588", -1, 3.32, 331.33)])
         points = capital_timeline(cycles[0], date(2025, 9, 16))

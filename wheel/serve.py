@@ -7,6 +7,8 @@ Routes
 ------
 ``GET  /``                 the dashboard page
 ``GET  /api/dashboard``    filtered JSON  (?tickers=MU,QQQ&start=&end=&status=)
+``GET  /api/spreads``      Credit Spreads tab (?account=&start=&end=, strategy
+                           settings, optional check_* spread; see wheel.creditspreads)
 ``GET  /api/health``       liveness plus the cash reconciliation verdict
 ``GET  /api/datasets``     exports available to load, and which one is active
 ``POST /api/upload``       accept a new Fidelity CSV (``X-Account`` targets one
@@ -60,7 +62,7 @@ from wheel.api import (  # noqa: E402
     looks_like_export,
     looks_like_multi_account_export,
 )
-from wheel import exporter  # noqa: E402
+from wheel import creditspreads, exporter  # noqa: E402
 from wheel.closed_lots import looks_like_closed_lots  # noqa: E402
 from wheel.paths import DATA_DIR  # noqa: E402
 from wheel.positions import discover_position_snapshots, looks_like_position_snapshot  # noqa: E402
@@ -703,6 +705,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_file("app.js", "application/javascript; charset=utf-8")
             elif route == "/tiplayout.js":
                 self._send_file("tiplayout.js", "application/javascript; charset=utf-8")
+            elif route == "/spreads.js":
+                self._send_file("spreads.js", "application/javascript; charset=utf-8")
             elif route == "/styles.css":
                 self._send_file("styles.css", "text/css; charset=utf-8")
             elif route == "/wheel-strategy.png":
@@ -716,6 +720,25 @@ class Handler(BaseHTTPRequestHandler):
                 account_id = (query.get("account") or [None])[0]
                 try:
                     self._send_json(self.registry.build(account_id, filters))
+                except KeyError:
+                    self._send_json({"error": f"unknown account {account_id!r}"}, 404)
+            elif route == "/api/spreads":
+                self._sync_registry()
+                query = parse_qs(parsed.query)
+                account_id = (query.get("account") or [None])[0]
+                settings, settings_warnings = creditspreads.SpreadSettings.from_query(query)
+                check, check_error = creditspreads.SpreadCheck.from_query(query)
+                try:
+                    self._send_json(
+                        self.registry.build_credit_spreads(
+                            account_id,
+                            settings,
+                            Filters.from_query(query),
+                            check=check,
+                            check_error=check_error,
+                            settings_warnings=settings_warnings,
+                        )
+                    )
                 except KeyError:
                     self._send_json({"error": f"unknown account {account_id!r}"}, 404)
             elif route == "/api/health":

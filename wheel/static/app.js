@@ -103,6 +103,10 @@ const state = {
   // prefixed) -- see getManagementSettings()/setManagementSetting(). A
   // cycle with no entry here just uses MANAGEMENT_DEFAULTS.
   directionalManagement: {},
+  // Credit Spreads tab: only the strategy settings the reader changed, as
+  // typed ({dte_min: '35', ...}); the backend validates them and supplies
+  // every default. See spreads.js.
+  creditSpreads: {},
   // Tools tab: Capital projection card inputs.
   projection: {
     balanceSource: 'full_value',
@@ -154,6 +158,7 @@ function buildConfigSnapshot() {
     periodPlGranularity: state.periodPlGranularity,
     expCalGrain: state.expCalGrain,
     directionalManagement: state.directionalManagement,
+    creditSpreads: state.creditSpreads,
     projection: {
       balanceSource: state.projection.balanceSource,
       manualBalance: state.projection.manualBalance,
@@ -240,6 +245,8 @@ function applyConfigSnapshot(cfg) {
       if (settings) state.directionalManagement[cycleId] = settings;
     }
   }
+
+  state.creditSpreads = sanitizeSpreadSettings(cfg.creditSpreads);
 
   const p = cfg.projection;
   if (p && typeof p === 'object') {
@@ -6679,6 +6686,11 @@ function debounce(fn, wait) {
 // fetches (e.g. two account-chip clicks in quick succession) can resolve out
 // of order and let a stale, slower response overwrite a newer one on screen.
 let loadGeneration = 0;
+// The dashboardQuery() string state.data was fetched with, and the one the
+// newest load() still in flight asked for (null when none is). switchTab()
+// reads both to skip refetching data that is already current or on its way.
+let loadedQuery = null;
+let pendingQuery = null;
 
 /** The current filter state as a URLSearchParams -- shared by the dashboard
  * fetch and the CSV export links so a download matches what's on screen.
@@ -6732,6 +6744,8 @@ async function load({ background = false } = {}) {
   configRangeApplied = true;
 
   const params = dashboardQuery();
+  const query = params.toString();
+  pendingQuery = query;
 
   // A user-initiated load (account/filter switch, tab change) dims the whole
   // page -- clear feedback that something changed. The periodic background
@@ -6751,8 +6765,13 @@ async function load({ background = false } = {}) {
     const data = await response.json();
     if (generation !== loadGeneration) return; // superseded by a newer load()
     state.data = data;
+    loadedQuery = query;
     render();
     succeeded = true;
+    // The Credit Spreads tab has its own endpoint (it fetches option chains
+    // the Wheel views don't need), so it's only refreshed while it's open;
+    // loadSpreads throttles the background poll on its own.
+    if (state.activeTab === 'spreads') loadSpreads({ background });
     const errHost = $('load-error');
     errHost.hidden = true;
     clear(errHost);
@@ -6771,6 +6790,7 @@ async function load({ background = false } = {}) {
     host.hidden = false;
   } finally {
     if (generation === loadGeneration) {
+      pendingQuery = null;
       document.querySelector('.wrap').classList.remove('loading');
       if (liveDot) liveDot.hidden = true;
     }
@@ -6840,7 +6860,7 @@ function tradeLogTickers() {
   return [...tickers].sort();
 }
 
-const TAB_IDS = ['dashboard', 'planner', 'realized', 'tradelog', 'tools'];
+const TAB_IDS = ['dashboard', 'planner', 'realized', 'tradelog', 'spreads', 'tools'];
 
 function renderTabs() {
   TAB_IDS.forEach((name) => {
@@ -6866,18 +6886,30 @@ function switchTab(name) {
     if (name === 'planner' && state.data) renderPlanner();
     if (name === 'realized' && state.data) renderRealizedGains();
     if (name === 'tools' && state.data) renderCapitalProjection();
+    if (name === 'spreads') renderSpreads();
   } catch (error) {
     console.error('tab render failed:', error);
   }
   applySearchFilter();
-  // Also refetch on every tab change, not just on an account/filter switch.
+  // The tab must settle on data matching the current account and filters.
   // An account switch's own load() runs asynchronously, so a tab entered
-  // while it's still in flight would otherwise render off whatever *older*
-  // state.data happens to be sitting around above -- a different account's
-  // data than the one now selected. load() re-renders every tab once the
-  // fetch actually lands, so this guarantees the tab settles on data that
-  // matches the current filters even if the render just above didn't.
-  load();
+  // while it's still in flight renders off *older* state.data above; that
+  // load() re-renders every tab when it lands, so there is nothing to add.
+  // When state.data already matches, re-render now that the tab is visible
+  // (charts size themselves to a container that read as 0 while hidden)
+  // instead of refetching the whole dashboard: the live-price poll keeps it
+  // fresh. Anything else (a failed or never-made fetch) loads as before.
+  const query = dashboardQuery().toString();
+  if (state.data && loadedQuery === query) {
+    try {
+      render();
+    } catch (error) {
+      console.error('tab render failed:', error);
+    }
+    if (name === 'spreads') loadSpreads();
+  } else if (pendingQuery !== query) {
+    load();
+  }
   // A new top-level view -- don't leave the reader parked wherever the old
   // (often much taller) page was scrolled.
   const tabs = document.querySelector('nav.tabs');

@@ -186,6 +186,24 @@ def _active_spread_contracts(spread, leg_by_id, day: date) -> float:
     )
 
 
+def _leg_fully_closed_from(leg: OptionLeg) -> date | None:
+    """The first day from which ``leg.remaining_contracts_on`` is 0 for good:
+    its last close, when the closes add up to every contract opened. ``None``
+    while any contract is still open."""
+    if not leg.closes or leg.contracts - sum(close.contracts for close in leg.closes) > 0:
+        return None
+    return max(close.date for close in leg.closes)
+
+
+def _lot_fully_sold_from(lot: ShareLot) -> date | None:
+    """The first day from which ``lot.capital_on`` is 0 for good: its last
+    disposal, when the disposals add up to every share. ``None`` while any
+    share is still held."""
+    if not lot.disposals or lot.shares - sum(disposal["shares"] for disposal in lot.disposals) > 0:
+        return None
+    return max(disposal["date"] for disposal in lot.disposals)
+
+
 def capital_timeline(cycle: Cycle, through: date) -> list[CapitalPoint]:
     """Daily committed capital for a cycle, from its start through ``through``.
 
@@ -216,6 +234,14 @@ def capital_timeline(cycle: Cycle, through: date) -> list[CapitalPoint]:
     end = min(cycle.end_date, through) if cycle.end_date is not None else through
 
     leg_by_id = {leg.leg_id: leg for leg in cycle.legs}
+    leg_windows = [(leg, leg.open_date, _leg_fully_closed_from(leg)) for leg in cycle.legs]
+    lot_windows = [
+        (lot, lot.acquired, _lot_fully_sold_from(lot)) for lot in cycle.share_lots if lot.basis_per_share is not None
+    ]
+    # Starts at int 0 when the cycle has no lots at all, exactly as summing
+    # every lot's (all 0.0) capital_on used to, so an empty cycle's
+    # stock_basis keeps its old type.
+    stock_basis_start = 0.0 if cycle.share_lots else 0
 
     points: list[CapitalPoint] = []
     day = cycle.start_date
@@ -232,7 +258,12 @@ def capital_timeline(cycle: Cycle, through: date) -> list[CapitalPoint]:
 
         put_collateral = call_collateral = long_premium = 0.0
         has_open_covered_call = False
-        for leg in cycle.legs:
+        for leg, opened, closed_from in leg_windows:
+            # A leg not yet open, or closed out in full, has no contracts on
+            # `day` and would only add 0.0 below, so skipping it leaves every
+            # sum unchanged; this loop runs once per leg per day.
+            if day < opened or (closed_from is not None and day >= closed_from):
+                continue
             naked = max(leg.remaining_contracts_on(day) - protected.get(leg.leg_id, 0.0), 0.0)
             contribution = naked * leg.collateral_per_contract
             if leg.strategy == CSP:
@@ -244,7 +275,16 @@ def capital_timeline(cycle: Cycle, through: date) -> list[CapitalPoint]:
             if leg.strategy == COVERED_CALL and leg.shares_tracked and leg.remaining_contracts_on(day) > 1e-9:
                 has_open_covered_call = True
 
-        stock_basis = sum(lot.capital_on(day) for lot in cycle.share_lots)
+        # Same skip for lots not yet acquired, sold out in full, or with an
+        # unknown basis: their capital_on is 0.0.
+        stock_basis = sum(
+            (
+                lot.capital_on(day)
+                for lot, acquired, sold_from in lot_windows
+                if day >= acquired and (sold_from is None or day < sold_from)
+            ),
+            stock_basis_start,
+        )
         points.append(
             CapitalPoint(
                 day=day,

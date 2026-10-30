@@ -107,6 +107,14 @@
         <button
           class="tab"
           type="button"
+          data-tab="spreads"
+          aria-selected="false"
+        >
+          Credit Spreads
+        </button>
+        <button
+          class="tab"
+          type="button"
           data-tab="tools"
           aria-selected="false"
         >
@@ -1156,6 +1164,81 @@
         </section>
       </div>
 
+      <div id="tab-spreads" hidden>
+        <p class="hint tab-intro">
+          Bull put and bear call credit spreads: what to open, when to close
+          what you hold, and how the strategy is doing. Guidance only; nothing
+          here places a trade.
+        </p>
+
+        <div id="spreads-status" role="status"></div>
+
+        <details class="card" id="spreads-settings-card" style="margin-bottom: var(--gap)">
+          <summary style="cursor: pointer; font-size: 14px; font-weight: 640">
+            Strategy settings
+          </summary>
+          <p class="hint" style="margin-top: 8px">
+            Starting points, not proven best values. Changes apply right away and are remembered.
+          </p>
+          <div class="spreads-settings" id="spreads-settings"></div>
+          <div id="spreads-settings-warnings"></div>
+        </details>
+
+        <section class="card" id="spreads-opportunities-card" style="margin-bottom: var(--gap)">
+          <header>
+            <h2>Spread opportunities</h2>
+          </header>
+          <ul class="hint-list">
+            <li><strong>Credit</strong>: short bid - long ask, the price you can count on filling. Midpoint is shown as an estimate only.</li>
+            <li><strong>Max loss</strong>: (width - credit) × 100 per spread, before fees.</li>
+            <li><strong>Chance of profit</strong>: a Black-Scholes estimate from the short leg's implied volatility, not a forecast.</li>
+            <li><strong>Delta</strong>: model value from Yahoo's implied volatility; Yahoo publishes no Greeks.</li>
+            <li>Press T over a row's credit for the full calculation.</li>
+          </ul>
+          <div id="spreads-scan"></div>
+          <div class="card-subsection" id="spreads-check-section">
+            <header><h3>Check a spread</h3></header>
+            <p class="hint">Pick any strikes and test them against the same rules.</p>
+            <div class="spreads-check-form" id="spreads-check-form"></div>
+            <div id="spreads-check-result"></div>
+          </div>
+        </section>
+
+        <section class="card" id="spreads-open-card" style="margin-bottom: var(--gap)">
+          <header>
+            <h2>Open spreads</h2>
+          </header>
+          <ul class="hint-list">
+            <li><strong>Close now</strong>: short ask - long bid, what buying the spread back costs right now.</li>
+            <li><strong>Target close</strong>: original credit × (1 - profit target %).</li>
+            <li><strong>Loss trigger</strong>: original credit × loss multiple. A prompt to review, not a guaranteed exit price.</li>
+            <li><strong>Time exit</strong>: expiration minus the time-exit DTE.</li>
+            <li><strong>Action priority</strong>: past expiration, one leg open, profit target, loss trigger, time exit, short strike under pressure.</li>
+          </ul>
+          <div id="spreads-open" style="overflow-x: auto"></div>
+        </section>
+
+        <section class="card" id="spreads-recommendations-card" style="margin-bottom: var(--gap)">
+          <header>
+            <h2>Spread recommendations</h2>
+          </header>
+          <div id="spreads-recommendations" class="spreads-recs"></div>
+        </section>
+
+        <section class="card" id="spreads-performance-card" style="margin-bottom: var(--gap)">
+          <header>
+            <h2>Performance analytics</h2>
+          </header>
+          <ul class="hint-list" id="spreads-notes"></ul>
+          <div class="tiles" id="spreads-tiles"></div>
+          <div id="spreads-exits" class="spreads-exits"></div>
+          <div class="card-subsection">
+            <header><h3>Closed spreads</h3></header>
+            <div id="spreads-closed" style="overflow-x: auto"></div>
+          </div>
+        </section>
+      </div>
+
       <div id="tab-tools" hidden>
         <p class="hint tab-intro">
           Modeling aids that answer "what if" questions. Nothing here is real
@@ -1319,6 +1402,7 @@
     <div id="tooltip" role="tooltip" aria-live="polite"></div>
 
     <script src="/tiplayout.js"></script>
+    <script src="/spreads.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>

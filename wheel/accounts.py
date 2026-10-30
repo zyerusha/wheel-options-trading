@@ -113,6 +113,7 @@ from typing import TYPE_CHECKING, Any, Sequence
 from wheel import assignment as assignment_mod
 from wheel import benchmark as bm
 from wheel import cashflow as cf
+from wheel import creditspreads
 from wheel import expiration as expiration_mod
 from wheel import taxes as taxes_mod
 from wheel import workflow as workflow_mod
@@ -779,8 +780,11 @@ class AccountRegistry:
         # so a name only ever traded elsewhere shows up here exactly when this
         # account could actually write the put.
         if len(self._accounts) > 1:
+            # Only the filter-independent candidate inputs are read from the
+            # other accounts, so they are not rebuilt in full (filtered P&L,
+            # capital series...) just to be discarded.
             others = {
-                aid: (payload if aid == account_id else dash.build(filters))
+                aid: (payload if aid == account_id else dash.csp_candidate_inputs())
                 for aid, dash in self._accounts.items()
             }
             own_exposure = sector_exposure((payload.get("trade_log") or {}).get("wheels", []))
@@ -798,6 +802,43 @@ class AccountRegistry:
             }
 
         return payload
+
+    def build_credit_spreads(
+        self,
+        account_id: str | None,
+        settings: creditspreads.SpreadSettings,
+        filters: Filters | None = None,
+        *,
+        check: creditspreads.SpreadCheck | None = None,
+        check_error: str | None = None,
+        settings_warnings: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """The Credit Spreads tab for one account, or Combined: every
+        account's spreads (each row naming its account) and the sum of every
+        account's latest Positions total value for sizing. The scan is per
+        ticker, not per account, so Combined runs it once. Raises
+        ``KeyError`` for an unknown account, like :meth:`build`."""
+        options = dict(filters=filters, check=check, check_error=check_error, settings_warnings=settings_warnings)
+        combined = not account_id or account_id.lower() == COMBINED_ACCOUNT_ID
+        if not combined:
+            return self.get(account_id).build_credit_spreads(settings, **options)
+        if not self._accounts:
+            raise ValueError("no accounts discovered under " + self.base_dir)
+
+        labels = {row["id"]: row["label"] for row in self.list_accounts()}
+        positions = [
+            position
+            for aid, dashboard in self._accounts.items()
+            for position in dashboard.credit_spread_positions(account_id=aid, account_label=labels.get(aid, aid))
+        ]
+        values = [value for value, _ in (d.account_equity() for d in self._accounts.values()) if value]
+        equity = (
+            (sum(values), f"Sum of the latest Positions total value across {len(values)} account(s)")
+            if values
+            else (None, "No Positions export loaded, so trades can't be sized to your account.")
+        )
+        market = next(iter(self._accounts.values()))
+        return market.build_credit_spreads(settings, positions=positions, equity=equity, **options)
 
     def _realized_gains(self, account_id: str | None) -> dict[str, Any] | None:
         """Cross-check the wheel engine's option P/L against any Fidelity

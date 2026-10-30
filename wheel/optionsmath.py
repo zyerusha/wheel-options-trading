@@ -71,6 +71,29 @@ def intrinsic_value_per_share(*, spot: float, strike: float, right: str) -> floa
     return max(spot - strike, 0.0) if right == CALL else max(strike - spot, 0.0)
 
 
+def probability_finish_above(
+    *,
+    spot: float | None,
+    level: float | None,
+    days_to_expiry: float | None,
+    implied_volatility: float | None,
+    risk_free_rate: float = 0.0,
+) -> float | None:
+    """Black-Scholes risk-neutral probability that the underlying closes
+    above ``level`` at expiry: N(d2) with ``level`` as the strike. A model
+    estimate from one implied volatility, not a forecast. ``None`` on the
+    same unusable inputs as :func:`black_scholes_greeks`; the probability of
+    finishing below is ``1 -`` this."""
+    if spot is None or level is None or implied_volatility is None or days_to_expiry is None:
+        return None
+    if spot <= 0 or level <= 0 or implied_volatility <= 0 or days_to_expiry <= 0:
+        return None
+    t = days_to_expiry / 365.0
+    sigma = implied_volatility
+    d2 = (math.log(spot / level) + (risk_free_rate - 0.5 * sigma * sigma) * t) / (sigma * math.sqrt(t))
+    return _NORMAL.cdf(d2)
+
+
 def black_scholes_greeks(
     *,
     spot: float | None,

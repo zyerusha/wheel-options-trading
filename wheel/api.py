@@ -23,6 +23,7 @@ from typing import Any, Sequence
 from wheel import assignment as assignment_mod
 from wheel import benchmark as bm
 from wheel import ccexit
+from wheel import creditspreads
 from wheel import cspentry
 from wheel import cashflow as cf
 from wheel import expiration as expiration_mod
@@ -1442,6 +1443,29 @@ def _cc_exit_fields(wheel: dict[str, Any] | None) -> dict[str, Any]:
     table's row -- the only way a table gets them, so none can disagree."""
     wheel = wheel or {}
     return {key: wheel.get(key) for key in CC_EXIT_FIELDS}
+
+
+def _chain_quotes(
+    snapshot: marketdata.OptionChainSnapshot, fetched_at: datetime | None
+) -> creditspreads.ChainQuotes:
+    """A fetched Yahoo chain in the shape ``wheel/creditspreads.py`` reads,
+    the underlying price and quote time taken from the same response."""
+
+    def side(right: str) -> tuple[creditspreads.LegQuote, ...]:
+        return tuple(
+            creditspreads.LegQuote(c.strike, c.bid, c.ask, c.implied_volatility, c.open_interest)
+            for c in snapshot.contracts
+            if c.right == right
+        )
+
+    return creditspreads.ChainQuotes(
+        ticker=snapshot.ticker,
+        expiry=snapshot.expiration,
+        spot=snapshot.underlying_price,
+        timing=creditspreads.QuoteTiming(snapshot.quote_time, fetched_at),
+        puts=side("P"),
+        calls=side("C"),
+    )
 
 
 def _csp_to_enter_payload(result: cspentry.CspEntry, ticker: str | None = None) -> dict[str, Any]:
@@ -4658,6 +4682,237 @@ class Dashboard:
             out[ticker] = _csp_to_enter_payload(result, ticker)
         return out
 
+    # ---- credit spreads ----
+
+    def credit_spread_positions(
+        self, account_id: str | None = None, account_label: str | None = None
+    ) -> list[creditspreads.SpreadPosition]:
+        """Every credit spread in this account's full ledger history (the
+        engine's same-day pairs that took in a net credit), open and closed.
+        Built from ``all_cycles``, never the date-filtered view, so an open
+        spread always shows however the range is set."""
+        legs = {leg.leg_id: leg for cycle in self.all_cycles for leg in cycle.legs}
+        spreads = [spread for cycle in self.all_cycles for spread in cycle.spreads]
+        return creditspreads.credit_spread_positions(
+            spreads, legs, account_id=account_id, account_label=account_label
+        )
+
+    def account_equity(self) -> tuple[float | None, str]:
+        """``(total account value, where it came from)`` for position sizing:
+        the latest Positions export's total value, or ``None`` without one."""
+        net_worth = self._net_worth
+        if not net_worth.get("available") or not net_worth.get("total_value"):
+            return None, "No Positions export loaded, so trades can't be sized to your account."
+        return net_worth["total_value"], f"Total value in your Positions export of {net_worth['as_of'][:10]}"
+
+    def build_credit_spreads(
+        self,
+        settings: creditspreads.SpreadSettings,
+        *,
+        filters: Filters | None = None,
+        check: creditspreads.SpreadCheck | None = None,
+        check_error: str | None = None,
+        positions: list[creditspreads.SpreadPosition] | None = None,
+        equity: tuple[float | None, str] | None = None,
+        settings_warnings: Sequence[str] = (),
+        today: date | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """The Credit Spreads tab's whole payload (``/api/spreads``): entry
+        scan and recommendations for ``settings.underlyings``, guidance for
+        every open spread, the hand-picked ``check``, and performance. Every
+        number comes from ``wheel/creditspreads.py``. ``positions``/``equity``
+        default to this account's own; the Combined view passes every
+        account's. Chains come from the shared ``_option_chains`` cache in
+        one parallel batch; a failed fetch becomes a stated reason, never a
+        substituted price. Fetch warnings raised here are returned with this
+        payload and removed from ``_price_warnings`` so they never leak into
+        the Wheel dashboard's own warning list.
+        """
+        filters = filters or Filters()
+        today = today or date.today()
+        now = now or datetime.now(timezone.utc)
+        warnings_before = len(self._price_warnings)
+        positions = self.credit_spread_positions() if positions is None else positions
+        account_equity, equity_source = self.account_equity() if equity is None else equity
+        fee = ccexit.OPTION_FEE_PER_CONTRACT
+        rate = DIRECTIONAL_RISK_FREE_RATE_ASSUMPTION
+
+        tickers = list(settings.underlyings)
+        if check is not None and check.ticker not in tickers:
+            tickers.append(check.ticker)
+        listed = self._option_expirations(tickers)
+        scan_dates = {
+            t: creditspreads.scan_expirations(listed.get(t, []), today, settings) for t in settings.underlyings
+        }
+        open_positions = [p for p in positions if not p.is_closed]
+        pairs = {(t, d) for t, dates in scan_dates.items() for d in dates}
+        pairs |= {(p.ticker, p.expiry) for p in open_positions if p.expiry >= today}
+        if check is not None:
+            pairs.add((check.ticker, check.expiry))
+        fetched = self._option_chains(pairs) if pairs else {}
+        fetched_at = getattr(self, "_option_chain_fetched_at", {})
+        chains: dict[tuple[str, date], creditspreads.ChainQuotes] = {}
+        chain_errors: dict[tuple[str, date], str] = {}
+        for pair, (snapshot, warning) in fetched.items():
+            if snapshot is None:
+                chain_errors[pair] = f"Option prices for {pair[0]} {pair[1].isoformat()} couldn't be loaded."
+                if warning:
+                    self._price_warnings.append(warning)
+            else:
+                chains[pair] = _chain_quotes(snapshot, fetched_at.get(pair))
+
+        bars = self._daily_bars(tickers)
+        fundamentals = self._fundamentals(tickers)
+        contexts = {
+            t: creditspreads.market_context(
+                t, [b.close for b in bars.get(t, [])], (fundamentals.get(t) or {}).get("earnings_date")
+            )
+            for t in tickers
+        }
+
+        open_count = sum(1 for p in open_positions if p.contracts_open > 1e-9)
+        scan_rows: list[dict[str, Any]] = []
+        recommendations: list[dict[str, Any]] = []
+        for ticker in settings.underlyings:
+            dates = scan_dates[ticker]
+            candidates: list[creditspreads.SpreadCandidate] = []
+            notes: list[str] = []
+            for expiry in dates:
+                chain = chains.get((ticker, expiry))
+                if chain is None:
+                    notes.append(chain_errors.get((ticker, expiry), f"No option prices for {expiry.isoformat()}."))
+                    continue
+                found, skipped = creditspreads.scan_chain(
+                    chain=chain,
+                    today=today,
+                    settings=settings,
+                    context=contexts[ticker],
+                    account_equity=account_equity,
+                    risk_free_rate=rate,
+                    fee_per_contract=fee,
+                )
+                candidates.extend(found)
+                notes.extend(skipped)
+            loaded = [chains[(ticker, d)] for d in dates if (ticker, d) in chains]
+            unavailable = None
+            if not dates:
+                unavailable = (
+                    f"No listed {ticker} expiration between {settings.entry_dte_min} and "
+                    f"{settings.entry_dte_max} DTE could be loaded."
+                )
+            elif not loaded:
+                unavailable = f"Option prices for {ticker} couldn't be loaded."
+            candidates.sort(key=lambda c: (c.status != creditspreads.QUALIFIES, c.rank_key))
+            scan_rows.append(
+                {
+                    "ticker": ticker,
+                    "spot": loaded[0].spot if loaded else None,
+                    "quote": loaded[0].timing.payload(now) if loaded else None,
+                    "context": contexts[ticker].payload(),
+                    "expirations": [d.isoformat() for d in dates],
+                    "candidates": [creditspreads.candidate_payload(c, now) for c in candidates],
+                    "notes": notes,
+                    "unavailable_reason": unavailable,
+                }
+            )
+            recommendation = creditspreads.recommend(
+                ticker,
+                candidates,
+                open_spread_count=open_count,
+                settings=settings,
+                now=now,
+                unavailable_reason=unavailable,
+            )
+            recommendations.append(creditspreads.recommendation_payload(recommendation, now))
+
+        guidance: dict[str, creditspreads.Guidance] = {}
+        for position in open_positions:
+            pair = (position.ticker, position.expiry)
+            guidance[position.spread_id] = creditspreads.manage_spread(
+                position,
+                today=today,
+                chain=chains.get(pair),
+                settings=settings,
+                risk_free_rate=rate,
+                now=now,
+                chain_unavailable_reason=chain_errors.get(pair),
+            )
+        open_rows = sorted(
+            (creditspreads.guidance_payload(g, settings, now) for g in guidance.values()),
+            key=lambda row: (row["expiry"], row["ticker"], row["short_strike"]),
+        )
+        # Same date rule as the performance figures (close date in range), so
+        # the table always lists exactly the spreads the tiles count. Open
+        # spreads are current positions and show regardless of the range.
+        closed_rows = sorted(
+            (
+                creditspreads.position_payload(p, settings)
+                for p in creditspreads.closed_in_range(positions, filters.start, filters.end)
+            ),
+            key=lambda row: (row["close_date"] or "", row["ticker"]),
+            reverse=True,
+        )
+
+        check_payload: dict[str, Any] | None = {"error": check_error} if check_error else None
+        if check is not None:
+            chain = chains.get((check.ticker, check.expiry))
+            listed_dates = listed.get(check.ticker, [])
+            if chain is None:
+                reason = chain_errors.get((check.ticker, check.expiry)) or "No option prices for that date."
+                if listed_dates and check.expiry not in listed_dates:
+                    reason = f"{check.expiry.isoformat()} is not a listed {check.ticker} expiration."
+                check_payload = {"error": reason}
+            else:
+                try:
+                    candidate = creditspreads.evaluate_spread(
+                        ticker=check.ticker,
+                        strategy=check.strategy,
+                        chain=chain,
+                        short_strike=check.short_strike,
+                        long_strike=check.long_strike,
+                        today=today,
+                        settings=settings,
+                        context=contexts[check.ticker],
+                        account_equity=account_equity,
+                        risk_free_rate=rate,
+                        fee_per_contract=fee,
+                    )
+                except ValueError as error:
+                    check_payload = {"error": str(error)}
+                else:
+                    check_payload = {
+                        "candidate": creditspreads.candidate_payload(candidate, now),
+                        "risks": creditspreads.candidate_risks(candidate, now),
+                    }
+
+        warnings = list(dict.fromkeys(self._price_warnings[warnings_before:]))
+        del self._price_warnings[warnings_before:]
+        return {
+            "api_version": creditspreads.API_VERSION,
+            "settings": settings.as_dict(),
+            "settings_warnings": list(settings_warnings),
+            "calculated_at": now.isoformat(),
+            "today": today.isoformat(),
+            "account_equity": {"value": account_equity, "source": equity_source},
+            "fee_per_contract": fee,
+            "risk_free_rate": rate,
+            "open_spread_count": open_count,
+            "scan": scan_rows,
+            "recommendations": recommendations,
+            "check": check_payload,
+            "check_expirations": {
+                t: [d.isoformat() for d in listed.get(t, []) if 0 < (d - today).days <= 120] for t in tickers
+            },
+            "open_spreads": open_rows,
+            "closed_spreads": closed_rows,
+            "performance": creditspreads.performance(
+                positions, guidance, settings, start=filters.start, end=filters.end
+            ),
+            "notes": [creditspreads.OVERLAP_NOTE, creditspreads.PAIRING_NOTE],
+            "warnings": warnings,
+        }
+
     def _build_cc_candidates(self, wheels: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
         """Every position holding shares not yet covered by an open covered
         call. Positions with >= 100 uncovered shares are the actionable ones
@@ -4854,6 +5109,68 @@ class Dashboard:
 
     # ---- query ----
 
+    def _refresh_price_marked(self) -> dict[str, float | None]:
+        """Current live prices, with every filter-independent, price-marked
+        cache (trade log, hedges, open positions, candidates, CSP TO ENTER)
+        rebuilt if a newer price fetch landed since they were last built.
+        Shared by :meth:`build` and :meth:`csp_candidate_inputs` so both read
+        the same generation of marks."""
+        current_prices = self._current_prices()
+        if self._price_marked_at != self._price_cache_at:
+            # A newer live-price fetch landed since these were last built (or
+            # this is the first build ever) -- every mark below is stale, not
+            # just whichever of these happens to still be None. Without this,
+            # _current_prices() refreshing every _LIVE_PRICE_TTL_SECONDS did
+            # nothing observable: these six are what the frontend actually
+            # renders, and an `is None` guard alone means "built once, kept
+            # forever" regardless of how often the live price underneath it
+            # moves on.
+            self._wheel_return = None
+            self._trade_log = None
+            self._open_hedges = None
+            self._open_positions = None
+            self._cc_candidates = None
+            self._csp_candidates = None
+            self._csp_to_enter = None
+            self._cycle_metrics_cache = {}
+        if self._wheel_return is None:
+            self._wheel_return = self._build_wheel_return(current_prices)
+        if self._trade_log is None:
+            self._trade_log = self._build_trade_log(current_prices)
+        if self._open_hedges is None:
+            self._open_hedges = self._build_open_hedges(current_prices)
+        if self._open_positions is None:
+            self._open_positions = self._build_open_positions(
+                current_prices, self._prev_closes, (self._trade_log or {}).get("wheels", [])
+            )
+        if self._cc_candidates is None:
+            self._cc_candidates = self._build_cc_candidates((self._trade_log or {}).get("wheels", []))
+        if self._csp_candidates is None:
+            _wheels = (self._trade_log or {}).get("wheels", [])
+            self._csp_candidates = self._build_csp_candidates(_wheels, sector_exposure(_wheels))
+        if self._csp_to_enter is None:
+            # Every ticker any surface shows CSP TO ENTER for: open positions /
+            # wheels (the live marks) and the CSP candidates (their own last
+            # price, same live-quote source). The live mark wins on overlap.
+            entry_prices = {row["underlying"]: row.get("last_close") for row in self._csp_candidates or []}
+            entry_prices.update(current_prices)
+            self._csp_to_enter = self._build_csp_to_enter(entry_prices)
+        self._price_marked_at = self._price_cache_at
+        return current_prices
+
+    def csp_candidate_inputs(self) -> dict[str, Any]:
+        """The three filter-independent payload keys another account's
+        single-account view merges into its CSP candidates
+        (``AccountRegistry.build``), exactly as :meth:`build` would return
+        them, without paying for the filtered P&L/capital work of a full
+        build this account's own view doesn't need."""
+        self._refresh_price_marked()
+        return {
+            "csp_candidates": self._csp_candidates,
+            "csp_candidate_history": aggregate_csp_history((self._trade_log or {}).get("wheels", [])),
+            "csp_to_enter": self._csp_to_enter or {},
+        }
+
     def build(self, filters: Filters | None = None) -> dict[str, Any]:
         filters = filters or Filters()
         transactions = [t for t in self.transactions if filters.matches_transaction(t)]
@@ -4925,48 +5242,8 @@ class Dashboard:
         # ticker/date/status-filtered set every other P&L figure here uses --
         # not `capital_cycles`, so a filtered-out ticker's dividends and
         # unrealized gains don't leak into the figures on screen.
-        current_prices = self._current_prices()
-        if self._price_marked_at != self._price_cache_at:
-            # A newer live-price fetch landed since these were last built (or
-            # this is the first build ever) -- every mark below is stale, not
-            # just whichever of these happens to still be None. Without this,
-            # _current_prices() refreshing every _LIVE_PRICE_TTL_SECONDS did
-            # nothing observable: these six are what the frontend actually
-            # renders, and an `is None` guard alone means "built once, kept
-            # forever" regardless of how often the live price underneath it
-            # moves on.
-            self._wheel_return = None
-            self._trade_log = None
-            self._open_hedges = None
-            self._open_positions = None
-            self._cc_candidates = None
-            self._csp_candidates = None
-            self._csp_to_enter = None
-            self._cycle_metrics_cache = {}
+        current_prices = self._refresh_price_marked()
         dividends = dividends_by_cycle(cycles, transactions)
-        if self._wheel_return is None:
-            self._wheel_return = self._build_wheel_return(current_prices)
-        if self._trade_log is None:
-            self._trade_log = self._build_trade_log(current_prices)
-        if self._open_hedges is None:
-            self._open_hedges = self._build_open_hedges(current_prices)
-        if self._open_positions is None:
-            self._open_positions = self._build_open_positions(
-                current_prices, self._prev_closes, (self._trade_log or {}).get("wheels", [])
-            )
-        if self._cc_candidates is None:
-            self._cc_candidates = self._build_cc_candidates((self._trade_log or {}).get("wheels", []))
-        if self._csp_candidates is None:
-            _wheels = (self._trade_log or {}).get("wheels", [])
-            self._csp_candidates = self._build_csp_candidates(_wheels, sector_exposure(_wheels))
-        if self._csp_to_enter is None:
-            # Every ticker any surface shows CSP TO ENTER for: open positions /
-            # wheels (the live marks) and the CSP candidates (their own last
-            # price, same live-quote source). The live mark wins on overlap.
-            entry_prices = {row["underlying"]: row.get("last_close") for row in self._csp_candidates or []}
-            entry_prices.update(current_prices)
-            self._csp_to_enter = self._build_csp_to_enter(entry_prices)
-        self._price_marked_at = self._price_cache_at
         earnings_in_view = self._build_earnings_in_view(
             self._open_positions or [], (self._trade_log or {}).get("wheels", []), through
         )
