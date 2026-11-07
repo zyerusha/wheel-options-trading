@@ -394,6 +394,9 @@ class Cycle:
     # ``_resumable_cycle``). Terminal cycles -- year turned, or stock called
     # away -- have this False.
     resumable: bool = False
+    # metrics.capital_timeline's results by horizon; derived data, not part of
+    # the cycle's identity.
+    capital_timeline_memo: dict[date, list] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     @property
     def is_open(self) -> bool:

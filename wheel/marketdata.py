@@ -183,6 +183,27 @@ def parse_yahoo_chart(text: str) -> list[PricePoint]:
 # --------------------------------------------------------------------------
 
 
+# A price cache holds thousands of rows per ticker and a server start reads
+# every ticker's file, so the general broker-cell parsers dominated start-up
+# (two strptime calls per row, since "%m/%d/%Y" is tried first). save_cache
+# only ever writes ISO dates and plain floats: these try exactly that first and
+# hand anything else to the general parser, so every cell reads as it always did.
+def _cache_date(cell: str) -> date | None:
+    if len(cell) == 10 and cell[4] == "-" and cell[7] == "-":
+        try:
+            return date.fromisoformat(cell)
+        except ValueError:
+            pass
+    return _parse_date(cell)
+
+
+def _cache_num(cell: str) -> float | None:
+    try:
+        return float(cell)
+    except ValueError:
+        return _num(cell)
+
+
 def load_cache(cache_path: str) -> list[PricePoint]:
     """Reads both cache layouts: the original ``date,close`` and the current
     ``date,close,high,low,volume`` (close stays second so either reads the
@@ -195,13 +216,13 @@ def load_cache(cache_path: str) -> list[PricePoint]:
             cells = line.strip().split(",")
             if len(cells) not in (2, 5):
                 continue
-            day = _parse_date(cells[0])
-            close = _num(cells[1])
+            day = _cache_date(cells[0])
+            close = _cache_num(cells[1])
             if day is None or close is None:
                 continue
             high = low = volume = None
             if len(cells) == 5:
-                high, low, volume = (_num(cell) if cell else None for cell in cells[2:5])
+                high, low, volume = (_cache_num(cell) if cell else None for cell in cells[2:5])
             points.append(PricePoint(day=day, close=close, high=high, low=low, volume=volume))
     points.sort(key=lambda point: point.day)
     return points
@@ -400,8 +421,7 @@ def price_on_or_before(points: Sequence[PricePoint], day: date) -> PricePoint | 
     """Nearest prior-or-equal trading-day close, or None before the series starts."""
     if not points:
         return None
-    days = [point.day for point in points]
-    index = bisect_right(days, day) - 1
+    index = bisect_right(points, day, key=lambda point: point.day) - 1
     if index < 0:
         return None
     return points[index]

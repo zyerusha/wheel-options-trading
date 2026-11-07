@@ -106,6 +106,7 @@ import json
 import os
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import date
 from typing import TYPE_CHECKING, Any, Sequence
@@ -115,6 +116,7 @@ from wheel import benchmark as bm
 from wheel import cashflow as cf
 from wheel import creditspreads
 from wheel import expiration as expiration_mod
+from wheel import marketdata
 from wheel import taxes as taxes_mod
 from wheel import workflow as workflow_mod
 from wheel.closed_lots import (
@@ -127,12 +129,14 @@ from wheel.closed_lots import (
 from wheel.api import (
     Dashboard,
     Filters,
+    LiveQuoteBatch,
     build_cycles,
     csp_candidate_row,
     discover_exports,
     discover_multi_account_exports,
     is_csp_history_winner,
     merge_csp_history,
+    prefetch_option_chains,
     sector_exposure,
     wheel_target_gap_pct,
 )
@@ -462,6 +466,7 @@ class AccountRegistry:
         self.base_dir = base_dir
         self.extra_dirs = tuple(extra_dirs)
         self._lock = threading.Lock()
+        self._prefetch_lock = threading.Lock()
         self._default_dashboard: Dashboard | None = None  # overridden by serve.py's uploader
         self._accounts: dict[str, Dashboard] = {}
         self._build_warnings: list[str] = []
@@ -747,6 +752,7 @@ class AccountRegistry:
             latest = latest_snapshot(dashboard.snapshots)
             if latest is not None:
                 account_number, account_name = latest.account_number, latest.account_name
+            last_date = dashboard.last_date
             label = account_name or ("Combined default" if account_id == DEFAULT_ACCOUNT_ID else account_id)
             rows.append(
                 {
@@ -755,6 +761,7 @@ class AccountRegistry:
                     "account_number": account_number,
                     "account_name": account_name,
                     "transactions": len(dashboard.transactions),
+                    "data_last_date": last_date.isoformat() if last_date else None,
                     "has_positions": bool(dashboard.snapshots),
                     "warnings": list(dashboard.position_warnings),
                 }
@@ -762,7 +769,29 @@ class AccountRegistry:
         rows.sort(key=lambda row: (row["id"] != DEFAULT_ACCOUNT_ID, row["label"]))
         return rows
 
+    def _prefetch_market_data(self) -> None:
+        """Fetch one price refresh's live data for every account at once.
+
+        Every view reads every account (Combined builds them all; one account's
+        view reads the others' CSP candidates), so each account fetching its own
+        quotes one after another cost about 2 s per refresh for what a single
+        batched request answers. Concurrent requests wait on the lock and then
+        find the prices fresh, so one refresh still fetches once.
+        """
+        with self._prefetch_lock:
+            dashboards = list(self._accounts.values())
+            if not any(dashboard.live_prices_expired() for dashboard in dashboards):
+                return
+            quoted_at = time.monotonic()
+            tickers = sorted({ticker for dashboard in dashboards for ticker in dashboard.live_quote_tickers()})
+            prices, warnings = marketdata.get_last_prices(tickers)
+            batch = LiveQuoteBatch({ticker: prices.get(ticker) for ticker in tickers}, tuple(warnings), quoted_at)
+            for dashboard in dashboards:
+                dashboard.adopt_quote_batch(batch)
+            prefetch_option_chains()
+
     def build(self, account_id: str | None, filters: Filters | None = None) -> dict[str, Any]:
+        self._prefetch_market_data()
         combined = not account_id or account_id.lower() == COMBINED_ACCOUNT_ID
         if combined:
             payload = self._build_combined(filters)

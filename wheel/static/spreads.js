@@ -25,7 +25,7 @@
   // Must match API_VERSION in wheel/creditspreads.py. Static files are read
   // from disk on every request but the server only loads new Python code when
   // restarted, so a mismatch means the page is newer than the running server.
-  const SPREADS_API_VERSION = 3;
+  const SPREADS_API_VERSION = 4;
   // Candidate rows shown per ticker before "Show all".
   const SPREADS_ROWS_SHOWN = 12;
 
@@ -38,7 +38,7 @@
     { key: 'widths', label: 'Spread width $', type: 'text', list: true, hint: 'One or more, comma separated.' },
     { key: 'min_credit_pct', label: 'Min credit % of width', type: 'number', step: 1 },
     { key: 'profit_target_pct', label: 'Profit target %', type: 'number', step: 5 },
-    { key: 'loss_multiple', label: 'Loss trigger × credit', type: 'number', step: 0.25 },
+    { key: 'loss_multiple', label: 'Close when cost to close reaches × credit', type: 'number', step: 0.25 },
     { key: 'time_exit_dte', label: 'Time exit DTE', type: 'number', step: 1 },
     { key: 'max_risk_pct', label: 'Max risk % of account', type: 'number', step: 0.25 },
     { key: 'max_open', label: 'Max open spreads', type: 'number', step: 1 },
@@ -633,8 +633,12 @@
       [['Open spreads', p.open_count], ...(p.unrealized_unpriced_count ? [['Without a quote', p.unrealized_unpriced_count]] : [])],
       signClass(p.unrealized)));
     tiles.appendChild(perfTile('Win rate', pct(p.win_rate_pct),
-      formula(['Win rate = closed spreads with net P/L above $0 ÷ closed spreads', `= ${p.win_count} ÷ ${p.closed_count}`, `= ${pct(p.win_rate_pct)}`]),
-      [['Closed', p.closed_count], ['Losses', p.loss_count]]));
+      formula([
+        'Win rate = closed spreads with net P/L above $0 ÷ closed spreads', `= ${p.win_count} ÷ ${p.closed_count}`, `= ${pct(p.win_rate_pct)}`,
+        ...(p.unsettled_closed_count ? ['  Spreads assigned on one leg only are left out of every P/L figure: their result depends on the share trade.'] : []),
+      ]),
+      [['Closed', p.closed_count], ['Losses', p.loss_count],
+        ...(p.unsettled_closed_count ? [['Not settled by the spread', p.unsettled_closed_count]] : [])]));
     tiles.appendChild(perfTile('Avg per closed spread', usd(p.avg_net_per_closed),
       formula(['Avg per closed spread = net realized P/L of closed spreads ÷ closed spreads']),
       [['Avg win', usd(p.avg_win)], ['Avg loss', usd(p.avg_loss)]], signClass(p.avg_net_per_closed)));
@@ -678,12 +682,12 @@
       { text: usd(r.net_premium_collected), title: r.net_collected_tip },
       { text: usd(r.breakeven), title: r.breakeven_tip },
       usd(r.closing_debit),
-      {
+      r.result_settled ? {
         text: usd(r.realized_net),
         sub: `Gross ${usd(r.realized_gross)}, fees ${usd(r.realized_fees)}`,
         class: signClass(r.realized_net),
         title: formula(['Net P/L = gross P/L - fees', `= ${usd(r.realized_gross)} - ${usd(r.realized_fees)}`, `= ${usd(r.realized_net)}`]),
-      },
+      } : { text: 'Not settled', sub: r.result_note },
       r.exit_label,
     ]);
     host.appendChild(table(head, body));

@@ -478,6 +478,13 @@ class DashboardState:
         return dashboard
 
 
+class DashboardHTTPServer(ThreadingHTTPServer):
+    # The default backlog of 5 refuses connections on Windows when a page opens
+    # its burst of requests while a build is holding the interpreter, which
+    # leaves the page without a script until it is reloaded.
+    request_queue_size = 128
+
+
 @dataclass
 class Workspace:
     """Everything one tenant's requests are served from: a directory, an
@@ -1087,7 +1094,7 @@ def serve(
         session_manager.start_background_sweep()
         Handler.workspace = None
         Handler.session_manager = session_manager
-        httpd = ThreadingHTTPServer((host, port), Handler)
+        httpd = DashboardHTTPServer((host, port), Handler)
 
         print("  mode          hosted (multi-tenant browser upload)")
         print(f"  sessions      {sessions_root}")
@@ -1115,7 +1122,7 @@ def serve(
 
         Handler.workspace = workspace
         Handler.session_manager = None
-        httpd = ThreadingHTTPServer((host, port), Handler)
+        httpd = DashboardHTTPServer((host, port), Handler)
 
         # No broker export anywhere yet -- a brand-new checkout, or a fresh
         # Docker volume with nothing uploaded. The old behavior was to refuse to

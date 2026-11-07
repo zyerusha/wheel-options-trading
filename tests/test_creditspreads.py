@@ -19,7 +19,7 @@ from wheel.api import Dashboard, Filters  # noqa: E402
 from wheel.engine import build_cycles  # noqa: E402
 from wheel.marketdata import OptionChainSnapshot, OptionContractQuote, PricePoint  # noqa: E402
 from wheel.optionsmath import CALL, PUT, black_scholes_greeks, probability_finish_above  # noqa: E402
-from wheel.parser import BTC, BTO, EXPIRED, STC, STO  # noqa: E402
+from wheel.parser import ASSIGNED, BTC, BTO, EXPIRED, STC, STO  # noqa: E402
 
 RATE = 0.045
 FEE = 0.65
@@ -220,6 +220,13 @@ class TestSettings(unittest.TestCase):
         self.assertEqual(s.widths, (5.0,))
         self.assertEqual(s.loss_multiple, 2.0)
         self.assertEqual(len(warnings), 4)
+
+    def test_invalid_min_iv_says_no_filter_not_nan(self):
+        s, warnings = cs.SpreadSettings.from_query({"min_iv_pct": ["abc"], "loss_multiple": ["1"]})
+        self.assertIsNone(s.min_short_iv_pct)
+        self.assertIn("min_iv_pct must be a number from 0 to 500; no volatility filter used.", warnings)
+        self.assertIn("loss_multiple must be a number from 1.01 to 10; using 2.", warnings)
+        self.assertFalse(any("nan" in w for w in warnings))
 
     def test_time_exit_must_be_below_entry_dte(self):
         s, warnings = cs.SpreadSettings.from_query({"dte_min": ["20"], "dte_max": ["30"], "time_exit_dte": ["21"]})
@@ -567,6 +574,173 @@ class TestPerformance(unittest.TestCase):
         self.assertIsNone(perf["win_rate_pct"])
         self.assertIsNone(perf["profit_factor"])
         self.assertEqual(perf["max_drawdown"], 0.0)
+
+
+class TestEarningsRisk(unittest.TestCase):
+    """Only a report between today and expiration is a risk to the trade."""
+
+    def risks(self, earnings_date):
+        context = cs.MarketContext("ABC", last_close=110.0, sma=100.0, earnings_date=earnings_date)
+        return [r for r in cs.candidate_risks(evaluate(context=context), NOW) if "Earnings" in r]
+
+    def test_past_earnings_date_is_not_a_risk(self):
+        self.assertEqual(self.risks(TODAY - timedelta(days=2)), [])
+
+    def test_upcoming_earnings_inside_expiry_is_a_risk(self):
+        self.assertEqual(len(self.risks(TODAY + timedelta(days=10))), 1)
+        self.assertEqual(len(self.risks(TODAY)), 1)
+        self.assertEqual(len(self.risks(EXPIRY)), 1)
+
+    def test_earnings_after_expiry_is_not_a_risk(self):
+        self.assertEqual(self.risks(EXPIRY + timedelta(days=1)), [])
+
+    def test_market_context_drops_a_past_date(self):
+        closes = [80 + i * 0.2 for i in range(60)]
+        self.assertIsNone(cs.market_context("ABC", closes, TODAY - timedelta(days=1), today=TODAY).earnings_date)
+        self.assertIsNone(cs.market_context("ABC", closes[:5], TODAY - timedelta(days=1), today=TODAY).earnings_date)
+        upcoming = TODAY + timedelta(days=3)
+        payload = cs.market_context("ABC", closes, upcoming, today=TODAY).payload()
+        self.assertEqual(payload["earnings_date"], upcoming.isoformat())
+
+
+# Bull put 500/495 x1, credit 1.00 (net $98.70 after two $0.65 fees), both
+# legs assigned/exercised at expiration. The option rows carry $0; the share
+# rows (bought at 500, sold at 495) settle the width against the trader.
+BOTH_ASSIGNED = opened_put_spread() + [
+    tx("2026-10-19", ASSIGNED, "-SPY261016P500", 1, None, 0.0, as_of="2026-10-16"),
+    tx("2026-10-19", ASSIGNED, "-SPY261016P495", 1, None, 0.0, as_of="2026-10-16"),
+]
+# The same spread with only the short assigned; the long expired worthless.
+SHORT_ONLY_ASSIGNED = opened_put_spread() + [
+    tx("2026-10-19", ASSIGNED, "-SPY261016P500", 1, None, 0.0, as_of="2026-10-16"),
+    tx("2026-10-19", EXPIRED, "-SPY261016P495", 1, None, 0.0, as_of="2026-10-16"),
+]
+
+
+class TestAssignment(unittest.TestCase):
+    def test_both_legs_assigned_is_the_exact_max_loss(self):
+        (p,) = positions_from(BOTH_ASSIGNED)
+        self.assertTrue(p.is_closed)
+        self.assertTrue(p.result_settled)
+        self.assertAlmostEqual(p.realized_net, 98.70 - 500.0)  # -(max loss $400) - $1.30 opening fees
+        self.assertAlmostEqual(p.realized_net, -p.max_loss - p.open_fees)
+        self.assertAlmostEqual(p.realized_fees, 1.30)
+        self.assertAlmostEqual(p.closing_debit, 5.00)  # the full width
+        self.assertEqual(cs.classify_exit(p, DEFAULTS), cs.EXIT_ASSIGNED)
+        ((day, net, fees),) = p.realized_events()
+        self.assertEqual(day, date(2026, 10, 16))
+        self.assertAlmostEqual(net, -401.30)
+        self.assertAlmostEqual(fees, 1.30)
+
+        payload = cs.position_payload(p, DEFAULTS)
+        self.assertEqual(payload["realized_net"], -401.30)
+        self.assertEqual(payload["realized_gross"], -400.00)
+        self.assertTrue(payload["result_settled"])
+        self.assertIsNone(payload["result_note"])
+        settled = [t for t in payload["trades"] if t["action"] == "Assignment settled"]
+        self.assertEqual([t["net_cash"] for t in settled], [-500.0])
+        self.assertAlmostEqual(sum(t["net_cash"] for t in payload["trades"]), payload["realized_net"])
+
+        perf = cs.performance([p], {}, DEFAULTS)
+        self.assertEqual((perf["win_count"], perf["loss_count"], perf["closed_count"]), (0, 1, 1))
+        self.assertEqual(perf["win_rate_pct"], 0.0)
+        self.assertAlmostEqual(perf["realized_net"], -401.30)
+        self.assertAlmostEqual(perf["max_drawdown"], 401.30)
+        self.assertEqual(perf["unsettled_closed_count"], 0)
+
+    def test_bear_call_both_assigned_settles_the_width_too(self):
+        txs = [
+            tx("2026-09-01", STO, "-SPY261016C600", -2, 1.20, 240 - 2 * FEE, commission=2 * FEE),
+            tx("2026-09-01", BTO, "-SPY261016C605", 2, 0.20, -40 - 2 * FEE, commission=2 * FEE),
+            tx("2026-10-19", ASSIGNED, "-SPY261016C600", 2, None, 0.0, as_of="2026-10-16"),
+            tx("2026-10-19", ASSIGNED, "-SPY261016C605", 2, None, 0.0, as_of="2026-10-16"),
+        ]
+        (p,) = positions_from(txs)
+        self.assertEqual(p.strategy, cs.BEAR_CALL)
+        self.assertAlmostEqual(p.realized_net, (240 - 2 * FEE) + (-40 - 2 * FEE) - 1000.0)
+
+    def test_short_only_assigned_is_flagged_and_left_out_of_every_pl_figure(self):
+        (p,) = positions_from(SHORT_ONLY_ASSIGNED)
+        self.assertTrue(p.is_closed)
+        self.assertFalse(p.result_settled)
+        self.assertIsNone(p.realized_net)
+        self.assertIsNone(p.closing_debit)
+        self.assertEqual(p.realized_events(), [])
+        self.assertEqual(cs.classify_exit(p, DEFAULTS), cs.EXIT_ASSIGNED)
+        payload = cs.position_payload(p, DEFAULTS)
+        self.assertIsNone(payload["realized_net"])
+        self.assertIsNone(payload["realized_gross"])
+        self.assertFalse(payload["result_settled"])
+        self.assertIn("depends on the share trade", payload["result_note"])
+        self.assertIn("Wheel tab", payload["result_note"])
+
+        alone = cs.performance([p], {}, DEFAULTS)
+        self.assertEqual((alone["closed_count"], alone["unsettled_closed_count"]), (0, 1))
+        self.assertIsNone(alone["win_rate_pct"])
+        self.assertEqual(alone["realized_net"], 0.0)
+
+        # Added to the three settled spreads, it changes none of their figures.
+        mixed = cs.performance(positions_from(WIN + LOSS + EXPIRES) + [p], {}, DEFAULTS)
+        self.assertEqual(mixed["closed_count"], 3)
+        self.assertEqual(mixed["unsettled_closed_count"], 1)
+        self.assertEqual((mixed["win_count"], mixed["loss_count"]), (2, 1))
+        self.assertEqual(mixed["win_rate_pct"], 66.7)
+        self.assertAlmostEqual(mixed["realized_net"], 43.50)
+        self.assertAlmostEqual(mixed["avg_net_per_closed"], 14.50)
+        self.assertAlmostEqual(mixed["profit_factor"], round(166.10 / 122.60, 2))
+        self.assertAlmostEqual(mixed["return_on_max_risk_pct"], round(43.5 / 1200 * 100, 1))
+        self.assertAlmostEqual(mixed["max_drawdown"], 122.60)
+        counts = {row["key"]: row["count"] for row in mixed["exit_counts"]}
+        self.assertEqual(counts["ASSIGNED"], 1)
+
+
+class TestUnequalLegSizes(unittest.TestCase):
+    """Sell 1 600 put, buy 2 595 puts the same day: one spread of 1 contract
+    plus one unpaired long put. Closes go to the unpaired put first."""
+
+    OPEN = [
+        tx("2026-08-10", STO, "-SPY260918P600", -1, 2.00, 200 - FEE, commission=FEE),
+        tx("2026-08-10", BTO, "-SPY260918P595", 2, 0.50, -100 - 2 * FEE, commission=2 * FEE),
+    ]
+
+    def assert_whole(self, p):
+        for fill in p.short.closes + p.long.closes:
+            self.assertEqual(fill.contracts, int(fill.contracts))
+
+    def test_closing_the_extra_long_leaves_the_spread_whole(self):
+        txs = self.OPEN + [tx("2026-08-20", STC, "-SPY260918P595", -1, 0.40, 40 - FEE, commission=FEE)]
+        (p,) = positions_from(txs)
+        self.assertEqual(p.contracts, 1)
+        self.assertEqual((p.short.remaining, p.long.remaining), (1, 1))
+        self.assertEqual(p.contracts_open, 1)
+        self.assertFalse(p.is_broken)
+        self.assertEqual(p.long.closes, ())
+        self.assertAlmostEqual(p.long.open_cash, -50 - FEE)  # half the 2-lot's cost: opening is pro rata
+        g = cs.manage_spread(p, today=date(2026, 8, 21), chain=None, settings=DEFAULTS, risk_free_rate=RATE, now=NOW)
+        self.assertNotEqual(g.action_label, "REVIEW: ONE LEG OPEN")
+
+    def test_a_fill_spanning_both_parts_is_split_in_whole_contracts(self):
+        txs = self.OPEN + [
+            tx("2026-08-25", BTC, "-SPY260918P600", 1, 0.80, -80 - FEE, commission=FEE),
+            tx("2026-08-25", STC, "-SPY260918P595", -2, 0.20, 40 - 2 * FEE, commission=2 * FEE),
+        ]
+        (p,) = positions_from(txs)
+        self.assert_whole(p)
+        self.assertTrue(p.is_closed)
+        (long_fill,) = p.long.closes
+        self.assertEqual(long_fill.contracts, 1)
+        self.assertAlmostEqual(long_fill.cash, 20 - FEE)
+        self.assertAlmostEqual(long_fill.fees, FEE)
+        # Credit 2.00 - 0.50 = 1.50; closed for 0.80 - 0.20 = 0.60; 4 x $0.65 fees.
+        self.assertAlmostEqual(p.closing_debit, 0.60)
+        self.assertAlmostEqual(p.realized_net, 90 - 4 * FEE)
+
+    def test_closing_more_than_the_extra_breaks_the_spread_by_a_whole_contract(self):
+        txs = self.OPEN + [tx("2026-08-20", STC, "-SPY260918P595", -2, 0.40, 80 - 2 * FEE, commission=2 * FEE)]
+        (p,) = positions_from(txs)
+        self.assert_whole(p)
+        self.assertEqual((p.short.remaining, p.long.remaining), (1, 0))
+        self.assertTrue(p.is_broken)
 
 
 # ---------------------------------------------------------------- dashboard integration

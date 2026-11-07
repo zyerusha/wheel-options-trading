@@ -3253,6 +3253,72 @@ _LIVE_PRICE_TTL_SECONDS = 15.0
 # the same stale pair twice.
 _OPTION_CHAIN_CACHE: dict[tuple[str, date], tuple[float, Any, str | None, datetime]] = {}
 _OPTION_CHAIN_CACHE_LOCK = threading.Lock()
+# Every (ticker, expiry) a build has read from _OPTION_CHAIN_CACHE since the
+# last prefetch_option_chains(), under the same lock.
+_OPTION_CHAIN_DEMAND: set[tuple[str, date]] = set()
+# A refresh needs about 70 chains at once. Measured against Yahoo: 2.4 s at 8
+# parallel requests, 1.5 s at 16, 1.2 s at 24, no failures at any of them.
+# 16 takes most of the gain without pushing the free endpoint harder than needed.
+_OPTION_CHAIN_PREFETCH_WORKERS = 16
+
+
+def _fetch_option_chain(
+    pair: tuple[str, date],
+) -> tuple[tuple[str, date], marketdata.OptionChainSnapshot | None, str | None]:
+    """One chain fetch. A failure comes back as ``(pair, None, warning)``;
+    callers read that as unavailable, never as a stale or invented value."""
+    ticker, expiry = pair
+    try:
+        text = marketdata.fetch_yahoo_option_chain(ticker, expiry)
+        return pair, marketdata.parse_yahoo_option_chain(text, expiry), None
+    except marketdata.MarketDataError as error:
+        return pair, None, f"could not fetch option chain for {ticker} {expiry.isoformat()}: {error}"
+
+
+def prefetch_option_chains() -> None:
+    """Refresh together every chain the previous refresh read, ahead of the
+    builds that read them one account and one card at a time.
+
+    Without this each account's cards wait on their own small batches in turn,
+    so 70-odd chains took 3-7 s even though they could run side by side. It
+    only changes when a chain is fetched: entries keep their real fetch time
+    and the same ``_LIVE_PRICE_TTL_SECONDS`` limit, and a pair that isn't
+    needed any more drops out after one wasted fetch.
+    """
+    now = time.monotonic()
+    today = date.today()
+    with _OPTION_CHAIN_CACHE_LOCK:
+        stale = sorted(
+            pair
+            for pair in _OPTION_CHAIN_DEMAND
+            if pair[1] >= today
+            and (pair not in _OPTION_CHAIN_CACHE or now - _OPTION_CHAIN_CACHE[pair][0] >= _LIVE_PRICE_TTL_SECONDS)
+        )
+        _OPTION_CHAIN_DEMAND.clear()
+    if not stale:
+        return
+    with ThreadPoolExecutor(max_workers=min(_OPTION_CHAIN_PREFETCH_WORKERS, len(stale))) as pool:
+        fetched = list(pool.map(_fetch_option_chain, stale))
+    fetched_at = datetime.now(timezone.utc)
+    with _OPTION_CHAIN_CACHE_LOCK:
+        for pair, snapshot, warning in fetched:
+            _OPTION_CHAIN_CACHE[pair] = (now, snapshot, warning, fetched_at)
+
+
+@dataclass(frozen=True)
+class LiveQuoteBatch:
+    """One Yahoo quote response shared by every account (see
+    ``AccountRegistry._prefetch_market_data``). ``fetched_at`` is
+    ``time.monotonic()`` when the request started, and a Dashboard's price
+    freshness counts from it, so sharing a batch can't make a price older than
+    ``_LIVE_PRICE_TTL_SECONDS``."""
+
+    prices: dict[str, float | None]
+    warnings: tuple[str, ...]
+    fetched_at: float
+
+    def is_fresh(self) -> bool:
+        return time.monotonic() - self.fetched_at < _LIVE_PRICE_TTL_SECONDS
 
 
 class Dashboard:
@@ -3263,6 +3329,11 @@ class Dashboard:
     seamless history instead of positions that appear to open or close out of
     nowhere at each file boundary.
     """
+
+    # Quotes the registry fetched once for every account (None for a Dashboard
+    # used on its own), and the CSP candidates the next batch should cover.
+    _quote_batch: LiveQuoteBatch | None = None
+    _candidate_quote_tickers: frozenset[str] | set[str] = frozenset()
 
     def __init__(
         self,
@@ -3390,6 +3461,43 @@ class Dashboard:
 
     # ---- market data ----
 
+    def _held_tickers(self) -> list[str]:
+        """Every ticker with open shares *or* an open option leg -- the latter so
+        a pure cash-secured-put wheel (no shares yet) still gets a current mark
+        for the Open option positions table and the hedge banner."""
+        return sorted(
+            {
+                cycle.underlying
+                for cycle in self.all_cycles
+                if any(lot.remaining > 1e-9 for lot in cycle.share_lots)
+                or any(leg.is_open for leg in cycle.legs)
+            }
+        )
+
+    def live_prices_expired(self) -> bool:
+        return self._price_cache is None or time.monotonic() - self._price_cache_at >= _LIVE_PRICE_TTL_SECONDS
+
+    def live_quote_tickers(self) -> set[str]:
+        """Every ticker this dashboard's next price refresh will ask Yahoo to
+        quote: what it holds, plus the CSP candidates its last refresh priced
+        (unknown before its first refresh, which then quotes them itself)."""
+        return set(self._held_tickers()) | self._candidate_quote_tickers
+
+    def adopt_quote_batch(self, batch: LiveQuoteBatch) -> None:
+        """Use ``batch`` for the next price refresh, and make that refresh happen
+        now so every account in a build reads the same quotes."""
+        self._quote_batch = batch
+        self._price_cache = None
+
+    def _live_quotes(self, tickers: Sequence[str], now: float) -> tuple[dict[str, float | None], list[str], float]:
+        """``(prices, warnings, time quoted)`` from the shared batch when it is
+        still fresh and covers every ticker, else from Yahoo directly."""
+        batch = self._quote_batch
+        if batch is not None and batch.is_fresh() and set(tickers) <= batch.prices.keys():
+            return {ticker: batch.prices[ticker] for ticker in tickers}, list(batch.warnings), batch.fetched_at
+        prices, warnings = marketdata.get_last_prices(tickers)
+        return prices, warnings, now
+
     def _current_prices(self) -> dict[str, float | None]:
         """Live last-trade price for every ticker this dashboard holds open
         shares or an open option leg in, falling back to the latest completed
@@ -3415,20 +3523,10 @@ class Dashboard:
         per-ticker.
         """
         now = time.monotonic()
-        if self._price_cache is not None and now - self._price_cache_at < _LIVE_PRICE_TTL_SECONDS:
+        if not self.live_prices_expired():
             return self._price_cache
 
-        # Every ticker with open shares *or* an open option leg -- the latter so a
-        # pure cash-secured-put wheel (no shares yet) still gets a current mark for
-        # the Open option positions table and the hedge banner.
-        tickers = sorted(
-            {
-                cycle.underlying
-                for cycle in self.all_cycles
-                if any(lot.remaining > 1e-9 for lot in cycle.share_lots)
-                or any(leg.is_open for leg in cycle.legs)
-            }
-        )
+        tickers = self._held_tickers()
         prev: dict[str, float | None] = {}
         warnings: list[str] = []
         misses: list[str] = []
@@ -3455,7 +3553,7 @@ class Dashboard:
                     warnings.extend(ticker_warnings)
                     _record(ticker, points)
 
-        live, live_warnings = marketdata.get_last_prices(tickers)
+        live, live_warnings, quoted_at = self._live_quotes(tickers, now)
         warnings.extend(live_warnings)
         prices: dict[str, float | None] = {
             ticker: live.get(ticker) if live.get(ticker) is not None else prev.get(ticker)
@@ -3463,7 +3561,7 @@ class Dashboard:
         }
 
         self._price_cache = prices
-        self._price_cache_at = now
+        self._price_cache_at = quoted_at
         self._prev_closes = prev
         self._price_warnings = warnings
         return prices
@@ -3527,7 +3625,8 @@ class Dashboard:
                     self._price_warnings.extend(warns)
                     _compute(ticker, points)
 
-        live, live_warnings = marketdata.get_last_prices(tickers)
+        self._candidate_quote_tickers = set(tickers)
+        live, live_warnings, _ = self._live_quotes(tickers, time.monotonic())
         self._price_warnings.extend(live_warnings)
         for ticker, price in live.items():
             if price is not None and ticker in out:
@@ -4414,23 +4513,15 @@ class Dashboard:
         if not hasattr(self, "_option_chain_fetched_at"):
             self._option_chain_fetched_at: dict[tuple[str, date], datetime] = {}
         with _OPTION_CHAIN_CACHE_LOCK:
+            if cache is _OPTION_CHAIN_CACHE:
+                _OPTION_CHAIN_DEMAND.update(pairs)
             stale = sorted(
                 pair for pair in pairs if pair not in cache or now - cache[pair][0] >= _LIVE_PRICE_TTL_SECONDS
             )
 
-        def _fetch_one(
-            pair: tuple[str, date]
-        ) -> tuple[tuple[str, date], marketdata.OptionChainSnapshot | None, str | None]:
-            ticker, expiry = pair
-            try:
-                text = marketdata.fetch_yahoo_option_chain(ticker, expiry)
-                return pair, marketdata.parse_yahoo_option_chain(text, expiry), None
-            except marketdata.MarketDataError as error:
-                return pair, None, f"could not fetch option chain for {ticker} {expiry.isoformat()}: {error}"
-
         if stale:
             with ThreadPoolExecutor(max_workers=min(8, len(stale))) as pool:
-                fetched = list(pool.map(_fetch_one, stale))
+                fetched = list(pool.map(_fetch_option_chain, stale))
             fetched_at = datetime.now(timezone.utc)
             with _OPTION_CHAIN_CACHE_LOCK:
                 for pair, snapshot, warning in fetched:
@@ -4766,7 +4857,10 @@ class Dashboard:
         fundamentals = self._fundamentals(tickers)
         contexts = {
             t: creditspreads.market_context(
-                t, [b.close for b in bars.get(t, [])], (fundamentals.get(t) or {}).get("earnings_date")
+                t,
+                [b.close for b in bars.get(t, [])],
+                (fundamentals.get(t) or {}).get("earnings_date"),
+                today=today,
             )
             for t in tickers
         }

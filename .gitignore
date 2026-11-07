@@ -16,3 +16,7 @@ sandbox/
 
 # Local Docker env overrides (.env.example is committed)
 .env
+
+# Claude Code personal settings and hourly bug-hunt log (local only)
+.claude/settings.local.json
+.claude/bug-hunt/

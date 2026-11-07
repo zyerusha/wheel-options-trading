@@ -204,7 +204,31 @@ def _lot_fully_sold_from(lot: ShareLot) -> date | None:
     return max(disposal["date"] for disposal in lot.disposals)
 
 
+# A build asks about two or three horizons per cycle (the request's end date,
+# the latest Positions export, the last transaction); this only stops date
+# filters clicked through over a long session from piling up on long-lived cycles.
+_CAPITAL_TIMELINE_MEMO_LIMIT = 4
+
+
 def capital_timeline(cycle: Cycle, through: date) -> list[CapitalPoint]:
+    """Daily committed capital for a cycle (see :func:`_compute_capital_timeline`).
+
+    A build needs the same timeline about six times per cycle (metrics, cycle
+    payload, portfolio and ticker capital series, wheel state), which was half
+    of its CPU, so each result is kept on the cycle. That is safe because a
+    cycle is only changed while the engine builds it, before any of this runs.
+    The returned list is shared: callers must not change it or its points.
+    """
+    memo = cycle.capital_timeline_memo
+    points = memo.get(through)
+    if points is None:
+        if len(memo) >= _CAPITAL_TIMELINE_MEMO_LIMIT:
+            memo.clear()
+        points = memo[through] = _compute_capital_timeline(cycle, through)
+    return points
+
+
+def _compute_capital_timeline(cycle: Cycle, through: date) -> list[CapitalPoint]:
     """Daily committed capital for a cycle, from its start through ``through``.
 
     ``long_premium`` (a protective put, or the unpaired portion of a

@@ -32,7 +32,11 @@ Original credit and every realized figure come from the broker ledger
 (``wheel.engine.Spread`` pairs a short and long leg opened the same day on
 the same ticker, right and expiry). Cash is the broker's Amount, already net
 of fees; gross = net + fees, so fees are always reported separately and
-never double-counted.
+never double-counted. An assignment row carries no cash (the share row
+does): both legs assigned settle at width x 100 per contract against the
+trader; one leg assigned alone leaves the result to the share trade, so
+that spread is flagged and kept out of every P/L figure
+(``SpreadPosition.result_settled``).
 """
 
 from __future__ import annotations
@@ -50,7 +54,7 @@ from wheel.parser import ASSIGNED, EXPIRED, OPTION_MULTIPLIER
 # Bumped whenever /api/spreads gains or changes a field the page reads.
 # spreads.js expects the same number, so a server still running older code
 # says "restart" instead of showing blanks. Must match SPREADS_API_VERSION there.
-API_VERSION = 3
+API_VERSION = 4
 
 BULL_PUT = "BULL_PUT"
 BEAR_CALL = "BEAR_CALL"
@@ -145,7 +149,11 @@ class SpreadSettings:
             text = values[0].strip() if values else ""
             return text or None
 
-        def number(name: str, default: float, low: float, high: float, *, integer: bool = False) -> float:
+        def number(
+            name: str, default: float, low: float, high: float, *, integer: bool = False, fallback: str | None = None
+        ) -> float:
+            """``fallback`` words what an invalid value falls back to when
+            ``default`` isn't a number worth printing (an optional filter)."""
             text = raw(name)
             if text is None:
                 return default
@@ -155,7 +163,8 @@ class SpreadSettings:
                 parsed = math.nan
             if not math.isfinite(parsed) or not low <= parsed <= high or (integer and parsed != int(parsed)):
                 kind = "a whole number" if integer else "a number"
-                warnings.append(f"{name} must be {kind} from {low:g} to {high:g}; using {default:g}.")
+                instead = fallback if fallback is not None else f"using {default:g}"
+                warnings.append(f"{name} must be {kind} from {low:g} to {high:g}; {instead}.")
                 return default
             return int(parsed) if integer else parsed
 
@@ -200,7 +209,7 @@ class SpreadSettings:
 
         min_iv = None
         if raw("min_iv_pct") is not None:
-            min_iv = number("min_iv_pct", math.nan, 0, 500)
+            min_iv = number("min_iv_pct", math.nan, 0, 500, fallback="no volatility filter used")
             min_iv = None if math.isnan(min_iv) else min_iv
 
         require_trend = defaults.require_trend
@@ -382,8 +391,16 @@ class MarketContext:
         }
 
 
-def market_context(ticker: str, closes: Sequence[float], earnings_date: date | None = None) -> MarketContext:
-    """Trend and realized volatility from daily closes (oldest first)."""
+def market_context(
+    ticker: str, closes: Sequence[float], earnings_date: date | None = None, *, today: date | None = None
+) -> MarketContext:
+    """Trend and realized volatility from daily closes (oldest first).
+
+    An earnings date before ``today`` is dropped: it is a report that already
+    happened and the fetch hasn't refreshed yet, not an upcoming risk (the
+    same rule as the Planner's earnings list, ``_build_earnings_in_view``)."""
+    if earnings_date is not None and today is not None and earnings_date < today:
+        earnings_date = None
     usable = [c for c in closes if c and c > 0]
     if len(usable) < TREND_SMA_SESSIONS:
         return MarketContext(
@@ -886,7 +903,10 @@ def candidate_risks(candidate: SpreadCandidate, now: datetime) -> list[str]:
     if candidate.timing.status(now)[0] != "FRESH":
         risks.append("Quotes are not current; recheck prices before placing the order.")
     earnings = candidate.context.earnings_date
-    if earnings is not None and earnings <= candidate.expiry:
+    # Only a report between the scan date and expiration is a risk to this
+    # trade; a past date is one the earnings fetch hasn't refreshed yet.
+    scan_day = candidate.expiry - timedelta(days=candidate.dte)
+    if earnings is not None and scan_day <= earnings <= candidate.expiry:
         risks.append(f"Earnings on {_day(earnings)}, before this expiration.")
     for leg_name, quote in (("short", candidate.short), ("long", candidate.long)):
         if quote is not None and quote.open_interest is not None and quote.open_interest < LOW_OPEN_INTEREST:
@@ -1001,19 +1021,43 @@ class LegSlice:
         per_contract = self.open_fees / self.contracts if self.contracts else 0.0
         return sum(per_contract * f.contracts + f.fees for f in fills)
 
+    @property
+    def assigned_contracts(self) -> float:
+        """Contracts closed by assignment or exercise (the parser books both as ASSIGNED)."""
+        return sum(f.contracts for f in self.closes if f.action == ASSIGNED)
+
 
 def _slice(leg: OptionLeg, contracts: float) -> LegSlice:
-    fraction = contracts / leg.contracts if leg.contracts else 0.0
+    """This spread's ``contracts`` of ``leg`` and the closing fills that belong to them.
+
+    The engine pairs a leg into at most one spread (``_detect_spreads`` pairs
+    only on the open day, one short with one long), so the rest of the leg,
+    ``leg.contracts - contracts``, is unpaired. Closes go to that unpaired
+    part first, oldest first, and reach the spread only once it is used up:
+    the spread is the hedged position, so trimming an oversized leg trims
+    its extra contracts. Fills are split in whole contracts as the broker
+    filled them, never pro rata, so a slice never holds a fraction of a
+    contract; a split fill's cash and fees follow its contracts.
+    """
+    open_fraction = contracts / leg.contracts if leg.contracts else 0.0
+    unpaired = max(leg.contracts - contracts, 0.0)
+    closes: list[LegFill] = []
+    for close in sorted(leg.closes, key=lambda c: c.date):  # stable: same-day fills keep ledger order
+        to_unpaired = min(close.contracts, unpaired)
+        unpaired -= to_unpaired
+        taken = close.contracts - to_unpaired
+        if taken <= _EPS:
+            continue
+        share = taken / close.contracts
+        closes.append(LegFill(close.date, close.action, taken, close.cash * share, close.fees * share))
     return LegSlice(
         leg_id=leg.leg_id,
         side=leg.side,
         strike=leg.strike,
         contracts=contracts,
-        open_cash=leg.open_cash * fraction,
-        open_fees=leg.open_fees * fraction,
-        closes=tuple(
-            LegFill(c.date, c.action, c.contracts * fraction, c.cash * fraction, c.fees * fraction) for c in leg.closes
-        ),
+        open_cash=leg.open_cash * open_fraction,
+        open_fees=leg.open_fees * open_fraction,
+        closes=tuple(closes),
         right=leg.right,
         open_price=leg.open_price,
     )
@@ -1098,9 +1142,54 @@ class SpreadPosition:
     def max_loss(self) -> float:
         return max_loss_per_contract(self.width, self.credit) * self.contracts
 
+    # Assignment. A broker's ASSIGNED (or EXERCISED) option row carries $0;
+    # the cash moves in the separate share row, which this module can't see.
+    # When both legs are assigned for the same contracts the share trades are
+    # fixed by the strikes alone: the short leg's shares change hands at the
+    # short strike and the long leg's at the long strike, so the pair settles
+    # for exactly width x 100 per contract against the trader (bull put: buy
+    # at the higher strike, sell at the lower; bear call: the reverse). Any
+    # regulatory fee on the share sale sits in the share row and is not
+    # included. When the legs' assigned counts differ, the result depends on
+    # what happened to the shares afterward, so the spread can't settle it.
+
     @property
-    def realized_net(self) -> float:
-        return self.short.realized_net() + self.long.realized_net()
+    def result_settled(self) -> bool:
+        """True when the spread's own fills (plus the strike settlement of a
+        both-legs assignment) are its whole result. False when one leg was
+        assigned or exercised without the other."""
+        return abs(self.short.assigned_contracts - self.long.assigned_contracts) <= 1e-6
+
+    @property
+    def unsettled_note(self) -> str | None:
+        if self.result_settled:
+            return None
+        return (
+            "Assigned without the other leg: the result depends on the share trade, which this tab can't see; "
+            "see the Wheel tab."
+        )
+
+    @property
+    def assignment_settlement(self) -> tuple[date, float, float] | None:
+        """``(date, net cash, contracts)`` of a both-legs assignment, booked on
+        the last assignment date: -width x 100 x contracts. ``None`` without one."""
+        if not self.result_settled:
+            return None
+        contracts = self.short.assigned_contracts
+        if contracts <= _EPS:
+            return None
+        day = max(f.date for f in self.short.closes + self.long.closes if f.action == ASSIGNED)
+        return day, -self.width * OPTION_MULTIPLIER * contracts, contracts
+
+    @property
+    def realized_net(self) -> float | None:
+        """Net realized P/L, fees included. ``None`` when the result isn't
+        settled by the spread (see :attr:`result_settled`), never the option
+        cash alone, which would book a short-only assignment as a win."""
+        if not self.result_settled:
+            return None
+        settlement = self.assignment_settlement
+        return self.short.realized_net() + self.long.realized_net() + (settlement[1] if settlement else 0.0)
 
     @property
     def realized_fees(self) -> float:
@@ -1108,14 +1197,22 @@ class SpreadPosition:
 
     @property
     def closing_debit(self) -> float | None:
-        """Average gross closing debit per share once fully closed: -(close cash + close fees) / (100 x contracts)."""
-        if not self.is_closed or not self.contracts:
+        """Average gross closing debit per share once fully closed:
+        -(close cash + close fees + assignment settlement) / (100 x contracts).
+        ``None`` while open or when the result isn't settled by the spread."""
+        if not self.is_closed or not self.contracts or not self.result_settled:
             return None
+        settlement = self.assignment_settlement
         gross = sum(f.cash + f.fees for f in self.short.closes + self.long.closes)
+        gross += settlement[1] if settlement else 0.0
         return -gross / (OPTION_MULTIPLIER * self.contracts)
 
     def realized_events(self) -> list[tuple[date, float, float]]:
-        """``[(date, net realized, fees)]`` per close date, for P/L by period and drawdown."""
+        """``[(date, net realized, fees)]`` per close date, for P/L by period
+        and drawdown. Empty when the result isn't settled by the spread."""
+        if not self.result_settled:
+            return []
+        settlement = self.assignment_settlement
         days = sorted({f.date for f in self.short.closes + self.long.closes})
         out = []
         for day in days:
@@ -1124,6 +1221,8 @@ class SpreadPosition:
                 fills = [f for f in leg.closes if f.date == day]
                 net += leg.realized_net(fills)
                 fees += leg.realized_fees(fills)
+            if settlement and settlement[0] == day:
+                net += settlement[1]
             out.append((day, net, fees))
         return out
 
@@ -1409,6 +1508,11 @@ def performance(
       gross, fees, and net = gross - fees (the broker's Amounts).
     * per-trade figures (win rate, averages, profit factor, holding period,
       return on max risk, exit counts): spreads fully closed in the range.
+    * a spread whose result isn't settled by the spread (one leg assigned
+      without the other, :attr:`SpreadPosition.result_settled`) is left out
+      of every P/L figure (realized, win/loss, averages, profit factor,
+      return on max risk, drawdown) and counted in ``unsettled_closed_count``
+      instead; its exit and holding period still count.
     * unrealized: open spreads now, at the executable closing cost, before
       closing fees.
     * max drawdown: largest drop from a running peak of cumulative net
@@ -1425,12 +1529,13 @@ def performance(
     net_realized = sum(e[1] for e in events)
     fees = sum(e[2] for e in events)
 
-    closed = closed_in_range(positions, start, end)
+    every_closed = closed_in_range(positions, start, end)
+    closed = [p for p in every_closed if p.result_settled]
     nets = [p.realized_net for p in closed]
     wins = [v for v in nets if v > _EPS]
     losses = [v for v in nets if v < -_EPS]
     risk_total = sum(p.max_loss for p in closed)
-    holding = [(p.close_date - p.open_date).days for p in closed]
+    holding = [(p.close_date - p.open_date).days for p in every_closed]
 
     peak = cumulative = drawdown = 0.0
     for _, net, _, _ in events:
@@ -1446,7 +1551,7 @@ def performance(
     unpriced = sum(1 for v in unrealized_values if v is None)
 
     exits = {key: 0 for key in EXIT_LABELS}
-    for p in closed:
+    for p in every_closed:
         exits[classify_exit(p, settings)] += 1
 
     return {
@@ -1461,6 +1566,7 @@ def performance(
         "unrealized_unpriced_count": unpriced,
         "open_count": sum(1 for p in positions if not p.is_closed),
         "closed_count": len(closed),
+        "unsettled_closed_count": len(every_closed) - len(closed),
         "win_count": len(wins),
         "loss_count": len(losses),
         "win_rate_pct": _round(len(wins) / len(closed) * 100, 1) if closed else None,
@@ -1635,6 +1741,22 @@ def _trades(p: SpreadPosition) -> list[dict[str, Any]]:
                     "fees": round(fill.fees, 2),
                 }
             )
+    settlement = p.assignment_settlement
+    if settlement:
+        day, cash, contracts = settlement
+        rows.append(
+            {
+                "date": day.isoformat(),
+                "action": "Assignment settled",
+                "description": (
+                    f"{contracts * OPTION_MULTIPLIER:g} {p.ticker} shares at {_strike(p.short_strike)} and "
+                    f"{_strike(p.long_strike)}: {_usd(p.width)} width × 100 × {contracts:g}"
+                ),
+                "price": None,
+                "net_cash": round(cash, 2),
+                "fees": 0.0,
+            }
+        )
     return sorted(rows, key=lambda row: row["date"])
 
 
@@ -1703,9 +1825,11 @@ def position_payload(p: SpreadPosition, settings: SpreadSettings) -> dict[str, A
         "is_closed": p.is_closed,
         "close_date": _iso(p.close_date),
         "closing_debit": _round(p.closing_debit, 4),
-        "realized_net": round(p.realized_net, 2),
+        "realized_net": _round(p.realized_net),
         "realized_fees": round(p.realized_fees, 2),
-        "realized_gross": round(p.realized_net + p.realized_fees, 2),
+        "realized_gross": None if p.realized_net is None else round(p.realized_net + p.realized_fees, 2),
+        "result_settled": p.result_settled,
+        "result_note": p.unsettled_note,
         "holding_days": (p.close_date - p.open_date).days if p.close_date else None,
         "exit": exit_key,
         "exit_label": EXIT_LABELS.get(exit_key) if exit_key else None,

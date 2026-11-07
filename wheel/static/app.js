@@ -6218,12 +6218,33 @@ function renderNoDataBanner(empty) {
   }
 }
 
+// {account id: last transaction date}, from /api/accounts.
+let accountLastDataDates = {};
+
+/**
+ * Turn the restored date preset into dates before the first fetch, so a page
+ * load doesn't fetch the dates saved last time and then fetch again with the
+ * right ones. Uses the same last-transaction date the first response's
+ * meta.data_last_date reports (the latest of any account for Combined); load()
+ * still checks against that response and refetches if the two ever differ.
+ */
+function applyRestoredPreset() {
+  const preset = state.datePreset;
+  if (!preset || preset === 'all' || preset === 'custom') return;
+  const lastDataDate =
+    state.account === COMBINED_ACCOUNT_ID
+      ? Object.values(accountLastDataDates).filter(Boolean).sort().pop()
+      : accountLastDataDates[state.account];
+  if (lastDataDate) applyPreset(preset, lastDataDate);
+}
+
 async function refreshAccounts() {
   try {
     const response = await fetch('/api/accounts');
     if (!response.ok) return;
     const listing = await response.json();
     hasAnyAccounts = (listing.accounts || []).length > 0;
+    accountLastDataDates = Object.fromEntries((listing.accounts || []).map((a) => [a.id, a.data_last_date]));
     renderNoDataBanner(!hasAnyAccounts);
     renderAccountChips(listing.accounts || []);
   } catch (error) {
@@ -6436,33 +6457,32 @@ async function applyScatterFilter() {
 
 const PRESET_YEARS = { '1y': 1, '3y': 3, '5y': 5 };
 
-function applyPreset(preset) {
-  const meta = state.data.meta;
-  const last = parseDay(meta.data_last_date);
+function applyPreset(preset, lastDataDate = state.data.meta.data_last_date) {
+  const last = parseDay(lastDataDate);
   if (preset === 'all') {
     state.start = null;
     state.end = null;
   } else if (preset === 'ytd') {
     state.start = localIso(new Date(last.getFullYear(), 0, 1).getTime());
-    state.end = meta.data_last_date;
+    state.end = lastDataDate;
   } else if (preset in PRESET_YEARS) {
     const from = new Date(last);
     from.setFullYear(from.getFullYear() - PRESET_YEARS[preset]);
     state.start = localIso(from.getTime());
-    state.end = meta.data_last_date;
+    state.end = lastDataDate;
   } else if (preset.startsWith('year:')) {
     // A specific calendar year, e.g. "year:2025" -> Jan 1 through Dec 31
     // (or the last available data date, if that year is still in progress).
     const year = Number(preset.slice('year:'.length));
     const yearEnd = new Date(year, 11, 31);
     state.start = localIso(new Date(year, 0, 1).getTime());
-    state.end = yearEnd.getTime() < last.getTime() ? localIso(yearEnd.getTime()) : meta.data_last_date;
+    state.end = yearEnd.getTime() < last.getTime() ? localIso(yearEnd.getTime()) : lastDataDate;
   } else if (preset !== 'custom') {
     // A bare day count, e.g. "10" for the last 10 days.
     const from = new Date(last);
     from.setDate(from.getDate() - Number(preset));
     state.start = localIso(from.getTime());
-    state.end = meta.data_last_date;
+    state.end = lastDataDate;
   }
   $('start').value = state.start || '';
   $('end').value = state.end || '';
@@ -6808,7 +6828,7 @@ async function load({ background = false } = {}) {
   if (isFirstAttempt && succeeded && preset && preset !== 'all' && preset !== 'custom') {
     applyPreset(preset);
     $('preset').value = preset;
-    await load();
+    if (dashboardQuery().toString() !== query) await load();
   }
 }
 
@@ -6895,16 +6915,20 @@ function switchTab(name) {
   // An account switch's own load() runs asynchronously, so a tab entered
   // while it's still in flight renders off *older* state.data above; that
   // load() re-renders every tab when it lands, so there is nothing to add.
-  // When state.data already matches, re-render now that the tab is visible
-  // (charts size themselves to a container that read as 0 while hidden)
-  // instead of refetching the whole dashboard: the live-price poll keeps it
-  // fresh. Anything else (a failed or never-made fetch) loads as before.
+  // When state.data already matches there is no need to refetch the whole
+  // dashboard: the live-price poll keeps it fresh. The tab just needs drawing
+  // now that it's visible (charts size themselves to a container that read as
+  // 0 while hidden). The other tabs did that above; the Dashboard tab does it
+  // here, and hidden tabs keep what the last data landing rendered.
+  // Anything else (a failed or never-made fetch) loads as before.
   const query = dashboardQuery().toString();
   if (state.data && loadedQuery === query) {
-    try {
-      render();
-    } catch (error) {
-      console.error('tab render failed:', error);
+    if (name === 'dashboard') {
+      try {
+        render({ dashboardTabOnly: true });
+      } catch (error) {
+        console.error('tab render failed:', error);
+      }
     }
     if (name === 'spreads') loadSpreads();
   } else if (pendingQuery !== query) {
@@ -12623,9 +12647,17 @@ function renderTradeLog() {
   drawTradeLogBreakeven(entry);
 }
 
-function render() {
+/**
+ * Draws every tab from state.data. `dashboardTabOnly` is for re-entering the
+ * Dashboard tab when state.data hasn't changed: its charts need redrawing at
+ * their visible size, while the hidden tabs' content is already current.
+ */
+function render({ dashboardTabOnly = false } = {}) {
   const data = state.data;
   if (!data) return;
+  // Before any drawing: a chart sizes itself to its tab's width, so the tab
+  // restored at page load has to be showing when the first data draws it.
+  renderTabs();
   const {
     meta,
     portfolio,
@@ -12859,9 +12891,11 @@ function render() {
   // Planner / Realized-Gains render last and are isolated: a failure in one of
   // their (chart-heavy) panels must never blank the dashboard cards above.
   try {
-    renderPlanner();
-    renderRealizedGains();
-    renderCapitalProjection();
+    if (!dashboardTabOnly) {
+      renderPlanner();
+      renderRealizedGains();
+      renderCapitalProjection();
+    }
     updateExportLinks();
   } catch (error) {
     console.error('Planner/Realized-Gains render failed:', error);
@@ -12869,7 +12903,6 @@ function render() {
 
   // The Trade Log is filter-independent (payload's `trade_log` is built from
   // full history), but re-render it so the picker tracks an account switch.
-  renderTabs();
   if (state.activeTab === 'tradelog') renderTradeLog();
 
   applySearchFilter();
@@ -13375,7 +13408,10 @@ async function boot() {
   wireFilters();
   wireCapitalProjection();
   refreshDatasets();
-  refreshAccounts().then(load);
+  refreshAccounts().then(() => {
+    applyRestoredPreset();
+    return load();
+  });
 }
 boot();
 
