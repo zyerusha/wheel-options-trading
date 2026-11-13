@@ -94,6 +94,32 @@ def probability_finish_above(
     return _NORMAL.cdf(d2)
 
 
+def black_scholes_price(
+    *,
+    spot: float | None,
+    strike: float | None,
+    days_to_expiry: float | None,
+    implied_volatility: float | None,
+    right: str,
+    risk_free_rate: float = 0.0,
+) -> float | None:
+    """European Black-Scholes value per share, ``None`` on the same unusable
+    inputs as :func:`black_scholes_greeks`. Used to test whether a quoted
+    implied volatility actually reproduces the quoted price."""
+    if spot is None or strike is None or implied_volatility is None or days_to_expiry is None:
+        return None
+    if spot <= 0 or strike <= 0 or implied_volatility <= 0 or days_to_expiry <= 0:
+        return None
+    t = days_to_expiry / 365.0
+    sqrt_t = math.sqrt(t)
+    d1 = (math.log(spot / strike) + (risk_free_rate + 0.5 * implied_volatility**2) * t) / (implied_volatility * sqrt_t)
+    d2 = d1 - implied_volatility * sqrt_t
+    discounted_strike = strike * math.exp(-risk_free_rate * t)
+    if right == PUT:
+        return discounted_strike * _NORMAL.cdf(-d2) - spot * _NORMAL.cdf(-d1)
+    return spot * _NORMAL.cdf(d1) - discounted_strike * _NORMAL.cdf(d2)
+
+
 def black_scholes_greeks(
     *,
     spot: float | None,

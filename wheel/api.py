@@ -1445,27 +1445,7 @@ def _cc_exit_fields(wheel: dict[str, Any] | None) -> dict[str, Any]:
     return {key: wheel.get(key) for key in CC_EXIT_FIELDS}
 
 
-def _chain_quotes(
-    snapshot: marketdata.OptionChainSnapshot, fetched_at: datetime | None
-) -> creditspreads.ChainQuotes:
-    """A fetched Yahoo chain in the shape ``wheel/creditspreads.py`` reads,
-    the underlying price and quote time taken from the same response."""
-
-    def side(right: str) -> tuple[creditspreads.LegQuote, ...]:
-        return tuple(
-            creditspreads.LegQuote(c.strike, c.bid, c.ask, c.implied_volatility, c.open_interest)
-            for c in snapshot.contracts
-            if c.right == right
-        )
-
-    return creditspreads.ChainQuotes(
-        ticker=snapshot.ticker,
-        expiry=snapshot.expiration,
-        spot=snapshot.underlying_price,
-        timing=creditspreads.QuoteTiming(snapshot.quote_time, fetched_at),
-        puts=side("P"),
-        calls=side("C"),
-    )
+_chain_quotes = creditspreads.chain_quotes_from_snapshot
 
 
 def _csp_to_enter_payload(result: cspentry.CspEntry, ticker: str | None = None) -> dict[str, Any]:
@@ -3270,7 +3250,7 @@ def _fetch_option_chain(
     ticker, expiry = pair
     try:
         text = marketdata.fetch_yahoo_option_chain(ticker, expiry)
-        return pair, marketdata.parse_yahoo_option_chain(text, expiry), None
+        return pair, marketdata.parse_yahoo_option_chain(text, expiry, ticker=ticker), None
     except marketdata.MarketDataError as error:
         return pair, None, f"could not fetch option chain for {ticker} {expiry.isoformat()}: {error}"
 
@@ -4527,7 +4507,8 @@ class Dashboard:
                 for pair, snapshot, warning in fetched:
                     cache[pair] = (now, snapshot, warning, fetched_at)
         with _OPTION_CHAIN_CACHE_LOCK:
-            entries = {pair: cache[pair] for pair in pairs}
+            # Sorted: `pairs` is a set, and its order would leak into the warnings list.
+            entries = {pair: cache[pair] for pair in sorted(pairs)}
         for pair, entry in entries.items():
             self._option_chain_fetched_at[pair] = entry[3]
         return {pair: (entry[1], entry[2]) for pair, entry in entries.items()}
@@ -4670,7 +4651,7 @@ class Dashboard:
                 today,
                 expiry,
                 calls,
-                quotes_as_of=snapshot.quote_time,
+                quotes_as_of=snapshot.options_as_of,
                 fetched_at=self._option_chain_fetched_at.get((ticker, expiry)),
                 resistance=resistance[ticker],
             )
@@ -4757,7 +4738,7 @@ class Dashboard:
                         for c in snapshot.contracts
                         if c.right == "P"
                     )
-                    quotes_as_of = snapshot.quote_time
+                    quotes_as_of = snapshot.options_as_of
             result = cspentry.recommend_put(
                 current_price=prices[ticker],
                 support=support[ticker],

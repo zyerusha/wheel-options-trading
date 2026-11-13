@@ -413,6 +413,73 @@ class TestSpreadDetection(unittest.TestCase):
         self.assertEqual(cycle.spreads, [])
         self.assertTrue(any("ambiguous" in warning.lower() or "same day" in warning.lower() for warning in cycle.warnings))
 
+    def test_split_short_fill_pairs_with_one_long_fill(self):
+        """Real SPY 2026-11-12 trade: the 745 put sold in two fills (1 + 2),
+        the 740 put bought as one fill of 3. Both short fills are the same
+        contract, so this is one 3-lot spread, not an ambiguous group."""
+        cycles, _ = build_cycles(
+            [
+                tx("2026-11-12", STO, "-SPY261113P745", -1, 1.17, 116.34, row_id=1),
+                tx("2026-11-12", STO, "-SPY261113P745", -2, 1.18, 234.67, row_id=2),
+                tx("2026-11-12", BTO, "-SPY261113P740", 3, 0.67, -202.99, row_id=3),
+            ]
+        )
+        cycle = cycles[0]
+        self.assertEqual(cycle.warnings, [])
+        self.assertEqual(len(cycle.spreads), 1)
+        spread = cycle.spreads[0]
+        self.assertEqual((spread.short_strike, spread.long_strike), (745.0, 740.0))
+        self.assertEqual(spread.paired_contracts, 3)
+        self.assertAlmostEqual(spread.net_credit, 116.34 + 234.67 - 202.99)
+
+        short_legs = [leg for leg in cycle.legs if leg.strike == 745.0]
+        self.assertEqual(len(short_legs), 1)
+        short_leg = short_legs[0]
+        self.assertEqual(short_leg.contracts, 3)
+        self.assertAlmostEqual(short_leg.open_cash, 351.01)
+        self.assertAlmostEqual(short_leg.open_price, (1.17 * 1 + 1.18 * 2) / 3)
+
+    def test_split_fills_on_both_sides_pair_into_one_spread(self):
+        """Real SPY 2026-11-10 trade: 740 put sold 2 + 1, 735 put bought 1 + 2."""
+        cycles, _ = build_cycles(
+            [
+                tx("2026-11-10", BTO, "-SPY261113P735", 1, 2.00, -200.66, row_id=1),
+                tx("2026-11-10", BTO, "-SPY261113P735", 2, 2.10, -421.32, row_id=2),
+                tx("2026-11-10", STO, "-SPY261113P740", -2, 3.22, 642.65, row_id=3),
+                tx("2026-11-10", STO, "-SPY261113P740", -1, 3.06, 305.34, row_id=4),
+            ]
+        )
+        cycle = cycles[0]
+        self.assertEqual(cycle.warnings, [])
+        self.assertEqual(len(cycle.legs), 2)
+        self.assertEqual(len(cycle.spreads), 1)
+        self.assertEqual(cycle.spreads[0].paired_contracts, 3)
+        self.assertAlmostEqual(cycle.spreads[0].net_credit, 642.65 + 305.34 - 200.66 - 421.32)
+
+    def test_fills_on_different_days_stay_separate_legs(self):
+        """Only same-day fills are one order; a later add is its own position."""
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250201P100", -1, 3.00, 300.0, row_id=1),
+                tx("2025-01-02", STO, "-XYZ250201P100", -1, 2.50, 250.0, row_id=2),
+            ]
+        )
+        self.assertEqual([leg.contracts for leg in cycles[0].legs], [1, 1])
+
+    def test_same_day_fill_closed_later_that_day_closes_the_merged_leg(self):
+        cycles, _ = build_cycles(
+            [
+                tx("2025-01-01", STO, "-XYZ250201P100", -1, 3.00, 300.0, row_id=1),
+                tx("2025-01-01", BTC, "-XYZ250201P100", 2, 2.00, -400.0, row_id=2),
+                tx("2025-01-01", STO, "-XYZ250201P100", -1, 3.20, 320.0, row_id=3),
+            ]
+        )
+        legs = cycles[0].legs
+        self.assertEqual(len(legs), 1)
+        self.assertEqual(legs[0].contracts, 2)
+        self.assertFalse(legs[0].is_open)
+        self.assertAlmostEqual(legs[0].realized_pl, 300.0 + 320.0 - 400.0)
+
     def test_puts_and_calls_opened_same_day_pair_independently(self):
         cycles, _ = build_cycles(
             [

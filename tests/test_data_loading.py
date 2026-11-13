@@ -274,7 +274,7 @@ class TestOptionChainPrefetch(unittest.TestCase):
                 raise marketdata.MarketDataError("no chain")
             return f"{ticker}|{expiry}"
 
-        def fake_parse(text, expiry):
+        def fake_parse(text, expiry, ticker=None):
             return f"parsed {text}"
 
         for target, replacement in (

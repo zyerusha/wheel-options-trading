@@ -854,6 +854,21 @@ class AccountRegistry:
         if not self._accounts:
             raise ValueError("no accounts discovered under " + self.base_dir)
 
+        positions, equity = self.credit_spread_book(account_id)
+        market = next(iter(self._accounts.values()))
+        return market.build_credit_spreads(settings, positions=positions, equity=equity, **options)
+
+    def credit_spread_book(
+        self, account_id: str | None
+    ) -> tuple[list[creditspreads.SpreadPosition], tuple[float | None, str]]:
+        """``(positions, (account value, where it came from))`` for one
+        account, or for Combined: every account's spreads (each naming its
+        account) and the sum of every latest Positions total value. Raises
+        ``KeyError`` for an unknown account, like :meth:`build`."""
+        combined = not account_id or account_id.lower() == COMBINED_ACCOUNT_ID
+        if not combined:
+            dashboard = self.get(account_id)
+            return dashboard.credit_spread_positions(), dashboard.account_equity()
         labels = {row["id"]: row["label"] for row in self.list_accounts()}
         positions = [
             position
@@ -866,8 +881,7 @@ class AccountRegistry:
             if values
             else (None, "No Positions export loaded, so trades can't be sized to your account.")
         )
-        market = next(iter(self._accounts.values()))
-        return market.build_credit_spreads(settings, positions=positions, equity=equity, **options)
+        return positions, equity
 
     def _realized_gains(self, account_id: str | None) -> dict[str, Any] | None:
         """Cross-check the wheel engine's option P/L against any Fidelity
@@ -1263,7 +1277,7 @@ def _combine_tickers(payloads: dict[str, dict]) -> list[dict]:
     combined = [
         {**row, "account_id": account_id} for account_id, payload in payloads.items() for row in payload["tickers"]
     ]
-    combined.sort(key=lambda row: row["net_realized_pl"], reverse=True)
+    combined.sort(key=lambda row: (-row["net_realized_pl"], row["underlying"], row["account_id"]))
     return combined
 
 

@@ -107,6 +107,7 @@ const state = {
   // typed ({dte_min: '35', ...}); the backend validates them and supplies
   // every default. See spreads.js.
   creditSpreads: {},
+  creditSpreadScanner: {},
   // Tools tab: Capital projection card inputs.
   projection: {
     balanceSource: 'full_value',
@@ -159,6 +160,7 @@ function buildConfigSnapshot() {
     expCalGrain: state.expCalGrain,
     directionalManagement: state.directionalManagement,
     creditSpreads: state.creditSpreads,
+    creditSpreadScanner: state.creditSpreadScanner,
     projection: {
       balanceSource: state.projection.balanceSource,
       manualBalance: state.projection.manualBalance,
@@ -247,6 +249,7 @@ function applyConfigSnapshot(cfg) {
   }
 
   state.creditSpreads = sanitizeSpreadSettings(cfg.creditSpreads);
+  state.creditSpreadScanner = sanitizeScannerSettings(cfg.creditSpreadScanner);
 
   const p = cfg.projection;
   if (p && typeof p === 'object') {

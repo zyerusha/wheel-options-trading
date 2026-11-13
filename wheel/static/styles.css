@@ -3185,3 +3185,148 @@ body.presentation .wrap {
   color: var(--text-muted);
   margin-top: 6px;
 }
+
+/* Credit Spreads: Top Opportunities. */
+.scanner-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.scanner-progress {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+
+.scanner-progress progress {
+  flex: 1 1 160px;
+  max-width: 320px;
+}
+
+.scanner-table {
+  width: 100%;
+}
+
+.scanner-row {
+  cursor: pointer;
+}
+
+.scanner-row:hover td,
+.scanner-row:focus-visible td {
+  background: var(--accent-soft);
+}
+
+.scanner-score {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+
+.scanner-detail-row > td {
+  white-space: normal;
+  padding: 10px 6px 16px;
+}
+
+.scanner-detail {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 14px 22px;
+  font-size: 13px;
+}
+
+.scanner-detail-section {
+  min-width: 0;
+}
+
+.scanner-detail-section.wide {
+  grid-column: 1 / -1;
+}
+
+.scanner-detail table {
+  width: 100%;
+}
+
+/* The page table already pins its header; a nested one must scroll with its section. */
+.scanner-detail th {
+  position: static;
+}
+
+.scanner-detail .spread-why {
+  max-width: none;
+}
+
+.scanner-detail-section h4,
+.scanner-filter-group h4,
+#scanner-rejected h4 {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin: 0 0 6px;
+}
+
+#scanner-rejected h4 {
+  margin-top: 10px;
+}
+
+.scanner-detail-section p {
+  margin: 0 0 6px;
+  white-space: normal;
+}
+
+.scanner-chart {
+  width: 100%;
+}
+
+.scanner-chart svg {
+  display: block;
+  width: 100%;
+  height: 220px;
+}
+
+.scanner-facts {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+  gap: 3px 10px;
+  margin: 0 0 6px;
+}
+
+.scanner-facts dt {
+  color: var(--text-secondary);
+}
+
+.scanner-facts dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.scanner-score-total td {
+  font-weight: 640;
+  border-top: 1px solid var(--border);
+}
+
+.scanner-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.scanner-filter-group {
+  margin-top: 10px;
+}
+
+#spreads-tracked-section > summary {
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 640;
+}

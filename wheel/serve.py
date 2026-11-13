@@ -9,6 +9,8 @@ Routes
 ``GET  /api/dashboard``    filtered JSON  (?tickers=MU,QQQ&start=&end=&status=)
 ``GET  /api/spreads``      Credit Spreads tab (?account=&start=&end=, strategy
                            settings, optional check_* spread; see wheel.creditspreads)
+``GET  /api/spreads/opportunities``  ranked scanner results (filters in the query; no network)
+``POST /api/spreads/scan``           start a scan (?mode=full|refresh, same query)
 ``GET  /api/health``       liveness plus the cash reconciliation verdict
 ``GET  /api/datasets``     exports available to load, and which one is active
 ``POST /api/upload``       accept a new Fidelity CSV (``X-Account`` targets one
@@ -36,9 +38,11 @@ Two run modes, one shared processing pipeline (see ``Workspace``):
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import re
+import socket
 import sys
 import tempfile
 import threading
@@ -55,6 +59,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from wheel.accounts import COMBINED_ACCOUNT_ID, DEFAULT_ACCOUNT_ID, AccountRegistry  # noqa: E402
 from wheel.api import (  # noqa: E402
+    DIRECTIONAL_RISK_FREE_RATE_ASSUMPTION,
     Dashboard,
     Filters,
     discover_exports,
@@ -62,7 +67,9 @@ from wheel.api import (  # noqa: E402
     looks_like_export,
     looks_like_multi_account_export,
 )
-from wheel import creditspreads, exporter  # noqa: E402
+from wheel import ccexit, creditspreads, exporter, spreadjournal  # noqa: E402
+from wheel.spreadscanner import ScannerSettings  # noqa: E402
+from wheel.spreadscanservice import ScanService  # noqa: E402
 from wheel.closed_lots import looks_like_closed_lots  # noqa: E402
 from wheel.paths import DATA_DIR  # noqa: E402
 from wheel.positions import discover_position_snapshots, looks_like_position_snapshot  # noqa: E402
@@ -478,11 +485,50 @@ class DashboardState:
         return dashboard
 
 
+# One scan at a time for the whole process: the scan is market-wide, and each
+# request applies its own account and filters to the shared result.
+SPREAD_SCANNER = ScanService(
+    risk_free_rate=DIRECTIONAL_RISK_FREE_RATE_ASSUMPTION, fee_per_contract=ccexit.OPTION_FEE_PER_CONTRACT
+)
+
+
 class DashboardHTTPServer(ThreadingHTTPServer):
     # The default backlog of 5 refuses connections on Windows when a page opens
     # its burst of requests while a build is holding the interpreter, which
     # leaves the page without a script until it is reloaded.
     request_queue_size = 128
+
+    # SO_REUSEADDR means different things per platform. Elsewhere it only lets
+    # a quick restart bind past connections still in TIME_WAIT. On Windows it
+    # lets a second server bind a port another server is already listening
+    # on, and requests then reach either one. Windows binds past TIME_WAIT
+    # without it, so there the socket claims the port exclusively instead.
+    allow_reuse_address = sys.platform != "win32"
+
+    def server_bind(self) -> None:
+        if sys.platform == "win32":
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+# What a bind to a busy port raises: EADDRINUSE elsewhere, WSAEADDRINUSE on Windows.
+_ADDRESS_IN_USE_ERRNOS = frozenset(
+    code for code in (errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", None)) if code is not None
+)
+
+
+def _bind_dashboard_server(host: str, port: int, handler: type[BaseHTTPRequestHandler]) -> DashboardHTTPServer:
+    """The dashboard's listening server, or a plain exit message when the
+    port is taken (usually an earlier dashboard that is still running)."""
+    try:
+        return DashboardHTTPServer((host, port), handler)
+    except OSError as error:
+        if error.errno in _ADDRESS_IN_USE_ERRNOS or getattr(error, "winerror", None) in _ADDRESS_IN_USE_ERRNOS:
+            raise SystemExit(
+                f"Port {port} is already in use, probably by another dashboard that is still running. "
+                f"Stop that one first, or start this one on another port with --port."
+            ) from error
+        raise
 
 
 @dataclass
@@ -714,6 +760,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_file("tiplayout.js", "application/javascript; charset=utf-8")
             elif route == "/spreads.js":
                 self._send_file("spreads.js", "application/javascript; charset=utf-8")
+            elif route == "/spreadscanner.js":
+                self._send_file("spreadscanner.js", "application/javascript; charset=utf-8")
             elif route == "/styles.css":
                 self._send_file("styles.css", "text/css; charset=utf-8")
             elif route == "/wheel-strategy.png":
@@ -748,6 +796,13 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 except KeyError:
                     self._send_json({"error": f"unknown account {account_id!r}"}, 404)
+            elif route == "/api/spreads/opportunities":
+                self._sync_registry()
+                query = parse_qs(parsed.query)
+                try:
+                    self._send_json(self._spread_opportunities(query))
+                except KeyError:
+                    self._send_json({"error": f"unknown account {(query.get('account') or [None])[0]!r}"}, 404)
             elif route == "/api/health":
                 self._sync_registry()
                 try:
@@ -798,6 +853,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._handle_select()
             elif route == "/api/config":
                 self._handle_config()
+            elif route == "/api/spreads/scan":
+                self._handle_spread_scan()
             else:
                 self._send_json({"error": "not found", "path": route}, 404)
         except DatasetError as error:
@@ -857,6 +914,35 @@ class Handler(BaseHTTPRequestHandler):
         self._send_csv(text, f"wheel-{name}.csv")
 
     # ---- dataset endpoints ----
+
+    # ---- credit spread scanner ----
+
+    def _spread_opportunities(self, query: dict[str, list[str]]) -> dict:
+        """Ranked scanner results for one account. Local data only, so it
+        answers instantly even while a scan runs."""
+        account_id = (query.get("account") or [None])[0]
+        settings, warnings = ScannerSettings.from_query(query)
+        management_keys = ("profit_target_pct", "loss_multiple", "time_exit_dte")
+        management, _ = creditspreads.SpreadSettings.from_query({k: query[k] for k in management_keys if k in query})
+        positions, equity = self.registry.credit_spread_book(account_id)
+        return SPREAD_SCANNER.view(
+            settings,
+            management=management,
+            positions=positions,
+            equity=equity,
+            settings_warnings=warnings,
+            journal_path=os.path.join(self.registry.base_dir, spreadjournal.JOURNAL_FILE_NAME),
+        )
+
+    def _handle_spread_scan(self) -> None:
+        query = parse_qs(urlparse(self.path).query)
+        mode = (query.get("mode") or ["full"])[0]
+        if mode not in ("full", "refresh"):
+            self._send_json({"error": "mode must be full or refresh"}, 400)
+            return
+        settings, _ = ScannerSettings.from_query(query)
+        started, message = SPREAD_SCANNER.start(mode, settings)
+        self._send_json({"started": started, "message": message, "scan": SPREAD_SCANNER.status_payload()})
 
     def _read_body(self) -> bytes:
         length = int(self.headers.get("Content-Length") or 0)
@@ -1094,7 +1180,7 @@ def serve(
         session_manager.start_background_sweep()
         Handler.workspace = None
         Handler.session_manager = session_manager
-        httpd = DashboardHTTPServer((host, port), Handler)
+        httpd = _bind_dashboard_server(host, port, Handler)
 
         print("  mode          hosted (multi-tenant browser upload)")
         print(f"  sessions      {sessions_root}")
@@ -1122,7 +1208,7 @@ def serve(
 
         Handler.workspace = workspace
         Handler.session_manager = None
-        httpd = DashboardHTTPServer((host, port), Handler)
+        httpd = _bind_dashboard_server(host, port, Handler)
 
         # No broker export anywhere yet -- a brand-new checkout, or a fresh
         # Docker volume with nothing uploaded. The old behavior was to refuse to

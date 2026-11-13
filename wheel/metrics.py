@@ -1402,7 +1402,9 @@ def ticker_summary(
                 "annualized_total_position_roi_pct": annualized_total_position_roi_pct,
             }
         )
-    rows.sort(key=lambda row: row["net_realized_pl"], reverse=True)
+    # Ticker breaks ties: the rows are built in set order, which changes
+    # between processes (hash randomization).
+    rows.sort(key=lambda row: (-row["net_realized_pl"], row["underlying"]))
     return rows
 
 

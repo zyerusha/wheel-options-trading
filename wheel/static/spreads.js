@@ -93,6 +93,14 @@
     return params;
   }
 
+  /** The Top Opportunities "send" action: fill Check a spread and run it. */
+  function checkSpreadFromScanner(check) {
+    spreads.check = check;
+    spreads.fillCheckForm = true;
+    loadSpreads();
+    $('spreads-check-section').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
   function settingDisplay(field, value) {
     if (value === null || value === undefined) return '';
     if (field.type === 'select') return value ? 'on' : 'off';
@@ -165,6 +173,8 @@
   /* ------------------------------------------------------------ loading */
 
   async function loadSpreads({ background = false } = {}) {
+    // Independent of this endpoint, so neither can take the other down.
+    global.loadSpreadScanner({ background });
     if (background && Date.now() - spreads.lastFetchAt < SPREADS_BACKGROUND_REFRESH_MS) return;
     const generation = ++spreads.generation;
     spreads.lastFetchAt = Date.now();
@@ -421,7 +431,17 @@
     if (!spreads.checkForm) spreads.checkForm = buildCheckForm();
     const form = spreads.checkForm;
     syncOptions(form.ticker, Object.keys(data.check_expirations).map((t) => [t, t]));
-    syncOptions(form.expiry, expirationOptions(form.ticker.value));
+    if (spreads.fillCheckForm && spreads.check) {
+      form.ticker.value = spreads.check.ticker;
+      syncOptions(form.expiry, expirationOptions(form.ticker.value));
+      form.expiry.value = spreads.check.expiry;
+      form.strategy.value = spreads.check.strategy;
+      form.short.value = spreads.check.short;
+      form.long.value = spreads.check.long;
+      spreads.fillCheckForm = false;
+    } else {
+      syncOptions(form.expiry, expirationOptions(form.ticker.value));
+    }
   }
 
   function renderCheckResult(data) {
@@ -507,6 +527,7 @@
               `= (${usd(r.credit)} - ${usd(r.closing_debit_now)}) × 100 × ${r.contracts_open}`,
               `= ${usd(r.unrealized_pl)}`,
               '  Before closing fees.',
+              ...(r.quote ? [`  ${r.quote.label}.`] : []),
             ]),
           },
           {
@@ -725,6 +746,7 @@
   }
 
   global.loadSpreads = loadSpreads;
+  global.checkSpreadFromScanner = checkSpreadFromScanner;
   global.renderSpreads = renderSpreads;
   global.sanitizeSpreadSettings = sanitizeSpreadSettings;
 })(window);

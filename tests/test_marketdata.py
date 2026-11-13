@@ -674,6 +674,29 @@ class TestParseYahooOptionChain(unittest.TestCase):
         bare = parse_yahoo_option_chain(_option_chain_payload("AAPL", self.EXPIRY, calls=[_contract(150.0)]), self.EXPIRY)
         self.assertIsNone(bare.contract(150.0, "C").open_interest)
 
+    def test_option_prices_are_timed_by_the_newest_trade_not_the_stock_quote(self):
+        """Yahoo's stock price is real-time but its option prices run on the
+        ~15-minute-delayed feed (SPY 2026-11-13: stock at 17:10:53, the
+        busiest puts last traded 16:55). The options' age must come from the
+        contracts, never from the stock's regularMarketTime."""
+        older = int(datetime(2026, 6, 1, 16, 55, 18, tzinfo=timezone.utc).timestamp())
+        newest = int(datetime(2026, 6, 1, 16, 55, 38, tzinfo=timezone.utc).timestamp())
+        payload = _option_chain_payload(
+            "AAPL",
+            self.EXPIRY,
+            calls=[_contract(150.0, last_trade_epoch=older)],
+            puts=[_contract(150.0, last_trade_epoch=newest, symbol="AAPL260619P00150000"), _contract(140.0)],
+        )
+        snap = parse_yahoo_option_chain(payload, self.EXPIRY)
+        self.assertEqual(snap.options_as_of, datetime(2026, 6, 1, 16, 55, 38, tzinfo=timezone.utc))
+        self.assertNotEqual(snap.options_as_of, snap.underlying_time)
+
+    def test_option_prices_time_is_none_when_no_contract_traded(self):
+        payload = _option_chain_payload("AAPL", self.EXPIRY, calls=[_contract(150.0)])
+        snap = parse_yahoo_option_chain(payload, self.EXPIRY)
+        self.assertIsNotNone(snap.underlying_time)
+        self.assertIsNone(snap.options_as_of)
+
     def test_missing_last_trade_date_is_none(self):
         payload = _option_chain_payload("AAPL", self.EXPIRY, calls=[_contract(150.0)])
         snap = parse_yahoo_option_chain(payload, self.EXPIRY)

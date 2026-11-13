@@ -100,7 +100,13 @@ class LegClose:
 
 @dataclass
 class OptionLeg:
-    """One opening fill and everything that later closed it."""
+    """One opened position and everything that later closed it.
+
+    Every same-day opening fill of one contract on one side is a single leg
+    (see :meth:`WheelEngine._apply_open`): an order the broker fills in pieces
+    is one position, so ``contracts``, ``open_cash`` and ``open_fees`` are the
+    fills' totals and ``open_price`` their contract-weighted average.
+    """
 
     leg_id: str
     cycle_id: str
@@ -672,12 +678,15 @@ class WheelEngine:
         """Apply one ticker's activity for a single day."""
         closed_records: list[dict] = []
         opened_records: list[dict] = []
+        # (occ_symbol, side) -> today's open record, so later fills of the same
+        # contract join the leg the first fill created.
+        opened_today: dict[tuple[str, str], dict] = {}
 
         for row in self._intraday_order(rows):
             if row.action in self._CLOSING:
                 closed_records.extend(self._apply_close(underlying, row))
             elif row.action in self._OPENING:
-                record = self._apply_open(underlying, row)
+                record = self._apply_open(underlying, row, opened_today)
                 if record:
                     opened_records.append(record)
 
@@ -687,7 +696,12 @@ class WheelEngine:
 
     # ---------------- opens ----------------
 
-    def _apply_open(self, underlying: str, row: Transaction) -> dict | None:
+    def _apply_open(
+        self, underlying: str, row: Transaction, opened_today: dict[tuple[str, str], dict]
+    ) -> dict | None:
+        """Apply one opening row; return the new leg's record, or ``None``
+        when the row opened no new leg (stock, or a further fill of a leg
+        already opened today)."""
         # Only a fresh option open (STO/BTO) may revive a same-month flat wheel;
         # a bare stock purchase starts its own cycle as before.
         cycle = self._cycle_for(underlying, row.event_date, resume=row.action in (STO, BTO))
@@ -703,6 +717,25 @@ class WheelEngine:
 
         side = SHORT if row.action == STO else LONG
         strategy, shares_tracked = self._classify(underlying, row.right, side)
+
+        # A broker fills one order in pieces (1 + 2 contracts at $1.17/$1.18).
+        # Those fills are one position; as separate legs they made a plain
+        # same-day spread look ambiguous to _detect_spreads. A fill whose
+        # classification differs (a stock purchase between two covered-call
+        # fills) stays its own leg so neither keeps the wrong strategy.
+        earlier = opened_today.get((row.occ_symbol, side))
+        if earlier is not None:
+            earlier_leg: OptionLeg = earlier["leg"]
+            if (
+                earlier_leg.cycle_id == cycle.cycle_id
+                and earlier_leg.strategy == strategy
+                and earlier_leg.shares_tracked == shares_tracked
+            ):
+                _add_fill(earlier_leg, row)
+                earlier["contracts"] = earlier_leg.contracts
+                earlier["cash"] = earlier_leg.open_cash
+                return None
+
         leg = OptionLeg(
             leg_id=f"L{next(self._ids)}",
             cycle_id=cycle.cycle_id,
@@ -725,7 +758,7 @@ class WheelEngine:
             cycle.capital_estimated = True
         cycle.legs.append(leg)
         self._open_legs.setdefault(row.occ_symbol, []).append(leg)
-        return {
+        record = {
             "leg": leg,
             "occ_symbol": leg.occ_symbol,
             "right": leg.right,
@@ -735,6 +768,8 @@ class WheelEngine:
             "cash": leg.open_cash,
             "side": side,
         }
+        opened_today[(row.occ_symbol, side)] = record
+        return record
 
     def _classify(self, underlying: str, right: str, side: str) -> tuple[str, bool]:
         """Return the leg's strategy and whether its backing stock is visible.
@@ -1280,6 +1315,29 @@ class WheelEngine:
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
+
+
+def _add_fill(leg: OptionLeg, row: Transaction) -> None:
+    """Fold a further same-day opening fill of ``leg``'s contract into it.
+
+    Runs before any same-day close can touch the leg (``_intraday_order``
+    puts opens ahead of closes of contracts opened today), so ``closes`` is
+    still empty and only the opening totals change.
+    """
+    fill_contracts = abs(row.contracts)
+    if leg.open_price is None or row.price is None:
+        # An average over a fill with no price would be invented.
+        leg.open_price = None
+    else:
+        total_contracts = leg.contracts + fill_contracts
+        leg.open_price = (
+            (leg.open_price * leg.contracts + row.price * fill_contracts) / total_contracts
+            if total_contracts
+            else leg.open_price
+        )
+    leg.contracts += fill_contracts
+    leg.open_cash += row.amount
+    leg.open_fees += row.total_fees
 
 
 def _roll_item(record: dict) -> dict:

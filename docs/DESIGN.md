@@ -826,6 +826,13 @@ stay naked, and a cycle warning names the ambiguous group -- the same
 "ambiguous → leave unmatched, warn" rule already used for ticker-rename matching
 (`_lots_under_former_ticker`).
 
+A "candidate" is a contract, not a fill. An order the broker fills in pieces (SPY
+2026-11-12: the 745 put sold as 1 + 2 contracts, the 740 put bought as 3) is one
+position: `WheelEngine._apply_open` folds every same-day opening fill of one
+contract on one side into a single leg (contracts, cash and fees summed, open
+price contract-weighted) before rolls and spreads are detected. Fills on
+different days stay separate legs.
+
 **A spread's netting only holds while both legs remain open.** If one side closes
 early, the other reverts to its own naked collateral formula for whatever it has
 left -- `paired_contracts` is fixed at pairing time, but each day's actual netted
@@ -1552,6 +1559,21 @@ already-cached series. `price_on_or_before` resolves an arbitrary calendar date 
 weekend, a holiday, the day a Positions snapshot happened to be taken) to the
 nearest prior trading-day close, the same way a broker values a non-trading day.
 
+**Option chains carry two clocks.** In one Yahoo option-chain response the
+stock price (`regularMarketPrice` / `regularMarketTime`) is real-time, but the
+bids and asks come from the free options feed, about 15 minutes behind (SPY,
+2026-11-13: stock quoted 17:10:53 UTC, its busiest puts last traded 16:55).
+Yahoo sends no timestamp for the bids and asks, so
+`OptionChainSnapshot.options_as_of`, the newest trade on any contract in the
+chain, is their time. On a quiet chain that reads older than the quotes may
+really be, which errs toward "recheck". It, never `underlying_time`, is the
+option prices' age everywhere: credit-spread freshness and labels, the scanner's
+quote status, and CSP TO ENTER / CC TO EXIT "Prices as of". Distance to a short
+strike and delta use the live price on purpose (risk right now); credits,
+closing costs and P/L are as of the option time. The quote label says so
+whenever the stock price is 2 or more minutes newer (`PRICE_LEAD_NOTE_MINUTES`),
+because P/L then lags a fast move in the price shown beside it.
+
 `Dashboard._current_prices()` fetches every held ticker's price once per
 `Dashboard` instance, not once per `build()` call: the frontend calls `build()` on
 every filter change, and `get_price_series` still does disk I/O and a
@@ -1739,6 +1761,49 @@ either source is wrong. An
 equity-lot basis backfill into `PRE_HISTORY` share lots (closing the honest gap
 in the Verification section above) is a documented follow-up, not built — the
 export on hand is options-only.
+
+## Credit spread opportunity scanner
+
+Top Opportunities on the Credit Spreads tab finds and ranks spreads across the
+market. `wheel/spreadscanner.py` holds the rules (pure), `wheel/spreadscanservice.py`
+runs the scan in a background thread, `wheel/spreaduniverse.py` builds the company
+list and `wheel/spreadjournal.py` keeps the track record. `spreadscanner.js` only
+displays. Spread math stays in `wheel/creditspreads.py`.
+
+**Stages.** (1) Universe: S&P 500, Nasdaq-100, the largest 1,000 US companies by
+market cap, cached 7 days, plus the reader's ETF list. (2) Screen: batched quotes,
+no option data. (3) Chains: option dates, chains and history for ETFs plus the
+`max_stocks` most actively traded stocks that passed. (4) Rank: filters and scores
+apply at view time, so a filter change needs no download. (5) Verify: re-download
+the chains behind the top candidates; a chain that fails loses its spreads.
+
+**Separate from the Wheel.** Scanner chains don't go through
+`Dashboard._option_chains`, whose demand set is refetched on every price refresh.
+A scan failure only reaches the scan's own status line and the last result stays.
+
+**Known data limits.** The Russell 1000 is a stand-in (largest 1,000 US companies)
+because iShares' IWB holdings link returned a web page. Yahoo has no real-time
+option quotes (so nothing is labelled LIVE), no implied volatility history (no IV
+rank), no broker probabilities and no calendar beyond earnings. Each shows as
+unavailable. A better feed means a new `ScanDataProvider` class.
+
+**Probability and expected value.** Chance of profit uses the short leg's implied
+volatility at the breakeven, and only when that volatility reprices the quote
+within 35% (or $0.10). Otherwise it and expected value are unavailable and the
+spread is rejected by the hard filter. Expected value = POP x max profit - (1 - POP)
+x max loss - four legs of fees. Because the odds are market-implied, it shows what
+the market charges for the trade; it isn't evidence of an edge.
+
+**Score.** The category weights, curves and rating thresholds are named constants
+at the top of `wheel/spreadscanner.py` and are shown on the page. Missing data earns
+no credit. Penalties come off the total; caps limit a rating however high the score
+(old quotes, earnings inside the trade or no expected value: Watch; low POP, low
+return, thin liquidity or poor expected value: Good). For each short strike the
+protective leg is the best score, or within 2 points of it, whichever risks least.
+
+**Track record.** `data/spread_recommendations.json` keeps each listed spread priced
+on current quotes, once, from its first recommendation. Outcomes are worked out from
+the ledger when read. Target and risk results are judged by closing price only.
 
 ## CSV export
 

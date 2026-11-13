@@ -69,6 +69,9 @@ UNVERIFIED = "UNVERIFIED"
 # A quote older than this is flagged stale (Yahoo's free feed can lag, and
 # outside market hours every quote is the last session's).
 QUOTE_STALE_MINUTES = 20
+# The quote label warns that P/L can trail the price once the live stock
+# price is at least this many minutes newer than the option prices.
+PRICE_LEAD_NOTE_MINUTES = 2
 # Short-leg delta at or past this flags the trade for review. Roughly twice
 # the default 15-18 entry delta: the market now prices the short strike as
 # about twice as likely to finish in the money as when the trade was opened.
@@ -286,36 +289,58 @@ class LegQuote:
     ask: float | None
     iv: float | None
     open_interest: int | None = None
+    volume: int | None = None
 
 
 @dataclass(frozen=True)
 class QuoteTiming:
-    """When a chain's prices are from. ``as_of`` is the quote time Yahoo
-    reports; ``fetched_at`` is when this app downloaded it (a cached chain
+    """When a chain's prices are from. ``as_of`` is the option prices' time
+    (``OptionChainSnapshot.options_as_of``) and is what freshness is judged
+    on; ``underlying_as_of`` is the stock price's own, usually newer, time;
+    ``fetched_at`` is when this app downloaded the chain (a cached chain
     keeps its original fetch time)."""
 
     as_of: datetime | None
     fetched_at: datetime | None
+    underlying_as_of: datetime | None = None
 
     def status(self, now: datetime) -> tuple[str, float | None]:
-        """``("FRESH" | "STALE" | "UNKNOWN", age in minutes)``."""
+        """``("FRESH" | "STALE" | "UNKNOWN", age in minutes)`` of the option prices."""
         if self.as_of is None:
             return "UNKNOWN", None
         age = max((now - self.as_of).total_seconds() / 60, 0.0)
         return ("FRESH" if age <= QUOTE_STALE_MINUTES else "STALE"), age
 
+    def price_lead_minutes(self) -> float | None:
+        """How many minutes newer the stock price is than the option prices,
+        or ``None`` when either time is unknown or the stock price isn't newer."""
+        if self.as_of is None or self.underlying_as_of is None:
+            return None
+        lead = (self.underlying_as_of - self.as_of).total_seconds() / 60
+        return lead if lead > 0 else None
+
     def payload(self, now: datetime) -> dict[str, Any]:
         status, age = self.status(now)
         if status == "UNKNOWN":
-            label = "Quote time unknown"
+            label = "Option price time unknown"
         elif status == "FRESH":
-            label = f"Yahoo quote, {age:.0f} min old (free feed, may be delayed)"
+            label = f"Option prices about {age:.0f} min old (Yahoo's free feed is delayed)"
         else:
-            label = f"Stale: Yahoo quote is {_age_text(age)} old, likely the last session's prices"
+            label = f"Stale: option prices are {_age_text(age)} old, likely the last session's"
+        lead = self.price_lead_minutes()
+        if lead is not None and lead >= PRICE_LEAD_NOTE_MINUTES:
+            # The stock price is live, the option prices are not: a closing
+            # cost or P/L trails a fast move in the price shown beside it.
+            label += (
+                f". The stock price is {_age_text(lead)} newer, so closing cost and P/L "
+                "can lag a fast move in the price"
+            )
         return {
             "status": status,
             "age_minutes": _round(age, 1),
             "as_of": _iso_dt(self.as_of),
+            "underlying_as_of": _iso_dt(self.underlying_as_of),
+            "price_lead_minutes": _round(lead, 1),
             "fetched_at": _iso_dt(self.fetched_at),
             "label": label,
         }
@@ -332,7 +357,12 @@ def _age_text(minutes: float) -> str:
 @dataclass(frozen=True)
 class ChainQuotes:
     """One ticker's chain for one expiration, with the underlying price from
-    the same response so delta and distance use one moment's prices."""
+    the same response. Same response is not same moment: ``spot`` is live
+    while the bids and asks run on the delayed options feed (``timing`` has
+    both clocks). Distance to the short strike and delta deliberately use the
+    live ``spot``, since they describe the risk right now and implied
+    volatility moves far slower than the price; credits, closing costs and
+    P/L are as of ``timing.as_of``."""
 
     ticker: str
     expiry: date
@@ -349,6 +379,27 @@ class ChainQuotes:
             if abs(candidate.strike - strike) < _CENT:
                 return candidate
         return None
+
+
+def chain_quotes_from_snapshot(snapshot: Any, fetched_at: datetime | None) -> ChainQuotes:
+    """A fetched ``marketdata.OptionChainSnapshot`` in the shape this module
+    reads, the underlying price and quote time taken from the same response."""
+
+    def side(right: str) -> tuple[LegQuote, ...]:
+        return tuple(
+            LegQuote(c.strike, c.bid, c.ask, c.implied_volatility, c.open_interest, c.volume)
+            for c in snapshot.contracts
+            if c.right == right
+        )
+
+    return ChainQuotes(
+        ticker=snapshot.ticker,
+        expiry=snapshot.expiration,
+        spot=snapshot.underlying_price,
+        timing=QuoteTiming(snapshot.options_as_of, fetched_at, snapshot.underlying_time),
+        puts=side(PUT),
+        calls=side(CALL),
+    )
 
 
 @dataclass(frozen=True)
@@ -1413,7 +1464,9 @@ def manage_spread(
                 f"{dte} DTE, at or past the {settings.time_exit_dte}-DTE exit. Losing about {_usd(-pl_now)} before fees, "
                 f"with up to {_usd(still_at_risk)} more at risk if held; time will not fix this on its own."
             )
-        return guidance(ACTION_CLOSE, f"CLOSE: TIME EXIT ({settings.time_exit_dte} DTE)", reason)
+        # The label shows the spread's own DTE; the reason names the rule's
+        # threshold. Showing the threshold made a 0-DTE trade read "21 DTE".
+        return guidance(ACTION_CLOSE, f"CLOSE: TIME EXIT ({dte} DTE)", reason)
     pressured = breached or (delta is not None and delta + _EPS >= SHORT_DELTA_ALERT)
     if pressured:
         return guidance(
@@ -1683,7 +1736,7 @@ def recommendation_payload(r: Recommendation, now: datetime) -> dict[str, Any]:
     }
 
 
-def guidance_tip(g: Guidance, settings: SpreadSettings) -> str:
+def guidance_tip(g: Guidance, settings: SpreadSettings, now: datetime) -> str:
     p = g.position
     lines = [
         "Target close = credit × (1 - profit target %)",
@@ -1701,6 +1754,8 @@ def guidance_tip(g: Guidance, settings: SpreadSettings) -> str:
             f"= {_usd(g.short_quote.ask)} - {_usd(g.long_quote.bid)}",
             f"= {_usd(g.closing_debit)}",
         ]
+        if g.timing is not None:
+            lines.append(f"  {g.timing.payload(now)['label']}.")
     lines += ["", f"Time exit: {_day(g.time_exit_date)}"]
     return "\n".join(lines)
 
@@ -1860,7 +1915,7 @@ def guidance_payload(g: Guidance, settings: SpreadSettings, now: datetime) -> di
             "action_label": g.action_label,
             "reason": g.reason,
             "flags": list(g.flags),
-            "tip": guidance_tip(g, settings),
+            "tip": guidance_tip(g, settings, now),
         }
     )
     return payload

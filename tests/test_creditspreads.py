@@ -317,6 +317,36 @@ class TestEntryEvaluation(unittest.TestCase):
         c = evaluate(chain(qualifying_put_chain().puts, as_of=NOW - timedelta(hours=18)))
         self.assertTrue(any("not current" in r for r in cs.candidate_risks(c, NOW)))
 
+    def test_freshness_is_judged_on_the_option_prices_not_the_live_stock_price(self):
+        """A live stock price must not make delayed option prices look current."""
+        stale_options = cs.QuoteTiming(NOW - timedelta(minutes=25), NOW, underlying_as_of=NOW)
+        self.assertEqual(stale_options.status(NOW), ("STALE", 25.0))
+
+    def test_label_warns_when_the_stock_price_is_newer_than_the_option_prices(self):
+        timing = cs.QuoteTiming(NOW - timedelta(minutes=15), NOW, underlying_as_of=NOW)
+        payload = timing.payload(NOW)
+        self.assertEqual(payload["status"], "FRESH")
+        self.assertEqual(payload["age_minutes"], 15.0)
+        self.assertEqual(payload["price_lead_minutes"], 15.0)
+        self.assertIn("Option prices about 15 min old", payload["label"])
+        self.assertIn("stock price is 15 min newer", payload["label"])
+
+    def test_no_lag_note_when_the_clocks_agree(self):
+        payload = cs.QuoteTiming(NOW, NOW, underlying_as_of=NOW).payload(NOW)
+        self.assertIsNone(payload["price_lead_minutes"])
+        self.assertNotIn("newer", payload["label"])
+        self.assertNotIn("newer", cs.QuoteTiming(NOW, NOW).payload(NOW)["label"])
+
+    def test_chain_quotes_take_the_option_time_and_keep_the_stock_time(self):
+        from wheel.marketdata import OptionChainSnapshot, OptionContractQuote
+
+        traded = NOW - timedelta(minutes=15)
+        contract = OptionContractQuote("ABC P90", 90.0, "P", 1.0, 1.1, 1.05, traded, 0.3, False, 10, 4)
+        quiet = OptionContractQuote("ABC P85", 85.0, "P", 0.1, 0.2, None, None, 0.3, False, 10, None)
+        snapshot = OptionChainSnapshot("ABC", date(2026, 11, 20), 100.0, NOW, (contract, quiet))
+        timing = cs.chain_quotes_from_snapshot(snapshot, NOW).timing
+        self.assertEqual((timing.as_of, timing.underlying_as_of, timing.fetched_at), (traded, NOW, NOW))
+
 
 class TestScanAndRecommend(unittest.TestCase):
     def scan(self, c, settings=DEFAULTS):
@@ -491,7 +521,7 @@ class TestManagement(unittest.TestCase):
 
     def test_time_exit_losing_shows_loss_and_remaining_risk(self):
         g = self.manage(1.45, 0.05, days_left=15)
-        self.assertEqual(g.action_label, "CLOSE: TIME EXIT (21 DTE)")
+        self.assertEqual(g.action_label, "CLOSE: TIME EXIT (15 DTE)")
         self.assertIn("Losing about $40.00", g.reason)
         self.assertIn("$360.00 more at risk", g.reason)
 
@@ -500,6 +530,13 @@ class TestManagement(unittest.TestCase):
         self.assertEqual(g.action_label, "CLOSE: TIME EXIT (21 DTE)")
         self.assertIn("keeps about $30.00", g.reason)
         self.assertEqual(g.time_exit_date, date(2026, 9, 25))
+
+    def test_time_exit_label_shows_the_spreads_own_dte_on_expiration_day(self):
+        """SPY 745/740 opened at 1 DTE: on expiration day the label read
+        "21 DTE" (the rule's threshold) for a 0-DTE trade."""
+        g = self.manage(0.75, 0.05, days_left=0)
+        self.assertEqual(g.action_label, "CLOSE: TIME EXIT (0 DTE)")
+        self.assertIn("21-DTE exit", g.reason)
 
     def test_breached_short_strike_is_reviewed_not_closed(self):
         g = self.manage(1.55, 0.05, spot=498.0)
@@ -520,7 +557,7 @@ class TestManagement(unittest.TestCase):
         self.assertIsNone(g.unrealized_pl)
         late = cs.manage_spread(self.position, today=self.expiry - timedelta(days=5), chain=None, settings=DEFAULTS,
                                 risk_free_rate=RATE, now=NOW)
-        self.assertEqual(late.action_label, "CLOSE: TIME EXIT (21 DTE)")
+        self.assertEqual(late.action_label, "CLOSE: TIME EXIT (5 DTE)")
         self.assertIn("P/L is unknown", late.reason)
 
     def test_past_expiration_in_the_ledger(self):

@@ -29,6 +29,8 @@ import http.cookiejar
 import json
 import os
 import re
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -74,6 +76,41 @@ class PricePoint:
         return self.high is not None and self.low is not None
 
 
+# Class shares (Berkshire B, Brown-Forman B, ...) are spelled three ways:
+# Fidelity's stock rows run the letters together (BRKB), its option symbols
+# use a dot (-BRK.B260116P400), and Yahoo wants a dash (BRK-B). Yahoo answers
+# BRKB and BRK.B with an error or an empty quote, so every Yahoo call goes
+# through yahoo_symbol() while the app keeps the ledger's own spelling for
+# its keys, display and cache files.
+#
+# A separator form (BRK.B, BRK/B, BRK-B) maps by pattern: one to five
+# letters, a separator, one class letter. The run-together form can't be
+# told apart by pattern (GOOGL and BFH are their own companies, not GOOG-L or
+# BF-H), so only these known listings are mapped; each run-together spelling
+# was checked to return nothing on Yahoo and its dash form to return data.
+_CLASS_SHARE_SEPARATED_RE = re.compile(r"([A-Z]{1,5})[./-]([A-Z])")
+_RUN_TOGETHER_CLASS_SHARES = {
+    "BRKA": "BRK-A",
+    "BRKB": "BRK-B",
+    "BFA": "BF-A",
+    "BFB": "BF-B",
+    "HEIA": "HEI-A",
+    "LENB": "LEN-B",
+}
+
+
+def yahoo_symbol(ticker: str) -> str:
+    """The symbol Yahoo knows ``ticker`` by: class shares in Yahoo's dash
+    form (BRK.B, BRK/B and BRKB all become BRK-B), anything else just
+    trimmed and upper-cased. Used by every Yahoo fetch in this module; the
+    callers' own ticker stays the key of every result and cache entry."""
+    symbol = ticker.strip().upper()
+    separated = _CLASS_SHARE_SEPARATED_RE.fullmatch(symbol)
+    if separated:
+        return f"{separated.group(1)}-{separated.group(2)}"
+    return _RUN_TOGETHER_CLASS_SHARES.get(symbol, symbol)
+
+
 def yahoo_chart_url(ticker: str, *, period2: int | None = None) -> str:
     """Yahoo's chart endpoint, full daily history from the ticker's first
     trading day through ``period2`` (Unix seconds, defaulting to now).
@@ -86,7 +123,7 @@ def yahoo_chart_url(ticker: str, *, period2: int | None = None) -> str:
     end = period2 if period2 is not None else int(time.time())
     return (
         "https://query1.finance.yahoo.com/v8/finance/chart/"
-        f"{ticker.strip().upper()}?period1=0&period2={end}&interval=1d"
+        f"{yahoo_symbol(ticker)}?period1=0&period2={end}&interval=1d"
     )
 
 
@@ -438,6 +475,8 @@ def price_on_or_before(points: Sequence[PricePoint], day: date) -> PricePoint | 
 # --------------------------------------------------------------------------
 
 _FUNDAMENTALS_CACHE_PATH = os.path.join(_DATA_DIR, "fundamentals_cache.json")
+# Yahoo's quoteType for a symbol it doesn't recognise.
+_UNKNOWN_QUOTE_TYPE = "NONE"
 _QUOTE_URL = "https://query2.finance.yahoo.com/v7/finance/quote"
 _CRUMB_URL = "https://query2.finance.yahoo.com/v1/test/getcrumb"
 _COOKIE_URL = "https://fc.yahoo.com/"
@@ -556,12 +595,13 @@ def _yahoo_get(url: str, params: dict[str, str] | None = None, *, timeout: float
 def fetch_yahoo_quotes(tickers: Sequence[str], timeout: float = 10.0) -> str:
     """Raw JSON text from Yahoo's batched quote endpoint. MarketDataError on
     any transport failure (the crumb handshake included)."""
-    symbols = ",".join(sorted({t.upper() for t in tickers}))
+    symbols = ",".join(sorted({yahoo_symbol(t) for t in tickers}))
     return _yahoo_get(_QUOTE_URL, {"symbols": symbols}, timeout=timeout, error_context=f"quotes for {symbols}")
 
 
 def parse_yahoo_quotes(text: str) -> dict[str, dict]:
-    """Yahoo ``quoteResponse.result`` -> ``{TICKER: raw quote dict}``. Raises
+    """Yahoo ``quoteResponse.result`` -> ``{YAHOO SYMBOL: raw quote dict}``
+    (look a ticker up with :func:`yahoo_symbol`: BRKB's row is under BRK-B). Raises
     MarketDataError on a response with no parseable ``quoteResponse`` (an error
     payload or a challenge page), the same way :func:`parse_yahoo_chart` does."""
     try:
@@ -610,7 +650,7 @@ def get_last_prices(
         ]
     out: dict[str, float | None] = {}
     for ticker in tickers:
-        row = quotes.get(ticker)
+        row = quotes.get(yahoo_symbol(ticker))
         price = row.get("regularMarketPrice") if row else None
         out[ticker] = float(price) if isinstance(price, (int, float)) else None
     return out, []
@@ -634,37 +674,67 @@ def _fundamentals_from_quote(ticker: str, row: dict, as_of: date) -> Fundamental
     )
 
 
-def _load_json_cache(path: str) -> dict | None:
-    """Read a cache file's raw JSON dict, or None if it's missing or not
-    valid JSON. Shared by the fundamentals and option-expirations caches --
+# One lock for every JSON cache file this module writes. The dashboard
+# serves requests on many threads, and two builds can refresh the same cache
+# at once: each update re-reads the file, merges its new entries and replaces
+# the file while holding this lock, so neither write drops the other's
+# entries. Reads take it too, because on Windows a file that another thread
+# has open can't be replaced. Re-entrant so an update can call the loaders.
+_JSON_CACHE_LOCK = threading.RLock()
+
+
+def _load_json_cache(path: str) -> tuple[dict, str | None]:
+    """``(raw JSON object, warning)`` for a cache file. A missing file is
+    ``({}, None)``; an unreadable or corrupt one (not JSON, or not a JSON
+    object) is ``({}, warning)``, so a damaged cache only costs a refetch,
+    never a build. Shared by the fundamentals and option-expirations caches --
     the rest of loading (turning each entry into a dataclass) differs per
     cache, so it stays in each cache's own load function."""
-    if not os.path.isfile(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            return json.load(handle)
-    except (OSError, ValueError):
-        return None
+    name = os.path.basename(path)
+    with _JSON_CACHE_LOCK:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                raw = json.load(handle)
+        except FileNotFoundError:
+            return {}, None
+        except (OSError, ValueError) as error:
+            return {}, f"ignored unreadable cache file {name} ({error}); it will be refetched"
+    if not isinstance(raw, dict):
+        return {}, f"ignored cache file {name}: it does not hold a JSON object; it will be refetched"
+    return raw, None
 
 
-def _save_json_cache(serializable: dict, path: str) -> None:
-    """Write a cache's already-JSON-shaped dict to disk, making the parent
-    folder if needed. Shared by the fundamentals and option-expirations
-    caches -- only how each cache turns its values into plain dicts first
-    differs."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(serializable, handle, indent=2, sort_keys=True)
-        handle.write("\n")
+def _save_json_cache(serializable: dict, path: str) -> str | None:
+    """Write a cache's already-JSON-shaped dict to disk atomically (a
+    temporary file in the same folder, then ``os.replace``), so a reader
+    never sees a half-written file. Returns a warning instead of raising
+    when the write fails: the data just fetched is still used, it just
+    isn't kept for next time."""
+    text = json.dumps(serializable, indent=2, sort_keys=True) + "\n"
+    folder = os.path.dirname(path) or "."
+    with _JSON_CACHE_LOCK:
+        try:
+            os.makedirs(folder, exist_ok=True)
+            handle_fd, temporary = tempfile.mkstemp(dir=folder, prefix=os.path.basename(path) + ".", suffix=".tmp")
+            try:
+                with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                os.replace(temporary, path)
+            except BaseException:
+                try:
+                    os.remove(temporary)
+                except OSError:
+                    pass
+                raise
+        except OSError as error:
+            return f"could not save cache file {os.path.basename(path)}: {error}"
+    return None
 
 
-def _load_fundamentals_cache(path: str) -> dict[str, Fundamentals]:
-    raw = _load_json_cache(path)
-    if raw is None:
-        return {}
+def _load_fundamentals_cache(path: str) -> tuple[dict[str, Fundamentals], str | None]:
+    raw, warning = _load_json_cache(path)
     out: dict[str, Fundamentals] = {}
-    for ticker, entry in (raw or {}).items():
+    for ticker, entry in raw.items():
         if not isinstance(entry, dict):
             continue
         as_of = _parse_date(str(entry.get("as_of", "")))
@@ -680,10 +750,10 @@ def _load_fundamentals_cache(path: str) -> dict[str, Fundamentals]:
             earnings_date=_parse_date(str(entry.get("earnings_date", ""))),
             long_name=entry.get("long_name"),
         )
-    return out
+    return out, warning
 
 
-def _save_fundamentals_cache(cache: dict[str, Fundamentals], path: str) -> None:
+def _save_fundamentals_cache(cache: dict[str, Fundamentals], path: str) -> str | None:
     serializable = {
         ticker: {
             "as_of": f.as_of.isoformat(),
@@ -696,11 +766,34 @@ def _save_fundamentals_cache(cache: dict[str, Fundamentals], path: str) -> None:
         }
         for ticker, f in sorted(cache.items())
     }
-    _save_json_cache(serializable, path)
+    return _save_json_cache(serializable, path)
+
+
+def _merge_fundamentals_cache(fresh: dict[str, Fundamentals], path: str) -> str | None:
+    """Add ``fresh`` entries to the cache file, re-reading it under the lock
+    so entries another thread saved since this build loaded it are kept."""
+    with _JSON_CACHE_LOCK:
+        latest, _ = _load_fundamentals_cache(path)
+        latest.update(fresh)
+        return _save_fundamentals_cache(latest, path)
+
+
+def _quote_identifies_security(row: dict | None) -> bool:
+    """Whether a quote row describes a real listing. Yahoo answers a symbol
+    it doesn't know (BRKB rather than BRK-B) with ``quoteType: "NONE"`` and
+    nothing else, which is a blank, not fundamentals."""
+    if not row:
+        return False
+    quote_type = row.get("quoteType")
+    return bool((quote_type and quote_type != _UNKNOWN_QUOTE_TYPE) or row.get("marketCap"))
 
 
 def _fundamentals_stale(entry: Fundamentals | None, today: date, max_age_days: int) -> bool:
     if entry is None:
+        return True
+    # A blank cached before unknown symbols were rejected (see
+    # _quote_identifies_security): refetch rather than serve it for weeks.
+    if entry.quote_type == _UNKNOWN_QUOTE_TYPE and entry.market_cap_b is None:
         return True
     age = (today - entry.as_of).days
     if age >= max_age_days:
@@ -736,7 +829,7 @@ def fetch_yahoo_option_expirations(ticker: str, timeout: float = 10.0) -> str:
     Unlike :func:`fetch_yahoo_quotes`, this endpoint isn't batchable across
     symbols -- one request per ticker. MarketDataError on any transport
     failure (the crumb handshake included)."""
-    url = _OPTIONS_URL_TMPL.format(ticker=urllib.parse.quote(ticker.upper()))
+    url = _OPTIONS_URL_TMPL.format(ticker=urllib.parse.quote(yahoo_symbol(ticker)))
     return _yahoo_get(url, timeout=timeout, error_context=f"option expirations for {ticker}")
 
 
@@ -763,19 +856,22 @@ def parse_yahoo_option_expirations(text: str) -> list[date]:
 _option_expirations_memo: dict[str, tuple[float, dict[str, OptionSchedule]]] = {}
 
 
-def _load_option_expirations_cache(path: str) -> dict[str, OptionSchedule]:
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        return {}
-    memoized = _option_expirations_memo.get(path)
-    if memoized is not None and memoized[0] == mtime:
-        return memoized[1]
-    raw = _load_json_cache(path)
-    if raw is None:
-        return {}
+def _load_option_expirations_cache(path: str) -> tuple[dict[str, OptionSchedule], str | None]:
+    """``(cache, warning)``. The cache is the caller's own copy: the memo
+    behind it is shared by every request thread and must never be mutated."""
+    with _JSON_CACHE_LOCK:
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return {}, None
+        memoized = _option_expirations_memo.get(path)
+        if memoized is not None and memoized[0] == mtime:
+            return dict(memoized[1]), None
+        raw, warning = _load_json_cache(path)
+    if warning is not None:
+        return {}, warning
     out: dict[str, OptionSchedule] = {}
-    for ticker, entry in (raw or {}).items():
+    for ticker, entry in raw.items():
         if not isinstance(entry, dict):
             continue
         as_of = _parse_date(str(entry.get("as_of", "")))
@@ -786,20 +882,32 @@ def _load_option_expirations_cache(path: str) -> dict[str, OptionSchedule]:
         )
         out[ticker.upper()] = OptionSchedule(ticker=ticker.upper(), as_of=as_of, expirations=expirations)
     _option_expirations_memo[path] = (mtime, out)
-    return out
+    return dict(out), None
 
 
-def _save_option_expirations_cache(cache: dict[str, OptionSchedule], path: str) -> None:
+def _save_option_expirations_cache(cache: dict[str, OptionSchedule], path: str) -> str | None:
     serializable = {
         ticker: {"as_of": s.as_of.isoformat(), "expirations": [d.isoformat() for d in s.expirations]}
         for ticker, s in sorted(cache.items())
     }
-    _save_json_cache(serializable, path)
-    # Keep the in-process memo in step with what was just written, so the
-    # very next read (this process, this ticker's freshly-saved entry
-    # included) doesn't immediately re-read the file to learn what it just
-    # wrote.
-    _option_expirations_memo[path] = (os.path.getmtime(path), dict(cache))
+    with _JSON_CACHE_LOCK:
+        warning = _save_json_cache(serializable, path)
+        if warning is None:
+            # Keep the in-process memo in step with what was just written, so
+            # the very next read (this process, this ticker's freshly-saved
+            # entry included) doesn't immediately re-read the file to learn
+            # what it just wrote.
+            _option_expirations_memo[path] = (os.path.getmtime(path), dict(cache))
+    return warning
+
+
+def _merge_option_expirations_cache(fresh: dict[str, OptionSchedule], path: str) -> str | None:
+    """Add ``fresh`` entries to the cache file, re-reading it under the lock
+    so entries another thread saved since this build loaded it are kept."""
+    with _JSON_CACHE_LOCK:
+        latest, _ = _load_option_expirations_cache(path)
+        latest.update(fresh)
+        return _save_option_expirations_cache(latest, path)
 
 
 def _option_expirations_stale(entry: OptionSchedule | None, today: date, max_age_days: int) -> bool:
@@ -841,13 +949,13 @@ def get_option_expirations(
     today = today or date.today()
     wanted = sorted({t.upper() for t in tickers if t})
 
-    cache = _load_option_expirations_cache(path)
+    cache, load_warning = _load_option_expirations_cache(path)
+    warnings: list[str] = [load_warning] if load_warning else []
     if local_only:
-        return {t: list(cache[t].expirations) for t in wanted if t in cache}, []
+        return {t: list(cache[t].expirations) for t in wanted if t in cache}, warnings
 
     stale = [t for t in wanted if force_refresh or _option_expirations_stale(cache.get(t), today, max_age_days)]
-    warnings: list[str] = []
-    touched = False
+    fresh: dict[str, OptionSchedule] = {}
 
     def _fetch_one(ticker: str) -> tuple[str, list[date] | None, str | None]:
         try:
@@ -861,10 +969,12 @@ def get_option_expirations(
                 if warning is not None:
                     warnings.append(warning)
                     continue
-                cache[ticker] = OptionSchedule(ticker=ticker, as_of=today, expirations=tuple(expirations or []))
-                touched = True
-    if touched:
-        _save_option_expirations_cache(cache, path)
+                fresh[ticker] = OptionSchedule(ticker=ticker, as_of=today, expirations=tuple(expirations or []))
+    if fresh:
+        cache.update(fresh)
+        save_warning = _merge_option_expirations_cache(fresh, path)
+        if save_warning:
+            warnings.append(save_warning)
 
     return {t: list(cache[t].expirations) for t in wanted if t in cache}, warnings
 
@@ -926,14 +1036,30 @@ class OptionContractQuote:
 
 @dataclass(frozen=True)
 class OptionChainSnapshot:
-    """One ticker's full chain for one expiration date, as of the moment it
-    was fetched."""
+    """One ticker's full chain for one expiration date.
+
+    The response carries two clocks. ``underlying_time`` is when
+    ``underlying_price`` was quoted, and Yahoo serves that price in real time.
+    The contracts' bids and asks come from the free options feed, which runs
+    about 15 minutes behind it, and Yahoo sends no timestamp for them; use
+    :attr:`options_as_of` for their age, never ``underlying_time``.
+    """
 
     ticker: str
     expiration: date
     underlying_price: float | None
-    quote_time: datetime | None
+    underlying_time: datetime | None
     contracts: tuple[OptionContractQuote, ...]
+
+    @property
+    def options_as_of(self) -> datetime | None:
+        """Best evidence of when the option prices are from: the newest trade
+        on any contract in this chain. On a busy chain (SPY trades every
+        second) that is the feed's own clock. On a quiet one it reads older
+        than the quotes may really be, which errs toward "recheck before
+        trading", never toward calling old prices current. ``None`` when no
+        contract reports a trade."""
+        return max((c.last_trade_date for c in self.contracts if c.last_trade_date is not None), default=None)
 
     def contract(self, strike: float, right: str) -> OptionContractQuote | None:
         for candidate in self.contracts:
@@ -951,7 +1077,7 @@ def fetch_yahoo_option_chain(ticker: str, expiration: date, timeout: float = 10.
     crumb handshake included), the same as every other fetch in this module.
     """
     epoch = int(datetime.combine(expiration, datetime.min.time(), tzinfo=timezone.utc).timestamp())
-    url = _OPTIONS_URL_TMPL.format(ticker=urllib.parse.quote(ticker.upper()))
+    url = _OPTIONS_URL_TMPL.format(ticker=urllib.parse.quote(yahoo_symbol(ticker)))
     return _yahoo_get(
         url,
         {"date": str(epoch)},
@@ -989,7 +1115,7 @@ def _non_negative_count(raw: object) -> int | None:
     return int(raw)
 
 
-def parse_yahoo_option_chain(text: str, expiration: date) -> OptionChainSnapshot:
+def parse_yahoo_option_chain(text: str, expiration: date, *, ticker: str | None = None) -> OptionChainSnapshot:
     """Yahoo's ``optionChain.result[0]`` -> the one ``options`` group whose
     own ``expirationDate`` resolves closest to ``expiration`` (a response can
     carry more than one date's worth of strikes; which one Yahoo treats as
@@ -998,6 +1124,10 @@ def parse_yahoo_option_chain(text: str, expiration: date) -> OptionChainSnapshot
     MarketDataError on an unparseable response, or when no group resolves
     within a day of ``expiration`` (a delisted ticker, or a contract that has
     already expired and dropped off the chain).
+
+    ``ticker`` is the caller's own spelling of the symbol the chain was
+    fetched for (BRKB, where Yahoo answers as BRK-B); without it the
+    snapshot carries Yahoo's ``underlyingSymbol``.
     """
     try:
         result = json.loads(text)["optionChain"]["result"]
@@ -1027,10 +1157,10 @@ def parse_yahoo_option_chain(text: str, expiration: date) -> OptionChainSnapshot
     underlying_price = quote.get("regularMarketPrice")
 
     return OptionChainSnapshot(
-        ticker=str(chain.get("underlyingSymbol") or "").upper(),
+        ticker=ticker.strip().upper() if ticker else str(chain.get("underlyingSymbol") or "").upper(),
         expiration=expiration,
         underlying_price=float(underlying_price) if isinstance(underlying_price, (int, float)) else None,
-        quote_time=_epoch_to_datetime(quote.get("regularMarketTime")),
+        underlying_time=_epoch_to_datetime(quote.get("regularMarketTime")),
         contracts=tuple(calls + puts),
     )
 
@@ -1061,26 +1191,28 @@ def get_fundamentals(
     today = today or date.today()
     wanted = sorted({t.upper() for t in tickers if t})
 
-    cache = _load_fundamentals_cache(path)
+    cache, load_warning = _load_fundamentals_cache(path)
+    warnings: list[str] = [load_warning] if load_warning else []
     if local_only:
-        return {t: cache[t] for t in wanted if t in cache}, []
+        return {t: cache[t] for t in wanted if t in cache}, warnings
 
     stale = [
         t for t in wanted if force_refresh or _fundamentals_stale(cache.get(t), today, max_age_days)
     ]
-    warnings: list[str] = []
     if stale:
         try:
             quotes = parse_yahoo_quotes(fetch(stale))
-            touched = False
+            fresh: dict[str, Fundamentals] = {}
             for ticker in stale:
-                row = quotes.get(ticker)
-                if not row or not (row.get("quoteType") or row.get("marketCap")):
+                row = quotes.get(yahoo_symbol(ticker))
+                if not _quote_identifies_security(row):
                     continue  # nothing usable came back -- don't cache a blank
-                cache[ticker] = _fundamentals_from_quote(ticker, row, today)
-                touched = True
-            if touched:
-                _save_fundamentals_cache(cache, path)
+                fresh[ticker] = _fundamentals_from_quote(ticker, row, today)
+            if fresh:
+                cache.update(fresh)
+                save_warning = _merge_fundamentals_cache(fresh, path)
+                if save_warning:
+                    warnings.append(save_warning)
         except MarketDataError as error:
             warnings.append(f"could not refresh fundamentals ({len(stale)} ticker(s)): {error}")
 

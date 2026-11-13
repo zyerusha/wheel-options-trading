@@ -1188,14 +1188,45 @@
           <header>
             <h2>Spread opportunities</h2>
           </header>
-          <ul class="hint-list">
-            <li><strong>Credit</strong>: short bid - long ask, the price you can count on filling. Midpoint is shown as an estimate only.</li>
-            <li><strong>Max loss</strong>: (width - credit) × 100 per spread, before fees.</li>
-            <li><strong>Chance of profit</strong>: a Black-Scholes estimate from the short leg's implied volatility, not a forecast.</li>
-            <li><strong>Delta</strong>: model value from Yahoo's implied volatility; Yahoo publishes no Greeks.</li>
-            <li>Press T over a row's credit for the full calculation.</li>
-          </ul>
-          <div id="spreads-scan"></div>
+          <p class="hint">
+            The best credit spreads to consider right now, found across the market and ranked by quality.
+            Click a row for the full analysis. Guidance only; nothing here places a trade.
+          </p>
+          <div class="scanner-controls">
+            <button class="toggle" type="button" id="scanner-run">Run scan now</button>
+            <button class="toggle" type="button" id="scanner-refresh">Refresh top opportunities</button>
+          </div>
+          <div id="scanner-status" role="status"></div>
+          <details class="spreads-notes" id="scanner-filters">
+            <summary>Filters and settings</summary>
+            <div id="scanner-filter-groups"></div>
+            <div id="scanner-settings-warnings"></div>
+          </details>
+          <div id="scanner-top"></div>
+          <details class="spreads-notes" id="scanner-also-card" hidden>
+            <summary>Also considered</summary>
+            <div id="scanner-also"></div>
+          </details>
+          <details class="spreads-notes" id="scanner-rejected-card" hidden>
+            <summary>Why trades were rejected</summary>
+            <div id="scanner-rejected"></div>
+          </details>
+          <details class="spreads-notes">
+            <summary>Your risk, the market, and how scoring works</summary>
+            <div id="scanner-context" class="scanner-detail"></div>
+          </details>
+          <details class="card-subsection" id="spreads-tracked-section">
+            <summary>Your tracked underlyings</summary>
+            <p class="hint">Every spread on the tickers in Strategy settings, tested against those rules.</p>
+            <ul class="hint-list">
+              <li><strong>Credit</strong>: short bid - long ask, the price you can count on filling. Midpoint is shown as an estimate only.</li>
+              <li><strong>Max loss</strong>: (width - credit) × 100 per spread, before fees.</li>
+              <li><strong>Chance of profit</strong>: a Black-Scholes estimate from the short leg's implied volatility, not a forecast.</li>
+              <li><strong>Delta</strong>: model value from Yahoo's implied volatility; Yahoo publishes no Greeks.</li>
+              <li>Press T over a row's credit for the full calculation.</li>
+            </ul>
+            <div id="spreads-scan"></div>
+          </details>
           <div class="card-subsection" id="spreads-check-section">
             <header><h3>Check a spread</h3></header>
             <p class="hint">Pick any strikes and test them against the same rules.</p>
@@ -1403,6 +1434,7 @@
 
     <script src="/tiplayout.js"></script>
     <script src="/spreads.js"></script>
+    <script src="/spreadscanner.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>
