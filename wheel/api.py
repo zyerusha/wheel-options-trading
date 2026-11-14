@@ -1546,6 +1546,45 @@ def wheel_target_gap_pct(
     return round(100.0 * (target - last_close) / last_close, 2)
 
 
+def open_wheel_pl_rows(wheels: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per currently open wheel for the Dashboard's Open wheel P/L
+    chart, copied from its Trade Log entry (``_trade_log_entry``), so the
+    figures are the same ones the Trade Log shows -- nothing is recomputed.
+
+    Open wheel = ``is_wheel and is_open``, the same rule as the Wheel price
+    targets banner; directional and buy-and-hold cycles are left out.
+    ``option_pl + holding_pl == mark_to_market_pl`` holds exactly (see
+    ``_trade_log_entry``). A wheel holding shares with no price has
+    ``holding_pl``/``mark_to_market_pl`` None and sorts last. Otherwise the
+    best total comes first; ties break on ticker, then ``cycle_id``, so the
+    order never depends on input order. ``account_id`` is set only in the
+    Combined view, where each wheel came from one account.
+    """
+    rows = [
+        {
+            "cycle_id": wheel["cycle_id"],
+            "account_id": wheel.get("account_id"),
+            "underlying": wheel["underlying"],
+            "name": wheel.get("name"),
+            "option_pl": wheel.get("option_mtm_pl"),
+            "holding_pl": wheel.get("holding_mtm_pl"),
+            "mark_to_market_pl": wheel.get("mark_to_market_pl"),
+            "open_option_pl_marked": wheel.get("open_option_pl_marked"),
+        }
+        for wheel in wheels
+        if wheel.get("is_wheel") and wheel.get("is_open")
+    ]
+    rows.sort(
+        key=lambda row: (
+            row["mark_to_market_pl"] is None,
+            -(row["mark_to_market_pl"] or 0.0),
+            row["underlying"],
+            row["cycle_id"],
+        )
+    )
+    return rows
+
+
 def _trade_log_entry(
     cycle: Cycle,
     transactions: Sequence[Transaction],
@@ -1843,12 +1882,22 @@ def _trade_log_entry(
     # buy back. A leg with no live mark on hand still falls back to the
     # expiry valuation, leg by leg. `stock_unrealized_pl` marks held shares to
     # the latest close (None when there is no price / no shares).
-    non_stock_pl_marked = metrics.option_realized_pl + metrics.stock_realized_pl + dividends + metrics.option_open_pl
-    mark_to_market_pl = (
+    #
+    # Split into where the money came from (the Dashboard's Open wheel P/L
+    # chart stacks these two):
+    #   option_mtm_pl  = realized option P&L + open options marked (hedges included)
+    #   holding_mtm_pl = realized share P&L + dividends + held shares marked
+    # Each part is rounded to the cent first and the total is their sum, so
+    # option_mtm_pl + holding_mtm_pl == mark_to_market_pl exactly, on every
+    # surface. Unpriced held shares leave both the holding part and the total
+    # unknown (None), never a partial total.
+    option_mtm_pl = _money(metrics.option_realized_pl + metrics.option_open_pl)
+    holding_mtm_pl = (
         None
         if shares_held > 1e-9 and stock_unrealized is None
-        else non_stock_pl_marked + (stock_unrealized or 0.0)
+        else _money(metrics.stock_realized_pl + dividends + (stock_unrealized or 0.0))
     )
+    mark_to_market_pl = None if holding_mtm_pl is None else _money(option_mtm_pl + holding_mtm_pl)
     # The stock price at which the whole campaign nets to $0: raw cost of the
     # shares still held, less every other dollar the campaign has banked or paid.
     # <= 0 means the premium/profit already banked exceeds the share cost -- there
@@ -1991,7 +2040,9 @@ def _trade_log_entry(
         "stock_unrealized_pl": _money(stock_unrealized),
         "open_option_pl": _money(metrics.option_open_pl),
         "open_option_pl_marked": metrics.option_open_pl_marked,
-        "mark_to_market_pl": _money(mark_to_market_pl),
+        "mark_to_market_pl": mark_to_market_pl,
+        "option_mtm_pl": option_mtm_pl,
+        "holding_mtm_pl": holding_mtm_pl,
         "current_price": _money(current_price),
         "break_even_price": _money(break_even_price),
         "dollars_to_break_even": _money(dollars_to_break_even),
@@ -5569,6 +5620,7 @@ class Dashboard:
             "trade_log": self._trade_log,
             "open_hedges": self._open_hedges,
             "wheel_targets": wheel_targets_banner,
+            "open_wheel_pl": open_wheel_pl_rows(_wheels),
             "open_positions": _open_positions_for_payload,
             "cc_candidates": self._cc_candidates,
             "csp_candidates": self._csp_candidates,

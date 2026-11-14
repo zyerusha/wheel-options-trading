@@ -30,6 +30,11 @@
 
   --pos: #2a78d6;
   --neg: #e34948;
+  /* Open wheel P/L: hue = gain/loss, shade = options (strong) vs shares (soft). */
+  --gain-strong: #1a7f37;
+  --gain-soft: #8fd19e;
+  --loss-strong: #c62828;
+  --loss-soft: #f4a3a3;
   --mid: #f0efec;
   --target: #7c3aed;
 
@@ -64,6 +69,10 @@
     --series-4: #c98500;
     --pos: #3987e5;
     --neg: #e66767;
+    --gain-strong: #2ea44f;
+    --gain-soft: #9be9a8;
+    --loss-strong: #e5534b;
+    --loss-soft: #ffb3ae;
     --mid: #383835;
     --target: #a78bfa;
     --success-text: #0ca30c;
@@ -90,6 +99,10 @@
   --series-4: #c98500;
   --pos: #3987e5;
   --neg: #e66767;
+  --gain-strong: #2ea44f;
+  --gain-soft: #9be9a8;
+  --loss-strong: #e5534b;
+  --loss-soft: #ffb3ae;
   --mid: #383835;
   --target: #a78bfa;
   --success-text: #0ca30c;
@@ -832,6 +845,12 @@ svg text {
 svg .axis-line {
   stroke: var(--axis);
   stroke-width: 1;
+}
+
+/* $0 on a chart whose bars go both ways: darker than gridlines so it reads. */
+svg .zero-line {
+  stroke: var(--text-secondary);
+  stroke-width: 1.25;
 }
 
 svg .grid-line {

@@ -359,6 +359,42 @@
           ></div>
         </section>
 
+        <!-- Open wheel P/L: one diverging stacked bar per open wheel -->
+        <section
+          class="card"
+          id="open-wheel-pl-card"
+          style="margin-bottom: var(--gap)"
+        >
+          <header>
+            <h2>Open wheel P/L</h2>
+            <button
+              class="toggle"
+              data-twin="open-wheel-pl-table"
+              aria-pressed="false"
+            >
+              Table
+            </button>
+          </header>
+
+          <ul class="hint-list">
+            <li><strong>Bar</strong>: one per open wheel. Its end is the wheel's total P/L right now: everything already closed, plus what's still open at its latest price.</li>
+            <li><strong>Options P/L</strong> (darker): closed option trades plus open options at their last price in your Positions export (with no price, as if they expire worthless).</li>
+            <li><strong>Holding P/L</strong> (lighter): shares sold, shares still held at today's price, and dividends.</li>
+            <li>Gains stack up from zero in green, losses down in red, so a wheel can show both at once.</li>
+            <li>Hover a bar for the exact figures; click it to open that wheel in the Trade Log.</li>
+          </ul>
+
+          <p class="hint" id="open-wheel-pl-note" role="status" hidden></p>
+
+          <div class="chart-scroll">
+            <svg id="chart-open-wheel-pl" role="img"></svg>
+          </div>
+
+          <div class="legend" id="legend-open-wheel-pl"></div>
+
+          <div class="table-twin" id="open-wheel-pl-table" hidden></div>
+        </section>
+
         <!-- Capital deployed + Cumulative Wheel P/L: realized & mark-to-market -->
         <div class="grid two">
           <!-- Capital deployed -->
@@ -385,6 +421,7 @@
               <li><strong>Idle shares</strong>: shares held without an open covered call.</li>
               <li><strong>Call-backed shares</strong>: shares covered by an open short call.</li>
               <li>Dots show broker-reported account value: cash plus current market value of holdings.</li>
+              <li><strong>Unrealized loss</strong> (red hatching): when what you hold is worth less than you paid, the account value sits below the top of the cash band, and the hatching shows by how much.</li>
             </ul>
 
             <div class="chart-scroll">

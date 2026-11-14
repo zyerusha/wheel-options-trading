@@ -944,6 +944,28 @@ summed from the rounded parts so the column always adds up on screen. It
 reconciles to the chart's latest day to the cent; only Cash / Unrealized are
 dated to the (possibly older) Positions snapshot.
 
+**Cash and Unrealized: one split, never clamped** (`splitAccountValue` in
+`wheel/static/app.js`, used by both the chart and the donut):
+
+- Cash = account cash - open CSP collateral (the collateral is a hold on that
+  same cash, already in the Put collateral band), never below 0.
+- Unrealized = Total value - committed capital - Cash. Committed capital is at
+  cost, so this is the holdings' gain or loss against cost (plus equity the
+  history can't track), and it is **negative** when holdings are below cost.
+
+An earlier version clamped Unrealized at 0: a reading taken while holdings were
+below cost by more than the cash was dropped entirely (no dot, no band), and a
+smaller loss was hidden by shrinking Cash. On the chart a loss is a hatched red
+band (`UNREALIZED_LOSS_COLOR`) reaching down from the top of Cash to the real
+account value, where the dashed Total-value line and its dot sit; it gets its own
+key entry while shown. Between snapshots the chart interpolates the two raw
+readings (total value and broker cash) and re-splits them against each day's own
+committed capital, so a put sold the day after a snapshot moves money out of Cash
+on that day with no double count. The donut can't draw a negative wedge, so its
+ring holds committed capital + Cash (+ any gain), its centre shows the real Total
+value, and its legend lists "Unrealized loss" as a negative row so Total value
+still adds up.
+
 Every `WHEEL_STATE_COMPONENTS` label matches its `CAPITAL_BANDS` twin
 ("Covered-call shares (cost basis)", not "Backing shares…"), and `displayLabel`
 always uses the component label, so a wedge, its legend row and the matching
@@ -1132,7 +1154,7 @@ tables, so it is never cached across calls the way those are. `since` (a `start`
 filter) is applied afterward as a pure display crop over the finished rows, safe
 because neither series carries anything cumulative across buckets. The dashboard
 renders it as the *Periodic P/L* card: one diverging stacked bar per period
-(`drawPeriodPl`, via `stackPeriodPl`), Option P/L and Stock P/L each a fixed
+(`drawPeriodPl`, via the shared `stackDiverging`), Option P/L and Stock P/L each a fixed
 identity color stacked from a shared zero baseline -- same-signed values stack
 contiguously (whichever series comes first in `PERIOD_PL_SERIES` sits against
 the zero line), opposite-signed values extend to opposite sides of zero instead
@@ -1148,6 +1170,39 @@ Combined view merges accounts via `_combine_period_pl`, summing by the shared
 `period` key -- safe because `period` is a deterministic function of the
 calendar (unlike a capital or P/L date series, nothing here is cumulative
 across periods).
+
+### Open wheel P/L
+
+One diverging stacked bar per currently open wheel (`is_wheel and is_open`, the
+Wheel price targets banner's rule; directional and buy-and-hold cycles are
+left out), showing where its mark-to-market P&L comes from:
+
+- `option_mtm_pl` = realized option P&L + open options marked (hedges included)
+- `holding_mtm_pl` = realized share P&L + dividends + held shares marked
+- `mark_to_market_pl` = `option_mtm_pl + holding_mtm_pl`
+
+The split lives in `_trade_log_entry`, the one place a wheel's mark-to-market is
+computed. Each part is rounded to the cent first and the total is their sum,
+so the identity holds exactly on every surface (previously the total was
+rounded from the raw sum, which could sit a cent off its rounded parts). Held
+shares with no price leave the holding part and the total `None`, never a
+partial total. Open options with no quote in a Positions export are valued at
+expiry, as everywhere else (`open_option_pl_marked` false).
+
+`open_wheel_pl_rows` (wheel/api.py) copies those three figures per open wheel
+into the payload's `open_wheel_pl`, best total first, unpriced wheels last.
+The Combined view runs the same function over the combined Trade Log, so a
+ticker wheeled in two accounts is two bars (labelled with the account), never
+one blended bar. The frontend (`drawOpenWheelPl`) only draws: `stackDiverging`
+puts the options part next to zero and the holding part beyond it on each
+side. Ticker chips narrow it; the date range doesn't apply (it is today's
+position). Wheels it cannot price are named in a note above the chart and
+still listed in its table.
+
+Colour is the one exception to the identity-colour rule above, at the user's
+request: hue = sign (`--gain-*` green, `--loss-*` red), shade = source
+(`-strong` options, `-soft` shares). Position off the zero line carries the
+sign too, so colour is never the only cue.
 
 ### Cost basis: tax basis vs. net adjusted cost basis
 

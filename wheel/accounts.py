@@ -136,6 +136,7 @@ from wheel.api import (
     discover_multi_account_exports,
     is_csp_history_winner,
     merge_csp_history,
+    open_wheel_pl_rows,
     prefetch_option_chains,
     sector_exposure,
     wheel_target_gap_pct,
@@ -1020,6 +1021,9 @@ class AccountRegistry:
             "trade_log": combined_trade_log,
             "open_hedges": combined_hedges,
             "wheel_targets": combined_wheel_targets,
+            # Built from the combined Trade Log (already account-tagged), so a
+            # ticker wheeled in two accounts is two bars, never one blended one.
+            "open_wheel_pl": open_wheel_pl_rows(combined_trade_log.get("wheels", [])),
             "open_positions": combined_open_positions,
             "cc_candidates": combined_cc_candidates,
             "csp_candidates": combined_csp_candidates,

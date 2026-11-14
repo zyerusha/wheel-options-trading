@@ -1127,7 +1127,10 @@ const CAPITAL_BANDS = [
 // The wheel-state donut uses these same two tokens for its Cash/Unrealized
 // wedges, so the two charts read as one shared vocabulary.
 const NOT_DEPLOYED_COLOR = '--text-muted'; // Cash
-const UNREALIZED_COLOR = '--text-secondary'; // Unrealized
+const UNREALIZED_COLOR = '--text-secondary'; // Unrealized gain
+// Unrealized loss: holdings below cost, drawn as a hatched band reaching down
+// to the real account value (see drawCapital). Same red as a loss elsewhere.
+const UNREALIZED_LOSS_COLOR = '--loss-strong';
 
 // Derived from CAPITAL_BANDS so the column headers, the tooltip formulas and
 // the aria text can never drift from the legend labels. Order matches the
@@ -1145,7 +1148,8 @@ const CAPITAL_TABLE_HEAD = [
   },
   {
     text: 'Unrealized',
-    title: 'Unrealized gains plus equity this history can\'t track, blank except on a Positions snapshot date.',
+    title:
+      'Gain or loss (negative) on what you hold vs. what you paid, plus equity this history can\'t track. Blank except on a Positions snapshot date.',
   },
   { text: 'Total value', title: 'Total committed + Cash + Unrealized: the whole account.' },
 ];
@@ -1213,13 +1217,28 @@ function lastSnapshotAtOrBefore(timeline, asOf) {
  * accounts happened to snapshot that exact day.
  */
 /**
- * `{ amount, cash, unrealized }` per date, ``amount`` being the combined
- * figure described above and ``cash``/``unrealized`` its same split as the
- * "Where the wheel is right now" donut's own Cash/Unrealized
- * wedges (see `drawWheelState`): ``cash`` is that day's committed capital
- * point's ``put`` collateral subtracted from the snapshot's own
- * ``cash_total`` (never double-counted with the Cash Secured (puts) band),
- * ``unrealized`` is whatever of ``amount`` that leaves.
+ * Splits one account-value reading into what sits outside committed capital:
+ *   cash       = account cash - open CSP collateral (the collateral is a hold
+ *                on that same cash, already in the Cash Secured band), >= 0
+ *   unrealized = total value - committed capital - cash
+ *   amount     = cash + unrealized = total value - committed capital
+ * Committed capital is at cost, so unrealized is the holdings' gain or loss
+ * against cost (plus any equity this history can't track) and is NEGATIVE
+ * when holdings are below cost. It is never clamped: clamping it to zero
+ * dropped or shrank every reading taken while the account was losing.
+ * The one definition the Capital deployed chart and the donut both use.
+ */
+function splitAccountValue(totalValue, cashTotal, committed, putCollateral) {
+  const cash = Math.max((cashTotal || 0) - (putCollateral || 0), 0);
+  const amount = totalValue - committed;
+  return { amount, cash, unrealized: amount - cash };
+}
+
+/**
+ * `{ amount, cash, unrealized, totalValue, cashTotal, estimated }` per
+ * snapshot date: ``amount``/``cash``/``unrealized`` are `splitAccountValue`
+ * against that day's committed-capital point. ``unrealized`` (and so
+ * ``amount``) can be negative; the reading is kept either way.
  */
 function notDeployedByDate(points, netWorth) {
   const map = new Map();
@@ -1253,18 +1272,15 @@ function notDeployedByDate(points, netWorth) {
       }
     }
     if (!anyKnown) continue;
-    const amount = totalValue - point.total;
-    if (amount <= 1e-9) continue;
-    const cash = Math.min(Math.max(cashTotal - point.put, 0), amount);
-    // `totalValue` (this snapshot's real total account value) rides along too
-    // -- the day-to-day interpolation between two snapshots needs it to
-    // derive the not-deployed amount from *that day's own* committed capital,
-    // rather than interpolating cash/unrealized on their own and stacking
-    // them on top of a committed-capital figure that can jump independently
-    // in between (a CSP sold the day after a snapshot moves cash into
-    // collateral without changing total value at all -- see drawCapital()'s
-    // ndInterp).
-    map.set(asOf, { amount, cash, unrealized: amount - cash, estimated, totalValue });
+    // `totalValue` and `cashTotal` (this snapshot's raw readings) ride along
+    // so the day-to-day interpolation between two snapshots can re-split them
+    // against *that day's own* committed capital (see drawCapital()'s ndInterp).
+    map.set(asOf, {
+      ...splitAccountValue(totalValue, cashTotal, point.total, point.put),
+      estimated,
+      totalValue,
+      cashTotal,
+    });
   }
   return map;
 }
@@ -1401,34 +1417,33 @@ function drawCapital(points, netWorth) {
     ndAnchors.length >= 2
       ? points.map((p) => {
           const t = parseDay(p.date).getTime();
-          if (t < ndAnchors[0].t || t > ndAnchors[ndAnchors.length - 1].t) return { cash: 0, unrealized: 0 };
+          if (t < ndAnchors[0].t || t > ndAnchors[ndAnchors.length - 1].t) return null;
           const hi = ndAnchors.findIndex((a) => a.t >= t);
           const a = ndAnchors[hi - 1] || ndAnchors[0];
           const b = ndAnchors[hi] || ndAnchors[0];
           const f = b.t === a.t ? 0 : (t - a.t) / (b.t - a.t);
-          // Interpolate *total account value* -- the one figure only known at
-          // sparse snapshot dates -- then subtract that day's own real
-          // committed capital (capital_series, known every day) to get the
-          // not-deployed amount. Interpolating cash/unrealized directly and
-          // stacking them on top of committed capital was wrong: selling a
-          // put the day after a snapshot moves cash into collateral without
-          // changing total value at all, but the interpolated cash figure
-          // wouldn't have caught up yet, so the same dollars got counted in
-          // both bands at once -- a false spike right on the trade date.
+          // Interpolate the two raw readings only known on snapshot dates --
+          // total account value and the broker's cash -- then split them
+          // against that day's own committed capital (known every day).
+          // Interpolating cash/unrealized directly was wrong: selling a put
+          // the day after a snapshot moves cash into collateral without
+          // changing total value or broker cash, so re-splitting per day nets
+          // the new collateral out of Cash on the trade date itself, with no
+          // false spike and no double count.
           const totalValue = a.totalValue + (b.totalValue - a.totalValue) * f;
-          const amount = Math.max(totalValue - p.total, 0);
-          // The cash/unrealized split itself is interpolated as a ratio of
-          // that (now-correct) amount, not as absolute dollars.
-          const cashFraction = (x) => (x.amount > 1e-9 ? x.cash / x.amount : 1);
-          const fraction = cashFraction(a) + (cashFraction(b) - cashFraction(a)) * f;
-          const cash = Math.min(Math.max(fraction, 0), 1) * amount;
-          return { cash, unrealized: amount - cash };
+          const cashTotal = a.cashTotal + (b.cashTotal - a.cashTotal) * f;
+          return splitAccountValue(totalValue, cashTotal, p.total, p.put);
         })
       : null;
-  const ndTopAt = (i) =>
-    ndInterp
-      ? ndInterp[i].cash + ndInterp[i].unrealized
-      : notDeployed.get(points[i].date)?.amount || 0;
+  // The overlay on day i, or null outside the snapshot range (account value
+  // unknown there). A lone snapshot is drawn on its own date only.
+  const ndAt = (i) => (ndInterp ? ndInterp[i] : notDeployed.get(points[i].date) || null);
+  // How far above committed capital the overlay reaches: Cash plus any gain.
+  // A loss reaches *down* from the top of Cash, so it never raises the axis.
+  const ndTopAt = (i) => {
+    const nd = ndAt(i);
+    return nd ? nd.cash + Math.max(nd.unrealized, 0) : 0;
+  };
   const last = points[points.length - 1];
   const margin = { top: 12, right: 64, bottom: 30, left: 62 };
   const width = chartWidth(svg);
@@ -1537,22 +1552,25 @@ function drawCapital(points, netWorth) {
     );
   }
 
-  // 5. Cash + Unrealized -- the shaded area between committed capital and the
-  //    account's Total value, stacked Cash then Unrealized with the same two
-  //    colors the "Where the wheel is right now" donut uses
-  //    (see `notDeployedByDate` / `drawWheelState`). The Positions snapshots
-  //    (dots) are the only real readings; with two or more they are connected
-  //    by a dashed Total-value line so the fill spans the whole snapshot
-  //    range as one interpolated estimate, not isolated single-day slivers.
-  //    A lone snapshot can't be connected, so it stays just its dots.
+  // 5. Cash + Unrealized -- what sits between committed capital (at cost) and
+  //    the account's Total value, in the same colours the "Where the wheel is
+  //    right now" donut uses (see `splitAccountValue` / `drawWheelState`).
+  //    Cash stacks on top of committed capital. A gain stacks above Cash; a
+  //    loss (holdings below cost) is a hatched red band reaching *down* from
+  //    the top of Cash to the real account value, so the dashed Total-value
+  //    line and its dot always sit at the real figure, whichever way it went.
+  //    The Positions snapshots (dots) are the only real readings; with two or
+  //    more the bands span the range between them as one interpolated
+  //    estimate. A lone snapshot can't be connected, so it stays just its dots.
   if (ndInterp || notDeployed.size) {
-    const cash = points.map((p, i) => (ndInterp ? ndInterp[i].cash : notDeployed.get(p.date)?.cash || 0));
-    const unrealized = points.map((p, i) =>
-      ndInterp ? ndInterp[i].unrealized : notDeployed.get(p.date)?.unrealized || 0
-    );
+    const inRange = points.map((_, i) => ndAt(i) !== null);
+    const cash = points.map((_, i) => (inRange[i] ? ndAt(i).cash : 0));
+    const unrealized = points.map((_, i) => (inRange[i] ? ndAt(i).unrealized : 0));
     const cashLower = points.map((p) => p.total);
     const cashUpper = points.map((p, i) => cashLower[i] + cash[i]);
-    const unrUpper = points.map((p, i) => cashUpper[i] + unrealized[i]);
+    const gainUpper = points.map((p, i) => cashUpper[i] + Math.max(unrealized[i], 0));
+    const lossLower = points.map((p, i) => cashUpper[i] + Math.min(unrealized[i], 0));
+    const accountValue = points.map((p, i) => cashUpper[i] + unrealized[i]);
 
     const fillRun = (lower, upper, color, opacity = BAND_WASH) => {
       for (const run of bandRuns(lower, upper)) {
@@ -1570,19 +1588,36 @@ function drawCapital(points, netWorth) {
     };
     const notDeployedColor = cssVar(NOT_DEPLOYED_COLOR);
     const unrealizedColor = cssVar(UNREALIZED_COLOR);
+    const lossColor = cssVar(UNREALIZED_LOSS_COLOR);
     // Unrealized fills noticeably denser than Cash (not just a different grey
-    // at the same low wash) so the two read apart at a glance, not just on
-    // close inspection -- two adjacent bands this close in hue were
-    // indistinguishable at a shared low opacity.
+    // at the same low wash) so the two read apart at a glance.
     fillRun(cashLower, cashUpper, notDeployedColor, BAND_WASH);
-    fillRun(cashUpper, unrUpper, unrealizedColor, BAND_WASH * 1.9);
+    fillRun(cashUpper, gainUpper, unrealizedColor, BAND_WASH * 1.9);
 
-    // A firm cap along the Cash/Unrealized boundary itself, in Unrealized's
-    // own full-strength colour -- the same "edge, not outline" cap the hued
-    // capital bands above use to stay legible where two fills meet, which
-    // this pair never had (a fill-only boundary is still a soft, easy-to-miss
-    // transition even once the two washes are visibly different densities).
-    for (const run of bandRuns(cashUpper, unrUpper)) {
+    // The loss band overlaps Cash and, when the loss is bigger than the cash,
+    // the top of the committed stack too: it is a deduction from those, not
+    // more money. Diagonal hatching over a light red wash keeps the bands
+    // underneath readable and marks it as "less than this" rather than a layer.
+    if (bandRuns(lossLower, cashUpper).length) {
+      const hatchId = 'capital-loss-hatch';
+      const defs = svgEl('defs');
+      const pattern = svgEl('pattern', {
+        id: hatchId,
+        width: 6,
+        height: 6,
+        patternUnits: 'userSpaceOnUse',
+        patternTransform: 'rotate(45)',
+      });
+      pattern.appendChild(svgEl('rect', { width: 6, height: 6, fill: lossColor, 'fill-opacity': BAND_WASH * 0.6 }));
+      pattern.appendChild(svgEl('line', { x1: 0, y1: 0, x2: 0, y2: 6, stroke: lossColor, 'stroke-width': 2 }));
+      defs.appendChild(pattern);
+      group.appendChild(defs);
+      fillRun(lossLower, cashUpper, `url(#${hatchId})`, 1);
+    }
+
+    // A firm cap along the Cash/gain boundary in Unrealized's full-strength
+    // colour, so the two washes meet at an edge rather than a soft blur.
+    for (const run of bandRuns(cashUpper, gainUpper)) {
       group.appendChild(
         svgEl('path', {
           d: 'M' + run.map((i) => `${x(points[i].date)},${y(cashUpper[i])}`).join('L'),
@@ -1594,13 +1629,13 @@ function drawCapital(points, netWorth) {
       );
     }
 
-    // The connecting Total-value line, along the top of the area. `--text-primary`
-    // (the strong ink both "total" lines use), dashed to say the stretch between
-    // two real snapshot dots is interpolated.
-    for (const run of bandRuns(cashLower, unrUpper)) {
+    // The connecting Total-value line at the real account value, dashed to
+    // say the stretch between two snapshot dots is interpolated.
+    for (const run of bandRuns(points.map(() => 0), inRange.map((on) => (on ? 1 : 0)))) {
+      if (run.length < 2) continue;
       group.appendChild(
         svgEl('path', {
-          d: 'M' + run.map((i) => `${x(points[i].date)},${y(unrUpper[i])}`).join('L'),
+          d: 'M' + run.map((i) => `${x(points[i].date)},${y(accountValue[i])}`).join('L'),
           fill: 'none',
           stroke: cssVar('--text-primary'),
           'stroke-width': 1.5,
@@ -1610,20 +1645,23 @@ function drawCapital(points, netWorth) {
       );
     }
 
-    // Dots: real snapshot readings, at each sub-band's true peak -- except a
-    // dot flagged `estimated` (a configured opening balance standing in for
-    // a missing earlier snapshot, see notDeployedByDate()), which draws
-    // hollow with a dashed ring instead of solid-filled: the same "this
-    // figure is a guess" vocabulary the estimate capital band above uses,
-    // so a reader never mistakes a manual number for an itemized reading.
+    // Dots: real snapshot readings -- one at the top of Cash, one at the
+    // account value when a gain or loss separates the two. A dot flagged
+    // `estimated` (a configured opening balance standing in for a missing
+    // earlier snapshot, see notDeployedByDate()) draws hollow with a dashed
+    // ring: the same "this figure is a guess" vocabulary as the estimate band.
     for (const [date, nd] of notDeployed) {
       const point = points.find((p) => p.date === date);
       if (!point) continue;
-      for (const stop of [
-        { v: nd.cash, top: point.total + nd.cash, color: cssVar(NOT_DEPLOYED_COLOR) },
-        { v: nd.unrealized, top: point.total + nd.cash + nd.unrealized, color: cssVar(UNREALIZED_COLOR) },
-      ]) {
-        if (!(stop.v > 1e-9)) continue;
+      const stops = [];
+      if (nd.cash > 1e-9) stops.push({ top: point.total + nd.cash, color: notDeployedColor });
+      if (Math.abs(nd.unrealized) > 1e-9) {
+        stops.push({
+          top: point.total + nd.amount,
+          color: nd.unrealized > 0 ? unrealizedColor : lossColor,
+        });
+      }
+      for (const stop of stops) {
         group.appendChild(
           svgEl('circle', {
             cx: x(date),
@@ -1688,7 +1726,12 @@ function drawCapital(points, netWorth) {
         const tag = nd.estimated ? ' (estimated)' : '';
         rows.push(
           { label: 'Cash' + tag, value: money(nd.cash), color: cssVar(NOT_DEPLOYED_COLOR) },
-          { label: 'Unrealized' + tag, value: money(nd.unrealized), color: cssVar(UNREALIZED_COLOR) },
+          {
+            label: (nd.unrealized < 0 ? 'Unrealized loss' : 'Unrealized') + tag,
+            value: money(nd.unrealized),
+            color: cssVar(nd.unrealized < 0 ? UNREALIZED_LOSS_COLOR : UNREALIZED_COLOR),
+            valueClass: nd.unrealized < 0 ? 'neg' : undefined,
+          },
           { label: 'Total value' + tag, value: money(point.total + nd.amount) }
         );
       }
@@ -1743,6 +1786,17 @@ function drawCapital(points, netWorth) {
     item.appendChild(document.createTextNode(band.label));
     legend.appendChild(item);
   });
+  // The loss band is the one overlay mark that isn't self-explanatory (it
+  // overlaps the bands it deducts from), so it gets a key entry while shown.
+  if (!share && ndAnchors.some((a) => a.unrealized < -1e-9)) {
+    const item = el('span');
+    const swatch = el('i');
+    const lossColor = cssVar(UNREALIZED_LOSS_COLOR);
+    swatch.style.background = `repeating-linear-gradient(45deg, ${lossColor} 0 2px, transparent 2px 4px)`;
+    item.appendChild(swatch);
+    item.appendChild(document.createTextNode('Unrealized loss (holdings below cost)'));
+    legend.appendChild(item);
+  }
   if (share) {
     legend.appendChild(el('span', { class: 'legend-note' }, 'Switch to $ to add Cash and Unrealized.'));
   } else if (ndAnchors.length >= 2) {
@@ -1849,14 +1903,22 @@ function drawWheelState(wheelState, netWorth) {
   const netWorthTotals = netWorth && netWorth.available ? netWorth.combined || netWorth : null;
   const totalValue = netWorthTotals && netWorthTotals.total_value != null ? netWorthTotals.total_value : null;
   const cashTotal = netWorthTotals && netWorthTotals.cash_total != null ? netWorthTotals.cash_total : null;
-  const gap = totalValue !== null ? Math.max(totalValue - deployed, 0) : 0;
-  const cash = cashTotal !== null ? Math.min(Math.max(cashTotal - phaseMeta.puts.amount, 0), gap) : 0;
-  const unrealized = Math.max(gap - cash, 0);
+  // Same split as the Capital deployed chart (`splitAccountValue`): cash is
+  // its real amount and unrealized is signed. A loss can't be a wedge, so the
+  // ring holds committed capital + cash (+ any gain) and the legend below
+  // lists the loss and the real Total value.
+  const split =
+    totalValue !== null
+      ? splitAccountValue(totalValue, cashTotal, deployed, phaseMeta.puts.amount)
+      : { cash: 0, unrealized: 0, amount: 0 };
+  const cash = split.cash;
+  const unrealized = split.unrealized;
+  const unrealizedWedge = Math.max(unrealized, 0);
 
   const hasParts = Object.keys(rawParts).length > 0;
   let components;
   if (hasParts) {
-    const amt = { ...rawParts, cash, unrealized };
+    const amt = { ...rawParts, cash, unrealized: unrealizedWedge };
     components = WHEEL_STATE_COMPONENTS.map((c) => ({
       ...c,
       amount: amt[c.key] || 0,
@@ -1868,7 +1930,7 @@ function drawWheelState(wheelState, netWorth) {
     components = ['puts', 'holding', 'calls', 'other', 'cash', 'unrealized']
       .map((key) => {
         const m = WHEEL_STATE_PHASE_META[key];
-        const amount = key === 'cash' ? cash : key === 'unrealized' ? unrealized : phaseMeta[key].amount;
+        const amount = key === 'cash' ? cash : key === 'unrealized' ? unrealizedWedge : phaseMeta[key].amount;
         return {
           key,
           phase: key,
@@ -2002,18 +2064,29 @@ function drawWheelState(wheelState, netWorth) {
     svgEl(
       'text',
       { x: cx, y: cy - 4, 'text-anchor': 'middle', style: 'fill: var(--text-primary); font-weight: 700; font-size: 16px;' },
-      compactMoney(grandTotal)
+      // The real account value whenever a snapshot is loaded: with a gain it
+      // equals the ring's sum; with a loss the ring (cost + cash) is larger,
+      // and the centre must still say what the account is worth.
+      compactMoney(totalValue !== null ? totalValue : grandTotal)
     )
   );
   group.appendChild(
-    svgEl('text', { x: cx, y: cy + 14, 'text-anchor': 'middle', class: 'tick-label' }, 'total')
+    svgEl(
+      'text',
+      { x: cx, y: cy + 14, 'text-anchor': 'middle', class: 'tick-label' },
+      totalValue !== null ? 'total value' : 'total'
+    )
   );
 
   svg.setAttribute(
     'aria-label',
     `${totalValue !== null ? 'Account value if liquidated today' : 'Current wheel capital'}: ${components
       .map((c) => `${displayLabel(c)} ${pct((c.amount / grandTotal) * 100, 0)}`)
-      .join(', ')}. Total ${money(grandTotal)}, ${activeCycles} active cycle(s).`
+      .join(', ')}. ` +
+      (totalValue !== null && unrealized < 0
+        ? `Holdings are ${money(-unrealized)} below cost, so the account is worth ${money(totalValue)}. `
+        : `Total ${money(totalValue !== null ? totalValue : grandTotal)}. `) +
+      `${activeCycles} active cycle(s).`
   );
 
   // The page's one figured capital breakdown: the deployed components (same
@@ -2054,9 +2127,11 @@ function drawWheelState(wheelState, netWorth) {
 
   const cashR = r(cash);
   const unrealR = r(unrealized);
-  if (cashR > 0 || unrealR > 0) {
+  if (totalValue !== null) {
     row('Cash', cashR, { color: cssVar(NOT_DEPLOYED_COLOR) });
-    row('Unrealized', unrealR, { color: cssVar(UNREALIZED_COLOR) });
+    row(unrealR < 0 ? 'Unrealized loss' : 'Unrealized', unrealR, {
+      color: cssVar(unrealR < 0 ? UNREALIZED_LOSS_COLOR : UNREALIZED_COLOR),
+    });
     row('Total value', committed + cashR + unrealR, {
       kind: 'dashed',
       color: cssVar('--text-primary'),
@@ -2814,31 +2889,34 @@ const periodPlRangeLabel = (row, granularity) =>
   granularity === 'week' ? weekRangeLabel(row.week_start, row.week_end) : monthLabel(row.period);
 
 /**
- * Stacks `PERIOD_PL_SERIES` values for one period into a diverging bar: each
- * series extends the positive cursor upward or the negative cursor downward
- * from zero, in series order, so same-signed values stack contiguously
- * (Option P/L touches zero, Stock P/L stacks beyond it) while opposite-signed
- * values extend to opposite sides of zero instead of overlapping and
- * visually canceling. Returns one `{ key, from, to, value }` segment per
- * non-zero series plus the resulting `top`/`bottom` extents of the whole bar.
+ * Stacks one row's `keys` values into a diverging bar: each value extends the
+ * positive cursor upward or the negative cursor downward from zero, in key
+ * order, so same-signed values stack contiguously (the first key touches
+ * zero, later ones stack beyond it) while opposite-signed values extend to
+ * opposite sides of zero instead of overlapping and visually canceling.
+ * Missing values count as 0. Returns one `{ key, from, to, value }` segment
+ * per non-zero value plus the resulting `top`/`bottom` extents of the bar.
+ * Shared by Periodic P/L and Open wheel P/L.
  */
-function stackPeriodPl(row) {
+function stackDiverging(row, keys) {
   let posCursor = 0;
   let negCursor = 0;
   const segments = [];
-  for (const series of PERIOD_PL_SERIES) {
-    const value = row[series.key] || 0;
+  for (const key of keys) {
+    const value = row[key] || 0;
     if (value === 0) continue;
     if (value > 0) {
-      segments.push({ key: series.key, from: posCursor, to: posCursor + value, value });
+      segments.push({ key, from: posCursor, to: posCursor + value, value });
       posCursor += value;
     } else {
-      segments.push({ key: series.key, from: negCursor, to: negCursor + value, value });
+      segments.push({ key, from: negCursor, to: negCursor + value, value });
       negCursor += value;
     }
   }
   return { segments, top: posCursor, bottom: negCursor };
 }
+
+const stackPeriodPl = (row) => stackDiverging(row, PERIOD_PL_SERIES.map((series) => series.key));
 
 /**
  * One diverging stacked bar per period -- Option P/L and Stock P/L stacked
@@ -3045,6 +3123,233 @@ function drawPeriodPl(periodPl) {
       money(row.stock_pl, { cents: true, sign: true }),
       money(row.total_realized_pl, { cents: true, sign: true }),
     ])
+  );
+}
+
+/* ------------------------------------------------ chart: open wheel P/L */
+
+// Four fixed colours: hue = gain or loss, shade = source (options darker and
+// stacked next to zero, shares lighter and stacked beyond). A segment's side
+// of the zero line shows the sign too, so colour is never the only cue.
+const OPEN_WHEEL_PL_PARTS = [
+  { key: 'option_pl', label: 'Options', gainVar: '--gain-strong', lossVar: '--loss-strong' },
+  { key: 'holding_pl', label: 'Holding', gainVar: '--gain-soft', lossVar: '--loss-soft' },
+];
+
+const OPEN_WHEEL_PL_TABLE_HEAD = [
+  'Wheel',
+  {
+    text: 'Options P/L',
+    title: 'Closed option trades plus open options at their last price in your Positions export (with no price, as if they expire worthless).',
+  },
+  { text: 'Holding P/L', title: 'Shares sold, shares still held at today’s price, and dividends.' },
+  { text: 'Total P/L now', title: 'Options P/L + Holding P/L.' },
+];
+
+// Room per bar so one rotated ticker label never overlaps the next; with more
+// wheels than fit, the chart grows wider and scrolls inside its card.
+const OPEN_WHEEL_PL_MIN_SLOT = 18;
+// Approximate width of one 11px tick-label character, for the rotated labels'
+// bottom margin.
+const OPEN_WHEEL_PL_LABEL_CHAR_PX = 7.5;
+
+/** A wheel's x-axis name: the ticker, plus the account only when the
+ *  Combined view has that ticker open in more than one account. */
+function openWheelPlLabel(row, sharedTickers) {
+  if (!row.account_id || !sharedTickers.has(row.underlying)) return row.underlying;
+  return `${row.underlying} · ${accountLabelsById[row.account_id] || row.account_id}`;
+}
+
+/** Click-through from an Open wheel P/L bar: that exact wheel in the Trade Log. */
+function openTradeLogForWheel(row) {
+  state.tradeLogCycleId = row.cycle_id;
+  state.tradeLogTicker = row.underlying;
+  switchTab('tradelog');
+}
+
+/**
+ * One diverging stacked bar per open wheel (`data.open_wheel_pl`, built by
+ * `open_wheel_pl_rows` in wheel/api.py from the Trade Log entries): Options
+ * P/L and Holding P/L stacked from zero with `stackDiverging`, so the bar's
+ * far end on each side is that side's sum and the two parts never cancel
+ * visually. Every figure is the backend's; nothing is computed here beyond
+ * pixel positions. Ticker chips narrow it like the other dashboard charts;
+ * the date range doesn't apply (this is today's position).
+ */
+function drawOpenWheelPl(allRows) {
+  const svg = $('chart-open-wheel-pl');
+  const legend = $('legend-open-wheel-pl');
+  const note = $('open-wheel-pl-note');
+  clear(legend);
+
+  const rows = (allRows || []).filter((row) => !state.tickers.size || state.tickers.has(row.underlying));
+  const priced = rows.filter((row) => row.mark_to_market_pl !== null && row.mark_to_market_pl !== undefined);
+  const unpriced = rows.filter((row) => row.mark_to_market_pl === null || row.mark_to_market_pl === undefined);
+
+  const notes = [];
+  if (!rows.length) {
+    notes.push(state.tickers.size ? 'No open wheels for the selected tickers.' : 'No open wheels right now.');
+  }
+  if (unpriced.length) {
+    const tickers = unpriced.map((row) => row.underlying).join(', ');
+    notes.push(`No share price for ${tickers}: total P/L can’t be worked out, so not shown.`);
+  }
+  note.textContent = notes.join(' ');
+  note.hidden = notes.length === 0;
+
+  const sharedCounts = {};
+  for (const row of priced) sharedCounts[row.underlying] = (sharedCounts[row.underlying] || 0) + 1;
+  const sharedTickers = new Set(Object.keys(sharedCounts).filter((ticker) => sharedCounts[ticker] > 1));
+  const labels = priced.map((row) => openWheelPlLabel(row, sharedTickers));
+
+  buildTable(
+    'open-wheel-pl-table',
+    OPEN_WHEEL_PL_TABLE_HEAD,
+    rows.map((row) => [
+      row.mark_to_market_pl === null || row.mark_to_market_pl === undefined
+        ? row.underlying
+        : labels[priced.indexOf(row)],
+      money(row.option_pl, { cents: true }),
+      money(row.holding_pl, { cents: true }),
+      money(row.mark_to_market_pl, { cents: true }),
+    ])
+  );
+
+  if (!priced.length) {
+    clear(svg);
+    svg.removeAttribute('width');
+    svg.setAttribute('height', 0);
+    svg.removeAttribute('aria-label');
+    return;
+  }
+
+  const partKeys = OPEN_WHEEL_PL_PARTS.map((part) => part.key);
+  const stacks = priced.map((row) => stackDiverging(row, partKeys));
+  const longestLabel = Math.max(...labels.map((label) => label.length));
+  const margin = { top: 14, right: 20, bottom: 14 + longestLabel * OPEN_WHEEL_PL_LABEL_CHAR_PX, left: 62 };
+  const width = Math.max(chartWidth(svg), margin.left + margin.right + priced.length * OPEN_WHEEL_PL_MIN_SLOT);
+  const height = 240 + margin.top + margin.bottom;
+  const yMax = Math.max(0, ...stacks.map((stack) => stack.top), 1) * 1.15;
+  const yMin = Math.min(0, ...stacks.map((stack) => stack.bottom)) * 1.15;
+
+  const { group, plotWidth, plotHeight, y } = frame(svg, { width, height, margin, yMin, yMax });
+  const zeroY = y(0);
+  const surface = cssVar('--surface-1');
+  const colorOf = (part, value) => cssVar(value > 0 ? part.gainVar : part.lossVar);
+
+  const slot = plotWidth / priced.length;
+  const barWidth = Math.max(8, Math.min(48, slot * 0.6));
+  const hitWidth = Math.max(barWidth, Math.min(slot * 0.9, slot - 2));
+
+  priced.forEach((row, index) => {
+    const cx = margin.left + slot * (index + 0.5);
+    for (const segment of stacks[index].segments) {
+      const part = OPEN_WHEEL_PL_PARTS.find((candidate) => candidate.key === segment.key);
+      const top = y(Math.max(segment.from, segment.to));
+      const bottom = y(Math.min(segment.from, segment.to));
+      group.appendChild(
+        svgEl('rect', {
+          class: 'mark',
+          'data-part': segment.key,
+          'data-sign': segment.value > 0 ? 'gain' : 'loss',
+          x: cx - barWidth / 2,
+          y: top,
+          width: barWidth,
+          height: Math.max(bottom - top, 1.5),
+          fill: colorOf(part, segment.value),
+          // A hairline in the card colour keeps two same-hue parts apart.
+          stroke: surface,
+          'stroke-width': 1,
+        })
+      );
+    }
+
+    const labelY = margin.top + plotHeight + 8;
+    group.appendChild(
+      svgEl(
+        'text',
+        {
+          class: 'tick-label',
+          x: cx,
+          y: labelY,
+          'text-anchor': 'end',
+          'dominant-baseline': 'middle',
+          transform: `rotate(-90 ${cx} ${labelY})`,
+        },
+        labels[index]
+      )
+    );
+
+    const hit = svgEl('rect', {
+      class: 'hit',
+      x: cx - hitWidth / 2,
+      y: margin.top,
+      width: hitWidth,
+      height: plotHeight,
+      'aria-label': `${labels[index]}: total P/L now ${money(row.mark_to_market_pl, { cents: true })}`,
+    });
+    group.appendChild(hit);
+    // The rows already show Options + Holding = Total; the only thing left to
+    // say is when an open option had no price to mark it with.
+    const unmarkedNote =
+      row.open_option_pl_marked === false
+        ? formula(['Some open options had no price in your Positions export, so they count as if they expire worthless.'])
+        : undefined;
+    attachTip(
+      hit,
+      row.name ? `${labels[index]} · ${row.name}` : labels[index],
+      [
+        ...OPEN_WHEEL_PL_PARTS.map((part) => ({
+          label: `${part.label} P/L`,
+          value: money(row[part.key], { cents: true }),
+          color: colorOf(part, row[part.key]),
+          valueClass: row[part.key] < 0 ? 'neg' : 'pos',
+        })),
+        {
+          label: 'Total P/L now',
+          value: money(row.mark_to_market_pl, { cents: true }),
+          valueClass: row.mark_to_market_pl < 0 ? 'neg' : 'pos',
+        },
+      ],
+      unmarkedNote
+    );
+    hit.addEventListener('click', () => openTradeLogForWheel(row));
+    hit.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        openTradeLogForWheel(row);
+      }
+    });
+  });
+
+  // Drawn last so the zero line sits on top of the bars it divides.
+  group.appendChild(
+    svgEl('line', {
+      class: 'axis-line zero-line',
+      x1: margin.left,
+      x2: margin.left + plotWidth,
+      y1: zeroY,
+      y2: zeroY,
+    })
+  );
+
+  for (const [label, varName] of [
+    ['Options gain', '--gain-strong'],
+    ['Holding gain', '--gain-soft'],
+    ['Options loss', '--loss-strong'],
+    ['Holding loss', '--loss-soft'],
+  ]) {
+    const item = el('span');
+    const swatch = el('i');
+    swatch.style.background = cssVar(varName);
+    item.appendChild(swatch);
+    item.appendChild(document.createTextNode(label));
+    legend.appendChild(item);
+  }
+
+  svg.setAttribute(
+    'aria-label',
+    `Open wheel P/L, ${priced.length} wheel(s). Hover or focus a bar for its breakdown; click to open it in the Trade Log.`
   );
 }
 
@@ -12702,6 +13007,7 @@ function render({ dashboardTabOnly = false } = {}) {
   renderDashboardInsights();
   renderNetWorth(net_worth, benchmark, wheel_return, wheel_state);
 
+  drawOpenWheelPl(data.open_wheel_pl);
   drawCapital(capital_series, net_worth);
   drawWheelState(wheel_state, net_worth);
   drawPnl(appendMarkToMarketPoint(pnl_series, meta, portfolio));
